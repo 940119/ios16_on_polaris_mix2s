@@ -2,9 +2,11 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the live FDT.
+  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+  mkadt.py OUT.adt --polaris [--ram 6|8] [--dump]
 """
-import hashlib, os, struct, sys
+import argparse, hashlib, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
@@ -12,19 +14,26 @@ import adt  # noqa: E402
 # Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
 PHYS_BASE = 0xb0000000
 MEM_SIZE = 0x4d000000
-# --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
+# --highmem (sweet, 8GB): the whole upper DDR bank. The live FDT memory node is
 # <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
 # carve-out is in the low bank and the dynamic pools are limited below 4G.
 HIGH_PHYS_BASE = 0x100000000
 HIGH_MEM_SIZE = 0xfcc00000
+# polaris (Mi MIX 2S, SDM845): same upper bank, but the installed RAM is 6 or
+# 8GB. 6GB ends at 0x1_80000000 and leaves at most 0x7cc00000 after the top
+# reservation, which is safe on both variants; --ram 8 uses the 8GB end.
+POLARIS_HIGH_MEM_SIZE = 0x7cc00000
+POLARIS_HIGH_MEM_SIZE_8 = 0xfcc00000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0x9c000000, 0x1700000
+POLARIS_FB, POLARIS_FB_SIZE = 0x9d400000, 0x2400000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
+POLARIS_FB_W, POLARIS_FB_H = 1080, 2160
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -68,10 +77,16 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, polaris=False, ram=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    if polaris:
+        highmem = True
+        mem_size = POLARIS_HIGH_MEM_SIZE_8 if ram == 8 else POLARIS_HIGH_MEM_SIZE
+    phys_base, mem_size = (HIGH_PHYS_BASE, mem_size if polaris else HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    fb, fb_size, fb_w, fb_h = ((POLARIS_FB, POLARIS_FB_SIZE, POLARIS_FB_W, POLARIS_FB_H)
+                               if polaris else (FB, FB_SIZE, FB_W, FB_H))
+    fb_stride = fb_w * 4
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -119,16 +134,23 @@ def build(seed=None, qemu=False, highmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
-    # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
-    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # SWEET SMP: all eight cores in physical-core order, one homogeneous
+    # cluster. The kernel defaults to one and uses cpus=N to select an initial
+    # prefix (N <= 8). sweet is 6x A55 + 2x A76; polaris is 4x A55 + 4x A75.
+    # The compatible string stays qcom,kryo470 because SweetCPU matches it;
+    # the real SoC name is added second for polaris.
+    # QEMU retains its original single-CPU tree: its MPIDRs differ.
     cpu_nodes = []
     for core in range(1 if qemu else 8):
+        if polaris:
+            clock = 2803200000 if core >= 4 else 1804800000
+        else:
+            clock = 2304000000 if core >= 6 else 1804800000
+        compat = cstr('qcom,kryo470') + (cstr('qcom,kryo385') if polaris else b'') + cstr('ARM,v8')
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
+            ('compatible', compat),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
@@ -139,7 +161,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(clock)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -181,10 +203,10 @@ def build(seed=None, qemu=False, highmem=False):
 
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
-        ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
-        ('stride', u32(FB_STRIDE)),
+        ('reg', u64(fb, fb_size)),
+        ('width', u32(fb_w)),
+        ('height', u32(fb_h)),
+        ('stride', u32(fb_stride)),
     ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
@@ -214,10 +236,14 @@ def build(seed=None, qemu=False, highmem=False):
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
-    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching;
+    # polaris adds its own board and SoC names after it.
+    compat = cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet')
+    compat += cstr('xiaomi,polaris') + cstr('qcom,sdm845') if polaris else cstr('qcom,sm7150')
+    compat += cstr('AppleARM')
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', compat),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
@@ -228,9 +254,19 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    ap = argparse.ArgumentParser()
+    ap.add_argument('out')
+    ap.add_argument('--dump', action='store_true')
+    ap.add_argument('--qemu', action='store_true')
+    ap.add_argument('--highmem', action='store_true')
+    ap.add_argument('--polaris', action='store_true', help='Mi MIX 2S: 1080x2160 splash, SDM845 CPU nodes, high RAM')
+    ap.add_argument('--ram', type=int, choices=(6, 8), help='polaris installed RAM (default 6, safe on both)')
+    a = ap.parse_args()
+    if a.ram and not a.polaris:
+        ap.error('--ram only applies to --polaris')
+    root = build(qemu=a.qemu, highmem=a.highmem, polaris=a.polaris, ram=a.ram)
     blob = adt.serialize(root)
-    open(sys.argv[1], 'wb').write(blob)
-    if '--dump' in sys.argv:
+    open(a.out, 'wb').write(blob)
+    if a.dump:
         adt.dump(adt.parse(blob)[0])
-    print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)
+    print(f'{a.out}: {len(blob)} bytes', file=sys.stderr)
