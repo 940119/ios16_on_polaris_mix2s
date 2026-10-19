@@ -13,7 +13,9 @@
 #include "console.h"
 #include "ufs.h"
 
-#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
+#ifndef UFS_BASE
+#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000 (sweet and polaris) */
+#endif
 
 #define REG_CAP		0x00
 #define REG_VER		0x08
@@ -80,11 +82,12 @@ static uint32_t be32(const uint8_t *p)
 }
 
 /*
- * Issue one SCSI command (read direction or no data) in slot 0.
+ * Issue one SCSI command in slot 0. dir: 0 = no data, 1 = read (device to
+ * host), 2 = write (host to device).
  * Returns 0 on success, otherwise a code describing the failure stage.
  */
-static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *buf, uint32_t len,
-    uint32_t *ocs_out, uint32_t *status_out)
+static uint32_t scsi_dir(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *buf,
+    uint32_t len, int dir, uint32_t *ocs_out, uint32_t *status_out)
 {
 	static uint8_t tag;
 	zero(&utrl[0], sizeof(utrl[0]));
@@ -92,7 +95,7 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 
 	/* Command UPIU: header (12 bytes), expected length, CDB. */
 	ucd.cmd[0] = 0x01;			/* transaction type: COMMAND */
-	ucd.cmd[1] = len ? 0x40 : 0x00;		/* flags: R (data in) */
+	ucd.cmd[1] = dir == 1 ? 0x40 : dir == 2 ? 0x20 : 0x00;	/* R / W */
 	ucd.cmd[2] = lun;
 	ucd.cmd[3] = ++tag;
 	ucd.cmd[12] = len >> 24;
@@ -103,7 +106,8 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 		ucd.cmd[16 + i] = cdb[i];
 
 	uintptr_t ucd_pa = (uintptr_t)&ucd;
-	utrl[0].dw0 = (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24);	/* UFS storage, dev->host */
+	utrl[0].dw0 = (1u << 28) |
+		      ((len ? (dir == 1 ? 2u : 1u) : 0u) << 25) | (1u << 24);
 	utrl[0].dw2 = 0x0f;			/* OCS: invalid until the host updates it */
 	utrl[0].ucdba = (uint32_t)ucd_pa;
 	utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
@@ -139,7 +143,14 @@ static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
 {
 	uint8_t cdb[10] = { 0x28, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
 	uint32_t ocs, st;
-	return scsi(0, cdb, sizeof(cdb), buf, count * BLOCK, &ocs, &st);
+	return scsi_dir(0, cdb, sizeof(cdb), buf, count * BLOCK, 1, &ocs, &st);
+}
+
+static uint32_t write_blocks(uint32_t lba, uint32_t count, void *buf)
+{
+	uint8_t cdb[10] = { 0x2a, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
+	uint32_t ocs, st;
+	return scsi_dir(0, cdb, sizeof(cdb), buf, count * BLOCK, 2, &ocs, &st);
 }
 
 static uint64_t le64(const uint8_t *p)
@@ -192,6 +203,136 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 	}
 }
 
+/* Take over the transfer request list. 0 = ok. */
+static int ufs_takeover(void)
+{
+	uint32_t hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
+
+	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY))
+		return 1;
+	if (ufs_rd(REG_UTRLDBR))
+		return 2;
+	ufs_wr(REG_UTRLRSR, 0);
+	uintptr_t list = (uintptr_t)utrl;
+	ufs_wr(REG_UTRLBA, (uint32_t)list);
+	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+	ufs_wr(REG_UTRLRSR, 1);
+	/*
+	 * Never ring a doorbell unless the host really uses our list: otherwise
+	 * it would execute whatever ABL left in its own slot 0 (maybe a write).
+	 */
+	if (ufs_rd(REG_UTRLBA) != (uint32_t)list ||
+	    ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+	    !(ufs_rd(REG_UTRLRSR) & 1))
+		return 3;
+	return 0;
+}
+
+/* First LBA and block count of a GPT partition, 0 if absent. */
+static uint32_t gpt_find(const char *want, uint32_t *out_lba)
+{
+	static uint8_t hdr[BLOCK] __attribute__((aligned(4096)));
+	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
+
+	if (read_blocks(1, 1, hdr))
+		return 0;
+	if (hdr[0] != 'E' || hdr[1] != 'F' || hdr[2] != 'I' || hdr[3] != ' ')
+		return 0;
+	uint32_t nent = hdr[80] | hdr[81] << 8 | hdr[82] << 16 | hdr[83] << 24;
+	uint32_t esz = hdr[84] | hdr[85] << 8 | hdr[86] << 16 | hdr[87] << 24;
+	uint32_t elba = hdr[72] | hdr[73] << 8 | hdr[74] << 16 | hdr[75] << 24;
+	if (esz != 128 || nent == 0 || nent > 128)
+		return 0;
+	if (read_blocks(elba, (nent * 128 + BLOCK - 1) / BLOCK, ents))
+		return 0;
+	for (uint32_t i = 0; i < nent; i++) {
+		const uint8_t *e = ents + i * 128;
+		int match = 1;
+		for (int c = 0; c < 16; c++) {
+			uint8_t lo = e[56 + 2 * c], hi = e[57 + 2 * c];
+			char ch = (hi == 0 && lo >= 32 && lo < 127) ? (char)lo : 0;
+			if (want[c] != ch) {
+				match = 0;
+				break;
+			}
+			if (!ch)
+				break;
+		}
+		if (!match)
+			continue;
+		uint64_t first = le64(e + 32), last = le64(e + 40);
+		if (!first || last < first + 8)
+			return 0;
+		*out_lba = (uint32_t)first;
+		return (uint32_t)(last - first + 1);
+	}
+	return 0;
+}
+
+/*
+ * Write one 4 KiB diagnostic block to the start of cache (fallback misc).
+ * Returns 0, or a negative stage code. Never touches any other LBA.
+ */
+int ufs_write_diag(const void *buf)
+{
+	if (ufs_takeover())
+		return -1;
+	uint32_t lba = 0, blocks = 0;
+
+	blocks = gpt_find("cache", &lba);
+	if (!blocks)
+		blocks = gpt_find("misc", &lba);
+	if (!blocks)
+		return -2;
+
+	/* Refuse to write unless the partition is inside the device. */
+	static uint8_t capbuf[BLOCK] __attribute__((aligned(4096)));
+	uint8_t cdb[10] = { 0x25 };
+	uint32_t ocs = 0, st = 0;
+	if (scsi_dir(0, cdb, sizeof(cdb), capbuf, 8, 1, &ocs, &st))
+		return -3;
+	uint32_t lastlba = be32(capbuf);
+	if (lba + 8 > lastlba)
+		return -4;
+
+	zero(data, BLOCK);
+	for (unsigned i = 0; i < BLOCK; i++)
+		data[i] = ((const uint8_t *)buf)[i];
+	__asm__ volatile("dsb sy" ::: "memory");
+	return write_blocks(lba, 1, data) ? -5 : 0;
+}
+
+int ufs_read_lba(uint32_t lba, void *buf)
+{
+	if (ufs_takeover())
+		return -1;
+	return read_blocks(lba, 1, buf) ? -2 : 0;
+}
+
+int ufs_write_lba(uint32_t lba, const void *buf)
+{
+	if (ufs_takeover())
+		return -1;
+	zero(data, BLOCK);
+	for (unsigned i = 0; i < BLOCK; i++)
+		data[i] = ((const uint8_t *)buf)[i];
+	__asm__ volatile("dsb sy" ::: "memory");
+	return write_blocks(lba, 1, data) ? -2 : 0;
+}
+
+int ufs_capacity(uint32_t *lastlba)
+{
+	if (ufs_takeover())
+		return -1;
+	static uint8_t capbuf[BLOCK] __attribute__((aligned(4096)));
+	uint8_t cdb[10] = { 0x25 };
+	uint32_t ocs = 0, st = 0;
+	if (scsi_dir(0, cdb, sizeof(cdb), capbuf, 8, 1, &ocs, &st))
+		return -2;
+	*lastlba = be32(capbuf);
+	return 0;
+}
+
 void test_ufs(void)
 {
 	con_str("UFS", "milestone 5 probe (read-only)");
@@ -232,21 +373,21 @@ void test_ufs(void)
 	static const uint8_t tur[6] = { 0x00 };
 	/* A first command may report a unit attention; retry a few times. */
 	for (int i = 0; i < 3; i++) {
-		rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
+		rc = scsi_dir(0, tur, sizeof(tur), 0, 0, 0, &ocs, &st);
 		con_hex2("UFS TUR", "rc=", rc, "ocs/st=", ocs << 8 | st);
 		if (!rc)
 			break;
 	}
 
 	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
-	rc = scsi(0, cap10, sizeof(cap10), data, 8, &ocs, &st);
+	rc = scsi_dir(0, cap10, sizeof(cap10), data, 8, 1, &ocs, &st);
 	con_hex2("UFS CAP", "rc=", rc, "ocs/st=", ocs << 8 | st);
 	if (!rc)
 		con_hex2("UFS LUN0", "lastlba=", be32(data), "blk=", be32(data + 4));
 
 	/* READ(10) LBA 0, 2 blocks: protective MBR and the GPT header. */
 	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
-	rc = scsi(0, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
+	rc = scsi_dir(0, rd10, sizeof(rd10), data, 2 * BLOCK, 1, &ocs, &st);
 	con_hex2("UFS READ", "rc=", rc, "ocs/st=", ocs << 8 | st);
 	if (rc)
 		return;

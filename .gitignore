@@ -4,7 +4,20 @@ dtb/
 recovery/
 # third-party/Apple sources fetched for reading
 research/
+# build output and local deliverables
+out/
+dist/
 shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+
+# local CI artifacts and platform tools
+xnu-kernel.zip
+tools/platform-tools/
+tools/platform-tools.zip
+*.ipsw
+*.dmg
+*.simg
+*.img
+wsl-*.log

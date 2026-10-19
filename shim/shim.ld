@@ -2,8 +2,12 @@ ENTRY(_head)
 SECTIONS
 {
 	. = 0;
-	.text : { *(.text.head) *(.text*) }
-	.rodata : { *(.rodata*) }
+	/*
+	 * Keep .rodata inside .text: a separate output section made objcopy
+	 * shift it 68 bytes away from its VMA, so every string and font lookup
+	 * read the wrong bytes at runtime.
+	 */
+	.text : { *(.text.head) *(.text*) *(.rodata*) }
 	.data : { *(.data*) }
 	. = ALIGN(16);
 	_bss_start = .;
