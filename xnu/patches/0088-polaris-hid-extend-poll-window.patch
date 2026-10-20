@@ -1,0 +1,19 @@
+diff --git a/bsd/dev/polaris_touch_i2c.c b/bsd/dev/polaris_touch_i2c.c
+--- a/bsd/dev/polaris_touch_i2c.c
++++ b/bsd/dev/polaris_touch_i2c.c
+@@ -309,10 +309,11 @@
+ 	if (pt_hid_enabled) {
+ 		unsigned candidates = 0, failures = 0;
+ 		int prior_x = 0, prior_y = 0;
+-		/* 50 Hz maximum; at most 12000 samples (four minutes) and stop
+-		 * after eight consecutive invalid/failed reads. Never log per poll. */
+-		printf("POLARIS HID: EXPERIMENTAL unproven F12 layout 0x08, bounded one-finger poll\n");
+-		for (unsigned i = 0; i < 12000; ++i) {
++		/* 50 Hz maximum; up to one hour so slow iOS first boot cannot
++		 * exhaust the experiment before the lock screen appears. Stop after
++		 * eight consecutive invalid/failed reads. Never log per poll. */
++		printf("POLARIS HID: EXPERIMENTAL unproven F12 layout 0x08, one-hour one-finger poll\n");
++		for (unsigned i = 0; i < 180000; ++i) {
+ 			int x = 0, y = 0;
+ 			bool present = false;
+ 			if (!pt_read(f12[3], raw, sizeof(raw)) ||
