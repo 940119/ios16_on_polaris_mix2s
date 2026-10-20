@@ -1,0 +1,211 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/polaris_touch_diag.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void polaris_touch_diag(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -659,6 +660,7 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	polaris_touch_diag();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -12,6 +12,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++extern bool sweet_touch_board(void);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -127,6 +128,10 @@ sweet_keys_init(void)
+ {
+ 	int enabled = 1;
+ 	thread_t thread;
++	if (!sweet_touch_board()) {
++		printf("SWEET KEYS: SM7150 not confirmed; PMIC driver prohibited\n");
++		return;
++	}
+ 	if (keys_started) {
+ 		return;
+ 	}
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -14,6 +14,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++extern bool sweet_touch_board(void);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -640,6 +641,10 @@ sweet_touch_init(void)
+ {
+ 	int enabled = 1;
+ 	thread_t thread;
++	if (!sweet_touch_board()) {
++		printf("SWEET TOUCH: SM7150 not confirmed; SE7/L11C driver prohibited\n");
++		return;
++	}
+ 	if (st.started) {
+ 		return;
+ 	}
+--- /dev/null
++++ b/bsd/dev/polaris_touch_diag.c
+@@ -0,0 +1,138 @@
++/*
++ * Polaris / SDM845 touch handoff diagnostics. No MMIO writes, I2C commands,
++ * regulator votes or GPIO configuration. This is NOT a touch driver.
++ * The compatible string comes from the board ADT, not a user boot argument.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define POLARIS_GCC_PA       0x00100000u
++#define POLARIS_SE14_PA      0x00a98000u
++#define POLARIS_NORTH_PA     0x03900000u
++#define POLARIS_SOUTH_PA     0x03d00000u
++#define POLARIS_EAST_PA      0x03500000u
++#define GCC_VOTE             0x5200cu
++#define GCC_S6_HALT          0x18734u
++#define GCC_S6_RCG           0x18738u
++#define GCC_M_AHB_HALT       0x1800cu
++#define GCC_S_AHB_HALT       0x18010u
++#define QUP_S6_VOTE          (1u << 28)
++#define QUP_M_AHB_VOTE       (1u << 20)
++#define QUP_S_AHB_VOTE       (1u << 21)
++
++static uint32_t
++polaris_diag_read(vm_offset_t base, uint32_t off)
++{
++	uint32_t val = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return val;
++}
++
++static bool
++polaris_board_has_compat(const char *name, unsigned int length)
++{
++	DTEntry root;
++	const char *compat = NULL;
++	unsigned int size = 0;
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", (void const **)&compat, &size) != kSuccess ||
++	    compat == NULL || size < length + 1 || size > 4096) {
++		return false;
++	}
++	/* compatible is a bounded sequence of NUL-terminated tokens. */
++	for (unsigned int i = 0; i < size;) {
++		unsigned int start = i;
++		while (i < size && compat[i] != '\0') {
++			i++;
++		}
++		if (i == size) {
++			break;
++		}
++		if (i - start == length &&
++		    memcmp(compat + start, name, length + 1) == 0) {
++			return true;
++		}
++		i++;
++	}
++	return false;
++}
++
++bool
++polaris_touch_board(void)
++{
++	static const char polaris[] = "xiaomi,polaris";
++	static const char sdm845[] = "qcom,sdm845";
++	return polaris_board_has_compat(polaris, sizeof(polaris) - 1) ||
++	    polaris_board_has_compat(sdm845, sizeof(sdm845) - 1);
++}
++
++bool
++sweet_touch_board(void)
++{
++	static const char sm7150[] = "qcom,sm7150";
++	return !polaris_touch_board() &&
++	    polaris_board_has_compat(sm7150, sizeof(sm7150) - 1);
++}
++
++void
++polaris_touch_diag(void)
++{
++	int enabled = 0;
++	vm_offset_t gcc, north, south, east, se;
++	uint32_t vote, s6, m, s;
++	if (!polaris_touch_board()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("polaristouchdiag", &enabled, sizeof(enabled));
++	if (enabled != 1) {
++		printf("POLARIS TOUCH: read-only diagnostics off (polaristouchdiag=1)\n");
++		return;
++	}
++	gcc = ml_io_map(POLARIS_GCC_PA, 0x60000);
++	if (!gcc) {
++		printf("POLARIS TOUCH: GCC map failed\n");
++		return;
++	}
++	vote = polaris_diag_read(gcc, GCC_VOTE);
++	s6 = polaris_diag_read(gcc, GCC_S6_HALT);
++	m = polaris_diag_read(gcc, GCC_M_AHB_HALT);
++	s = polaris_diag_read(gcc, GCC_S_AHB_HALT);
++	printf("POLARIS TOUCH: gcc vote=%#x s6=%#x m-ahb=%#x s-ahb=%#x rcg=%#x\n",
++	    vote, s6, m, s, polaris_diag_read(gcc, GCC_S6_RCG));
++	/* GCC TLMM is a separate always-on block; do not change mux, rails or reset. */
++	north = ml_io_map(POLARIS_NORTH_PA, 0x64000);
++	south = ml_io_map(POLARIS_SOUTH_PA, 0x18000);
++	east = ml_io_map(POLARIS_EAST_PA, 0x80000);
++	if (north && south && east) {
++		printf("POLARIS TOUCH: gpio33=%#x/%#x 34=%#x/%#x 99=%#x/%#x 23=%#x/%#x 125=%#x/%#x\n",
++		    polaris_diag_read(north, 33 * 0x1000u), polaris_diag_read(north, 33 * 0x1000u + 4),
++		    polaris_diag_read(north, 34 * 0x1000u), polaris_diag_read(north, 34 * 0x1000u + 4),
++		    polaris_diag_read(north, 99 * 0x1000u), polaris_diag_read(north, 99 * 0x1000u + 4),
++		    polaris_diag_read(south, 23 * 0x1000u), polaris_diag_read(south, 23 * 0x1000u + 4),
++		    polaris_diag_read(east, 125 * 0x1000u), polaris_diag_read(east, 125 * 0x1000u + 4));
++	} else {
++		printf("POLARIS TOUCH: TLMM map failed, skip GPIO reads\n");
++	}
++	/* Read SE14 only if GCC says all three clocks are locally voted and running. */
++	if ((vote & (QUP_S6_VOTE | QUP_M_AHB_VOTE | QUP_S_AHB_VOTE)) !=
++	    (QUP_S6_VOTE | QUP_M_AHB_VOTE | QUP_S_AHB_VOTE) ||
++	    ((s6 | m | s) & (1u << 31))) {
++		printf("POLARIS TOUCH: SE14 clocks not confirmed; MMIO withheld\n");
++		return;
++	}
++	se = ml_io_map(POLARIS_SE14_PA, 0x1000);
++	if (!se) {
++		printf("POLARIS TOUCH: SE14 map failed\n");
++		return;
++	}
++	printf("POLARIS TOUCH: se14 fw=%#x status=%#x hwtx=%#x hwrx=%#x\n",
++	    polaris_diag_read(se, 0x68), polaris_diag_read(se, 0x40),
++	    polaris_diag_read(se, 0xe24), polaris_diag_read(se, 0xe28));
++}
++#endif
