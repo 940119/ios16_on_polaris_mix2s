@@ -104,35 +104,49 @@ static void delay_ms(unsigned ms)
 }
 
 #ifdef TOUCHPROBE
-/* Bit-banged I2C on the SE14 pins (TLMM 33/34) to probe the touch IC. */
-static volatile uint32_t *tgpio;
+/* SDM845 pinctrl PINGROUP base offsets (relative to TLMM 0x03400000).
+ * Do not use the pin number alone: these five pins span three tiles. */
+static volatile uint32_t *treg(uint32_t pin)
+{
+	uintptr_t tile;
+
+	switch (pin) {
+	case 23:             tile = 0x900000u; break; /* SOUTH */
+	case 33: case 34:
+	case 99:             tile = 0x500000u; break; /* NORTH */
+	case 125:            tile = 0x100000u; break; /* EAST */
+	default:             return (volatile uint32_t *)0;
+	}
+	return (volatile uint32_t *)(0x03400000UL + tile + pin * 0x1000u);
+}
+
 static uint32_t tsda = 33, tscl = 34;
 
 static void tcfg(uint32_t pin, uint32_t mux, uint32_t pull, uint32_t drive, int out)
 {
-	uint32_t i = pin * 0x1000u / 4;
-	uint32_t cfg = tgpio[i];
+	volatile uint32_t *p = treg(pin);
+	uint32_t cfg = p[0];
 
 	cfg &= ~0x3ffu;
 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
-	tgpio[i] = cfg;
+	p[0] = cfg;
 }
 
 static void tset(uint32_t pin, int v)
 {
-	uint32_t i = pin * 0x1000u / 4 + 1;
-	uint32_t x = tgpio[i];
+	volatile uint32_t *p = treg(pin);
+	uint32_t x = p[1];
 
 	if (v)
 		x |= 2u;
 	else
 		x &= ~2u;
-	tgpio[i] = x;
+	p[1] = x;
 }
 
 static int tget(uint32_t pin)
 {
-	return (tgpio[pin * 0x1000u / 4 + 1] & 1u) != 0;
+	return (treg(pin)[1] & 1u) != 0;
 }
 
 static void tudelay(uint32_t us)
@@ -642,18 +656,17 @@ void shim_main(uint64_t dtb)
 		uint32_t p23_before, p23_after;
 		int irq2;
 
-		tgpio = (volatile uint32_t *)0x03400000UL;
 		con_config((void *)0x9d400000UL, 1080, 2160, 4320, 4);
 		con_clear(0xff000060);
-		con_str("TOUCH4", "BUS GPIO23 V4");
+		con_str("TOUCH5", "TLMM TILES V5");
 
 		/* GPIO23 VDDIO: record the TLMM latch and pad before and after.
 		 * Do not change any PMIC/SPMI regulator here. */
-		p23_before = tgpio[23 * 0x1000u / 4] & 0x3ffu;
+		p23_before = treg(23)[0] & 0x3ffu;
 		con_hex8("23BF", p23_before);
 		tset(23, 1); tcfg(23, 0, 0, 2, 1); tudelay(5000);
-		p23_after = (tgpio[23 * 0x1000u / 4] & 0x3ffu) |
-			     ((tgpio[23 * 0x1000u / 4 + 1] & 3u) << 12);
+		p23_after = (treg(23)[0] & 0x3ffu) |
+			     ((treg(23)[1] & 3u) << 12);
 		con_hex8("23AF", p23_after);
 		tset(99, 0); tcfg(99, 0, 0, 8, 1); tudelay(10000);
 		tset(99, 1); tudelay(200000);
