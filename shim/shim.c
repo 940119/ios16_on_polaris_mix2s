@@ -658,7 +658,7 @@ void shim_main(uint64_t dtb)
 
 		con_config((void *)0x9d400000UL, 1080, 2160, 4320, 4);
 		con_clear(0xff000060);
-		con_str("TOUCH7", "F12 RAW V7");
+		con_str("TOUCH8", "F12 QUERY V8");
 
 		/* GPIO23 VDDIO: record the TLMM latch and pad before and after.
 		 * Do not change any PMIC/SPMI regulator here. */
@@ -752,6 +752,22 @@ void shim_main(uint64_t dtb)
 					((uint32_t)b[1] << 16) |
 					((uint32_t)b[2] << 8) | b[3]);
 				con_hex8("Q51B", ((uint32_t)b[4] << 24) |
+					((uint32_t)b[5] << 16) |
+					((uint32_t)b[6] << 8) | b[7]);
+			}
+			if (rmi_read(0x20, 0x59, b, 8)) {
+				con_hex8("Q59A", ((uint32_t)b[0] << 24) |
+					((uint32_t)b[1] << 16) |
+					((uint32_t)b[2] << 8) | b[3]);
+				con_hex8("Q59B", ((uint32_t)b[4] << 24) |
+					((uint32_t)b[5] << 16) |
+					((uint32_t)b[6] << 8) | b[7]);
+			}
+			if (rmi_read(0x20, 0x61, b, 8)) {
+				con_hex8("Q61A", ((uint32_t)b[0] << 24) |
+					((uint32_t)b[1] << 16) |
+					((uint32_t)b[2] << 8) | b[3]);
+				con_hex8("Q61B", ((uint32_t)b[4] << 24) |
 					((uint32_t)b[5] << 16) |
 					((uint32_t)b[6] << 8) | b[7]);
 			}
