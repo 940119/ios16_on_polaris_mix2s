@@ -1,0 +1,135 @@
+diff --git a/bsd/dev/polaris_touch_i2c.c b/bsd/dev/polaris_touch_i2c.c
+--- a/bsd/dev/polaris_touch_i2c.c
++++ b/bsd/dev/polaris_touch_i2c.c
+@@ -32,7 +32,7 @@
+ #define CFG_MASK      0x3ffu
+ #define IN_PULL_UP    (3u | (2u << 6))
+ #define OUT_LOW       ((2u << 6) | 0x200u)
+-#define MAX_READ      16u
++#define MAX_READ      96u
+ #define MAX_FINGERS   10u
+ #define FINGER_BYTES  8u
+ 
+@@ -276,10 +276,11 @@
+ /* Vendor DSX Query5 contains size-of-Query6 then Control0.. presence bits.
+  * Each present Control below 23 occupies one address for this layout. */
+ static bool
+-pt_f12_fingers(uint8_t query_base, uint8_t ctrl_base, unsigned *count)
++pt_f12_fingers(uint8_t query_base, uint8_t ctrl_base, unsigned *count,
++    uint8_t *report_mask)
+ {
+ 	uint8_t q[32] = {0}, ctrl[2] = {0}, size = 0;
+-	unsigned offset = 0;
++	unsigned offset = 0, ctrl28_offset = 0;
+ 	if (!pt_read((uint16_t)(query_base + 4u), &size, 1) ||
+ 	    size < 4 || size > sizeof(q)) {
+ 		return false;
+@@ -307,6 +308,16 @@
+ 		return false;
+ 	}
+ 	*count = ctrl[1];
++	if (q[1 + 28 / 8] & (1u << (28 % 8))) {
++		for (unsigned n = 0; n < 28; ++n) {
++			ctrl28_offset += (q[1 + n / 8] >> (n % 8)) & 1u;
++		}
++		if (ctrl28_offset <= 0xffu - ctrl_base &&
++		    pt_read((uint16_t)(ctrl_base + ctrl28_offset), report_mask, 1)) {
++			printf("POLARIS HID: F12 Ctrl28 at 0x%02x report=0x%02x\n",
++			    (unsigned)(ctrl_base + ctrl28_offset), *report_mask);
++		}
++	}
+ 	return true;
+ }
+ 
+@@ -345,7 +356,8 @@
+ static void
+ pt_thread(void *arg __unused, wait_result_t result __unused)
+ {
+-	uint8_t f01[6] = {0}, f12[6] = {0}, query[16] = {0}, raw[8] = {0};
++	uint8_t f01[6] = {0}, f12[6] = {0}, query[16] = {0};
++	uint8_t raw[MAX_FINGERS * FINGER_BYTES] = {0};
+ 	pt_gpio = ml_io_map(NORTH_PA, 0x23000);
+ 	pt_reset_gpio = ml_io_map(NORTH_PA + RESET_CFG, 0x1000);
+ 	if (!pt_gpio || !pt_reset_gpio) {
+@@ -408,6 +420,15 @@
+ 	printf("POLARIS I2C: PDT F01 %02x %02x %02x %02x %02x %02x F12 %02x %02x %02x %02x %02x %02x\n",
+ 	    f01[0], f01[1], f01[2], f01[3], f01[4], f01[5],
+ 	    f12[0], f12[1], f12[2], f12[3], f12[4], f12[5]);
++	uint8_t f01_status[2] = {0}, f01_ctrl = 0;
++	if (!pt_read(f01[3], f01_status, sizeof(f01_status)) ||
++	    !pt_read(f01[2], &f01_ctrl, 1)) {
++		printf("POLARIS I2C: F01 status/control read failed stage=%u reason=%u\n",
++		    pt_read_stage, pt_read_failure);
++		goto restore;
++	}
++	printf("POLARIS I2C: F01 device=0x%02x irq=0x%02x control=0x%02x (configured=%u)\n",
++	    f01_status[0], f01_status[1], f01_ctrl, (f01_ctrl >> 7) & 1u);
+ 	if (!pt_read(f12[0], query, sizeof(query))) {
+ 		printf("POLARIS I2C: F12 raw query read failed\n");
+ 		goto restore;
+@@ -424,15 +445,22 @@
+ 	if (pt_hid_enabled) {
+ 		pt_fingers = 1; /* shim-observed single slot only */
+ 		unsigned reported = 0;
+-		if (pt_f12_fingers(f12[0], f12[2], &reported)) {
+-			pt_fingers = reported;
+-			printf("POLARIS HID: Ctrl23 confirmed %u slots\n", pt_fingers);
++		uint8_t report_mask = 0;
++		if (pt_f12_fingers(f12[0], f12[2], &reported, &report_mask)) {
++			if (report_mask == 0xffu) {
++				pt_fingers = reported;
++				printf("POLARIS HID: Ctrl23 confirmed %u slots, 8-byte report\n", pt_fingers);
++			} else {
++				printf("POLARIS HID: Ctrl28 is not 8-byte report; refusing HID\n");
++				goto restore;
++			}
+ 		} else {
+ 			printf("POLARIS HID: Ctrl23 unverified; one experimental slot only\n");
+ 		}
+ 	}
+ 	if (pt_hid_enabled) {
+ 		unsigned failures = 0;
++		bool logged_bad_frame = false;
+ 		unsigned candidates[MAX_FINGERS] = {0};
+ 		int prior_x[MAX_FINGERS] = {0}, prior_y[MAX_FINGERS] = {0};
+ 		printf("POLARIS HID: experimental F12 base 0x%02x, %u slots, 8 bytes each\n",
+@@ -440,12 +468,25 @@
+ 		for (;;) {
+ 			bool valid = true, present[MAX_FINGERS] = {0};
+ 			int x[MAX_FINGERS] = {0}, y[MAX_FINGERS] = {0};
+-			for (unsigned slot = 0; slot < pt_fingers; ++slot) {
+-				if (!pt_read((uint16_t)(f12[3] + slot * FINGER_BYTES), raw, FINGER_BYTES) ||
+-				    !pt_frame(raw, &x[slot], &y[slot], &present[slot])) {
+-					valid = false;
+-					break;
++			bool read_ok = pt_read(f12[3], raw, pt_fingers * FINGER_BYTES);
++			unsigned bad_slot = MAX_FINGERS;
++			if (read_ok) {
++				for (unsigned slot = 0; slot < pt_fingers; ++slot) {
++					if (!pt_frame(raw + slot * FINGER_BYTES,
++					    &x[slot], &y[slot], &present[slot])) {
++						valid = false;
++						bad_slot = slot;
++						break;
++					}
+ 				}
++			} else {
++				valid = false;
++			}
++			if (!valid && !logged_bad_frame) {
++				printf("POLARIS HID: first invalid frame read=%u stage=%u reason=%u slot=%u first=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++				    read_ok, pt_read_stage, pt_read_failure, bad_slot,
++				    raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
++				logged_bad_frame = true;
+ 			}
+ 			if (!valid) {
+ 				pt_release();
+@@ -493,7 +534,7 @@
+ 		}
+ 	} else {
+ 		for (unsigned i = 0; i < 4; ++i) {
+-			if (!pt_read(f12[3], raw, sizeof(raw))) {
++			if (!pt_read(f12[3], raw, FINGER_BYTES)) {
+ 				printf("POLARIS I2C: raw sample %u failed; stopping\n", i);
+ 				goto restore;
+ 			}
