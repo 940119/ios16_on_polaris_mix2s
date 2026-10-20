@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate this polaris S3330's F12 Query8 and decode observed Data1 frames.
+"""Reject unsupported F12 Query8 layouts and decode candidate Data1 frames.
 
-The vendor DSX implementation uses query_base+7 for Query8 length and
-query_base+8 for its bytes. This is intentionally a guarded device-specific
-parser, not a general RMI4 register-descriptor parser.
+Vendor DSX reads query_base+7 for Query8 length and query_base+8 for its bytes.
+The observed value at +7 is 1, insufficient to establish a Data1 presence
+bit under that parser. This guarded device-specific validator MUST reject it;
+the raw frame decoder is an offline hypothesis, not proof of register layout.
 """
 import argparse
 
@@ -12,9 +13,8 @@ def data1_address(query_base: int, data_base: int, query_bytes: bytes) -> int:
     if len(query_bytes) < 11:
         raise ValueError('need query bytes through query_base+10')
     size = query_bytes[7]
-    if size != 1:
-        # This device reports one byte at query_base+7; reject unseen layouts.
-        raise ValueError(f'unexpected Query8 size {size}')
+    if size < 2 or size > 5:
+        raise ValueError(f'Query8 too short for Data1 presence: {size}')
     q8_size = query_bytes[8]
     presence = query_bytes[9]
     if q8_size < 2 or q8_size > 32 or not (presence & 2):
@@ -43,7 +43,12 @@ def decode_finger(packet: bytes, max_x: int = 1079, max_y: int = 2159):
 
 def selftest():
     q = bytes.fromhex('03 04 26 ff 0f 00 01 01 07 12 80 00 00 50 ff 07')
-    assert data1_address(0x49, 0x08, q) == 0x08
+    try:
+        data1_address(0x49, 0x08, q)
+    except ValueError as exc:
+        assert 'too short' in str(exc)
+    else:
+        raise AssertionError('truncated Query8 incorrectly accepted')
     assert decode_finger(bytes.fromhex('00 00 00 00 00 00 00 00')) is None
     assert decode_finger(bytes.fromhex('01 11 02 8c 04 81 07 07')) == {
         'x': 529, 'y': 1164, 'pressure': 129, 'width_x': 7, 'width_y': 7}
