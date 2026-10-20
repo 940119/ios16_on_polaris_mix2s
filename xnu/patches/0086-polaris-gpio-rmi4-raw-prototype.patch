@@ -1,0 +1,346 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,3 +112,4 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/polaris_touch_diag.c		standard
++bsd/dev/polaris_touch_i2c.c		standard
+ bsd/dev/mem.c				standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,4 +53,5 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void polaris_touch_diag(void);
++extern void polaris_touch_i2c_init(void);
+ extern void sweet_usb_probe(void);
+@@ -660,4 +661,5 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	polaris_touch_diag();
++	polaris_touch_i2c_init();
+ 	sweet_usb_probe();
+--- a/bsd/dev/polaris_touch_diag.c
++++ b/bsd/dev/polaris_touch_diag.c
+@@ -72,5 +72,15 @@ polaris_touch_board(void)
+ 	    polaris_board_has_compat(sdm845, sizeof(sdm845) - 1);
+ }
+ 
++bool
++polaris_touch_i2c_board(void)
++{
++	static const char polaris[] = "xiaomi,polaris";
++	static const char sdm845[] = "qcom,sdm845";
++	/* Transport writes require BOTH identities, unlike the read-only probe. */
++	return polaris_board_has_compat(polaris, sizeof(polaris) - 1) &&
++	    polaris_board_has_compat(sdm845, sizeof(sdm845) - 1);
++}
++
+ bool
+ sweet_touch_board(void)
+diff --git a/bsd/dev/polaris_touch_i2c.c b/bsd/dev/polaris_touch_i2c.c
+new file mode 100644
+index 0000000..1a491fd
+--- /dev/null
++++ b/bsd/dev/polaris_touch_i2c.c
+@@ -0,0 +1,301 @@
++/*
++ * Polaris S3330 RMI4 raw probe on TLMM GPIO33/34. This is not an HID driver.
++ * Separate from the read-only GCC/GENI diagnostic and SM7150 SE7 driver.
++ * Requires both Polaris/SDM845 ADT identities AND polaristouch=1. No PMIC,
++ * GCC, SE14, reset, VDDIO or IRQ access. Only GPIO33/34 are configured.
++ * Query8 length seen in the shim is 1: F12 Data1 presence/offset is NOT
++ * established, so the 0x08 raw samples are diagnostic bytes, not contacts.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern bool polaris_touch_i2c_board(void);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++
++#define NORTH_PA       0x03900000u
++#define SDA_CFG        (33u * 0x1000u)
++#define SCL_CFG        (34u * 0x1000u)
++#define IO_REG         4u
++#define SDA           SDA_CFG
++#define SCL           SCL_CFG
++#define I2C_ADDR      0x20u
++#define CFG_MASK      0x3ffu
++#define IN_PULL_UP    (3u | (2u << 6))
++#define OUT_LOW       ((2u << 6) | 0x200u)
++#define MAX_READ      16u
++
++static vm_offset_t pt_gpio;
++static uint32_t saved_sda_cfg, saved_scl_cfg, saved_sda_io, saved_scl_io;
++static int pt_sleep_chan;
++static bool pt_started;
++
++static uint32_t
++pt_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(pt_gpio + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++pt_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(pt_gpio + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* Drive low by latching zero BEFORE enabling output; release to input/pull-up.
++ * Never actively drive high; preserve unrelated TLMM config bits. */
++static void
++pt_line(uint32_t cfg, bool release)
++{
++	uint32_t old = pt_rd(cfg);
++	if (!release) {
++		pt_wr(cfg + IO_REG, pt_rd(cfg + IO_REG) & ~2u);
++	}
++	pt_wr(cfg, (old & ~CFG_MASK) | (release ? IN_PULL_UP : OUT_LOW));
++}
++
++static bool
++pt_high(uint32_t cfg)
++{
++	return (pt_rd(cfg + IO_REG) & 1u) != 0;
++}
++
++static bool
++pt_clock(void)
++{
++	pt_line(SCL, true);
++	/* At most 100 us of bounded clock stretch, never assume SCL rose. */
++	for (unsigned i = 0; i < 20; ++i) {
++		if (pt_high(SCL)) {
++			delay(5);
++			return true;
++		}
++		delay(5);
++	}
++	return false;
++}
++
++static void
++pt_stop(void)
++{
++	pt_line(SDA, false);
++	delay(5);
++	(void)pt_clock();
++	pt_line(SDA, true);
++	delay(5);
++}
++
++static bool
++pt_idle(void)
++{
++	pt_line(SDA, true);
++	pt_line(SCL, true);
++	delay(20);
++	return pt_high(SDA) && pt_high(SCL);
++}
++
++static bool
++pt_start(bool repeated)
++{
++	pt_line(SDA, true);
++	if (!repeated) {
++		if (!pt_idle()) {
++			return false; /* stuck bus: do not report false ACK */
++		}
++	} else if (!pt_clock()) {
++		return false;
++	}
++	if (!pt_high(SDA) || !pt_high(SCL)) {
++		return false;
++	}
++	pt_line(SDA, false);
++	delay(5);
++	pt_line(SCL, false);
++	delay(5);
++	return true;
++}
++
++static bool
++pt_write(uint8_t b)
++{
++	for (int i = 7; i >= 0; --i) {
++		pt_line(SDA, (b & (1u << i)) != 0);
++		delay(3);
++		if (!pt_clock()) {
++			return false;
++		}
++		pt_line(SCL, false);
++		delay(3);
++	}
++	pt_line(SDA, true);
++	delay(5);
++	if (!pt_clock()) {
++		return false;
++	}
++	bool ack = !pt_high(SDA);
++	pt_line(SCL, false);
++	delay(5);
++	return ack;
++}
++
++static bool
++pt_read_byte(uint8_t *out, bool ack)
++{
++	uint8_t b = 0;
++	pt_line(SDA, true);
++	for (unsigned i = 0; i < 8; ++i) {
++		if (!pt_clock()) {
++			return false;
++		}
++		b = (uint8_t)((b << 1) | (pt_high(SDA) ? 1u : 0u));
++		pt_line(SCL, false);
++		delay(3);
++	}
++	pt_line(SDA, !ack);
++	delay(3);
++	if (!pt_clock()) {
++		return false;
++	}
++	pt_line(SCL, false);
++	pt_line(SDA, true);
++	*out = b;
++	return true;
++}
++
++/* Shim-proven RMI4 protocol: write 0xff,page then STOP; address the
++ * one-byte register and repeat-start for reading. Each transfer is capped.
++ * STOP and released lines on every exit, including a failed ACK/clock. */
++static bool
++pt_read(uint16_t reg, uint8_t *buf, unsigned len)
++{
++	bool ok = false;
++	if (!len || len > MAX_READ || !pt_start(false)) {
++		goto out;
++	}
++	if (!pt_write(I2C_ADDR << 1) || !pt_write(0xff) ||
++	    !pt_write((uint8_t)(reg >> 8))) {
++		goto out;
++	}
++	pt_stop();
++	if (!pt_start(false) || !pt_write(I2C_ADDR << 1) ||
++	    !pt_write((uint8_t)reg) || !pt_start(true) ||
++	    !pt_write((I2C_ADDR << 1) | 1u)) {
++		goto out;
++	}
++	for (unsigned i = 0; i < len; ++i) {
++		if (!pt_read_byte(&buf[i], i + 1 < len)) {
++			goto out;
++		}
++	}
++	ok = true;
++out:
++	pt_stop();
++	return ok && pt_idle();
++}
++
++static void
++pt_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&pt_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++pt_restore(void)
++{
++	/* Always disable outputs first, then restore exactly the prior latches
++	 * and mux/configuration of the two I2C pins. No other pin is touched. */
++	pt_line(SDA, true);
++	pt_line(SCL, true);
++	pt_wr(SDA + IO_REG, saved_sda_io);
++	pt_wr(SCL + IO_REG, saved_scl_io);
++	pt_wr(SDA, saved_sda_cfg);
++	pt_wr(SCL, saved_scl_cfg);
++}
++
++static void
++pt_thread(void *arg __unused, wait_result_t result __unused)
++{
++	uint8_t f01[6] = {0}, f12[6] = {0}, query[16] = {0}, raw[8] = {0};
++	pt_gpio = ml_io_map(NORTH_PA, 0x23000);
++	if (!pt_gpio) {
++		printf("POLARIS I2C: TLMM north map failed\n");
++		goto done;
++	}
++	saved_sda_cfg = pt_rd(SDA);
++	saved_scl_cfg = pt_rd(SCL);
++	saved_sda_io = pt_rd(SDA + IO_REG);
++	saved_scl_io = pt_rd(SCL + IO_REG);
++	/* GPIO33/34 only; don't reset controller, toggle VDDIO23, IRQ125 or
++	 * RESET99. Require verified released bus after configuring open drain. */
++	if (!pt_idle()) {
++		printf("POLARIS I2C: bus stuck; no RMI4 transactions\n");
++		goto restore;
++	}
++	if (!pt_read(0x00e3, f01, sizeof(f01)) || f01[5] != 0x01 ||
++	    !pt_read(0x00dd, f12, sizeof(f12)) || f12[5] != 0x12) {
++		printf("POLARIS I2C: F01/F12 PDT read or function check failed\n");
++		goto restore;
++	}
++	printf("POLARIS I2C: PDT F01 %02x %02x %02x %02x %02x %02x F12 %02x %02x %02x %02x %02x %02x\n",
++	    f01[0], f01[1], f01[2], f01[3], f01[4], f01[5],
++	    f12[0], f12[1], f12[2], f12[3], f12[4], f12[5]);
++	if (!pt_read(f12[0], query, sizeof(query))) {
++		printf("POLARIS I2C: F12 raw query read failed\n");
++		goto restore;
++	}
++	printf("POLARIS I2C: F12 query+0..15 %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x; Query8 length=%u, no HID decoding\n",
++	    query[0], query[1], query[2], query[3], query[4], query[5], query[6], query[7],
++	    query[8], query[9], query[10], query[11], query[12], query[13], query[14], query[15], query[7]);
++	for (unsigned i = 0; i < 4; ++i) {
++		/* 0x08 is a HYPOTHESIS from shim observations, not proven Data1. */
++		if (!pt_read(f12[3], raw, sizeof(raw))) {
++			printf("POLARIS I2C: raw sample %u failed; stopping\n", i);
++			goto restore;
++		}
++		printf("POLARIS I2C: raw 0x%02x sample %u: %02x %02x %02x %02x %02x %02x %02x %02x (NOT contacts)\n",
++		    f12[3], i, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
++		pt_wait(250);
++	}
++restore:
++	pt_restore();
++	printf("POLARIS I2C: stopped, GPIO33/34 restored; no HID events\n");
++done:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++polaris_touch_i2c_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (!polaris_touch_i2c_board()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("polaristouch", &enabled, sizeof(enabled));
++	if (enabled != 1 || pt_started) {
++		return;
++	}
++	pt_started = true;
++	printf("POLARIS I2C: opted in; GPIO33/34 raw/PDT prototype, no HID\n");
++	kern_return_t kr = kernel_thread_start(pt_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("POLARIS I2C: thread start failed %d\n", kr);
++	}
++}
++#endif
