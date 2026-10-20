@@ -1,0 +1,204 @@
+diff --git a/bsd/dev/polaris_touch_i2c.c b/bsd/dev/polaris_touch_i2c.c
+index 1a491fd..709a4c0 100644
+--- a/bsd/dev/polaris_touch_i2c.c
++++ b/bsd/dev/polaris_touch_i2c.c
+@@ -1,10 +1,11 @@
+ /*
+- * Polaris S3330 RMI4 raw probe on TLMM GPIO33/34. This is not an HID driver.
++ * Polaris S3330 RMI4 raw probe and opt-in experimental HID on GPIO33/34.
+  * Separate from the read-only GCC/GENI diagnostic and SM7150 SE7 driver.
+  * Requires both Polaris/SDM845 ADT identities AND polaristouch=1. No PMIC,
+  * GCC, SE14, reset, VDDIO or IRQ access. Only GPIO33/34 are configured.
+  * Query8 length seen in the shim is 1: F12 Data1 presence/offset is NOT
+- * established, so the 0x08 raw samples are diagnostic bytes, not contacts.
++ * established. polaristouchhid=1 treats 0x08 as an experimental candidate,
++ * never as a proven firmware layout. Default polaristouch=1 remains raw-only.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -16,6 +17,7 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern bool polaris_touch_i2c_board(void);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ 
+@@ -35,6 +37,9 @@ static vm_offset_t pt_gpio;
+ static uint32_t saved_sda_cfg, saved_scl_cfg, saved_sda_io, saved_scl_io;
+ static int pt_sleep_chan;
+ static bool pt_started;
++static bool pt_hid_enabled;
++static bool pt_down;
++static int pt_x, pt_y;
+ 
+ static uint32_t
+ pt_rd(uint32_t off)
+@@ -225,6 +230,38 @@ pt_restore(void)
+ 	pt_wr(SCL, saved_scl_cfg);
+ }
+ 
++/* Experimental: 0x08 is a finger-correlated candidate, NOT a proven F12
++ * Data1 layout. Do not invent a contact for unknown or malformed bytes. */
++static void
++pt_release(void)
++{
++	if (pt_down) {
++		sweet_hid_touch(0, 0, pt_x, pt_y);
++		pt_down = false;
++	}
++}
++
++static bool
++pt_frame(const uint8_t *b, int *x, int *y, bool *present)
++{
++	*present = false;
++	if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0 &&
++	    b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0) {
++		return true; /* only all-zero is an unambiguous release candidate */
++	}
++	/* Single finger object type 1, plausible observed tail, little-endian
++	 * coordinates inside Polaris panel. Any other object is invalid. */
++	*x = (int)((unsigned)b[1] | ((unsigned)b[2] << 8));
++	*y = (int)((unsigned)b[3] | ((unsigned)b[4] << 8));
++	if (b[0] != 1 || *x < 0 || *x >= 1080 || *y < 0 || *y >= 2160 ||
++	    b[5] == 0 || b[5] == 0xff || b[6] == 0 || b[6] > 0x20 ||
++	    b[7] == 0 || b[7] > 0x20) {
++		return false;
++	}
++	*present = true;
++	return true;
++}
++
+ static void
+ pt_thread(void *arg __unused, wait_result_t result __unused)
+ {
+@@ -244,8 +281,12 @@ pt_thread(void *arg __unused, wait_result_t result __unused)
+ 		printf("POLARIS I2C: bus stuck; no RMI4 transactions\n");
+ 		goto restore;
+ 	}
+-	if (!pt_read(0x00e3, f01, sizeof(f01)) || f01[5] != 0x01 ||
+-	    !pt_read(0x00dd, f12, sizeof(f12)) || f12[5] != 0x12) {
++	if (!pt_read(0x00e3, f01, sizeof(f01)) ||
++	    f01[0] != 0x2c || f01[1] != 0x23 || f01[2] != 0x0c ||
++	    f01[3] != 0x06 || f01[5] != 0x01 ||
++	    !pt_read(0x00dd, f12, sizeof(f12)) ||
++	    f12[0] != 0x49 || f12[1] != 0x00 || f12[2] != 0x12 ||
++	    f12[3] != 0x08 || f12[5] != 0x12) {
+ 		printf("POLARIS I2C: F01/F12 PDT read or function check failed\n");
+ 		goto restore;
+ 	}
+@@ -256,22 +297,79 @@ pt_thread(void *arg __unused, wait_result_t result __unused)
+ 		printf("POLARIS I2C: F12 raw query read failed\n");
+ 		goto restore;
+ 	}
+-	printf("POLARIS I2C: F12 query+0..15 %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x; Query8 length=%u, no HID decoding\n",
++	printf("POLARIS I2C: F12 query+0..15 %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x; Query8 length=%u; HID layout UNPROVEN\n",
+ 	    query[0], query[1], query[2], query[3], query[4], query[5], query[6], query[7],
+ 	    query[8], query[9], query[10], query[11], query[12], query[13], query[14], query[15], query[7]);
+-	for (unsigned i = 0; i < 4; ++i) {
+-		/* 0x08 is a HYPOTHESIS from shim observations, not proven Data1. */
+-		if (!pt_read(f12[3], raw, sizeof(raw))) {
+-			printf("POLARIS I2C: raw sample %u failed; stopping\n", i);
+-			goto restore;
++	if (pt_hid_enabled && (query[0] != 3 || query[1] != 4 ||
++	    query[2] != 0x26 || query[3] != 0xff || query[4] != 0x0f ||
++	    query[5] != 0 || query[6] != 1 || query[7] != 1)) {
++		printf("POLARIS HID: unknown F12 query signature; refusing HID\n");
++		goto restore;
++	}
++	if (pt_hid_enabled) {
++		unsigned candidates = 0, failures = 0;
++		int prior_x = 0, prior_y = 0;
++		/* 50 Hz maximum; at most 12000 samples (four minutes) and stop
++		 * after eight consecutive invalid/failed reads. Never log per poll. */
++		printf("POLARIS HID: EXPERIMENTAL unproven F12 layout 0x08, bounded one-finger poll\n");
++		for (unsigned i = 0; i < 12000; ++i) {
++			int x = 0, y = 0;
++			bool present = false;
++			if (!pt_read(f12[3], raw, sizeof(raw)) ||
++			    !pt_frame(raw, &x, &y, &present)) {
++				pt_release();
++				candidates = 0;
++				if (++failures >= 8) {
++					printf("POLARIS HID: repeated read/invalid frames, stopping\n");
++					break;
++				}
++			} else if (!present) {
++				pt_release();
++				candidates = failures = 0;
++			} else {
++				failures = 0;
++				if (!pt_down) {
++					/* Require two plausible nearby polls before first DOWN. */
++					if (candidates && x - prior_x < 80 && prior_x - x < 80 &&
++					    y - prior_y < 80 && prior_y - y < 80) {
++						sweet_hid_touch(0, 1, x, y);
++						pt_down = true;
++						candidates = 0;
++					} else {
++						candidates = 1;
++					}
++					prior_x = x;
++					prior_y = y;
++				} else if (x - pt_x >= 200 || pt_x - x >= 200 ||
++				    y - pt_y >= 200 || pt_y - y >= 200) {
++					pt_release(); /* improbable jump: no teleport contact */
++					candidates = 0;
++				} else if (x != pt_x || y != pt_y) {
++					sweet_hid_touch(0, 1, x, y);
++				}
++				if (pt_down) {
++					pt_x = x;
++					pt_y = y;
++				}
++			}
++			pt_wait(20);
++		}
++	} else {
++		for (unsigned i = 0; i < 4; ++i) {
++			if (!pt_read(f12[3], raw, sizeof(raw))) {
++				printf("POLARIS I2C: raw sample %u failed; stopping\n", i);
++				goto restore;
++			}
++			printf("POLARIS I2C: raw 0x%02x sample %u: %02x %02x %02x %02x %02x %02x %02x %02x (NOT contacts)\n",
++			    f12[3], i, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
++			pt_wait(250);
+ 		}
+-		printf("POLARIS I2C: raw 0x%02x sample %u: %02x %02x %02x %02x %02x %02x %02x %02x (NOT contacts)\n",
+-		    f12[3], i, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+-		pt_wait(250);
+ 	}
++
+ restore:
++	pt_release();
+ 	pt_restore();
+-	printf("POLARIS I2C: stopped, GPIO33/34 restored; no HID events\n");
++	printf("POLARIS I2C: stopped, GPIO33/34 restored\n");
+ done:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+@@ -280,17 +378,20 @@ done:
+ void
+ polaris_touch_i2c_init(void)
+ {
+-	int enabled = 0;
++	int enabled = 0, hid_enabled = 0;
+ 	thread_t thread;
+ 	if (!polaris_touch_i2c_board()) {
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("polaristouch", &enabled, sizeof(enabled));
+-	if (enabled != 1 || pt_started) {
++	(void)PE_parse_boot_argn("polaristouchhid", &hid_enabled, sizeof(hid_enabled));
++	if ((enabled != 1 && hid_enabled != 1) || pt_started) {
+ 		return;
+ 	}
+ 	pt_started = true;
+-	printf("POLARIS I2C: opted in; GPIO33/34 raw/PDT prototype, no HID\n");
++	pt_hid_enabled = hid_enabled == 1;
++	printf("POLARIS I2C: opted in; GPIO33/34 raw/PDT prototype; HID %s\n",
++	    pt_hid_enabled ? "EXPERIMENTAL" : "off");
+ 	kern_return_t kr = kernel_thread_start(pt_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
