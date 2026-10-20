@@ -658,7 +658,7 @@ void shim_main(uint64_t dtb)
 
 		con_config((void *)0x9d400000UL, 1080, 2160, 4320, 4);
 		con_clear(0xff000060);
-		con_str("TOUCH6", "RMI4 PDT V6");
+		con_str("TOUCH7", "F12 RAW V7");
 
 		/* GPIO23 VDDIO: record the TLMM latch and pad before and after.
 		 * Do not change any PMIC/SPMI regulator here. */
@@ -736,6 +736,42 @@ void shim_main(uint64_t dtb)
 				con_hex8(label, bases);
 				con_hex8("FNIRQ", ((uint32_t)ent[4] << 8) | ent[5]);
 			}
+			/* Known F12 from PDTDD on this firmware: query 0x49,
+			 * data 0x08. Samples are raw bytes, NOT decoded contacts.
+			 * Limit to 16 bytes so no read crosses the 0xff page select. */
+			if (rmi_read(0x20, 0x49, b, 8)) {
+				con_hex8("Q49A", ((uint32_t)b[0] << 24) |
+					((uint32_t)b[1] << 16) |
+					((uint32_t)b[2] << 8) | b[3]);
+				con_hex8("Q49B", ((uint32_t)b[4] << 24) |
+					((uint32_t)b[5] << 16) |
+					((uint32_t)b[6] << 8) | b[7]);
+			}
+			if (rmi_read(0x20, 0x51, b, 8)) {
+				con_hex8("Q51A", ((uint32_t)b[0] << 24) |
+					((uint32_t)b[1] << 16) |
+					((uint32_t)b[2] << 8) | b[3]);
+				con_hex8("Q51B", ((uint32_t)b[4] << 24) |
+					((uint32_t)b[5] << 16) |
+					((uint32_t)b[6] << 8) | b[7]);
+			}
+			con_str("TOUCH", "PRESS CENTER AND HOLD 8S");
+			for (int sample = 0; sample < 3; sample++) {
+				char label[] = "D0A";
+				delay_ms(sample ? 3500 : 1000);
+				label[1] = '0' + sample;
+				if (!rmi_read(0x20, 0x08, b, 8)) {
+					con_str("DATA", "NACK");
+					break;
+				}
+				con_hex8(label, ((uint32_t)b[0] << 24) |
+					((uint32_t)b[1] << 16) |
+					((uint32_t)b[2] << 8) | b[3]);
+				label[2] = 'B';
+				con_hex8(label, ((uint32_t)b[4] << 24) |
+					((uint32_t)b[5] << 16) |
+					((uint32_t)b[6] << 8) | b[7]);
+			}
 		}
 		if (a38) {
 			uint8_t v[4] = { 0 };
@@ -763,7 +799,7 @@ void shim_main(uint64_t dtb)
 
 		irq2 = tget(125);
 		con_hex8("IRQ2", (uint32_t)irq2);
-		con_str("TOUCH6", "done, reset in 90s");
+		con_str("TOUCH7", "done, reset in 90s");
 		delay_ms(90000);
 		reset_silent(5);
 	}
