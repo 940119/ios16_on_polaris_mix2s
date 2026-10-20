@@ -639,15 +639,22 @@ void shim_main(uint64_t dtb)
 		uint8_t b[8] = { 0 };
 		uint32_t st, idle, recv, a20, a2c, a38, a00, a7e, swp;
 		uint32_t r00 = 0, re9 = 0;
+		uint32_t p23_before, p23_after;
 		int irq2;
 
 		tgpio = (volatile uint32_t *)0x03400000UL;
 		con_config((void *)0x9d400000UL, 1080, 2160, 4320, 4);
 		con_clear(0xff000060);
-		con_str("TOUCH3", "BUS SAFE V3");
+		con_str("TOUCH4", "BUS GPIO23 V4");
 
-		/* VDDIO (TLMM 23) on, touch reset (TLMM 99) pulse, IRQ input. */
+		/* GPIO23 VDDIO: record the TLMM latch and pad before and after.
+		 * Do not change any PMIC/SPMI regulator here. */
+		p23_before = tgpio[23 * 0x1000u / 4] & 0x3ffu;
+		con_hex8("23BF", p23_before);
 		tset(23, 1); tcfg(23, 0, 0, 2, 1); tudelay(5000);
+		p23_after = (tgpio[23 * 0x1000u / 4] & 0x3ffu) |
+			     ((tgpio[23 * 0x1000u / 4 + 1] & 3u) << 12);
+		con_hex8("23AF", p23_after);
 		tset(99, 0); tcfg(99, 0, 0, 8, 1); tudelay(10000);
 		tset(99, 1); tudelay(200000);
 		tcfg(125, 0, 3, 8, 0);
