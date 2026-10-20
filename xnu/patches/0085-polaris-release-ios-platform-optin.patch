@@ -1,0 +1,38 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -192,10 +192,14 @@
+ static TUNABLE(bool, bootarg_arm64e_preview_abi, "-arm64e_preview_abi", false);
+ #endif /* __has_feature(ptrauth_calls) */
+ 
+-#if DEBUG || DEVELOPMENT
++#if DEBUG || DEVELOPMENT || defined(ARM64_BOARD_CONFIG_SWEET)
+ static TUNABLE(bool, unentitled_ios_sim_launch, "unentitled_ios_sim_launch", false);
+ #endif /* DEBUG || DEVELOPMENT */
+ #endif /* XNU_TARGET_OS_OSX */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern bool polaris_touch_board(void);
++#endif
+ 
+ #if CONFIG_DTRACE
+ /* Do not include dtrace.h, it redefines kmem_[alloc/free] */
+@@ -7392,13 +7396,18 @@
+ 		struct _posix_spawnattr *psa = (struct _posix_spawnattr *) imgp->ip_px_sa;
+ 		if (psa == NULL || psa->psa_platform == 0) {
+ 			boolean_t no_sandbox_entitled = FALSE;
+-#if DEBUG || DEVELOPMENT
++#if DEBUG || DEVELOPMENT || defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/*
+ 			 * Allow iOS binaries to spawn on internal systems
+ 			 * if no-sandbox entitlement is present of unentitled_ios_sim_launch
+ 			 * boot-arg set to true
+ 			 */
++			/* RELEASE exception requires an explicit boot arg and Polaris ADT. */
++#if DEBUG || DEVELOPMENT
+ 			if (unentitled_ios_sim_launch) {
++#else
++			if (unentitled_ios_sim_launch && polaris_touch_board()) {
++#endif
+ 				no_sandbox_entitled = TRUE;
+ 			} else {
+ 				no_sandbox_entitled = IOVnodeHasEntitlement(imgp->ip_vp,
