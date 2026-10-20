@@ -1,0 +1,102 @@
+diff --git a/bsd/dev/polaris_touch_i2c.c b/bsd/dev/polaris_touch_i2c.c
+--- a/bsd/dev/polaris_touch_i2c.c
++++ b/bsd/dev/polaris_touch_i2c.c
+@@ -177,6 +177,8 @@
+ 	return true;
+ }
+ 
++static unsigned pt_read_stage;
++
+ /* Shim-proven RMI4 protocol: write 0xff,page then STOP; address the
+  * one-byte register and repeat-start for reading. Each transfer is capped.
+  * STOP and released lines on every exit, including a failed ACK/clock. */
+@@ -184,28 +186,38 @@
+ pt_read(uint16_t reg, uint8_t *buf, unsigned len)
+ {
+ 	bool ok = false;
+-	if (!len || len > MAX_READ || !pt_start(false)) {
+-		goto out;
+-	}
+-	if (!pt_write(I2C_ADDR << 1) || !pt_write(0xff) ||
+-	    !pt_write((uint8_t)(reg >> 8))) {
+-		goto out;
+-	}
++	pt_read_stage = 1;
++	if (!len || len > MAX_READ || !pt_start(false)) goto out;
++	pt_read_stage = 2;
++	if (!pt_write(I2C_ADDR << 1)) goto out;
++	pt_read_stage = 3;
++	if (!pt_write(0xff)) goto out;
++	pt_read_stage = 4;
++	if (!pt_write((uint8_t)(reg >> 8))) goto out;
+ 	pt_stop();
+-	if (!pt_start(false) || !pt_write(I2C_ADDR << 1) ||
+-	    !pt_write((uint8_t)reg) || !pt_start(true) ||
+-	    !pt_write((I2C_ADDR << 1) | 1u)) {
+-		goto out;
+-	}
++	pt_read_stage = 5;
++	if (!pt_start(false)) goto out;
++	pt_read_stage = 6;
++	if (!pt_write(I2C_ADDR << 1)) goto out;
++	pt_read_stage = 7;
++	if (!pt_write((uint8_t)reg)) goto out;
++	pt_read_stage = 8;
++	if (!pt_start(true)) goto out;
++	pt_read_stage = 9;
++	if (!pt_write((I2C_ADDR << 1) | 1u)) goto out;
+ 	for (unsigned i = 0; i < len; ++i) {
+-		if (!pt_read_byte(&buf[i], i + 1 < len)) {
+-			goto out;
+-		}
++		pt_read_stage = 10 + i;
++		if (!pt_read_byte(&buf[i], i + 1 < len)) goto out;
+ 	}
+ 	ok = true;
+ out:
+ 	pt_stop();
+-	return ok && pt_idle();
++	pt_read_stage = ok ? 30 : pt_read_stage;
++	if (!pt_idle()) {
++		pt_read_stage = 31;
++		return false;
++	}
++	return ok;
+ }
+ 
+ static void
+@@ -281,13 +293,28 @@
+ 		printf("POLARIS I2C: bus stuck; no RMI4 transactions\n");
+ 		goto restore;
+ 	}
+-	if (!pt_read(0x00e3, f01, sizeof(f01)) ||
+-	    f01[0] != 0x2c || f01[1] != 0x23 || f01[2] != 0x0c ||
+-	    f01[3] != 0x06 || f01[5] != 0x01 ||
+-	    !pt_read(0x00dd, f12, sizeof(f12)) ||
+-	    f12[0] != 0x49 || f12[1] != 0x00 || f12[2] != 0x12 ||
++	if (!pt_read(0x00e3, f01, sizeof(f01))) {
++		printf("POLARIS I2C: F01 PDT read failed stage=%u lines=%u%u\n",
++		    pt_read_stage, pt_high(SDA), pt_high(SCL));
++		goto restore;
++	}
++	printf("POLARIS I2C: F01 PDT %02x %02x %02x %02x %02x %02x\n",
++	    f01[0], f01[1], f01[2], f01[3], f01[4], f01[5]);
++	if (f01[0] != 0x2c || f01[1] != 0x23 || f01[2] != 0x0c ||
++	    f01[3] != 0x06 || f01[5] != 0x01) {
++		printf("POLARIS I2C: F01 PDT identity mismatch; HID withheld\n");
++		goto restore;
++	}
++	if (!pt_read(0x00dd, f12, sizeof(f12))) {
++		printf("POLARIS I2C: F12 PDT read failed stage=%u lines=%u%u\n",
++		    pt_read_stage, pt_high(SDA), pt_high(SCL));
++		goto restore;
++	}
++	printf("POLARIS I2C: F12 PDT %02x %02x %02x %02x %02x %02x\n",
++	    f12[0], f12[1], f12[2], f12[3], f12[4], f12[5]);
++	if (f12[0] != 0x49 || f12[1] != 0x00 || f12[2] != 0x12 ||
+ 	    f12[3] != 0x08 || f12[5] != 0x12) {
+-		printf("POLARIS I2C: F01/F12 PDT read or function check failed\n");
++		printf("POLARIS I2C: F12 PDT identity mismatch; HID withheld\n");
+ 		goto restore;
+ 	}
+ 	printf("POLARIS I2C: PDT F01 %02x %02x %02x %02x %02x %02x F12 %02x %02x %02x %02x %02x %02x\n",
