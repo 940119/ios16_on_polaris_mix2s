@@ -1,5 +1,13 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## Polaris touch handoff (2026-10-20, local Windows workspace)
+
+- User's Mix 2S recovery dmesg (`out/twrp-dmesg.txt`) identifies `synaptics_dsi_force 3-0020`, chip S3330 and firmware ID 2812197; Focaltech probe at 0x38 failed. This is an observation under recovery Linux, **not** evidence that bare-metal shim has powered the same rails.
+- First bit-bang probe photo was interpreted ambiguously as `ADDR20=1` (possibly also `ADDR2C=1`), with zero register data. The later supplied readings `SLFT=0x09`, `IDLE=0`, `A20=0x1f`, all read values zero indicate SDA/SCL cannot return high and all five addresses are false ACKs. Do not claim a powered/responding touch controller from that scan.
+- Local DT sources: `research/polaris/polaris-p0.dtsi` lines 141-148 specify GPIO23 VDDIO boot-on; lines 438-475 specify Synaptics on SE14/0x20, L14/L28 and LAB/IBB supplies, reset GPIO99, IRQ GPIO125. L28 config at lines 216-220 sets 3.1 V, but lack of `regulator-boot-on` does **not** prove the actual rail is off. Mainline `research/polaris/polaris.dts` gives L28 3.0 V. Do not blindly write PMIC/SPMI.
+- `shim/shim.c` TOUCHPROBE now uses open-drain-only SDA/SCL self-test, reports released line state before/after recovery, refuses address scans on a stuck bus, tests non-device addresses 0x00/0x7e against false ACKs, and uses RMI4 page-select `0xff,page` followed by one-byte register address to read the 0xe9 PDT. It does not change PMIC supply state. Build with `PLATFORM=polaris EXTRA_CFLAGS=-DTOUCHPROBE ./shim/build.sh`; saved diagnostic image `out/shim-polaris-touchprobe-v3.img`, SHA256 `29184069b51bbedf3154a4db814d75841e54c7c604fd80a17d408b5668ca34cf`. Local compile, ELF relocation/image checks, Android boot image pack and `git diff --check` passed; one pre-existing unused `slot_band` warning. **Not boot-tested on phone.**
+- Next: first obtain readable line-state/photo from v3 via temporary `fastboot boot` only with user confirming phone is in fastboot; if IDLE/RECV are not 3, stop I2C interpretation and measure/inspect SDA/SCL pull-ups, GPIO mux and L28 actual status using recovery or external instrumentation. Confirm stock boot backup and recovery path before any more boot partition writes; earlier session flashed a probe to `boot`. Only after supply/pin evidence should a separately reviewed PMIC implementation or XNU RMI4/F12 driver be attempted. No working iOS touch driver exists yet.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

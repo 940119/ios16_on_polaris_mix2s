@@ -103,6 +103,226 @@ static void delay_ms(unsigned ms)
 		;
 }
 
+#ifdef TOUCHPROBE
+/* Bit-banged I2C on the SE14 pins (TLMM 33/34) to probe the touch IC. */
+static volatile uint32_t *tgpio;
+static uint32_t tsda = 33, tscl = 34;
+
+static void tcfg(uint32_t pin, uint32_t mux, uint32_t pull, uint32_t drive, int out)
+{
+	uint32_t i = pin * 0x1000u / 4;
+	uint32_t cfg = tgpio[i];
+
+	cfg &= ~0x3ffu;
+	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+	tgpio[i] = cfg;
+}
+
+static void tset(uint32_t pin, int v)
+{
+	uint32_t i = pin * 0x1000u / 4 + 1;
+	uint32_t x = tgpio[i];
+
+	if (v)
+		x |= 2u;
+	else
+		x &= ~2u;
+	tgpio[i] = x;
+}
+
+static int tget(uint32_t pin)
+{
+	return (tgpio[pin * 0x1000u / 4 + 1] & 1u) != 0;
+}
+
+static void tudelay(uint32_t us)
+{
+	uint64_t per = rsr("cntfrq_el0") / 1000000u;
+	uint64_t s = now();
+
+	while (now() - s < per * us)
+		;
+}
+
+static void sda_rel(void) { tcfg(tsda, 0, 3, 2, 0); }
+static void sda_low(void) { tset(tsda, 0); tcfg(tsda, 0, 0, 2, 1); }
+static void scl_rel(void) { tcfg(tscl, 0, 3, 2, 0); }
+static void scl_low(void) { tset(tscl, 0); tcfg(tscl, 0, 0, 2, 1); }
+
+/* Open-drain self-test: drive low, then release; never drive I2C high. */
+static uint32_t tp_selftest(void)
+{
+	uint32_t r = 0;
+
+	sda_low(); tudelay(10);
+	if (!tget(tsda)) r |= 1u;
+	sda_rel(); tudelay(20);
+	if (tget(tsda)) r |= 4u;
+	scl_low(); tudelay(10);
+	if (!tget(tscl)) r |= 8u;
+	scl_rel(); tudelay(20);
+	if (tget(tscl)) r |= 32u;
+	return r; /* healthy, both lines released: 0x2d */
+}
+
+static void i2c_stop(void);
+
+/* 0x3 means both lines released; never infer an ACK on a stuck bus. */
+static uint32_t bus_state(void)
+{
+	sda_rel(); scl_rel(); tudelay(20);
+	return (uint32_t)tget(tsda) | ((uint32_t)tget(tscl) << 1);
+}
+
+static void bus_recover(void)
+{
+	/* Only clock a bus whose SCL has actually risen. */
+	sda_rel(); scl_rel(); tudelay(20);
+	if (!tget(tscl))
+		return;
+	for (int i = 0; i < 9 && !tget(tsda); i++) {
+		scl_low(); tudelay(10);
+		scl_rel(); tudelay(10);
+		if (!tget(tscl))
+			return;
+	}
+	if (tget(tsda))
+		i2c_stop();
+}
+
+static void i2c_start(void)
+{
+	sda_rel(); scl_rel(); tudelay(5);
+	sda_low(); tudelay(5);
+	scl_low(); tudelay(5);
+}
+
+static void i2c_repeat(void)
+{
+	sda_rel(); tudelay(5);
+	scl_rel(); tudelay(5);
+	sda_low(); tudelay(5);
+	scl_low(); tudelay(5);
+}
+
+static void i2c_stop(void)
+{
+	sda_low(); tudelay(5);
+	scl_rel(); tudelay(5);
+	sda_rel(); tudelay(5);
+}
+
+static int i2c_write(uint8_t b)
+{
+	int ack;
+
+	for (int i = 7; i >= 0; i--) {
+		if (b & (1u << i))
+			sda_rel();
+		else
+			sda_low();
+		tudelay(3);
+		scl_rel(); tudelay(3);
+		scl_low(); tudelay(3);
+	}
+	sda_rel(); tudelay(5);
+	scl_rel(); tudelay(5);
+	if (!tget(tscl)) {
+		scl_low();
+		return 0;
+	}
+	ack = !tget(tsda);
+	scl_low(); tudelay(5);
+	return ack;
+}
+
+static uint8_t i2c_read(int ack)
+{
+	uint8_t v = 0;
+
+	sda_rel();
+	for (int i = 0; i < 8; i++) {
+		v <<= 1;
+		scl_rel(); tudelay(3);
+		if (tget(tsda))
+			v |= 1;
+		scl_low(); tudelay(3);
+	}
+	if (ack)
+		sda_low();
+	else
+		sda_rel();
+	tudelay(3);
+	scl_rel(); tudelay(3);
+	scl_low(); tudelay(3);
+	sda_rel();
+	return v;
+}
+
+static int probe_addr(uint8_t a7)
+{
+	int ack;
+
+	if (bus_state() != 3)
+		return 0;
+	i2c_start();
+	ack = i2c_write(a7 << 1);
+	i2c_stop();
+	tudelay(500);
+	return ack && bus_state() == 3;
+}
+
+/* RMI4 I2C: write 0xff,page to select a page, then send ONE register byte.
+ * Reading the PDT at 0xe9 should return a nonzero function number. */
+static int rmi_read(uint8_t addr, uint16_t reg, uint8_t *buf, int len)
+{
+	if (bus_state() != 3)
+		return 0;
+	i2c_start();
+	if (!i2c_write(addr << 1) || !i2c_write(0xff) ||
+	    !i2c_write(reg >> 8)) {
+		i2c_stop();
+		return 0;
+	}
+	i2c_stop();
+	if (bus_state() != 3)
+		return 0;
+	i2c_start();
+	if (!i2c_write(addr << 1) || !i2c_write(reg & 0xff)) {
+		i2c_stop();
+		return 0;
+	}
+	i2c_repeat();
+	if (!i2c_write((addr << 1) | 1)) {
+		i2c_stop();
+		return 0;
+	}
+	for (int i = 0; i < len; i++)
+		buf[i] = i2c_read(i + 1 < len);
+	i2c_stop();
+	return bus_state() == 3;
+}
+
+/* Legacy single-byte-register read (FocalTech-style devices). */
+static int leg_read(uint8_t addr, uint8_t reg, uint8_t *buf, int len)
+{
+	i2c_start();
+	if (!i2c_write(addr << 1) || !i2c_write(reg)) {
+		i2c_stop();
+		return 0;
+	}
+	i2c_repeat();
+	if (!i2c_write((addr << 1) | 1)) {
+		i2c_stop();
+		return 0;
+	}
+	for (int i = 0; i < len; i++)
+		buf[i] = i2c_read(i + 1 < len);
+	i2c_stop();
+	return 1;
+}
+#endif
+
 static void __attribute__((noreturn)) reset(unsigned after_s)
 {
 	con_skip();
@@ -413,6 +633,96 @@ void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
+#ifdef TOUCHPROBE
+	(void)dtb;
+	{
+		uint8_t b[8] = { 0 };
+		uint32_t st, idle, recv, a20, a2c, a38, a00, a7e, swp;
+		uint32_t r00 = 0, re9 = 0;
+		int irq2;
+
+		tgpio = (volatile uint32_t *)0x03400000UL;
+		con_config((void *)0x9d400000UL, 1080, 2160, 4320, 4);
+		con_clear(0xff000060);
+		con_str("TOUCH3", "BUS SAFE V3");
+
+		/* VDDIO (TLMM 23) on, touch reset (TLMM 99) pulse, IRQ input. */
+		tset(23, 1); tcfg(23, 0, 0, 2, 1); tudelay(5000);
+		tset(99, 0); tcfg(99, 0, 0, 8, 1); tudelay(10000);
+		tset(99, 1); tudelay(200000);
+		tcfg(125, 0, 3, 8, 0);
+
+		/* Pass 1: SDA=33, SCL=34. */
+		st = tp_selftest();
+		con_hex8("SLFT", st);
+		idle = bus_state() | ((uint32_t)tget(125) << 2);
+		con_hex8("IDLE", idle);
+
+		bus_recover();
+		recv = bus_state();
+		con_hex8("RECV", recv);
+
+		if (recv == 3) {
+			a20 = probe_addr(0x20);
+			a2c = probe_addr(0x2c);
+			a38 = probe_addr(0x38);
+			a00 = probe_addr(0x00);
+			a7e = probe_addr(0x7e);
+		} else {
+			a20 = a2c = a38 = a00 = a7e = 0;
+		}
+		con_hex8("A20", a20 | (a2c << 1) | (a38 << 2) |
+			       (a00 << 3) | (a7e << 4));
+		con_hex8("POST", bus_state());
+
+		if (a20 && !a00 && !a7e) {
+			r00 = rmi_read(0x20, 0x0000, b, 6);
+			if (r00) {
+				con_hex8("R00", ((uint32_t)b[0] << 24) |
+					 ((uint32_t)b[1] << 16) |
+					 ((uint32_t)b[2] << 8) | b[3]);
+				con_hex8("R04", ((uint32_t)b[4] << 8) | b[5]);
+			}
+			for (int i = 0; i < 6; i++)
+				b[i] = 0;
+			re9 = rmi_read(0x20, 0x00e9, b, 6);
+			if (re9) {
+				con_hex8("RE9", ((uint32_t)b[0] << 24) |
+					 ((uint32_t)b[1] << 16) |
+					 ((uint32_t)b[2] << 8) | b[3]);
+				con_hex8("RFN", b[5]);
+			}
+		}
+		con_hex8("READ", r00 | (re9 << 1));
+		if (a38) {
+			uint8_t v[4] = { 0 };
+
+			if (leg_read(0x38, 0xa8, v, 4))
+				con_hex8("L38", ((uint32_t)v[0] << 24) |
+					 ((uint32_t)v[1] << 16) |
+					 ((uint32_t)v[2] << 8) | v[3]);
+			else
+				con_str("L38", "NACK");
+		}
+
+		/* Pass 2: swapped pins, in case 33/34 are labeled backwards. */
+		sda_rel(); scl_rel();
+		tsda = 34; tscl = 33;
+		st = tp_selftest();
+		a20 = probe_addr(0x20);
+		a38 = probe_addr(0x38);
+		swp = (st << 8) | (a20 << 1) | a38;
+		con_hex8("SWP", swp);
+		sda_rel(); scl_rel();
+		tsda = 33; tscl = 34;
+
+		irq2 = tget(125);
+		con_hex8("IRQ2", (uint32_t)irq2);
+		con_str("TOUCH2", "done, reset in 90s");
+		delay_ms(90000);
+		reset_silent(5);
+	}
+#endif
 #ifdef HUGE
 	(void)dtb;
 	{
