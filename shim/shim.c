@@ -658,7 +658,7 @@ void shim_main(uint64_t dtb)
 
 		con_config((void *)0x9d400000UL, 1080, 2160, 4320, 4);
 		con_clear(0xff000060);
-		con_str("TOUCH5", "TLMM TILES V5");
+		con_str("TOUCH6", "RMI4 PDT V6");
 
 		/* GPIO23 VDDIO: record the TLMM latch and pad before and after.
 		 * Do not change any PMIC/SPMI regulator here. */
@@ -714,6 +714,29 @@ void shim_main(uint64_t dtb)
 			}
 		}
 		con_hex8("READ", r00 | (re9 << 1));
+		if (a20 && re9 && b[5] == 0x34) {
+			/* PDT entries: query/command/control/data, interrupt, function.
+			 * No RMI4 writes except the I2C page selector. */
+			for (int off = 0xe3; off >= 0xa5; off -= 6) {
+				char label[] = "PDT00";
+				uint8_t ent[6];
+				uint32_t bases;
+
+				if (!rmi_read(0x20, (uint16_t)off, ent, 6)) {
+					con_str("PDT", "NACK");
+					break;
+				}
+				if (!ent[5])
+					break;
+				label[3] = "0123456789ABCDEF"[(off >> 4) & 0xf];
+				label[4] = "0123456789ABCDEF"[off & 0xf];
+				bases = ((uint32_t)ent[0] << 24) |
+					((uint32_t)ent[1] << 16) |
+					((uint32_t)ent[2] << 8) | ent[3];
+				con_hex8(label, bases);
+				con_hex8("FNIRQ", ((uint32_t)ent[4] << 8) | ent[5]);
+			}
+		}
 		if (a38) {
 			uint8_t v[4] = { 0 };
 
@@ -725,20 +748,22 @@ void shim_main(uint64_t dtb)
 				con_str("L38", "NACK");
 		}
 
-		/* Pass 2: swapped pins, in case 33/34 are labeled backwards. */
-		sda_rel(); scl_rel();
-		tsda = 34; tscl = 33;
-		st = tp_selftest();
-		a20 = probe_addr(0x20);
-		a38 = probe_addr(0x38);
-		swp = (st << 8) | (a20 << 1) | a38;
-		con_hex8("SWP", swp);
-		sda_rel(); scl_rel();
-		tsda = 33; tscl = 34;
+		/* Do not reverse the pins after a valid RMI4 response. */
+		if (!a20) {
+			sda_rel(); scl_rel();
+			tsda = 34; tscl = 33;
+			st = tp_selftest();
+			a20 = probe_addr(0x20);
+			a38 = probe_addr(0x38);
+			swp = (st << 8) | (a20 << 1) | a38;
+			con_hex8("SWP", swp);
+			sda_rel(); scl_rel();
+			tsda = 33; tscl = 34;
+		}
 
 		irq2 = tget(125);
 		con_hex8("IRQ2", (uint32_t)irq2);
-		con_str("TOUCH2", "done, reset in 90s");
+		con_str("TOUCH6", "done, reset in 90s");
 		delay_ms(90000);
 		reset_silent(5);
 	}
