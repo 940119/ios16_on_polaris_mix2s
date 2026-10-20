@@ -1,0 +1,388 @@
+diff --git a/bsd/dev/polaris_touch_i2c.c b/bsd/dev/polaris_touch_i2c.c
+--- a/bsd/dev/polaris_touch_i2c.c
++++ b/bsd/dev/polaris_touch_i2c.c
+@@ -27,19 +27,25 @@
+ #define IO_REG         4u
+ #define SDA           SDA_CFG
+ #define SCL           SCL_CFG
++#define RESET_CFG     (99u * 0x1000u)
+ #define I2C_ADDR      0x20u
+ #define CFG_MASK      0x3ffu
+ #define IN_PULL_UP    (3u | (2u << 6))
+ #define OUT_LOW       ((2u << 6) | 0x200u)
+ #define MAX_READ      16u
++#define MAX_FINGERS   10u
++#define FINGER_BYTES  8u
+ 
+ static vm_offset_t pt_gpio;
++static vm_offset_t pt_reset_gpio;
+ static uint32_t saved_sda_cfg, saved_scl_cfg, saved_sda_io, saved_scl_io;
+ static int pt_sleep_chan;
+ static bool pt_started;
+ static bool pt_hid_enabled;
+-static bool pt_down;
+-static int pt_x, pt_y;
++static bool pt_reset_enabled;
++static bool pt_down[MAX_FINGERS];
++static int pt_x[MAX_FINGERS], pt_y[MAX_FINGERS];
++static unsigned pt_fingers;
+ 
+ static uint32_t
+ pt_rd(uint32_t off)
+@@ -54,6 +60,22 @@
+ {
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(pt_gpio + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static uint32_t
++pt_reset_rd(unsigned off)
++{
++	uint32_t v = *(volatile uint32_t *)(pt_reset_gpio + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++pt_reset_wr(unsigned off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(pt_reset_gpio + off) = v;
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ }
+ 
+@@ -130,13 +152,17 @@
+ 	return true;
+ }
+ 
++static unsigned pt_write_failure;
++
+ static bool
+ pt_write(uint8_t b)
+ {
++	pt_write_failure = 0;
+ 	for (int i = 7; i >= 0; --i) {
+ 		pt_line(SDA, (b & (1u << i)) != 0);
+ 		delay(3);
+ 		if (!pt_clock()) {
++			pt_write_failure = 1;
+ 			return false;
+ 		}
+ 		pt_line(SCL, false);
+@@ -145,11 +171,13 @@
+ 	pt_line(SDA, true);
+ 	delay(5);
+ 	if (!pt_clock()) {
++		pt_write_failure = 1;
+ 		return false;
+ 	}
+ 	bool ack = !pt_high(SDA);
+ 	pt_line(SCL, false);
+ 	delay(5);
++	if (!ack) pt_write_failure = 2;
+ 	return ack;
+ }
+ 
+@@ -178,6 +206,7 @@
+ }
+ 
+ static unsigned pt_read_stage;
++static unsigned pt_read_failure;
+ 
+ /* Shim-proven RMI4 protocol: write 0xff,page then STOP; address the
+  * one-byte register and repeat-start for reading. Each transfer is capped.
+@@ -186,6 +215,7 @@
+ pt_read(uint16_t reg, uint8_t *buf, unsigned len)
+ {
+ 	bool ok = false;
++	pt_read_failure = 0;
+ 	pt_read_stage = 1;
+ 	if (!len || len > MAX_READ || !pt_start(false)) goto out;
+ 	pt_read_stage = 2;
+@@ -211,6 +241,7 @@
+ 	}
+ 	ok = true;
+ out:
++	pt_read_failure = pt_write_failure;
+ 	pt_stop();
+ 	pt_read_stage = ok ? 30 : pt_read_stage;
+ 	if (!pt_idle()) {
+@@ -242,14 +273,54 @@
+ 	pt_wr(SCL, saved_scl_cfg);
+ }
+ 
+-/* Experimental: 0x08 is a finger-correlated candidate, NOT a proven F12
+- * Data1 layout. Do not invent a contact for unknown or malformed bytes. */
++/* Vendor DSX Query5 contains size-of-Query6 then Control0.. presence bits.
++ * Each present Control below 23 occupies one address for this layout. */
++static bool
++pt_f12_fingers(uint8_t query_base, uint8_t ctrl_base, unsigned *count)
++{
++	uint8_t q[32] = {0}, ctrl[2] = {0}, size = 0;
++	unsigned offset = 0;
++	if (!pt_read((uint16_t)(query_base + 4u), &size, 1) ||
++	    size < 4 || size > sizeof(q)) {
++		return false;
++	}
++	for (unsigned n = 0; n < size; n += MAX_READ) {
++		unsigned chunk = size - n < MAX_READ ? size - n : MAX_READ;
++		if (!pt_read((uint16_t)(query_base + 5u + n), q + n, chunk)) {
++			return false;
++		}
++	}
++	/* First Query5 byte is size-of-Query6, then Control0.. bits. */
++	if (!(q[1 + 23 / 8] & (1u << (23 % 8)))) {
++		return false;
++	}
++	for (unsigned n = 0; n < 23; ++n) {
++		offset += (q[1 + n / 8] >> (n % 8)) & 1u;
++	}
++	if (offset > 0xffu - ctrl_base ||
++	    !pt_read((uint16_t)(ctrl_base + offset), ctrl, sizeof(ctrl))) {
++		return false;
++	}
++	printf("POLARIS HID: F12 Ctrl23 at 0x%02x = %02x %02x\n",
++	    (unsigned)(ctrl_base + offset), ctrl[0], ctrl[1]);
++	if (!(ctrl[0] & 1u) || ctrl[1] < 1 || ctrl[1] > MAX_FINGERS) {
++		return false;
++	}
++	*count = ctrl[1];
++	return true;
++}
++
++/* Experimental: 0x08 is finger-correlated and the vendor driver's
++ * zero-initialized Query8 fallback reads Data1 from the data base, but
++ * Query8 length one does not independently establish its presence. */
+ static void
+ pt_release(void)
+ {
+-	if (pt_down) {
+-		sweet_hid_touch(0, 0, pt_x, pt_y);
+-		pt_down = false;
++	for (unsigned i = 0; i < MAX_FINGERS; ++i) {
++		if (pt_down[i]) {
++			sweet_hid_touch((int)i, 0, pt_x[i], pt_y[i]);
++			pt_down[i] = false;
++		}
+ 	}
+ }
+ 
+@@ -257,17 +328,14 @@
+ pt_frame(const uint8_t *b, int *x, int *y, bool *present)
+ {
+ 	*present = false;
+-	if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0 &&
+-	    b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0) {
+-		return true; /* only all-zero is an unambiguous release candidate */
+-	}
+-	/* Single finger object type 1, plausible observed tail, little-endian
+-	 * coordinates inside Polaris panel. Any other object is invalid. */
++	if ((b[0] & 0x0f) == 0) {
++		return true;
++	}
++	/* Vendor S3330 DSX: object status, LE x/y, z, wx, wy.
++	 * Reject unknown object types and out-of-panel coordinates. */
+ 	*x = (int)((unsigned)b[1] | ((unsigned)b[2] << 8));
+ 	*y = (int)((unsigned)b[3] | ((unsigned)b[4] << 8));
+-	if (b[0] != 1 || *x < 0 || *x >= 1080 || *y < 0 || *y >= 2160 ||
+-	    b[5] == 0 || b[5] == 0xff || b[6] == 0 || b[6] > 0x20 ||
+-	    b[7] == 0 || b[7] > 0x20) {
++	if ((b[0] & 0x0f) != 1 || *x >= 1080 || *y >= 2160) {
+ 		return false;
+ 	}
+ 	*present = true;
+@@ -279,7 +347,8 @@
+ {
+ 	uint8_t f01[6] = {0}, f12[6] = {0}, query[16] = {0}, raw[8] = {0};
+ 	pt_gpio = ml_io_map(NORTH_PA, 0x23000);
+-	if (!pt_gpio) {
++	pt_reset_gpio = ml_io_map(NORTH_PA + RESET_CFG, 0x1000);
++	if (!pt_gpio || !pt_reset_gpio) {
+ 		printf("POLARIS I2C: TLMM north map failed\n");
+ 		goto done;
+ 	}
+@@ -287,15 +356,34 @@
+ 	saved_scl_cfg = pt_rd(SCL);
+ 	saved_sda_io = pt_rd(SDA + IO_REG);
+ 	saved_scl_io = pt_rd(SCL + IO_REG);
+-	/* GPIO33/34 only; don't reset controller, toggle VDDIO23, IRQ125 or
+-	 * RESET99. Require verified released bus after configuring open drain. */
++	printf("POLARIS I2C: RESET99 before cfg=0x%x io=0x%x\n",
++	    pt_reset_rd(0), pt_reset_rd(IO_REG));
++	if (pt_reset_enabled) {
++		uint32_t cfg = pt_reset_rd(0);
++		uint32_t io = pt_reset_rd(IO_REG);
++		/* Only release an already asserted, GPIO-output active-low reset.
++		 * No low pulse, no VIO23 or PMIC change. Leave it deasserted. */
++		if ((cfg & CFG_MASK) != 0x201u || (io & 2u)) {
++			printf("POLARIS I2C: RESET99 not asserted as expected; refusing reset release\n");
++			goto restore;
++		}
++		pt_reset_wr(IO_REG, io | 2u);
++		pt_wait(200);
++		printf("POLARIS I2C: RESET99 released cfg=0x%x io=0x%x\n",
++		    pt_reset_rd(0), pt_reset_rd(IO_REG));
++		if (!(pt_reset_rd(IO_REG) & 1u)) {
++			printf("POLARIS I2C: RESET99 pad did not rise\n");
++			goto restore;
++		}
++	}
++	/* Require a verified released bus after configuring GPIO33/34 open drain. */
+ 	if (!pt_idle()) {
+ 		printf("POLARIS I2C: bus stuck; no RMI4 transactions\n");
+ 		goto restore;
+ 	}
+ 	if (!pt_read(0x00e3, f01, sizeof(f01))) {
+-		printf("POLARIS I2C: F01 PDT read failed stage=%u lines=%u%u\n",
+-		    pt_read_stage, pt_high(SDA), pt_high(SCL));
++		printf("POLARIS I2C: F01 PDT read failed stage=%u reason=%u (1=SCL,2=NACK) lines=%u%u\n",
++		    pt_read_stage, pt_read_failure, pt_high(SDA), pt_high(SCL));
+ 		goto restore;
+ 	}
+ 	printf("POLARIS I2C: F01 PDT %02x %02x %02x %02x %02x %02x\n",
+@@ -306,8 +394,8 @@
+ 		goto restore;
+ 	}
+ 	if (!pt_read(0x00dd, f12, sizeof(f12))) {
+-		printf("POLARIS I2C: F12 PDT read failed stage=%u lines=%u%u\n",
+-		    pt_read_stage, pt_high(SDA), pt_high(SCL));
++		printf("POLARIS I2C: F12 PDT read failed stage=%u reason=%u lines=%u%u\n",
++		    pt_read_stage, pt_read_failure, pt_high(SDA), pt_high(SCL));
+ 		goto restore;
+ 	}
+ 	printf("POLARIS I2C: F12 PDT %02x %02x %02x %02x %02x %02x\n",
+@@ -334,49 +422,71 @@
+ 		goto restore;
+ 	}
+ 	if (pt_hid_enabled) {
+-		unsigned candidates = 0, failures = 0;
+-		int prior_x = 0, prior_y = 0;
+-		/* 50 Hz maximum; at most 12000 samples (four minutes) and stop
+-		 * after eight consecutive invalid/failed reads. Never log per poll. */
+-		printf("POLARIS HID: EXPERIMENTAL unproven F12 layout 0x08, bounded one-finger poll\n");
+-		for (unsigned i = 0; i < 12000; ++i) {
+-			int x = 0, y = 0;
+-			bool present = false;
+-			if (!pt_read(f12[3], raw, sizeof(raw)) ||
+-			    !pt_frame(raw, &x, &y, &present)) {
++		pt_fingers = 1; /* shim-observed single slot only */
++		unsigned reported = 0;
++		if (pt_f12_fingers(f12[0], f12[2], &reported)) {
++			pt_fingers = reported;
++			printf("POLARIS HID: Ctrl23 confirmed %u slots\n", pt_fingers);
++		} else {
++			printf("POLARIS HID: Ctrl23 unverified; one experimental slot only\n");
++		}
++	}
++	if (pt_hid_enabled) {
++		unsigned failures = 0;
++		unsigned candidates[MAX_FINGERS] = {0};
++		int prior_x[MAX_FINGERS] = {0}, prior_y[MAX_FINGERS] = {0};
++		printf("POLARIS HID: experimental F12 base 0x%02x, %u slots, 8 bytes each\n",
++		    f12[3], pt_fingers);
++		for (;;) {
++			bool valid = true, present[MAX_FINGERS] = {0};
++			int x[MAX_FINGERS] = {0}, y[MAX_FINGERS] = {0};
++			for (unsigned slot = 0; slot < pt_fingers; ++slot) {
++				if (!pt_read((uint16_t)(f12[3] + slot * FINGER_BYTES), raw, FINGER_BYTES) ||
++				    !pt_frame(raw, &x[slot], &y[slot], &present[slot])) {
++					valid = false;
++					break;
++				}
++			}
++			if (!valid) {
+ 				pt_release();
+-				candidates = 0;
++				for (unsigned slot = 0; slot < pt_fingers; ++slot) candidates[slot] = 0;
+ 				if (++failures >= 8) {
+ 					printf("POLARIS HID: repeated read/invalid frames, stopping\n");
+ 					break;
+ 				}
+-			} else if (!present) {
+-				pt_release();
+-				candidates = failures = 0;
+-			} else {
+-				failures = 0;
+-				if (!pt_down) {
+-					/* Require two plausible nearby polls before first DOWN. */
+-					if (candidates && x - prior_x < 80 && prior_x - x < 80 &&
+-					    y - prior_y < 80 && prior_y - y < 80) {
+-						sweet_hid_touch(0, 1, x, y);
+-						pt_down = true;
+-						candidates = 0;
++				pt_wait(20);
++				continue;
++			}
++			failures = 0;
++			for (unsigned slot = 0; slot < pt_fingers; ++slot) {
++				if (!present[slot]) {
++					if (pt_down[slot]) {
++						sweet_hid_touch((int)slot, 0, pt_x[slot], pt_y[slot]);
++						pt_down[slot] = false;
++					}
++					candidates[slot] = 0;
++					continue;
++				}
++				if (!pt_down[slot]) {
++					if (candidates[slot] && x[slot] - prior_x[slot] < 80 &&
++					    prior_x[slot] - x[slot] < 80 && y[slot] - prior_y[slot] < 80 &&
++					    prior_y[slot] - y[slot] < 80) {
++						sweet_hid_touch((int)slot, 1, x[slot], y[slot]);
++						pt_down[slot] = true;
++						pt_x[slot] = x[slot]; pt_y[slot] = y[slot];
++						candidates[slot] = 0;
+ 					} else {
+-						candidates = 1;
++						candidates[slot] = 1;
+ 					}
+-					prior_x = x;
+-					prior_y = y;
+-				} else if (x - pt_x >= 200 || pt_x - x >= 200 ||
+-				    y - pt_y >= 200 || pt_y - y >= 200) {
+-					pt_release(); /* improbable jump: no teleport contact */
+-					candidates = 0;
+-				} else if (x != pt_x || y != pt_y) {
+-					sweet_hid_touch(0, 1, x, y);
+-				}
+-				if (pt_down) {
+-					pt_x = x;
+-					pt_y = y;
++					prior_x[slot] = x[slot]; prior_y[slot] = y[slot];
++				} else if (x[slot] - pt_x[slot] >= 200 || pt_x[slot] - x[slot] >= 200 ||
++				    y[slot] - pt_y[slot] >= 200 || pt_y[slot] - y[slot] >= 200) {
++					sweet_hid_touch((int)slot, 0, pt_x[slot], pt_y[slot]);
++					pt_down[slot] = false;
++					candidates[slot] = 0;
++				} else if (x[slot] != pt_x[slot] || y[slot] != pt_y[slot]) {
++					sweet_hid_touch((int)slot, 1, x[slot], y[slot]);
++					pt_x[slot] = x[slot]; pt_y[slot] = y[slot];
+ 				}
+ 			}
+ 			pt_wait(20);
+@@ -405,20 +515,22 @@
+ void
+ polaris_touch_i2c_init(void)
+ {
+-	int enabled = 0, hid_enabled = 0;
++	int enabled = 0, hid_enabled = 0, reset_enabled = 0;
+ 	thread_t thread;
+ 	if (!polaris_touch_i2c_board()) {
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("polaristouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("polaristouchhid", &hid_enabled, sizeof(hid_enabled));
++	(void)PE_parse_boot_argn("polaristouchreset", &reset_enabled, sizeof(reset_enabled));
+ 	if ((enabled != 1 && hid_enabled != 1) || pt_started) {
+ 		return;
+ 	}
+ 	pt_started = true;
+ 	pt_hid_enabled = hid_enabled == 1;
+-	printf("POLARIS I2C: opted in; GPIO33/34 raw/PDT prototype; HID %s\n",
+-	    pt_hid_enabled ? "EXPERIMENTAL" : "off");
++	pt_reset_enabled = reset_enabled == 1;
++	printf("POLARIS I2C: opted in; GPIO33/34 raw/PDT prototype; HID %s reset99 %s\n",
++	    pt_hid_enabled ? "EXPERIMENTAL" : "off", pt_reset_enabled ? "release" : "unchanged");
+ 	kern_return_t kr = kernel_thread_start(pt_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
