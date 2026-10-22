@@ -1,0 +1,7 @@
+# Polaris GPU 带宽投票数据的离线边界
+
+MiCode [cmd-db.c](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/polaris-o-oss/drivers/soc/qcom/cmd-db.c#L35-L61) 的 command-db 头为 144 字节，每项 24 字节；BCM slave ID=5，辅助数据相对头部的 `data_offset+entry.offset`。厂商 [msm_bus_fabric_rpmh.c](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/polaris-o-oss/drivers/soc/qcom/msm_bus/msm_bus_fabric_rpmh.c#L51-L56) 的 `bcm_db` 是 little-endian `unit_size:u32,width:u16,clk_domain:u8,reserved:u8`。`tools/polaris_bcm_db.py` 只接受显式提供的离线字节，验证头、BCM 地址 slave、唯一 ID、aux 界限、非零单位/宽度和 VCD<16；不与 `ml_io_map`、`/dev/mem`、RSC/TCS 或任何真机接口相连。
+
+[MiCode TCS bit layout](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/polaris-o-oss/drivers/soc/qcom/msm_bus/msm_bus_fabric_rpmh.c#L30-L56) 的主机编码函数仅用于已聚合的 AB/IB 向量回归：bit30 commit、bit29 valid、AB 左移14、IB 低14，两个 vote 饱和到 `0x3fff`。它**不是投票 API**：真实 13 档 GPU→DDR、2 档 GMU→CNOC 从 [DTS](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/polaris-o-oss/arch/arm64/boot/dts/qcom/sdm845-gpu.dtsi#L92-L113) 经过 bus path、并发客户端聚合、BCM width/unit_size 缩放、VCD 顺序和 command-db 地址，才由 [query 生成](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/polaris-o-oss/drivers/soc/qcom/msm_bus/msm_bus_fabric_rpmh.c#L405-L437) 成真实 HFI 命令。只得到 DB aux 无法安全重建 TCS 字。
+
+离线合成 DB 回归不等于已经取得手机 command-db：Recovery 无预先挂载的 0444 `cmd_db`，不能绕过内核 owner 读物理页。下一步需要**受信任的 Linux 驱动导出**或已知 XNU 保留区 ownership + read-only 映射；随后解析真实 BCM 路径/聚合，并核对 GMU HFI 与厂商 API 输出，再动供电写寄存器。此前 XNU 0092 已撤回未经证明的固定 PA 映射。任何手机临时启动/刷写先请求用户确认。
