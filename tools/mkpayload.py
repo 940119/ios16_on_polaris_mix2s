@@ -213,6 +213,8 @@ if __name__ == '__main__':
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     ap.add_argument('--blob', action='append', default=[], metavar='NAME=FILE',
                     help='add a file under /chosen/memory-map NAME')
+    ap.add_argument('--max-payload-size', type=lambda n: int(n, 0),
+                    help='fail if payload bytes exceed the bootloader ramdisk-to-DTB gap')
     a = ap.parse_args()
     blobs = []
     for item in a.blob:
@@ -220,6 +222,10 @@ if __name__ == '__main__':
             ap.error('--blob must be NAME=FILE')
         blobs.append(item.split('=', 1))
     blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, blobs)
+    if a.max_payload_size is not None and (a.max_payload_size <= 0 or
+                                           len(blob) > a.max_payload_size):
+        ap.error(f'payload {len(blob)} bytes exceeds --max-payload-size '
+                 f'{a.max_payload_size}')
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
