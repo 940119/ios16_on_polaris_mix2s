@@ -1,4 +1,4 @@
-# ios-sweet / iOS on sweet & polaris
+# ios16 on polaris mix2s
 
 **English · [简体中文](#简体中文--polaris-与-sweet-项目说明)**
 
