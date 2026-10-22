@@ -1,0 +1,159 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,3 +114,4 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/polaris_touch_diag.c		standard
+ bsd/dev/polaris_touch_i2c.c		standard
++bsd/dev/polaris_gpu_diag.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,3 +55,4 @@ extern void sweet_touch_init(void);
+ extern void polaris_touch_diag(void);
+ extern void polaris_touch_i2c_init(void);
++extern void polaris_gpu_diag(void);
+ extern void sweet_usb_probe(void);
+@@ -662,6 +663,7 @@
+ 	sweet_touch_init();
+ 	polaris_touch_diag();
+ 	polaris_touch_i2c_init();
++	polaris_gpu_diag();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+diff --git a/bsd/dev/polaris_gpu_diag.c b/bsd/dev/polaris_gpu_diag.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/polaris_gpu_diag.c
+@@ -0,0 +1,130 @@
++/*
++ * Polaris A630 firmware handoff diagnostic, NOT a GPU driver.
++ * No MMIO maps, regulator votes, SMMU changes or firmware execution.
++ * Keep CPU framebuffer and touch behavior unchanged on every failure.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern bool polaris_touch_i2c_board(void);
++
++#define GPU_BLOB_COUNT 6u
++#define GPU_PAGE       0x4000ull
++#define POLARIS_ZAP    0x8c415000ull
++#define POLARIS_ZAP_N  0x2000ull
++#define POLARIS_FB     0x9d400000ull
++#define POLARIS_FB_N   0x2400000ull
++
++static const struct {
++	const char *name;
++	uint32_t size;
++} gpu_blobs[GPU_BLOB_COUNT] = {
++	{ "GPU-SQE", 32136 }, { "GPU-GMU", 32768 },
++	{ "GPU-ZAP-MDT", 6684 }, { "GPU-ZAP-B00", 148 },
++	{ "GPU-ZAP-B01", 6536 }, { "GPU-ZAP-B02", 1968 },
++};
++
++/* ADT properties can be unaligned; copy rather than dereferencing as u64. */
++static bool
++gpu_pair(DTEntry node, const char *key, uint64_t *base, uint64_t *size)
++{
++	const void *value = NULL;
++	unsigned int length = 0;
++	if (SecureDTGetProperty(node, key, &value, &length) != kSuccess ||
++	    value == NULL || length != 16) {
++		return false;
++	}
++	memcpy(base, value, sizeof(*base));
++	memcpy(size, (const uint8_t *)value + sizeof(*base), sizeof(*size));
++	return true;
++}
++
++static bool
++gpu_u64(DTEntry node, const char *key, uint64_t *value)
++{
++	const void *data = NULL;
++	unsigned int length = 0;
++	if (SecureDTGetProperty(node, key, &data, &length) != kSuccess ||
++	    data == NULL || length != sizeof(*value)) {
++		return false;
++	}
++	memcpy(value, data, sizeof(*value));
++	return true;
++}
++
++static bool
++gpu_overlap(uint64_t a, uint64_t n, uint64_t b, uint64_t m)
++{
++	/* Callers validate overflow before using this comparison. */
++	return a < b + m && b < a + n;
++}
++
++void
++polaris_gpu_diag(void)
++{
++	DTEntry chosen, mmap;
++	uint64_t dram, dram_size, ranges[GPU_BLOB_COUNT][2] = {{0}};
++	unsigned int missing = 0;
++	int optin = 0;
++	/* The touch transport's board predicate requires BOTH exact ADT IDs. */
++	if (!polaris_touch_i2c_board()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("polarisgpudiag", &optin, sizeof(optin));
++	if (optin != 1) {
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    !gpu_u64(chosen, "dram-base", &dram) ||
++	    !gpu_u64(chosen, "dram-size", &dram_size) ||
++	    !dram_size || dram > UINT64_MAX - dram_size ||
++	    gpu_overlap(dram, dram_size, POLARIS_ZAP, POLARIS_ZAP_N) ||
++	    gpu_overlap(dram, dram_size, POLARIS_FB, POLARIS_FB_N)) {
++		printf("POLARIS GPU: invalid DRAM/reserved layout; no GPU access\n");
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mmap) != kSuccess) {
++		printf("POLARIS GPU: no memory-map; CPU display unchanged\n");
++		return;
++	}
++	for (unsigned int i = 0; i < GPU_BLOB_COUNT; ++i) {
++		uint64_t addr = 0, size = 0, reserve;
++		if (!gpu_pair(mmap, gpu_blobs[i].name, &addr, &size)) {
++			missing++;
++			continue;
++		}
++		if (size > UINT64_MAX - (GPU_PAGE - 1u)) {
++			printf("POLARIS GPU: %s size overflow; no GPU access\n",
++			    gpu_blobs[i].name);
++			return;
++		}
++		reserve = (size + GPU_PAGE - 1u) & ~(GPU_PAGE - 1u);
++		if (size != gpu_blobs[i].size || !reserve ||
++		    addr < dram || addr > dram + dram_size ||
++		    reserve > dram + dram_size - addr ||
++		    gpu_overlap(addr, reserve, POLARIS_ZAP, POLARIS_ZAP_N) ||
++		    gpu_overlap(addr, reserve, POLARIS_FB, POLARIS_FB_N)) {
++			printf("POLARIS GPU: invalid %s range; no GPU access\n",
++			    gpu_blobs[i].name);
++			return;
++		}
++		for (unsigned int j = 0; j < i; ++j) {
++			if (ranges[j][1] && gpu_overlap(addr, reserve,
++			    ranges[j][0], ranges[j][1])) {
++				printf("POLARIS GPU: overlapping %s; no GPU access\n",
++				    gpu_blobs[i].name);
++				return;
++			}
++		}
++		ranges[i][0] = addr;
++		ranges[i][1] = reserve;
++		printf("POLARIS GPU: %s present size=%llu (not executed)\n",
++		    gpu_blobs[i].name, size);
++	}
++	printf("POLARIS GPU: %u/6 blobs missing; firmware metadata only; "
++	    "GPU/GMU/SMMU registers untouched, CPU display unchanged\n", missing);
++}
++#endif
