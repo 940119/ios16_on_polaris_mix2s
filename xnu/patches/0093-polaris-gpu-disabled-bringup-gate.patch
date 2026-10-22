@@ -1,0 +1,149 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,3 +115,4 @@ bsd/dev/polaris_touch_diag.c		standard
+ bsd/dev/polaris_touch_i2c.c		standard
+ bsd/dev/polaris_gpu_diag.c		standard
++bsd/dev/polaris_gpu.c			standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,3 +56,4 @@ extern void polaris_touch_diag(void);
+ extern void polaris_touch_i2c_init(void);
+ extern void polaris_gpu_diag(void);
++extern void polaris_gpu_init(void);
+ extern void sweet_usb_probe(void);
+@@ -665,6 +666,7 @@
+ 	polaris_touch_diag();
+ 	polaris_touch_i2c_init();
+ 	polaris_gpu_diag();
++	polaris_gpu_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/polaris_gpu.c
+@@ -0,0 +1,120 @@
++/*
++ * Polaris A630 bring-up gate. This is NOT a GPU power driver.
++ * Deliberately does not map registers or pass command buffers to the GPU.
++ * Never replace the CPU framebuffer unless a fence and presentation work.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++extern bool polaris_touch_i2c_board(void);
++
++enum polaris_gpu_stage {
++	POLARIS_GPU_BOARD,
++	POLARIS_GPU_FIRMWARE,
++	POLARIS_GPU_RAILS,
++	POLARIS_GPU_CLOCKS,
++	POLARIS_GPU_BUS,
++	POLARIS_GPU_GMU,
++	POLARIS_GPU_HFI,
++	POLARIS_GPU_SMMU,
++	POLARIS_GPU_PAS,
++	POLARIS_GPU_CP,
++	POLARIS_GPU_FENCE,
++	POLARIS_GPU_STAGE_COUNT
++};
++
++enum polaris_gpu_state {
++	POLARIS_GPU_OFF,
++	POLARIS_GPU_STARTING,
++	POLARIS_GPU_IDLE,
++	POLARIS_GPU_QUARANTINED
++};
++
++/* Ownership is distinct from observing another owner's PWR_ON bit. */
++struct polaris_gpu_context {
++	enum polaris_gpu_state state;
++	unsigned int completed;
++	unsigned int owned;
++};
++
++static struct polaris_gpu_context polaris_gpu = { POLARIS_GPU_OFF, 0, 0 };
++
++static const char *const polaris_gpu_stage_name[POLARIS_GPU_STAGE_COUNT] = {
++	"board", "firmware", "rails", "clocks", "bus", "GMU",
++	"HFI", "SMMU", "PAS13", "CP", "fence"
++};
++
++/*
++ * Only an acquired resource may be released. Resource-specific release
++ * callbacks must be installed before ANY power or mapping code is enabled.
++ * No stages after the board stage have a backend in this revision.
++ */
++static bool
++polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
++{
++	if (ctx->state != POLARIS_GPU_STARTING ||
++	    stage != (enum polaris_gpu_stage)ctx->completed ||
++	    stage >= POLARIS_GPU_STAGE_COUNT) {
++		return false;
++	}
++	if (stage != POLARIS_GPU_BOARD) {
++		printf("POLARIS GPU: %s backend not implemented; no hardware access\n",
++		    polaris_gpu_stage_name[stage]);
++		return false;
++	}
++	/* Board identity is checked again here, not only at the caller. */
++	if (!polaris_touch_i2c_board()) {
++		return false;
++	}
++	ctx->completed++;
++	/* The board predicate acquires nothing; owned remains zero. */
++	return true;
++}
++
++static void
++polaris_gpu_unwind(struct polaris_gpu_context *ctx, bool idle_confirmed)
++{
++	/* Never collapse rails or unmap buffers while the GMU/CP may be busy. */
++	if (!idle_confirmed && ctx->completed > POLARIS_GPU_GMU) {
++		ctx->state = POLARIS_GPU_QUARANTINED;
++		printf("POLARIS GPU: idle unconfirmed; quarantined, CPU display unchanged\n");
++		return;
++	}
++	/* No hardware release is permitted while no backend owns a resource. */
++	if (ctx->owned != 0) {
++		ctx->state = POLARIS_GPU_QUARANTINED;
++		printf("POLARIS GPU: owned resource lacks release backend; quarantined\n");
++		return;
++	}
++	ctx->completed = 0;
++	ctx->state = POLARIS_GPU_OFF;
++}
++
++void
++polaris_gpu_init(void)
++{
++	int optin = 0;
++	if (!polaris_touch_i2c_board()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("polarisgpu", &optin, sizeof(optin));
++	if (optin != 1 || polaris_gpu.state != POLARIS_GPU_OFF) {
++		return;
++	}
++	polaris_gpu.state = POLARIS_GPU_STARTING;
++	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_BOARD)) {
++		goto fail;
++	}
++	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_FIRMWARE)) {
++		goto fail;
++	}
++	/* Unreachable until individually owned, bounded backends are installed. */
++	polaris_gpu.state = POLARIS_GPU_IDLE;
++	return;
++fail:
++	polaris_gpu_unwind(&polaris_gpu, true);
++	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
++}
++#endif
