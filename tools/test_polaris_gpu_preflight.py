@@ -26,6 +26,8 @@ class PolarisGpuPreflightTests(unittest.TestCase):
         for key, name in gpu.BLOBS:
             length = gpu.BLOB_SIZES[key]
             content = bytes(header) + bytes(length - len(header)) if name.endswith('.mdt') else bytes(length)
+            if key == 'GPU-GMU':
+                content = struct.pack('<II', 0x43f80, 9) + content[8:]
             (self.root / name).write_bytes(content)
 
     def test_valid_and_rejects_corrupt_segment(self):

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import adt
 import mkpayload
+from polaris_gmu_firmware import check_flat_a630_gmu
 
 PAGE = 0x4000
 ZAP_BASE, ZAP_SIZE = 0x8c415000, 0x2000
@@ -36,6 +37,7 @@ def check_firmware(folder):
         if len(data) != BLOB_SIZES[name]:
             raise ValueError(f'unexpected device firmware size: {filename}')
         files[name] = (path, data)
+    check_flat_a630_gmu(files['GPU-GMU'][1])
     meta = files['GPU-ZAP-MDT'][1]
     if len(meta) < 52 or meta[:6] != b'\x7fELF\x01\x01':
         raise ValueError('zap metadata is not little-endian ELF32')
