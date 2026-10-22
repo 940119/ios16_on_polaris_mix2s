@@ -1,4 +1,19 @@
-# ios-sweet
+# ios-sweet / iOS on sweet & polaris
+
+**English · [简体中文](#简体中文--polaris-与-sweet-项目说明)**
+
+This repository started as an iOS 16 port to Redmi Note 10 Pro (`sweet`, SM7150) and now also contains experimental Xiaomi Mi Mix 2S (`polaris`, SDM845/Adreno 630) bring-up. **These are different devices and drivers.** The sweet status below is historical to 2026-10-18; the Polaris status below is current to 2026-10-22. This repository does **not** contain a working Polaris GPU accelerator or a distributable iOS image.
+
+## English: Xiaomi Mi Mix 2S (`polaris`)
+
+The Polaris port is tracked in the **[full English and 简体中文 Polaris README](<research/polaris/README.md>)**. Its current status is distinct from sweet:
+
+- A temporary 0090 boot reached the iOS lock screen, and the user confirmed one- and two-finger touch. This is an experimental Synaptics S3330 implementation, not proof of complete multitouch or a production installation.
+- Display still uses CPU composition into the bootloader framebuffer. **GPU acceleration is not implemented.** Recovery Linux identified Adreno630v2; XNU patch 0091/0092 only compiled an opt-in, read-only firmware-metadata diagnostic in [CI 39739222780](https://github.com/luuu20309/ios-sweet/actions/runs/39739222780). No GPU power, GMU/HFI, secure PAS13, SMMU, CP fence, Mesa/EAGL or GPU presentation has run under XNU.
+- Host-only firmware/ARC/BCM/bandwidth and ownership tests have 26 passing cases. They neither exercise the phone nor create a GPU-enabled boot image. [Detailed Polaris milestones, hardware references, test command and roadmap](<research/polaris/README.md>) explain what remains and why the two devices' hardware paths cannot be mixed.
+- Proprietary firmware, Apple images, partition backups, device logs and build artifacts are intentionally **not** uploaded. Do not follow the sweet flashing recipe below on a Mi Mix 2S.
+
+## English: Redmi Note 10 Pro (`sweet`)
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**
 
@@ -34,7 +49,7 @@ As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock 
 - **Slow boot:** about 4 minutes on the Apple logo.
 - **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
 
-## How it boots
+## How sweet boots (Polaris has a separate ADT and board gates)
 
 ```
 ABL (stock Xiaomi bootloader, unlocked)
@@ -47,7 +62,7 @@ ABL (stock Xiaomi bootloader, unlocked)
 
 There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x9c000000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
 
-## How to do it yourself
+## How to do it yourself (sweet only; **not** Polaris)
 
 You need a Redmi Note 10 Pro (`sweet`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
 
@@ -118,7 +133,7 @@ What the less obvious boot-args do:
 | `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
 | `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
 
-### 4. Flash the root and boot
+### 4. Flash the sweet root and boot (destructive; **never use this recipe for Polaris**)
 
 ```sh
 fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
@@ -187,7 +202,7 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 | 0068 | IOSurface lookup semantics for already-mapped surfaces |
 | 0069 | Batched persistent-log flushes |
 
-## Key hardware facts
+## Key hardware facts (sweet only; **not** Polaris)
 
 - RAM: payloads use the upper bank, `0x100000000` + `0xfcc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
 - GICv3 with security extensions: the timer goes through Group 1 IRQ (virtual timer INTID 19), not FIQ as on Apple silicon.
@@ -197,6 +212,20 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 - Buttons: power and volume down on the PM6150 PON block, volume up on PM6150L GPIO2 (SPMI SID 4).
 
 More in [`NOTES.md`](NOTES.md).
+
+## 简体中文：Polaris 与 sweet 项目说明
+
+本仓库最初移植 iOS 16／XNU 到 Redmi Note 10 Pro（`sweet`、骁龙 732G）；现在也包含小米 MIX 2S（`polaris`、骁龙 845／Adreno 630v2）的独立实验工作。**两者的设备树、触摸、供电和 GPU 资源不通用。** 下方原有构建／刷机说明只针对 sweet，不是 MIX 2S 刷机教程。仓库不分发 iOS 固件或手机的专有 GPU 固件。
+
+### 当前成果（截至 2026-10-22）
+
+- **sweet：**已有 iOS 16.7.16 用户态启动到主屏幕、CPU 软件绘制、Goodix 触摸、按键与 UFS 根分区；该状态来自 2026-10-18 的项目记录，不应据此推断 Polaris 的功能。仍无 GPU 驱动，安全模型大幅放宽，绝非日常可用系统。
+- **polaris：**0090 临时测试镜像到达 iOS 锁屏，用户确认单指和双指触摸有效；但正式硬件 I²C、完整十指／手势与持续稳定性未证实。屏幕仍是 CPU framebuffer。
+- **polaris GPU：**已经核对 MiCode、主线 Linux 和 HackiOS 资料，完成本机固件的离线格式检查、带宽档位与资源归属模型，以及一次仅针对固件元数据诊断的 XNU CI 编译。**尚未实现可运行的 GPU 上电／GMU／HFI／PAS13／SMMU／CP／Mesa 路径；没有 GPU 加速镜像，也没有真机 GPU 执行结果。** 完整的双语进展、证据、测试命令和后续路线见 **[Polaris 项目 README](<research/polaris/README.md>)**，详细时间线见 [NOTES.md](<NOTES.md>)。
+
+### 使用和贡献注意
+
+优先阅读对应机型的文档，不要将下方 sweet 的 `userdata` 刷写命令或 SM7150 寄存器应用到 Polaris。研究脚本与通过的单元测试**不等于驱动已运行**；CI 编译成功也不等于 GPU 图形加速。任何设备分区操作先备份并单独确认，新的实验镜像优先临时 `fastboot boot`。请勿向公开仓库上传 Apple 镜像、专有固件、设备日志／序列号或分区备份。
 
 ## Credits
 
