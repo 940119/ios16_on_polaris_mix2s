@@ -21,14 +21,22 @@ class PolarisGpuPreflightTests(unittest.TestCase):
         struct.pack_into('<I', header, 28, 52)
         struct.pack_into('<HH', header, 42, 32, 1)
         struct.pack_into('<8I', header, 52, 1, 0x3000, 0x5000,
-                         0x5000, 4, 4, 0x8000007, 0x100000)
-        for _, name in gpu.BLOBS:
-            (self.root / name).write_bytes(bytes(header) if name.endswith('.mdt') else b'TEST')
+                         0x5000, gpu.BLOB_SIZES['GPU-ZAP-B02'],
+                         gpu.BLOB_SIZES['GPU-ZAP-B02'], 0x8000007, 0x100000)
+        for key, name in gpu.BLOBS:
+            length = gpu.BLOB_SIZES[key]
+            content = bytes(header) + bytes(length - len(header)) if name.endswith('.mdt') else bytes(length)
+            (self.root / name).write_bytes(content)
 
     def test_valid_and_rejects_corrupt_segment(self):
         gpu.check_firmware(self.root)
         (self.root / 'a630_zap.b02').write_bytes(b'BAD')
-        with self.assertRaisesRegex(ValueError, 'does not match'):
+        with self.assertRaisesRegex(ValueError, 'unexpected device firmware size'):
+            gpu.check_firmware(self.root)
+
+    def test_rejects_wrong_gmu_length(self):
+        (self.root / 'a630_gmu.bin').write_bytes(b'wrong')
+        with self.assertRaisesRegex(ValueError, 'unexpected device firmware size'):
             gpu.check_firmware(self.root)
 
     def test_rejects_bad_header_and_missing_segment(self):

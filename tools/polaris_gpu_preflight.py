@@ -21,6 +21,9 @@ BLOBS = (
     ('GPU-ZAP-MDT', 'a630_zap.mdt'), ('GPU-ZAP-B00', 'a630_zap.b00'),
     ('GPU-ZAP-B01', 'a630_zap.b01'), ('GPU-ZAP-B02', 'a630_zap.b02'),
 )
+# Sizes observed from this phone; do not silently accept another firmware set.
+BLOB_SIZES = dict(zip((name for name, _ in BLOBS),
+                      (32136, 32768, 6684, 148, 6536, 1968)))
 
 
 def check_firmware(folder):
@@ -30,8 +33,8 @@ def check_firmware(folder):
         if not path.is_file() or path.is_symlink():
             raise ValueError(f'missing or nonregular firmware: {filename}')
         data = path.read_bytes()
-        if not data or len(data) > 1024 * 1024:
-            raise ValueError(f'unexpected firmware size: {filename}')
+        if len(data) != BLOB_SIZES[name]:
+            raise ValueError(f'unexpected device firmware size: {filename}')
         files[name] = (path, data)
     meta = files['GPU-ZAP-MDT'][1]
     if len(meta) < 52 or meta[:6] != b'\x7fELF\x01\x01':
@@ -67,6 +70,8 @@ def check_layout(kernel, tree, cmdline, files):
     chosen = next(c for c in root.children if c.name == 'chosen')
     base, size = (struct.unpack('<Q', chosen.prop(n))[0]
                   for n in ('dram-base', 'dram-size'))
+    if not size or base + size > 1 << 64:
+        raise ValueError('invalid XNU managed RAM range')
     for label, addr, length in (('zap', ZAP_BASE, ZAP_SIZE),
                                 ('splash', SPLASH_BASE, SPLASH_SIZE)):
         if overlap(base, size, addr, length):
@@ -86,7 +91,8 @@ def check_layout(kernel, tree, cmdline, files):
             raise ValueError(f'missing ADT entry: {name}')
         addr, length = struct.unpack('<2Q', value)
         reserved = (length + PAGE - 1) & ~(PAGE - 1)
-        if length != len(files[name][1]) or addr < base or addr + reserved > base + size:
+        if length != len(files[name][1]) or addr & (PAGE - 1) or \
+                addr < base or addr + reserved > base + size:
             raise ValueError(f'invalid ADT firmware allocation: {name}')
         if any(overlap(addr, reserved, a, s) for a, s in intervals):
             raise ValueError(f'overlapping firmware allocations: {name}')

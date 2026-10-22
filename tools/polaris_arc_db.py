@@ -70,11 +70,13 @@ def parse_arc(data):
                 raise CommandDbError(f'invalid ARC entry for {name}')
             levels = struct.unpack_from('<' + 'H' * (length // 2), data, start)
             usable = []
+            terminated = False
             for value in levels:
                 if value == 0:
-                    break
-                if usable and value <= usable[-1]:
-                    break
+                    terminated = True
+                    continue
+                if terminated or (usable and value <= usable[-1]):
+                    raise CommandDbError(f'nonmonotonic ARC levels for {name}')
                 usable.append(value)
             if not usable:
                 raise CommandDbError(f'empty ARC levels for {name}')

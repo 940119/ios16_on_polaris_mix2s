@@ -54,6 +54,22 @@ class ArcDbTests(unittest.TestCase):
         with self.assertRaisesRegex(CommandDbError, 'missing ARC'):
             parse_arc(data)
 
+    def test_nonmonotonic_and_post_terminator(self):
+        data = sample_db()
+        struct.pack_into('<4H', data, 144 + 72, 16, 32, 16, 0)
+        with self.assertRaisesRegex(CommandDbError, 'nonmonotonic'):
+            parse_arc(data)
+        data = sample_db()
+        struct.pack_into('<4H', data, 144 + 72, 16, 0, 32, 0)
+        with self.assertRaisesRegex(CommandDbError, 'nonmonotonic'):
+            parse_arc(data)
+
+    def test_encoded_slave_high_bits(self):
+        data = sample_db()
+        struct.pack_into('<I', data, 144 + 16, 0xb0000)
+        with self.assertRaisesRegex(CommandDbError, 'invalid ARC'):
+            parse_arc(data)
+
     def test_standalone_and_version(self):
         data = sample_db()
         struct.pack_into('<I', data, 140, 1)

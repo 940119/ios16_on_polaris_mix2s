@@ -26,7 +26,7 @@ diff --git a/bsd/dev/polaris_gpu_diag.c b/bsd/dev/polaris_gpu_diag.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/polaris_gpu_diag.c
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,131 @@
 +/*
 + * Polaris A630 firmware handoff diagnostic, NOT a GPU driver.
 + * No MMIO maps, regulator votes, SMMU changes or firmware execution.
@@ -132,6 +132,7 @@ new file mode 100644
 +		}
 +		reserve = (size + GPU_PAGE - 1u) & ~(GPU_PAGE - 1u);
 +		if (size != gpu_blobs[i].size || !reserve ||
++		    (addr & (GPU_PAGE - 1u)) ||
 +		    addr < dram || addr > dram + dram_size ||
 +		    reserve > dram + dram_size - addr ||
 +		    gpu_overlap(addr, reserve, POLARIS_ZAP, POLARIS_ZAP_N) ||
