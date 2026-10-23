@@ -1,4 +1,4 @@
-# 酷安教程｜小米 MIX 2S 自行构建 iOS 16 并刷入 boot / userdata
+# 小米 MIX 2S 运行 iOS 16：内核打包、iOS 构建与 boot / userdata 刷入教程
 
 > **第一步：警告——本流程会永久清空手机数据。** `fastboot flash userdata` 会覆盖 Android 的用户分区（照片、聊天记录、应用及内部存储）；`fastboot flash boot` 会替换原有 Android 启动镜像，刷错可能无法正常启动。先在设备外完成并验证备份：`userdata`、原厂 `boot.img`、`dtbo`、`vbmeta`、`persist`、`modemst1/2`、`fsg`、`fsc`。不要上传含设备标识的备份。**只限自己已解锁 bootloader 的 Mi MIX 2S（`polaris`）；任何一步不确定就停下。不要重新锁 bootloader。**
 >
