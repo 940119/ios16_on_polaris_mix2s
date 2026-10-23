@@ -37,7 +37,7 @@
 2. **GPU：**先取得本机可信的 command-db/bus query 结果和 XNU 对 RPMh／GPUCC／SMMU／PAS13 的资源归属；实现可回退的上电路径，证明有界 CP fence 和缓冲区内容变化，然后才接 Mesa/EAGL、IOSurface 与显示。**编译成功不是 GPU 执行成功。**
 3. **触摸：**获准测试时补采真机 0090 ring 与触点数据，验证 SE14 硬件 I²C 和全部触点。
 
-更多细节：[Polaris 技术报告（中英）](<research/polaris/README.md>)、[Polaris 构建／CPU 指南](<docs/POLARIS-MIX2S.md>)、[逐次错误和真机日志交接](<NOTES.md>)、[XNU 补丁](<xnu/patches/>)、[CPU 测试](<tools/test_polaris_cpu_topology.py>)、[原 sweet 历史](<docs/SWEET-HISTORY.md>)。上游基础：[dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)；硬件资料：[MiCode Polaris 内核](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/tree/polaris-o-oss)。
+更多细节：[Polaris 技术报告（中英）](<research/polaris/README.md>)、[Polaris 构建／CPU 指南](<docs/POLARIS-MIX2S.md>)、[逐次错误和真机日志交接](<NOTES.md>)、[XNU 补丁](<xnu/patches/>)、[CPU 测试](<tools/test_polaris_cpu_topology.py>)、[原 sweet 历史](<docs/SWEET-HISTORY.md>)。**下载：**[0090 内核 Release](https://github.com/luuu20309/ios16_on_polaris_mix2s/releases/tag/polaris-kernel-0090)（仅内核，不能直接刷 boot）及[酷安平台刷入／临时启动教程](<docs/COOLAPK-POLARIS-INSTALL.md>)。上游基础：[dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)；硬件资料：[MiCode Polaris 内核](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/tree/polaris-o-oss)。
 
 ```sh
 # 离线测试；不需要专有固件，不证明真机运行
@@ -68,4 +68,4 @@ This repository highlights the **Polaris/SDM845** board port of the XNU/iPhone X
 
 **Next proof points:** On a user-approved *temporary* boot, try CPU4 using the known kernel/ADT with only `cpus=5` changed, then advance 6→8 if PSCI, SGI and userspace pass. For GPU, prove resource ownership and a bounded headless CP fence with changed buffer before Mesa/EAGL and screen presentation. Keep the CPU framebuffer fallback. Compilation is not execution.
 
-Read the [Polaris build/CPU guide](<docs/POLARIS-MIX2S.md>), [full bilingual GPU notes](<research/polaris/README.md>), [experiment log](<NOTES.md>) and [Sweet historical record](<docs/SWEET-HISTORY.md>). The host-only test command above is reproducible without proprietary firmware. Never publish Apple images, device-identifying dumps, partition backups or Qualcomm proprietary blobs; ask separately before temporary boots and partition writes.
+Read the [Polaris build/CPU guide](<docs/POLARIS-MIX2S.md>), [full bilingual GPU notes](<research/polaris/README.md>), [experiment log](<NOTES.md>) and [Sweet historical record](<docs/SWEET-HISTORY.md>). Download the [0090 kernel-only Release](https://github.com/luuu20309/ios16_on_polaris_mix2s/releases/tag/polaris-kernel-0090) and read the [Coolapk install/safety guide](<docs/COOLAPK-POLARIS-INSTALL.md>) before trying to package it: the Mach-O file is **not flashable by itself**. The host-only test command above is reproducible without proprietary firmware. Never publish Apple images, device-identifying dumps, partition backups or Qualcomm proprietary blobs; ask separately before temporary boots and partition writes.
