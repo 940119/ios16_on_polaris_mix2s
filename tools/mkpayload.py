@@ -215,7 +215,17 @@ if __name__ == '__main__':
                     help='add a file under /chosen/memory-map NAME')
     ap.add_argument('--max-payload-size', type=lambda n: int(n, 0),
                     help='fail if payload bytes exceed the bootloader ramdisk-to-DTB gap')
+    ap.add_argument('--check-polaris-cpus', action='store_true',
+                    help='require Polaris/SDM845 eight-node ADT and one contiguous cpus=1..8 prefix')
     a = ap.parse_args()
+    if a.check_polaris_cpus:
+        from polaris_cpu_topology import TopologyError, validate
+        try:
+            with open(a.adt, 'rb') as source:
+                selected = validate(source.read(), a.cmdline)
+        except (TopologyError, ValueError, IndexError, struct.error) as exc:
+            ap.error(f'Polaris CPU topology: {exc}')
+        print(f'Polaris CPU prefix {selected}/8 validated (CPU_ON not verified)')
     blobs = []
     for item in a.blob:
         if '=' not in item:

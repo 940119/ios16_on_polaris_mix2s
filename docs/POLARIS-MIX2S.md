@@ -330,15 +330,18 @@ python3 tools/mkadt.py out/polaris-8g.adt --polaris --ram 8
 ```sh
 python3 tools/mkpayload.py \
   xnu/out/kernel.development.sweet out/polaris.adt out/polaris-payload.bin \
+  --check-polaris-cpus \
   --cmdline 'debug=0xc serial=3 cpus=4 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_polaris=1 sweettouch=0 sweetkeys=0'
 ```
 
-启动参数说明：
+**CPU 核心数验证（不要自动跳到 8 核）。** 已有 0089 真机日志记录 `requested=4 selected=4 (limit=8)`，CPU1–3 的 PSCI CPU_ON 返回 0 并完成 SGI，最终 `4/4`；因此当前观测到 4 核是这条命令里的 `cpus=4` 所致，**没有 A75 失败的证据，也没有 A75 成功的证据**。`tools/mkadt.py` 已按 MiCode 的 MPIDR `0x000`–`0x700` 生成 4×A55 + 4×A75 节点，`0078` 将编译上限提升至 8。`--check-polaris-cpus` 在打包前只校验 ADT/命令行的连续 CPU 前缀，不证明 PSCI 已启动核心。优先复用已验证的内核和 ADT，仅将临时镜像的 `cpus=4` 改为 `cpus=5`，核查 CPU4 的 PSCI 返回值、进入 `initCPU`、SGI 确认和进入用户态；成功后再测试 `cpus=6`、最后 `cpus=8`。每次**临时 `fastboot boot` 都先由用户确认**，失败时保留 4 核镜像和持久日志，不把卡死的核心加入调度器。
+
+对照 [Luoxueowo/ios-polaris 固定版本](https://github.com/Luoxueowo/ios-polaris/tree/44556dec6995b8d9bb72717cf546b92b6c3dddda)：它的 0065/0078 与本项目 PSCI 启动和八核上限基本一致，并没有额外的 A75 上电修复；其 README 同时声称 8 核和“A75 未启用”，不能代替真机日志。**不要直接合并其 0088 跳过失败 CPU 的补丁**：XNU `cpu_start()` 丢弃 `PE_cpu_start` 错误，`num_cpus - skipped` 无法排除中间失败造成的 CPU ID 空洞，超时后晚到的核心也未隔离。只有实现完整处理器状态／调度器排除机制，才能安全提供降级启动。
 
 | 参数 | 作用 |
 | --- | --- |
 | `rd=ufsroot0 ufsrw=1 rootrw=1` | 根文件系统在 UFS 的 `userdata` 分区，可读写 |
-| `cpus=4` | 先只启动 4 个 A55 核，保守。稳定后可以试 `cpus=8`（4×A55 + 4×A75） |
+| `cpus=4` | 已测试的 4 个 A55 核；ADT 和内核上限原本支持 8 核，不等于 4 个 A75 已经验证上线。 |
 | `sweetfb_polaris=1` | 把 iPhone X 的 1125×2436 逻辑画面按高度缩放进 1080×2160 面板，左右各 41px 黑边 |
 | `sweetfb_noconsole=1` | 不再把内核文字画到 GUI 上；panic 仍会画 |
 | `sweetfb_hz=30` | CPU 拷贝刷新率 |

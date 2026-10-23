@@ -1,232 +1,71 @@
-# ios16 on polaris mix2s
+# iOS 16 on Xiaomi Mi MIX 2S (`polaris`)
 
-**English · [简体中文](#简体中文--polaris-与-sweet-项目说明)**
+[简体中文](#简体中文) · [English](#english) · [开发记录](<NOTES.md>)
 
-This repository started as an iOS 16 port to Redmi Note 10 Pro (`sweet`, SM7150) and now also contains experimental Xiaomi Mi Mix 2S (`polaris`, SDM845/Adreno 630) bring-up. **These are different devices and drivers.** The sweet status below is historical to 2026-10-18; the Polaris status below is current to 2026-10-22. This repository does **not** contain a working Polaris GPU accelerator or a distributable iOS image.
+> **实验性 Mi MIX 2S 项目，非日用系统。** 截至 2026-10-23；没有此次更新后的真机测试。此页只统计 Polaris（SDM845／Adreno 630v2）的成果，不把 Redmi Note 10 Pro (`sweet`) 的成果算进来。原项目详细说明另存为 [Sweet 历史文档](<docs/SWEET-HISTORY.md>)。
 
-## English: Xiaomi Mi Mix 2S (`polaris`)
+## 简体中文
 
-The Polaris port is tracked in the **[full English and 简体中文 Polaris README](<research/polaris/README.md>)**. Its current status is distinct from sweet:
+### MIX 2S 独立实现和证据
 
-- A temporary 0090 boot reached the iOS lock screen, and the user confirmed one- and two-finger touch. This is an experimental Synaptics S3330 implementation, not proof of complete multitouch or a production installation.
-- Display still uses CPU composition into the bootloader framebuffer. **GPU acceleration is not implemented.** Recovery Linux identified Adreno630v2; XNU patch 0091/0092 only compiled an opt-in, read-only firmware-metadata diagnostic in [CI 39739222780](https://github.com/luuu20309/ios-sweet/actions/runs/39739222780). No GPU power, GMU/HFI, secure PAS13, SMMU, CP fence, Mesa/EAGL or GPU presentation has run under XNU.
-- Host-only firmware/ARC/BCM/bandwidth and ownership tests have 26 passing cases. They neither exercise the phone nor create a GPU-enabled boot image. [Detailed Polaris milestones, hardware references, test command and roadmap](<research/polaris/README.md>) explain what remains and why the two devices' hardware paths cannot be mixed.
-- Proprietary firmware, Apple images, partition backups, device logs and build artifacts are intentionally **not** uploaded. Do not follow the sweet flashing recipe below on a Mi Mix 2S.
+这是基于 XNU 8796／iPhone X iOS 16 用户态基础设施的 **Polaris 板级移植**：4×Cortex-A55 + 4×Cortex-A75、Synaptics S3330、1080×2160 面板、A630v2。它有独立 ADT、板型门控、触摸复位／读帧和 GPU 固件预检；不能复用 sweet 的触摸供电、寄存器或刷机参数。
 
-## English: Redmi Note 10 Pro (`sweet`)
+“真机”= 临时启动结果或用户反馈；“CI”= 编译／链接；“离线”= 主机测试。三种证据不能互换。
 
-**Apple's iOS 16 running on a Redmi Note 10 Pro.**
+| 功能 | 已验证或已完成 | 未验证／限制 |
+| --- | --- | --- |
+| 启动和触摸 | 0090 RELEASE 临时启动到 iOS 锁屏；用户确认 **单指、双指**触摸。S3330 使用 GPIO33/34 实验性软件 I²C、GPIO99 复位释放、连续 F12 帧。 | 未取得完整 0090 ring；十指、正式 SE14 硬件 I²C、长期稳定性未验证。用户表示自行刷入过工作镜像，代理未读回 boot 分区确认。 |
+| CPU | Polaris ADT 有八个 MPIDR `0x000`–`0x700` 节点，XNU 上限为 8。**已测试镜像指定 `cpus=4`**；CPU1–3 的 PSCI CPU_ON／SGI 成功，最终 `4/4`。 | **没有 CPU4–7 四个 A75 在 MIX 2S 上运行的证据**。八核设备树和内核上限不等于八核已启动。 |
+| 存储、界面和显示 | 复用 XNU UFS／HFS+ `userdata` 根和 iPhone X 用户态链路；CPU 软件合成／缩放到 ABL 遗留 framebuffer。 | 完整应用稳定性、独立面板初始化和 GPU 屏幕呈现未验证。 |
+| GPU | Recovery Linux 只读报告 A630v2、257–710 MHz；本机六个固件组件通过离线预检。可选只读**固件元数据** XNU 0091/0092 在 [CI 39739222780](https://github.com/luuu20309/ios16_on_polaris_mix2s/actions/runs/39739222780) 编译／链接通过；26 个 GPU 主机测试通过。 | **没有 XNU GPU 上电、GMU/HFI、PAS13、SMMU、CP fence、GPU 渲染、Mesa/EAGL 或 Metal。** 0093 是默认关闭的初始化门槛，尚未 XNU 编译或真机执行，不能算 GPU 驱动。 |
 
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
+### 目前的错误、阻塞及处理
 
-As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+| 阶段 | 实际错误／原因 | 当前进度 |
+| --- | --- | --- |
+| 0088 触摸 | 首次 I²C 地址写入失败，GPIO99 保持输出低电平，控制器可能仍在复位。 | 0089 单独释放 GPIO99 后读出 F01/F12 PDT，越过初始失败；未动 sweet 触摸供电。 |
+| 0089 触摸 | 虽然 PDT 和 F12 Control23 可读，连续八帧数据无效，锁屏触摸仍无响应。 | 0090 改为单次有界连续读取最多 80 字节 F12 帧；随后用户确认单／双指可用。缺少完整 0090 真机 ring。 |
+| “只有 4 核” | 已测 payload 明确写 `cpus=4`，日志为 `requested=4 selected=4 (limit=8)`；**不是已证实的 A75 PSCI 故障**。 | 已有八核 ADT/PSCI 上限；新增[八核拓扑校验](<tools/polaris_cpu_topology.py>)与 `mkpayload.py --check-polaris-cpus`，仅检查板型、MPIDR、连续 `cpus=1..8`。下一次获准的临时启动先试 `cpus=5`，查 CPU4 的 PSCI 返回、initCPU、SGI 和用户态，再试 6→8。 |
+| 上游 CPU 失败回退 | 对照 [Luoxueowo/ios-polaris 固定版本](https://github.com/Luoxueowo/ios-polaris/tree/44556dec6995b8d9bb72717cf546b92b6c3dddda)，其 0065/0078 的 PSCI 与八核上限本仓库已有；0088 跳过失败核后仅用 `num_cpus-skipped` 上报，无法排除 CPU ID 空洞或晚到从核，XNU 还会丢弃 `PE_cpu_start` 错误。其 README 对 A75 是否启用也有矛盾。 | **未直接合并不安全的 0088 补丁**；先验证连续 CPU 前缀。完整对照见 [Polaris 指南](<docs/POLARIS-MIX2S.md>)。 |
+| GPU 命令数据库 | 缺少已证明 XNU 归属的 ARC/BCM command-db 和这台机器的 13 档 DDR／2 档 CNOC HFI 实际投票。旧 0092 固定物理地址映射因归属不明已撤回。 | 仅完成来源核对与离线格式解析；静态 DTS 数值不是已聚合的 RPMh 命令。 |
+| GPU 硬件后端 | CX/MX/GX 与共享 GPUCC/GFXCC 的所有权／回退、HYP 保护的 SMMU CB5–7、PAS13 的 8 KiB zap 区及 GMU/HFI 顺序尚未落实。 | 0093 在第一个未实现阶段拒绝并保留 CPU 显示。[安全实现契约](<research/polaris/gmu-secure-implementation.md>)定义后续有界 CP sentinel／fence 测试；**没有可交付的加速镜像**。 |
+| 其他功能 | Wi‑Fi、蓝牙、蜂窝、音频、相机、传感器、GPS、SEP／Face ID 尚未实现或未在 Polaris 上验收。 | iOS 锁屏不是这些模块可用的证据。 |
 
-> Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
+### 下一步、代码与安全
 
-## What works
+1. **CPU：**保持已启动内核和 Polaris ADT 不变，只将临时镜像 `cpus=4` 改为 `cpus=5`；检查镜像容量和命令行，经用户确认后临时 `fastboot boot`。获取 CPU4 PSCI／SGI／用户态证据，再考虑 6→8；失败保留四核，不将坏核交给调度器。
+2. **GPU：**先取得本机可信的 command-db/bus query 结果和 XNU 对 RPMh／GPUCC／SMMU／PAS13 的资源归属；实现可回退的上电路径，证明有界 CP fence 和缓冲区内容变化，然后才接 Mesa/EAGL、IOSurface 与显示。**编译成功不是 GPU 执行成功。**
+3. **触摸：**获准测试时补采真机 0090 ring 与触点数据，验证 SE14 硬件 I²C 和全部触点。
 
-| Area | State |
-| --- | --- |
-| Boot | Stock Xiaomi bootloader → `fastboot boot` of our shim → XNU. Nothing is flashed to the boot partitions |
-| CPU | 6 of the 8 cores (the six Cortex-A55s) via PSCI, 16K pages, GICv3 interrupts, timers |
-| Memory | About 3.95 GiB of the upper DDR bank |
-| Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write |
-| iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
-| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software; frames are copied into the bootloader's framebuffer. Presented to iOS as an iPhone X panel (1125×2436) |
-| GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification center, Settings |
-| Touch | Goodix GT9896 over I²C (GENI), rail enabled through RPMh, delivered as HID digitizer events |
-| Buttons | Power, volume up/down (PMIC through SPMI) as HID consumer keys; lock/wake works |
-| Battery | IOPMPowerSource service (static 100 %, charging icon; real fuel-gauge readout prepared) |
-| Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
-| Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
-
-## What does not work (yet)
-
-- **Navigation:** you cannot leave an app (the home gesture and AssistiveTouch Home do nothing yet).
-- **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS or SEP / Face ID.** Daemons for them start and fail or keep relaunching.
-- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps. The two Cortex-A76 cores are not used yet.
-- **Few apps.** The image has only what is on the system volume. There is no App Store, no Apple ID, and some Settings pages are empty.
-- **Slow boot:** about 4 minutes on the Apple logo.
-- **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
-
-## How sweet boots (Polaris has a separate ADT and board gates)
-
-```
-ABL (stock Xiaomi bootloader, unlocked)
-  -> fastboot boot shim-boot.img              (temporary; nothing is flashed to boot)
-     -> shim: own MMU setup, reads the live FDT, loads the payload from the ramdisk
-        -> XNU Mach-O + generated Apple Device Tree (ADT) + boot-args
-           -> XNU -> UFS driver -> HFS+ root in the userdata partition
-              -> dyld + shared cache -> launchd -> daemons -> backboardd + SpringBoard
-```
-
-There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x9c000000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
-
-## How to do it yourself (sweet only; **not** Polaris)
-
-You need a Redmi Note 10 Pro (`sweet`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
-
-### 0. Back up the phone
-
-Boot OrangeFox (or any recovery with adb root) temporarily and pull at least `persist`, `modemst1`, `modemst2`, `fsg`, `fsc` and `boot`, `dtbo`, `vbmeta`. They contain per-device calibration data. Keep them off git; `.gitignore` already excludes `backup/`, `dtb/` and `recovery/`.
-
-The shim needs the stock DTB. Unpack your phone's stock `boot.img`:
+更多细节：[Polaris 技术报告（中英）](<research/polaris/README.md>)、[Polaris 构建／CPU 指南](<docs/POLARIS-MIX2S.md>)、[逐次错误和真机日志交接](<NOTES.md>)、[XNU 补丁](<xnu/patches/>)、[CPU 测试](<tools/test_polaris_cpu_topology.py>)、[原 sweet 历史](<docs/SWEET-HISTORY.md>)。上游基础：[dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)；硬件资料：[MiCode Polaris 内核](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/tree/polaris-o-oss)。
 
 ```sh
-python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked   # -> dtb/boot_unpacked/dtb
+# 离线测试；不需要专有固件，不证明真机运行
+python -m unittest tools/test_polaris_cpu_topology.py tools/test_polaris_gpu_preflight.py tools/test_polaris_gmu_firmware.py tools/test_polaris_arc_db.py tools/test_polaris_bcm_db.py tools/test_polaris_bw_levels.py tools/test_polaris_gpu_stages.py -q
 ```
 
-### 1. Build the kernel
+仓库不上传 Apple 镜像、Qualcomm 固件、设备转储、序列号或分区备份。对 `userdata` 写入会清除现有数据；新的临时启动与任何分区写入均须事先分别确认，保留 bootloader、recovery、modem、persist 和备份。
 
-The kernel builds on GitHub's macOS runners with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build). The workflow fetches xnu-8796, applies `xnu/patches/` in order, and also stages the pinned open-source libpthread, HFS and BearSSL sources it needs. Fork the repo (public repos get free macOS minutes) and run:
+## English
 
-```sh
-gh workflow run xnu.yml -R YOU/ios-sweet
-gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel -D xnu/out
-```
+### Mi MIX 2S implementation, not Sweet results (2026-10-23)
 
-To check a patch locally before spending a CI run, `tools/xnu-cc.py` replays the compile commands of a previous CI log for single files.
+This repository highlights the **Polaris/SDM845** board port of the XNU/iPhone X iOS 16 infrastructure. Sweet's historical build and flash instructions live in [a separate archive](<docs/SWEET-HISTORY.md>) and are **not** Mi MIX 2S instructions. This is experimental, not a secure daily-use OS; no distributable iOS image or working Polaris GPU accelerator is provided.
 
-### 2. Build the iOS root image
+| Area | Evidence | Missing or unproven |
+| --- | --- | --- |
+| Boot/touch | Temporary 0090 RELEASE boot reached the lock screen; the user confirmed one- and two-finger S3330 input. | Full ten-contact reliability, hardware SE14 I²C, long-term stability, permanent-boot readback. |
+| CPUs | Eight ADT nodes and an XNU limit of eight. The observed `cpus=4` image started four A55s; PSCI and SGI passed for CPUs1–3. | No log proves CPU4–7 (the A75s) boot on this Polaris phone. Four selected CPUs follow the boot argument, **not** an observed A75 failure. |
+| Display | Software composition/scaling into the bootloader-inherited framebuffer. | GPU composition or independent panel initialization. |
+| GPU | Recovery Linux identified A630v2. Device firmware was screened **locally** and excluded from Git. Read-only XNU firmware-metadata diagnostics compiled/linked in [CI 39739222780](https://github.com/luuu20309/ios16_on_polaris_mix2s/actions/runs/39739222780); 26 host GPU tests passed. | **No XNU GPU power, GMU/HFI, secure PAS13, SMMU mappings, CP fence, rendering, Mesa/EAGL, or Metal.** 0093 is an uncompiled, default-off gate that refuses at its first missing backend. |
 
-Download the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW from Apple. Then, on Linux, with `apfs-fuse`, `hfsprogs` and sudo:
+### Known failures and why progress stopped
 
-```sh
-# OS, SystemOS and AppOS disk images from the IPSW (see BuildManifest.plist for their names)
-tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
-sudo fsck.hfsplus -fy ios16-root.img
-sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
-sudo umount /mnt/iosroot
-img2simg ios16-root.img ios16-root.simg
-```
+- **Touch 0088/0089:** The first I²C address write failed while GPIO99 was low. After 0089 reset release, F01/F12 were detected, but eight invalid frames still left touch unresponsive. A bounded contiguous F12 read in 0090 preceded the user's one-/two-finger confirmation; no full 0090 diagnostic ring was recovered.
+- **CPU count:** The tested payload explicitly used `cpus=4` and logged `requested=4 selected=4 (limit=8)`. Comparing pinned [Luoxueowo/ios-polaris](https://github.com/Luoxueowo/ios-polaris/tree/44556dec6995b8d9bb72717cf546b92b6c3dddda) found no missing eight-core ADT/PSCI path. Its `0088` skip-failed-CPU patch is unsafe to import: XNU discards `PE_cpu_start` errors, subtracting a count cannot represent CPU-ID holes, and late cores remain unresolved. A new opt-in [topology/boot-argument preflight](<tools/polaris_cpu_topology.py>) does **not** prove CPUs are online. With approval, test `cpus=5`, then 6 and 8, and collect CPU_ON/SGI/userland evidence each time.
+- **GPU:** A fixed-PA command-db map was withdrawn because XNU ownership was unproven. We still need genuine Polaris ARC/BCM/bus queries, owned reversible RPMh/GPUCC power, secure PAS13 and non-HYP SMMU mappings, GMU/HFI and bounded CP work. The `polarisgpu=1` 0093 gate refuses before hardware access and retains CPU display. [Technical report](<research/polaris/README.md>) and [implementation contract](<research/polaris/gmu-secure-implementation.md>) distinguish source facts, compilation, host tests and actual device execution.
+- **Other hardware:** Wi‑Fi, Bluetooth, cellular, audio, camera, sensors, GPS and SEP/Face ID are absent or unvalidated on this build. A lock screen does not establish functionality.
 
-`mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive journaled HFS+ volume. It adds the dyld cache links, the plain system keybag and the log directories the daemons expect. `sweet-root-tweaks.py` applies the bring-up changes: it skips Setup, seeds the activation state, removes the baseband daemon, disables the watchdogs that kill slow apps and the crash-looping media paths, and so on. The script's header explains each change.
+**Next proof points:** On a user-approved *temporary* boot, try CPU4 using the known kernel/ADT with only `cpus=5` changed, then advance 6→8 if PSCI, SGI and userspace pass. For GPU, prove resource ownership and a bounded headless CP fence with changed buffer before Mesa/EAGL and screen presentation. Keep the CPU framebuffer fallback. Compilation is not execution.
 
-The device tree builder copies `/product` from the real iPhone X device tree, which MobileGestalt needs. Extract it once, without downloading the whole IPSW:
-
-```sh
-python3 tools/remotezip.py IPSW_URL DeviceTree.d22ap.im4p research/ipsw-x/dt
-ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im4p -o research/ipsw-x/d22ap.adt
-```
-
-### 3. Build the boot image
-
-Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
-
-```sh
-python3 tools/mkadt.py shim/out/sweet.adt --highmem
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
-shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
-```
-
-What the less obvious boot-args do:
-
-| Boot-arg | Effect |
-| --- | --- |
-| `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on the `userdata` partition, writable |
-| `cpus=6` | Start the six A55 cores; `cpus=1` is the safe fallback |
-| `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
-| `wdt=-1 wdt_test=no_user_checkin` | No hardware watchdog |
-| `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
-| `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
-| `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
-
-### 4. Flash the sweet root and boot (destructive; **never use this recipe for Polaris**)
-
-```sh
-fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
-# Xiaomi's fastboot often hangs after a large flash: re-enter fastboot with Power + Volume down
-fastboot boot shim/out/shim-boot.img
-```
-
-The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down.
-
-### 5. Read the kernel log
-
-```sh
-fastboot boot recovery/recovery.img        # OrangeFox, temporary
-tools/sweet-log-pull.sh logs/boot.txt      # 4 MiB console ring from the end of userdata
-adb reboot bootloader
-```
-
-The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces of backboardd and SpringBoard, and the drivers' `SWEET ...` lines. `tools/sweet-crash.py` symbolicates them against the shared cache.
-
-### QEMU
-
-`tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
-
-## Repository layout
-
-| Path | What |
-| --- | --- |
-| `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
-| `xnu/patches/` | The XNU patch series (applied in order by CI), plus staging scripts for libpthread, HFS and BearSSL |
-| `.github/workflows/xnu.yml` | Kernel CI build |
-| `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
-| `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
-| `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images |
-| `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
-| `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |
-| `tools/sweet-crash.py` | Symbolicate console crash reports |
-| `tools/xnu-cc.py` | Local single-file compile check from a CI log |
-| `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
-| `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
-| `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
-
-Not in git: partition backups, live device trees, recovery images, Apple firmware and root images, and downloaded or generated build trees. They contain device serials and calibration data, or Apple's copyrighted files.
-
-## Kernel patches
-
-| # | What |
-| --- | --- |
-| 0001–0009 | Toolchain compatibility, SWEET machine config, non-PAC arm64, stubs for Apple-internal pieces |
-| 0010–0018 | Early framebuffer console, physmap fix, PRNG without corecrypto, device-tree platform expert, timer PPI, boot CPU driver |
-| 0019–0020 | Apple open-source libpthread kernel provider; BearSSL AES |
-| 0021–0027 | RAM-disk root, mockfs, SHA-256, minimal AMFI, Apple open-source HFS+, MD5 |
-| 0028–0034 | UFS host driver and root device, read/write root, DMA above 4 GiB |
-| 0035–0045 | Entitlements, bindfs, AppleKeyStore stub, IOWatchdog, console crash reports |
-| 0046 | IOSurface (IOCoreSurfaceRoot) and IOMobileFramebuffer (AppleCLCD) services |
-| 0047–0055 | Diagnostics: persistent log, /dev/null tee, IOKit trace, heap strings and user stack sampler on crash; permissive Sandbox policy; HFS rename-swap; AppleKeyStore selectors |
-| 0056–0057 | Throttled panel copy; no external identity resolver |
-| 0058 | HID event services. Apple's IOHIDFamily-1915.140.3 user client and event queue, matching the iOS 16.7 userland |
-| 0059 | iPhone X identity (`hw.product` / `hw.target` from the device tree) |
-| 0060 | Power and volume keys over SPMI; touch over GENI I²C |
-| 0061 | Present the display as 1125×2436 |
-| 0062 | RPMh regulator vote for the touch rail; battery power source |
-| 0063 | GENI FIFO packing fix and the Goodix GT9896 protocol |
-| 0064 | Grant PRIV_WORK_INTERVAL (UIKit's CoreAnimation work interval) |
-| 0065 | SMP: secondary A55 cores via PSCI CPU_ON |
-| 0066–0067 | Fault-region crash info; console mute |
-| 0068 | IOSurface lookup semantics for already-mapped surfaces |
-| 0069 | Batched persistent-log flushes |
-
-## Key hardware facts (sweet only; **not** Polaris)
-
-- RAM: payloads use the upper bank, `0x100000000` + `0xfcc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
-- GICv3 with security extensions: the timer goes through Group 1 IRQ (virtual timer INTID 19), not FIQ as on Apple silicon.
-- PSCI through `smc`, 19.2 MHz timer, ARMv8.2 without pointer authentication. MPIDR uses Aff1 for the core number.
-- Panel: 1080×2400 DSC video mode, continuous splash from ABL, no refresh kick needed.
-- Touch: Goodix GT9896 at I²C `0x5d` on QUP SE7 (`0xa84000`), powered by PM6150L LDO11 through RPMh.
-- Buttons: power and volume down on the PM6150 PON block, volume up on PM6150L GPIO2 (SPMI SID 4).
-
-More in [`NOTES.md`](NOTES.md).
-
-## 简体中文：Polaris 与 sweet 项目说明
-
-本仓库最初移植 iOS 16／XNU 到 Redmi Note 10 Pro（`sweet`、骁龙 732G）；现在也包含小米 MIX 2S（`polaris`、骁龙 845／Adreno 630v2）的独立实验工作。**两者的设备树、触摸、供电和 GPU 资源不通用。** 下方原有构建／刷机说明只针对 sweet，不是 MIX 2S 刷机教程。仓库不分发 iOS 固件或手机的专有 GPU 固件。
-
-### 当前成果（截至 2026-10-22）
-
-- **sweet：**已有 iOS 16.7.16 用户态启动到主屏幕、CPU 软件绘制、Goodix 触摸、按键与 UFS 根分区；该状态来自 2026-10-18 的项目记录，不应据此推断 Polaris 的功能。仍无 GPU 驱动，安全模型大幅放宽，绝非日常可用系统。
-- **polaris：**0090 临时测试镜像到达 iOS 锁屏，用户确认单指和双指触摸有效；但正式硬件 I²C、完整十指／手势与持续稳定性未证实。屏幕仍是 CPU framebuffer。
-- **polaris GPU：**已经核对 MiCode、主线 Linux 和 HackiOS 资料，完成本机固件的离线格式检查、带宽档位与资源归属模型，以及一次仅针对固件元数据诊断的 XNU CI 编译。**尚未实现可运行的 GPU 上电／GMU／HFI／PAS13／SMMU／CP／Mesa 路径；没有 GPU 加速镜像，也没有真机 GPU 执行结果。** 完整的双语进展、证据、测试命令和后续路线见 **[Polaris 项目 README](<research/polaris/README.md>)**，详细时间线见 [NOTES.md](<NOTES.md>)。
-
-### 使用和贡献注意
-
-优先阅读对应机型的文档，不要将下方 sweet 的 `userdata` 刷写命令或 SM7150 寄存器应用到 Polaris。研究脚本与通过的单元测试**不等于驱动已运行**；CI 编译成功也不等于 GPU 图形加速。任何设备分区操作先备份并单独确认，新的实验镜像优先临时 `fastboot boot`。请勿向公开仓库上传 Apple 镜像、专有固件、设备日志／序列号或分区备份。
-
-## Credits
-
-Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+Read the [Polaris build/CPU guide](<docs/POLARIS-MIX2S.md>), [full bilingual GPU notes](<research/polaris/README.md>), [experiment log](<NOTES.md>) and [Sweet historical record](<docs/SWEET-HISTORY.md>). The host-only test command above is reproducible without proprietary firmware. Never publish Apple images, device-identifying dumps, partition backups or Qualcomm proprietary blobs; ask separately before temporary boots and partition writes.
