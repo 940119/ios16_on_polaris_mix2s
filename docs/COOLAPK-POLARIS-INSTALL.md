@@ -76,7 +76,7 @@ sha256sum out/shim-polaris-xnu.img
 
 确认输出是 Android boot.img v1、内含 shim 内核和完全一致的 payload ramdisk；**这才是能给 `fastboot` 用的镜像**，与 Release 的 Mach-O 内核是两个文件。不要复制别人生成的 boot.img 的 SHA 当作自己的校验值。
 
-### 2.1 永久刷 boot（风险高；先临时测更安全）
+### 2.1 刷入 boot
 
 推荐先以**同一份完整镜像**运行 `fastboot boot out/shim-polaris-xnu.img` 做临时启动、记录结果，能够回到 fastboot 且确认正常后，再考虑永久刷写。没有可用 iOS 根卷时未必能进入用户态，这不证明镜像正确。若你仍明确选择永久写入，重新核对只有一台 `product: polaris` 的设备、原厂 boot 备份确实可用，**由你本人执行**：
 
