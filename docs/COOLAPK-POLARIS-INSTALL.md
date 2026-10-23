@@ -1,57 +1,129 @@
-# 酷安发布稿｜小米 MIX 2S 运行 iOS 16：内核下载与安全测试说明
+# 酷安教程｜小米 MIX 2S 自行构建 iOS 16 并刷入 boot / userdata
 
-> 本文可复制到酷安发布；最后核对日期、Release 链接和本机机型再发布。**这是研发阶段，不是“一键刷机包”或可日用 ROM。** Release 只提供 XNU Mach-O 内核，**不能把它直接 `fastboot flash boot`**。截至 2026-10-23，用户确认 0090 临时镜像到达 iOS 锁屏并支持单／双指；GPU 加速、A75 八核运行尚未在 MIX 2S 上验证。
+> **第一步：警告——本流程会永久清空手机数据。** `fastboot flash userdata` 会覆盖 Android 的用户分区（照片、聊天记录、应用及内部存储）；`fastboot flash boot` 会替换原有 Android 启动镜像，刷错可能无法正常启动。先在设备外完成并验证备份：`userdata`、原厂 `boot.img`、`dtbo`、`vbmeta`、`persist`、`modemst1/2`、`fsg`、`fsc`。不要上传含设备标识的备份。**只限自己已解锁 bootloader 的 Mi MIX 2S（`polaris`）；任何一步不确定就停下。不要重新锁 bootloader。**
+>
+> 本文是手工构建指南，**不是一键 ROM**。发布的 `kernel.release.sweet` 是 XNU Mach-O，不是 Android boot.img，**绝对不要执行 `fastboot flash boot kernel.release.sweet`**。要先将内核、Polaris ADT、启动参数与 boot shim 打包成完整 `out/shim-polaris-xnu.img`，核对后才可对 boot 分区执行 `fastboot flash boot`。旧有 0090 测试是临时 `fastboot boot`，**永久 flash boot 尚未由本教程独立验证**，其风险更高。GPU、八核 A75、日用稳定性均未验证。
 
-## 下载什么
+## 0. 准备及资料来源
 
-- 项目：[luuu20309/ios16_on_polaris_mix2s](https://github.com/luuu20309/ios16_on_polaris_mix2s)
-- 0090 内核候选 Release：[polaris-kernel-0090](https://github.com/luuu20309/ios16_on_polaris_mix2s/releases/tag/polaris-kernel-0090)
-- 内核附件 `kernel.release.sweet`：**12,285,320 字节**；SHA-256：`9c19baf0c804992bc72dc0a436ca23a36688f2e22db49a168fb4da24c344c3df`。`.sweet` 是沿用的 XNU 机器配置名称，并不意味着这个工件适用于 Redmi Note 10 Pro。
-- 该内核来自 [XNU CI 39381936308](https://github.com/luuu20309/ios16_on_polaris_mix2s/actions/runs/39381936308)，源码提交 `5c1c2bdc84be58052fbd304a8243158386ae46f3`。**CI 成功是编译/链接证据；0090 真机触摸结果另来自用户测试。**
-- Release **不包含** Android boot.img、原厂 DTB、iOS 根镜像／IPSW、专有固件、设备密钥／备份。其他提交（例如 GPU 0091–0093、CPU 预检）**没有**包含在 0090 内核里，也没有 GPU 驱动。
+- 源码：[项目主页](https://github.com/luuu20309/ios16_on_polaris_mix2s)；[0090 内核 Release](https://github.com/luuu20309/ios16_on_polaris_mix2s/releases/tag/polaris-kernel-0090)，下载 `kernel.release.sweet`（12,285,320 字节；SHA-256 `9c19baf0c804992bc72dc0a436ca23a36688f2e22db49a168fb4da24c344c3df`）。[构建来源 CI](https://github.com/luuu20309/ios16_on_polaris_mix2s/actions/runs/39381936308)，对应源码 `5c1c2bdc84be58052fbd304a8243158386ae46f3`。内核文件名沿用 SWEET 机器配置，但此项目的 0090 补丁和下列 ADT／boot image 是 Polaris 专用。
+- 自己手机的原厂 `boot.img`：用于提取**匹配自己设备/固件的原厂 DTB**及系统恢复。不要下载陌生机主的 boot.img。本机 Android/Recovery 中使用自己可信的备份工具取得；不要发布备份。`tools/unpack_bootv2.py` 和 `tools/polaris_dtb.py` 用于提取/打包。DTB 错误不得继续。
+- 一台运行 Linux 的 PC（建议 Ubuntu/Debian，至少 40GB 空闲）用于本地处理 Apple 官方 iPhone X `iPhone10,3` iOS 16.7.16 (20H392) IPSW，生成 HFS+ 根卷；另需 Python 3、Google platform-tools、`blacktop/ipsw`（提取 Apple 设备树）和 AArch64 交叉编译器或 Zig（编译 shim）。Windows 可用 Git Bash 做 shim/ADT 打包，Linux 做根卷。
+- 本仓库**不分发** IPSW、Apple 用户态、iOS 根卷、Qualcomm 固件、原厂 DTB 或可直接刷的完整 boot.img。所有涉及它们的操作都在你本机完成。
 
-## 先读：这个文件不能直接刷
+从仓库根目录运行下列命令。本文中 `out/`、`research/ipsw-x/` 为本机工作目录，不要 `git add`/公开上传。文件名中的 `.sweet` 是编译配置名；**不能借此给 Redmi Note 10 Pro 刷 Polaris 镜像**。
 
-XNU 内核只是多组件之一。要从 fastboot 临时启动 MIX 2S，还需按[项目 Polaris 完整构建说明](<POLARIS-MIX2S.md>)，使用**自己设备匹配的原厂 DTB**、本机生成的 Polaris ADT、boot shim、由 Apple 正式渠道取得并在本地构建的 iPhone X 16.7.16 用户态及 HFS+ 根卷。boot shim 的 ramdisk 容纳打包后的内核/ADT/启动参数，原厂 DTB 则由 shim 打包流程提供；内核单独不是 Android boot.img。
+## 1. 先备份、核对设备，再下载内核
 
-**任何 `fastboot flash boot kernel.release.sweet`、`fastboot flash recovery ...`、交叉刷别人的 `boot.img` 都是错误操作。** 不要重锁 bootloader，也不要拿 Redmi Note 10 Pro 的 DTB、触摸供电或 userdata 参数用于 MIX 2S。仓库及本文均不提供 Apple 用户态或能直接刷入的 iOS ROM。
+先确认备份能从其他存储读回、原厂 `boot.img` 与本机固件匹配，电量和 USB 线稳定。进入 fastboot 后：
 
-## 零写入检查（先做这部分）
-
-1. 明确手机确实是小米 MIX 2S（`polaris`，非 MIX 2、MIX 3、Redmi Note 10 Pro），电量和 USB 连接可靠；PC 已正确安装 Google platform-tools。
-2. **先离线备份**你的 `userdata` 和逐机校准/分区数据（包括 `persist`、`modemst1/2`、`fsg`、`fsc`、`boot`、`dtbo`、`vbmeta`）；妥善留在本机，不上传酷安、网盘公开目录或 GitHub。确认能恢复再继续。
-3. 从上述 Release 下载内核，在本机校验 SHA-256。Windows PowerShell：
-
-```powershell
-(Get-FileHash .\kernel.release.sweet -Algorithm SHA256).Hash.ToLower()
+```sh
+fastboot devices
+fastboot getvar product
+fastboot getvar unlocked
 ```
 
-Linux/macOS：
+必须只有**一台**设备，`product: polaris` 且 bootloader 已解锁。不要把包含序列号的原始输出贴到酷安。若机器无法进入 fastboot 或已经报错，**此处停止**。不要猜分区名、不要给 `recovery`/`dtbo`/`vbmeta` 写测试镜像。
+
+从 [Release](https://github.com/luuu20309/ios16_on_polaris_mix2s/releases/tag/polaris-kernel-0090) 下载内核并置于仓库根目录，核对 SHA-256：
 
 ```sh
 sha256sum kernel.release.sweet
+# 必须等于 9c19baf0c804992bc72dc0a436ca23a36688f2e22db49a168fb4da24c344c3df
 ```
 
-结果不等于 `9c19baf0c804992bc72dc0a436ca23a36688f2e22db49a168fb4da24c344c3df`，立即停止，不打包、不启动。
+Windows PowerShell 可用 `(Get-FileHash .\kernel.release.sweet -Algorithm SHA256).Hash.ToLower()`。不匹配立即停止。**不要直接 flash 这个内核文件**。
 
-4. 只读核对 bootloader 已解锁且设备唯一。进入 fastboot 后执行 `fastboot devices` 和 `fastboot getvar product`，必须看到**仅一台设备**、`product: polaris`。命令可能回显序列号，**不要把完整输出发到公开评论区**。连接异常时不要盲试写分区命令。
+## 2. 用内核制作完整 Polaris boot.img
 
-## 构建个人临时测试镜像（适合有 XNU／Android 打包经验的开发者）
+先在电脑上从**自己的**原厂 boot 备份提取 DTB。以下示例假设备份为 `backup/boot.img`；`--from-boot` 会扫描原厂内核所附 DTB 并列出机型信息。若未找到可信 DTB 或和本机板型不符，立刻停止，不要借用别人的 DTB：
 
-依照[Polaris 工程指南](<POLARIS-MIX2S.md>)生成 6GB 安全上限 ADT 和自己的 boot shim 镜像。`tools/mkadt.py --polaris --ram 6` 生成的是 Polaris 专用树；将下载的内核置于本地工作目录、用 `tools/mkpayload.py` 包装，并显式指定经过测试的 `cpus=4`、`sweettouch=0 sweetkeys=0` 和与 0090 对应的实验触摸选项。`--check-polaris-cpus` 会验证 8 个 CPU 节点及命令行，但**不会启动 A75**。完整示例和实际启动参数参见工程指南，不从本帖子随意拼接缺项命令。
+```sh
+mkdir -p out
+python3 tools/unpack_bootv2.py backup/boot.img out/stock-boot-check
+python3 tools/polaris_dtb.py --from-boot backup/boot.img out/polaris-dtb.bin
+```
 
-打包前强制检查 payload 小于 ABL ramdisk→DTB 间隔 **0xDEA000（14,589,952 字节）**，逐字节解包比对 ramdisk，确认所用原厂 DTB 是**这部手机对应的来源**。这次发布的 `kernel.release.sweet` 只对这套已知 0090 代码作说明；自己重新打包后的 image SHA-256 必然与作者测试镜像不同，必须由打包者自行检验。不同底层系统和存储布局不保证成功。
+先从自己合法取得的 iPhone X IPSW 中取出 `DeviceTree.d22ap.im4p`，再提取**解封装 ADT**到 `research/ipsw-x/d22ap.adt`，供 `mkadt.py` 导入 `/product`。例如使用 `unzip` 从本机 IPSW 解出目标文件（实际路径以包内目录为准），并安装 [blacktop/ipsw](https://github.com/blacktop/ipsw/releases)：
 
-## 启动与“刷入”到底有何区别
+```sh
+mkdir -p research/ipsw-x
+unzip -j /path/to/iPhone10,3_16.7.16_20H392_Restore.ipsw \
+  'Firmware/all_flash/DeviceTree.d22ap.im4p' -d research/ipsw-x
+ipsw img4 im4p extract research/ipsw-x/DeviceTree.d22ap.im4p \
+  -o research/ipsw-x/d22ap.adt
+python3 tools/mkadt.py out/polaris.adt --polaris --ram 6
+```
 
-- **首选临时启动**：当你已有与**自己手机**匹配、容量/解包均检查通过的完整 Android boot 镜像，取得该设备操作者的明确同意后，才从 fastboot 使用 `fastboot boot <你的完整polaris镜像.img>`。该命令不改写 boot 分区，但 iOS 仍可能对已准备的 `userdata` 作写入，**不等于零风险**。
-- **根卷写入是破坏性的**：要真正启动 iOS 用户态，原指南使用 `userdata` 中的 HFS+ 根卷。`fastboot flash userdata` 会删除原有 Android 数据；本文**没有提供可公开通用的 root 镜像，也不建议新手照抄这条命令**。只有独立备份、核对镜像和分区、亲自确认愿意清空数据后，按[完整工程指南](<POLARIS-MIX2S.md>)自行制作/写入。
-- **绝不因为 Release 里有内核就刷 boot**：本发布没有完整 boot.img；即使自制镜像临时启动成功，也不代表适合写入 boot 分区。
+6GB 的 RAM 上限配置适用于已验证的 6GB 流程；8GB 机型若要使用更多内存，参见[详细工程记录](<POLARIS-MIX2S.md>)，不要在首次刷写时改多个变量。**若 `mkadt.py` 报 `missing, no /product node` 则停止**，先检查 Apple ADT 提取路径/格式。不要把 Apple 文件提交到 Git。
 
-若卡在 fastboot、Apple logo、panic 或无触摸：停止后续写入，返回备份可恢复的 Android/recovery 环境；拍照记录不含序列号的报错并阅读[进度/已知错误](<../README.md>)与 [NOTES 实验记录](<../NOTES.md>)。历史 0088 地址 NACK、0089 F12 无效帧与 GPIO99 复位的问题已在 0090 路线上处理，但本项目仍缺完整 0090 真机 ring；新机型/新固件并无通过保证。
+0090 真机触摸测试的 payload 参数如下，整行保留（含禁用 sweet 触摸与 Polaris 的 GPIO99 复位开关），并设置容量上限及 CPU 拓扑预检：
 
-## 当前无法保证的内容
+```sh
+python3 tools/mkpayload.py kernel.release.sweet out/polaris.adt out/polaris-payload.bin \
+  --check-polaris-cpus --max-payload-size 0xdea000 \
+  --cmdline 'debug=0xc serial=3 cpus=4 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_polaris=1 sweettouch=0 sweetkeys=0 polaristouchdiag=1 polaristouch=1 polaristouchhid=1 polaristouchreset=1'
+PLATFORM=polaris shim/build.sh ../out/polaris-payload.bin
+```
 
-GPU、Metal、Wi‑Fi、蓝牙、蜂窝、音频、相机、传感器、GPS、Face ID/SEP、完整十指、A75 八核运行和日常安全性均**未在此工件中实现/验证**。屏幕仍由 CPU 软件渲染；GPU 0091/0092 的元数据 CI 是后续独立工作，0093 默认拒绝继续。不要宣称“流畅满帧 GPU”“八核已修复”或“完美移植”。遇到问题请附内核来源提交、机型/内存档位、镜像哈希、启动参数（移除设备 ID）及经脱敏的日志；**绝不上传原始分区备份、Apple 镜像和固件**。
+`shim/build.sh` 会选择本机 AArch64 GCC 或 Zig；先安装编译器并确认 `out/polaris-dtb.bin` 是从**当前手机**的原厂备份构建的。**警告：旧脚本只对超大 payload 发 warning；必须依赖上述 `--max-payload-size` 的硬拒绝，而不是忽略警告。** 打包后独立解包并比较 ramdisk：
 
-**免责声明：**仅供自有设备上经知情同意的研究与开发；刷机有丢失数据及无法启动风险。本文没有授权作者或其他人替你刷机，不含可直接刷入的通用 ROM。
+```sh
+python3 tools/unpack_bootv2.py out/shim-polaris-xnu.img out/check-polaris
+cmp out/check-polaris/ramdisk out/polaris-payload.bin
+sha256sum out/shim-polaris-xnu.img
+```
+
+确认输出是 Android boot.img v1、内含 shim 内核和完全一致的 payload ramdisk；**这才是能给 `fastboot` 用的镜像**，与 Release 的 Mach-O 内核是两个文件。不要复制别人生成的 boot.img 的 SHA 当作自己的校验值。
+
+### 2.1 永久刷 boot（风险高；先临时测更安全）
+
+推荐先以**同一份完整镜像**运行 `fastboot boot out/shim-polaris-xnu.img` 做临时启动、记录结果，能够回到 fastboot 且确认正常后，再考虑永久刷写。没有可用 iOS 根卷时未必能进入用户态，这不证明镜像正确。若你仍明确选择永久写入，重新核对只有一台 `product: polaris` 的设备、原厂 boot 备份确实可用，**由你本人执行**：
+
+```sh
+fastboot flash boot out/shim-polaris-xnu.img
+```
+
+这里只写 `boot`，不写 `recovery`、`dtbo`、`vbmeta`。刷成功只表示 fastboot 写入成功，**不是 iOS 启动成功**。刷完不要锁 bootloader。此步会替换 Android 原 boot，Android 可能无法启动；失败时回到已解锁 fastboot，使用自己此前备份的**原厂** `backup/boot.img` 恢复 `boot`（核对来源/哈希后再执行 `fastboot flash boot backup/boot.img`），必要时通过原厂完整固件恢复。不要用本文的 XNU 内核裸文件恢复 boot。
+
+## 3. 在 Linux 本地构建 iOS 用户态根卷
+
+**下面的处理在 PC 上，不读写手机。** 自行从 Apple 官方渠道获取匹配 iPhone X (`iPhone10,3`, D22AP) 的 iOS 16.7.16 (20H392) IPSW；不要将它或解出的 DMG 上传到项目/酷安。`tools/mkiosroot.sh` 输入分别为实际的 OS、SystemOS、AppOS 磁盘映像，**不能把字符串 `OS.dmg` 当作通用固定文件名**。从你取得的 IPSW `BuildManifest.plist` 核对三种角色与具体路径后，解压到本机，例如：
+
+```sh
+# 以下三个路径是你依据 BuildManifest.plist 识别并解压出的真实文件；不要按示例猜名称
+OS_DMG=/path/to/OS.dmg
+SYSTEMOS_DMG=/path/to/SystemOS.dmg
+APPOS_DMG=/path/to/AppOS.dmg
+sudo apt update
+sudo apt install apfs-fuse hfsprogs rsync python3 android-sdk-libsparse-utils
+
+tools/mkiosroot.sh "$OS_DMG" "$SYSTEMOS_DMG" "$APPOS_DMG" ios16-root.img 16G
+sudo fsck.hfsplus -fy ios16-root.img
+sudo mkdir -p /mnt/iosroot
+sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
+sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
+sudo umount /mnt/iosroot
+img2simg ios16-root.img ios16-root.simg
+sha256sum ios16-root.simg
+```
+
+`mkiosroot.sh` 把 iOS 系统卷和 cryptex 复制到**本地**区分大小写的 HFS+ 镜像并生成启动需要的目录；`sweet-root-tweaks.py` 名字是历史沿用，处理的是 iPhone X 用户态，并不会变出 MIX 2S 缺失的 GPU/基带/安全硬件。确认 fsck、mount、脚本、umount、img2simg 每步均成功，磁盘空间足够，并核对稀疏镜像对应的逻辑大小和实际分区容量。**任何失败都停下，不刷半成品。**
+
+## 4. 最后刷入 userdata（真正清空 Android 数据）
+
+再次确保备份已完成，boot 镜像来源和回退路径清楚，当前只有一台 `product: polaris`，`ios16-root.simg` 是**你自己本机构建且校验过**的文件，并明确接受清除 Android 数据。MIX 2S 的 `userdata` 要足以容纳 16GB HFS+ 卷；不同固件或存储布局需自行核对。仅在上述条件均满足且你本人确认时执行：
+
+```sh
+fastboot devices
+fastboot getvar product
+fastboot -S 512M flash userdata ios16-root.simg
+```
+
+等待每个分块返回 `OKAY`，**不要拔线或断电**。若 fastboot 连接卡住，不要重复 flash：先检查状态、重新进入 bootloader 并确认写入结果；必要时恢复原厂 boot、Android userdata/原厂固件。**刷 userdata 后，原 Android 数据不会自动回来。** 完成后可尝试启动前述完整 boot.img；没有把 XNU 镜像留在 boot 的话可用 `fastboot boot out/shim-polaris-xnu.img` 临时启动。永久刷 boot 不会绕过 iOS 根卷所需的数据写入。
+
+## 5. 失败与功能边界
+
+卡 Apple logo／panic／触摸无响应时**停止进一步写入**，保留错误照片和脱敏日志，先确认 0090 内核哈希、boot 镜像构成、ADT 是否含 `/product`、RAM 档位、GPIO99 复位开关及根卷的实际角色；可参照[项目现状和已知错误](<../README.md>)与 [NOTES](<../NOTES.md>)。不要公开设备序列号、分区备份、Apple 镜像和 Qualcomm 固件。若只能进 fastboot，先恢复自己保存的原厂 boot；已清空的 userdata 需用备份/原厂固件恢复，而不是再刷同一份未知 iOS 镜像。
+
+0090 镜像曾被用户确认锁屏单／双指，**本教程组合出的 boot.img 与那次测试镜像未做逐字节一致性验证，更未证明永久刷 boot 后成功**。CPU 仍采用已测的 `cpus=4`；GPU/Metal、A75 八核、Wi‑Fi、蜂窝、蓝牙、音频、相机、传感器、GPS、SEP/Face ID、正式十指与日用安全性都没有完成或验证。整套系统绕过部分 Apple 安全机制，请勿存放私人数据。本文所有 `fastboot flash` 都是给机主自行核对后执行的指令，作者未在你的手机上运行它们。
