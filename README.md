@@ -6,7 +6,7 @@
 
 ## 简体中文
 
-### MIX 2S 独立实现和证据
+### MIX 2S 实现和证据
 
 这是基于 XNU 8796／iPhone X iOS 16 用户态基础设施的 **Polaris 板级移植**：4×Cortex-A55 + 4×Cortex-A75、Synaptics S3330、1080×2160 面板、A630v2。它有独立 ADT、板型门控、触摸复位／读帧和 GPU 固件预检；不能复用 sweet 的触摸供电、寄存器或刷机参数。
 
