@@ -48,7 +48,7 @@ python -m unittest tools/test_polaris_cpu_topology.py tools/test_polaris_gpu_pre
 
 ## English
 
-### Mi MIX 2S implementation, not Sweet results (2026-10-23)
+### Mi MIX 2S implementation (2026-10-23)
 
 This repository highlights the **Polaris/SDM845** board port of the XNU/iPhone X iOS 16 infrastructure. Sweet's historical build and flash instructions live in [a separate archive](<docs/SWEET-HISTORY.md>) and are **not** Mi MIX 2S instructions. This is experimental, not a secure daily-use OS; no distributable iOS image or working Polaris GPU accelerator is provided.
 
