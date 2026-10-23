@@ -2,7 +2,7 @@
 
 [简体中文](#简体中文) · [English](#english) · [开发记录](<NOTES.md>)
 
-> **实验性 Mi MIX 2S 项目，非日用系统。** 截至 2026-10-23；没有此次更新后的真机测试。此页只统计 Polaris（SDM845／Adreno 630v2）的成果，不把 Redmi Note 10 Pro (`sweet`) 的成果算进来。原项目详细说明另存为 [Sweet 历史文档](<docs/SWEET-HISTORY.md>)。
+> **实验性 Mi MIX 2S 项目，非日用系统。** 截至 2026-10-23；没有此次更新后的真机测试。
 
 ## 简体中文
 
