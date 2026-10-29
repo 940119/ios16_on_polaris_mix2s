@@ -1,0 +1,137 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -210,6 +210,23 @@
+ #define UD_FRAME_MAX    0x800
+ #define UD_SIZE         0x4000
+ 
++/*
++ * Low (below 4 GiB) DMA windows, in the gaps of this phone's reserved-memory
++ * map as read out of the stock polaris DTB: 0x98000000 sits between
++ * pil_spss_region and cont_splash_region, 0xa1800000 between cont_splash_
++ * region and ramdump_fb_region, and 0xb0000000 above every carve-out (the
++ * last one ends exactly there). The DWC3 master cannot reach XNU's memory on
++ * polaris: the kernel is mapped at 0x1_00000000 (mkadt.py --highmem) while on
++ * sweet it sits at 0xb0000000, below 4 GiB, which is why the same code works
++ * there. With a buffer above 4 GiB no event ever lands (GEVNTCOUNT stays 0)
++ * and SETEPCONFIG never clears CMDACT.
++ */
++static const uint64_t ud_low_pa[] = {
++	0xa1800000,
++	0x98000000,
++	0xb0000000,
++};
++
+ /* Physical endpoints: 2n = OUT, 2n+1 = IN */
+ #define EP_RX           2               /* 0x01 bulk OUT */
+ #define EP_TX           3               /* 0x81 bulk IN */
+@@ -304,6 +321,30 @@
+ 	    ud.dma_pa >= 0x100000000ULL ? ">=" : "<");
+ 	return -1;
+ }
++
++/*
++ * The low DMA window is mapped as device memory (ml_io_map): bulk copies must
++ * not use NEON/block loads there, only naturally aligned 32-bit accesses.
++ */
++static void
++ud_copy32(void *dst, const void *src, uint32_t n)
++{
++	uint8_t *d = (uint8_t *)dst;
++	const uint8_t *s = (const uint8_t *)src;
++
++	while (n >= 4) {
++		*(uint32_t *)d = *(const uint32_t *)s;
++		d += 4;
++		s += 4;
++		n -= 4;
++	}
++	while (n) {
++		*d++ = *s++;
++		n--;
++	}
++}
++
++static uint8_t ud_txbuf[UD_FRAME_MAX];
+ 
+ /* One TRB (at DMA offset trb) on physical endpoint ep. */
+ static void
+@@ -452,8 +493,8 @@
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+-		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 1: ud_copy32(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
++		case 2: ud_copy32(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
+ 		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
+ 		default: ok = false; break;
+ 		}
+@@ -529,7 +570,7 @@
+ 		    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+ 		    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
+ 			struct ifnet_stat_increment_param stats = {};
+-			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
++			ud_copy32(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
+ 			mbuf_setlen(m, len);
+ 			mbuf_pkthdr_setlen(m, len);
+ 			void *frame_header = mbuf_data(m);
+@@ -561,7 +602,8 @@
+ 			mbuf_freem(m);
+ 			continue;
+ 		}
+-		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
++		mbuf_copydata(m, 0, len, ud_txbuf);
++		ud_copy32((void *)(ud.dma + UD_TX), ud_txbuf, (uint32_t)len);
+ 		mbuf_freem(m);
+ 		/* A frame of a multiple of 512 bytes would need a zero-length
+ 		 * packet to end it; one pad byte does the same (IP ignores it). */
+@@ -906,6 +948,48 @@
+ 	printf("SWEET USB: evt buf programmed: ADR 0x%08x%08x SIZ 0x%08x COUNT %u\n",
+ 	    dwc_rd(GEVNTADRHI), dwc_rd(GEVNTADRLO), dwc_rd(GEVNTSIZ), dwc_rd(GEVNTCOUNT) & 0xffff);
+ 
++	/* Find a window the controller can actually DMA into (see ud_low_pa). */
++	vm_offset_t low_va = 0;
++	int chosen = -1;
++	for (unsigned i = 0; i < sizeof(ud_low_pa) / sizeof(ud_low_pa[0]); i++) {
++		vm_offset_t va = ml_io_map((vm_offset_t)ud_low_pa[i], UD_SIZE);
++		if (va == 0) {
++			printf("SWEET USB: low 0x%llx: map failed\n", ud_low_pa[i]);
++			continue;
++		}
++		dwc_wr(GEVNTADRLO, (uint32_t)(ud_low_pa[i] + UD_EVT));
++		dwc_wr(GEVNTADRHI, (uint32_t)((ud_low_pa[i] + UD_EVT) >> 32));
++		dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);
++		dwc_wr(GEVNTCOUNT, 0);
++		for (unsigned w = 0; w < 8; w++) {
++			*(volatile uint32_t *)(va + UD_EVT + 4 * w) = 0;
++		}
++		(void)ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0);
++		int cnt = 0;
++		for (unsigned t = 0; t < 200; t++) {
++			cnt = (int)(dwc_rd(GEVNTCOUNT) & 0xffff);
++			if (cnt) {
++				break;
++			}
++			delay(1000);
++		}
++		printf("SWEET USB: probe 0x%llx: GEVNTCOUNT %d\n", ud_low_pa[i], cnt);
++		if (cnt != 0 && chosen < 0) {
++			chosen = (int)i;
++			low_va = va;
++		}
++	}
++	if (chosen >= 0) {
++		ud.dma_pa = ud_low_pa[chosen];
++		ud.dma = low_va;
++		dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
++		dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
++		dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);
++		dwc_wr(GEVNTCOUNT, 0);
++		ud.evt_pos = 0;
++		printf("SWEET USB: using low DMA window pa 0x%llx\n", ud.dma_pa);
++	}
++
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
