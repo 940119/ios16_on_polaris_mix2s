@@ -1,0 +1,117 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -346,6 +346,82 @@
+ 
+ static uint8_t ud_txbuf[UD_FRAME_MAX];
+ 
++static void
++ud_dump_regs(const char *when)
++{
++	printf("SWEET USB: %s: GSTS 0x%08x GUCTL 0x%08x GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x\n",
++	    when, dwc_rd(0xc118), dwc_rd(0xc12c), dwc_rd(0xc200), dwc_rd(0xc2c0));
++	printf("SWEET USB: %s: GHWPARAMS0 0x%08x GHWPARAMS1 0x%08x GHWPARAMS3 0x%08x GHWPARAMS4 0x%08x\n",
++	    when, dwc_rd(0xc140), dwc_rd(0xc144), dwc_rd(0xc14c), dwc_rd(0xc150));
++	printf("SWEET USB: %s: DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x DEVTEN 0x%08x DALEPENA 0x%08x\n",
++	    when, dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(DEVTEN), dwc_rd(DALEPENA));
++	printf("SWEET USB: %s: GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x\n",
++	    when, dwc_rd(GEVNTADRHI), dwc_rd(GEVNTADRLO), dwc_rd(GEVNTSIZ),
++	    dwc_rd(GEVNTCOUNT) & 0xffff);
++}
++
++/*
++ * Endpoint 0 bring-up, tried in several orders because SETEPCONFIG never
++ * clears CMDACT on polaris with any single order we have tried so far:
++ *   0 - DEPSTARTCFG, SETEPCONFIG, SETTRANSFRESOURCE (what sweet does)
++ *   1 - SETTRANSFRESOURCE before SETEPCONFIG
++ *   2 - Run/Stop set before the endpoint commands at all
++ * Each attempt starts from a device soft reset so a stuck CMDACT cannot
++ * poison the next one.
++ */
++static int
++ud_bringup(unsigned strategy)
++{
++	int i;
++
++	dwc_wr(DCTL, DCTL_CSFTRST);
++	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++		delay(1000);
++	}
++	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++		printf("SWEET USB: strategy %u: soft reset stuck\n", strategy);
++		return -1;
++	}
++	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
++	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
++	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);
++	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
++	ud.evt_pos = 0;
++	dwc_wr(DCFG, dwc_rd(DCFG) & ~(7u | (0x7fu << 3)));
++	dwc_wr(DEVTEN, 0x7);
++	if (strategy >= 2) {
++		dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	}
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0)) {
++		printf("SWEET USB: strategy %u: DEPSTARTCFG failed\n", strategy);
++		return -1;
++	}
++	if (strategy == 1 && ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("SWEET USB: strategy %u: early XFERRES failed\n", strategy);
++		return -1;
++	}
++	if (ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3),
++	    (1u << 8) | (1u << 10) | (0u << 25), 0)) {
++		printf("SWEET USB: strategy %u: SETEPCONFIG(0) failed\n", strategy);
++		return -1;
++	}
++	if (ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("SWEET USB: strategy %u: XFERRES(0) failed\n", strategy);
++		return -1;
++	}
++	if (ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3),
++	    (1u << 8) | (1u << 10) | (1u << 25), 0)) {
++		printf("SWEET USB: strategy %u: SETEPCONFIG(1) failed\n", strategy);
++		return -1;
++	}
++	if (ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("SWEET USB: strategy %u: XFERRES(1) failed\n", strategy);
++		return -1;
++	}
++	printf("SWEET USB: strategy %u: endpoint 0 configured\n", strategy);
++	return 0;
++}
++
+ /* One TRB (at DMA offset trb) on physical endpoint ep. */
+ static void
+ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
+@@ -996,17 +1072,22 @@
+ 	/* Events: disconnect, USB reset, connect done */
+ 	dwc_wr(DEVTEN, 0x7);
+ 
+-	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+-	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+-	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+-	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+-	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		printf("SWEET USB: endpoint 0 setup failed\n");
+-		return;
++	/* Endpoint 0 OUT/IN: control type, max packet 512 until connect done. */
++	ud_dump_regs("pre-ep0");
++	int brought = -1;
++	for (unsigned s = 0; s < 3; s++) {
++		if (ud_bringup(s) == 0) {
++			brought = (int)s;
++			break;
++		}
++		ud_dump_regs("post-fail");
+ 	}
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
++	if (brought < 0) {
++		printf("SWEET USB: endpoint 0 setup failed (all strategies)\n");
++		return;
++	}
+ 
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
