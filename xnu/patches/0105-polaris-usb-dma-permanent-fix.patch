@@ -1,0 +1,63 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1559,9 +1559,19 @@
+ 	 */
+ 	ud.dwc = dwc;
+ 	ppnum_t pn = 0;
+-	for (int try_ = 0; try_ < 8; try_++) {
++	uint64_t last_pa = 0;
++	int tries = 0;
++	/*
++	 * No KMA_PERMANENT here. The first version of this loop kept the flag
++	 * and then freed the rejected buffer, and vm_map_delete panicked on it:
++	 * "Attempting to remove permanent VM map entry" (vm_map.c:7940). A
++	 * permanent entry cannot be unmapped by design, so the retry needs an
++	 * ordinary one. Kernel object memory is never paged out, so nothing is
++	 * lost by dropping the flag.
++	 */
++	for (; tries < 8; tries++) {
+ 		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+-		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 			printf("SWEET USB: no DMA memory\n");
+ 			return;
+ 		}
+@@ -1569,17 +1579,33 @@
+ 		if (!pn) {
+ 			return;
+ 		}
+-		printf("SWEET USB: DMA try %d -> 0x%llx (%s 4GiB)\n", try_,
+-		    ptoa_64(pn), ptoa_64(pn) >= 0x100000000ULL ? ">=" : "<");
+-		if (ptoa_64(pn) < 0x100000000ULL) {
++		last_pa = ptoa_64(pn);
++		printf("SWEET USB: DMA try %d -> 0x%llx (%s 4GiB)\n", tries,
++		    last_pa, last_pa >= 0x100000000ULL ? ">=" : "<");
++		if (last_pa < 0x100000000ULL) {
+ 			break;
+ 		}
+ 		kmem_free(kernel_map, ud.dma, UD_SIZE);
+ 		ud.dma = 0;
+ 	}
+ 	if (ud.dma == 0) {
+-		printf("SWEET USB: no DMA memory below 4GiB\n");
+-		return;
++		/*
++		 * The last attempt was freed as well; take one more and use it
++		 * wherever it lands rather than leaving USB unarmed. The event
++		 * pointer is then above 4 GiB, which is exactly the case this
++		 * loop was trying to avoid - but the readback of GEVNTADR now
++		 * says whether the core can hold it.
++		 */
++		printf("SWEET USB: no DMA memory below 4GiB, falling back\n");
++		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET USB: no DMA memory at all\n");
++			return;
++		}
++		pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
++		if (!pn) {
++			return;
++		}
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+ 	printf("SWEET USB: DMA buffer pa 0x%llx (%s 4GiB) UD_SIZE 0x%x UD_EVT 0x%x\n",
