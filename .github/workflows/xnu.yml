@@ -15,15 +15,10 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
-  push:
-    branches: [main]
-    paths:
-      - "xnu/patches/**"
-      - ".github/workflows/xnu.yml"
-
-concurrency:
-  group: xnu-${{ github.ref }}
-  cancel-in-progress: true
+      runner:
+        description: runner label; macos-14 is being retired on 2026-11-02
+          and fails during its brownout windows (UTC 14:00-24:00)
+        default: macos-15
 
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
@@ -34,9 +29,12 @@ env:
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    # macos-14 is retired on 2026-11-02 and is browned out every day from
+    # 14:00 to 24:00 UTC until then, so the default is macos-15. That image
+    # has no Xcode 15 (16.0 is the oldest), and Xcode 16's iig emits
+    # IORPC.kernelContent, which xnu-8796 does not have; the runner input
+    # exists so the image can be switched without editing this file.
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -56,16 +54,19 @@ jobs:
       - name: Deps
         run: |
           brew install jq gum bash cmake ninja
-          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
+          # build.sh only checks that xcodes exists (Xcode is preinstalled)
+          sudo mkdir -p /usr/local/bin
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
+          # the oldest installed Xcode, which is the closest to Xcode 15
           XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
           xcrun --find iig
+          iig -v || true
 
       - name: Build
         working-directory: dxb
