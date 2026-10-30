@@ -1,0 +1,335 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -169,6 +169,7 @@
+  */
+ #define QSCRATCH_PA             0x0a6f8800
+ #define QSCRATCH_HS_PHY_CTRL    0x10
++#define   UTMI_PHY_SUSPEND_N    (1u << 0)
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
+ #define QSCRATCH_SS_PHY_CTRL    0x30
+@@ -964,6 +965,8 @@
+ #define UD_F_PHYINIT        0x20    /* run the DT qusb-phy-init-seq first */
+ #define UD_F_PIPE           0x40    /* point the wrapper at the UTMI clock */
+ #define UD_F_RUNSTOP        0x80    /* set DCTL.RUN_STOP before endpoint 0 */
++#define UD_F_RESUME         0x100   /* only clear POWER_DOWN, keep ABL config */
++#define UD_F_UTMI           0x200   /* deassert QSCRATCH UTMI_PHY_SUSPEND_N */
+ 
+ static void
+ ud_fifo_dump(void)
+@@ -1049,6 +1052,38 @@
+ }
+ 
+ /*
++ * ABL leaves this PHY fully configured - PLL_STATUS reads 0x64 and the
++ * efuse-trimmed TUNE1 reads 0x72 - and only gates it with POWER_DOWN. The
++ * vendor init table would overwrite that with its own defaults (TUNE1 0x07),
++ * so try the opposite of a full init: keep ABL's configuration untouched and
++ * clear nothing but the power-down bit.
++ */
++static int
++ud_qusb2_resume(void)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++
++	if (phy == 0) {
++		printf("SWEET USB: QUSB2 map failed\n");
++		return -1;
++	}
++	uint32_t pll0 = qusb2_rd(phy, QUSB2_PLL_STATUS);
++	uint32_t pd0  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
++	printf("SWEET USB: QUSB2 resume in: PLL_STATUS 0x%02x POWERDOWN 0x%02x TUNE1 0x%02x\n",
++	    pll0, pd0, qusb2_rd(phy, QUSB2_PORT_TUNE1));
++
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, pd0 & ~QUSB2_POWER_DOWN);
++	delay(200);
++
++	uint32_t pd  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
++	uint32_t pll = qusb2_rd(phy, QUSB2_PLL_STATUS);
++	printf("SWEET USB: QUSB2 resume out: PLL_STATUS 0x%02x (%s) POWERDOWN 0x%02x TUNE1 0x%02x\n",
++	    pll, (pll & QUSB2_PLL_LOCKED) ? "locked" : "not locked",
++	    pd, qusb2_rd(phy, QUSB2_PORT_TUNE1));
++	return 0;
++}
++
++/*
+  * Hand the wrapper the high-speed PHY's UTMI clock. The controller is wired
+  * for both PHYs and GENERAL_CFG selects which one feeds the core; the DT
+  * says maximum-speed = high-speed, and the register came up with PIPE3_SEL
+@@ -1153,6 +1188,95 @@
+ 	    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ }
+ 
++/*
++ * The wrapper register that nobody had written.
++ *
++ * QSCRATCH_HS_PHY_CTRL read 0x10000000 at handover: SW_SESSVLD_SEL only.
++ * Bit 0 of that register is UTMI_PHY_SUSPEND_N, and it was clear, i.e. the
++ * wrapper was holding the high-speed PHY's UTMI interface in suspend. That
++ * sits upstream of every hypothesis tried so far. A suspended UTMI block
++ * hands the controller no UTMI clock; a controller with no UTMI clock still
++ * retires DEPSTARTCFG, which is driven by the bus clock, but never finishes
++ * DEPCFG, which needs the PHY clock - and that is precisely the split the
++ * logs have shown in all nine builds. The VBUS override wrote bit 20 of this
++ * same register and never touched bit 0.
++ */
++static void
++ud_utmi_unsuspend(void)
++{
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++
++	if (qs == 0) {
++		printf("SWEET USB: QSCRATCH map failed (utmi)\n");
++		return;
++	}
++	uint32_t hs0 = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
++	*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs0 | UTMI_PHY_SUSPEND_N;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(1000);
++	uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
++	printf("SWEET USB: HS_PHY_CTRL 0x%08x -> 0x%08x (UTMI suspend %s)\n",
++	    hs0, hs, (hs & UTMI_PHY_SUSPEND_N) ? "deasserted" : "STILL HELD");
++}
++
++/*
++ * Read the whole QUSB2 window twice - once as ABL left it, once after
++ * clearing POWER_DOWN - and report only the registers that moved.
++ *
++ * The offsets used so far (PLL_STATUS 0x1a0, TUNE1 0x240, POWERDOWN 0x210)
++ * were inferred from the DT init table, not from a working reference, and
++ * PLL_STATUS has never made sense: it read 0x64 (bit 5, "locked") while the
++ * block was powered down and 0x17 once it was powered up. A sweep answers
++ * the question without guessing. A register that changes between the two
++ * samples is a live status bit; if nothing changes, the digital block is not
++ * being clocked at all and the fault is upstream of the PHY.
++ *
++ * The original POWER_DOWN value goes back at the end, so a no-touch strategy
++ * really does see the state ABL handed over.
++ */
++static void
++ud_qusb2_sweep(void)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	uint8_t off[QUSB2_SIZE / 4];
++	uint32_t pd0;
++	unsigned i;
++
++	if (phy == 0) {
++		printf("SWEET USB: QUSB2 map failed (sweep)\n");
++		return;
++	}
++	printf("SWEET USB: QUSB2 sweep, powered down\n");
++	for (i = 0; i < QUSB2_SIZE / 4; i++) {
++		off[i] = (uint8_t)qusb2_rd(phy, i * 4);
++	}
++	printf("SWEET USB: QUSB2 off:");
++	for (i = 0; i < QUSB2_SIZE / 4; i++) {
++		if (off[i]) {
++			printf(" %x=%02x", i * 4, off[i]);
++		}
++	}
++	printf("\n");
++
++	pd0 = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, pd0 & ~QUSB2_POWER_DOWN);
++	delay(2000);
++
++	printf("SWEET USB: QUSB2 on (deltas):");
++	for (i = 0; i < QUSB2_SIZE / 4; i++) {
++		uint8_t v = (uint8_t)qusb2_rd(phy, i * 4);
++		if (v != off[i]) {
++			printf(" %x:%02x>%02x", i * 4, off[i], v);
++		}
++	}
++	printf("\n");
++
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, pd0);
++	delay(200);
++	printf("SWEET USB: QUSB2 restored POWERDOWN 0x%02x -> 0x%02x\n",
++	    pd0, qusb2_rd(phy, QUSB2_PORT_POWERDOWN));
++}
++
+ static int
+ ud_try(const char *tag, unsigned flags)
+ {
+@@ -1174,11 +1298,18 @@
+ 	if (flags & UD_F_VBUS) {
+ 		ud_vbus_override();
+ 	}
+-	if (flags & UD_F_PHYINIT) {
++	if (flags & UD_F_RESUME) {
++		if (ud_qusb2_resume() != 0) {
++			printf("  %s: PHY resume failed\n", tag);
++		}
++	} else if (flags & UD_F_PHYINIT) {
+ 		if (ud_qusb2_init() != 0) {
+ 			printf("  %s: PHY stayed in power-down\n", tag);
+ 		}
+ 	}
++	if (flags & UD_F_UTMI) {
++		ud_utmi_unsuspend();
++	}
+ 	if (flags & UD_F_PIPE) {
+ 		ud_pipe_select();
+ 	}
+@@ -1270,6 +1401,7 @@
+ 
+ 	ud_fifo_dump();
+ 	ud_ahb2phy_probe();
++	ud_qusb2_sweep();
+ 
+ 	/*
+ 	 * All of them power the PHY up first, because that turned out to be
+@@ -1278,14 +1410,13 @@
+ 	 * it is the old shortlist, ordered cheapest first.
+ 	 */
+ 	static const char *names[] = {
+-		"phy+clkgt", "phy+clkgt+pipe+vbus", "phy+clkgt+runstop",
+-		"phy+clkgt+runstop+pipe+vbus"
++		"noreset", "resume+utmi", "resume+utmi+pipe+vbus", "table+utmi"
+ 	};
+ 	static const unsigned order[] = {
+-		UD_F_PHYINIT | UD_F_CLKGT,
+-		UD_F_PHYINIT | UD_F_CLKGT | UD_F_PIPE | UD_F_VBUS,
+-		UD_F_PHYINIT | UD_F_CLKGT | UD_F_RUNSTOP,
+-		UD_F_PHYINIT | UD_F_CLKGT | UD_F_RUNSTOP | UD_F_PIPE | UD_F_VBUS,
++		UD_F_NORESET,
++		UD_F_RESUME | UD_F_UTMI | UD_F_CLKGT,
++		UD_F_RESUME | UD_F_UTMI | UD_F_CLKGT | UD_F_PIPE | UD_F_VBUS,
++		UD_F_PHYINIT | UD_F_UTMI | UD_F_CLKGT,
+ 	};
+ 	int won = -1;
+ 	for (unsigned s = 0; s < sizeof(order) / sizeof(order[0]); s++) {
+--- a/bsd/dev/polaris_gpu_diag.c
++++ b/bsd/dev/polaris_gpu_diag.c
+@@ -6,10 +6,14 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ 
+ extern bool polaris_touch_i2c_board(void);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ #define GPU_BLOB_COUNT 6u
+ #define GPU_PAGE       0x4000ull
+@@ -129,4 +133,91 @@
+ 	    "GPU/GMU/SMMU registers untouched, CPU display unchanged\n", missing);
+ 	printf("POLARIS GPU: ARC DB mapping deferred until XNU reservation ownership is proven\n");
+ }
++
++/*
++ * Register state probe - the part that was never done.
++ *
++ * The device tree says the Adreno 3D0 block is at 0x05000000 (0x40000), its
++ * GMU at 0x0506a000 (0x30000), the CX debug window at 0x05061000 and the GPU
++ * clock/power controller at 0x05090000 (0x9000). Nothing in this kernel has
++ * ever read one of those addresses, so "there is no GPU driver in this tree"
++ * was never the same statement as "the GPU is dead".
++ *
++ * Each window is sampled twice, 2 ms apart, and the words that changed are
++ * counted. A powered block with running counters moves; a collapsed one
++ * answers with a constant, or with 0/0xffffffff forever. That distinguishes
++ * "powered but undriven" from "not powered" without assuming that any
++ * particular register offset is correct.
++ */
++#define GPU_3D0_PA    0x05000000ull
++#define GPU_3D0_N     0x40000u
++#define GPU_GMU_PA    0x0506a000ull
++#define GPU_GMU_N     0x30000u
++#define GPU_CXDBG_PA  0x05061000ull
++#define GPU_CXDBG_N   0x800u
++#define GPU_CXMISC_PA 0x0509e000ull
++#define GPU_CXMISC_N  0x1000u
++#define GPUCC_PA      0x05090000ull
++#define GPUCC_N       0x9000u
++#define GPU_SAMPLE    16u
++
++/*
++ * The samples are spread across the window rather than taken from its first
++ * 64 bytes, because a register block's opening words are usually reserved
++ * and read back zero whether the block is alive or not. The header is
++ * printed before the first read: if one of these windows turns out to be
++ * behind a collapsed power domain, the access can stall the NoC and take the
++ * whole CPU with it, and then the last line in the ring buffer has to say
++ * which window did it.
++ */
++static void
++gpu_state_window(const char *name, uint64_t pa, uint32_t bytes)
++{
++	vm_offset_t map;
++	uint32_t first[GPU_SAMPLE];
++	uint32_t step = (bytes / GPU_SAMPLE) & ~3u;
++	uint32_t changed = 0;
++
++	map = ml_io_map(pa, bytes);
++	if (map == 0) {
++		printf("POLARIS GPU: %s map failed\n", name);
++		return;
++	}
++	printf("POLARIS GPU: %s %llx reading\n", name, pa);
++	for (unsigned int i = 0; i < GPU_SAMPLE; ++i) {
++		first[i] = *(volatile uint32_t *)(map + step * i);
++	}
++	printf("POLARIS GPU: %s:", name);
++	for (unsigned int i = 0; i < GPU_SAMPLE; ++i) {
++		printf(" +%x=%08x", step * i, first[i]);
++	}
++	printf("\n");
++
++	delay(2000);
++	for (unsigned int i = 0; i < GPU_SAMPLE; ++i) {
++		if (*(volatile uint32_t *)(map + step * i) != first[i]) {
++			changed++;
++		}
++	}
++	printf("POLARIS GPU: %s changed %u/%u words in 2 ms\n",
++	    name, changed, GPU_SAMPLE);
++}
++
++void
++polaris_gpu_state_probe(void)
++{
++	int optin = 0;
++
++	(void)PE_parse_boot_argn("polarisgpuprobe", &optin, sizeof(optin));
++	if (optin != 1) {
++		return;
++	}
++	printf("POLARIS GPU: register probe, read only\n");
++	gpu_state_window("gpucc", GPUCC_PA, GPUCC_N);
++	gpu_state_window("gpu-3d0", GPU_3D0_PA, GPU_3D0_N);
++	gpu_state_window("gpu-gmu", GPU_GMU_PA, GPU_GMU_N);
++	gpu_state_window("gpu-cxdbgc", GPU_CXDBG_PA, GPU_CXDBG_N);
++	gpu_state_window("gpu-cxmisc", GPU_CXMISC_PA, GPU_CXMISC_N);
++	printf("POLARIS GPU: probe done\n");
++}
+ #endif
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@
+ extern void polaris_touch_diag(void);
+ extern void polaris_touch_i2c_init(void);
+ extern void polaris_gpu_diag(void);
++extern void polaris_gpu_state_probe(void);
+ extern void polaris_gpu_init(void);
+ extern void sweet_usb_probe(void);
+ 
+@@ -668,6 +669,13 @@
+ 	polaris_gpu_diag();
+ 	polaris_gpu_init();
+ 	sweet_usb_probe();
++	/*
++	 * Last, deliberately: the GPU windows sit behind power domains this
++	 * kernel never votes for, and a read of a collapsed block can abort or
++	 * stall the bus. Everything that has to be measured this boot - the USB
++	 * experiments included - has already run by the time this executes.
++	 */
++	polaris_gpu_state_probe();
+ 	return 0;
+ }
+ 
