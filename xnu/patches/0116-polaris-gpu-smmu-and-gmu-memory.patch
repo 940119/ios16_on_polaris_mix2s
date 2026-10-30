@@ -1,0 +1,234 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -6,7 +6,8 @@
+  * touched, no command buffer is ever handed to the GPU, and the CPU
+  * framebuffer is never replaced. The ladder runs only under
+  * `polarisgpu=1 polarisgpuup=N`, one step at a time, and it stops before the
+- * 3D core: no GMU firmware, no SMMU, no rings.
++ * 3D core: no GMU firmware, no rings; the GPU's SMMU is only read, never
++ * programmed.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -266,6 +267,7 @@
+ #define PG_GDSC_POLL_US			2000
+ 
+ static bool pg_cx_on;
++static bool pg_memnoc_on;
+ static bool pg_gmu_clk_on;
+ 
+ static bool
+@@ -357,7 +359,8 @@
+ 		printf("POLARIS GPU: 4 the CX switch is off; clocks not touched\n");
+ 		return false;
+ 	}
+-	if (!pg_branch_enable(pg_gcc, PG_GCC_GPU_MEMNOC, "gcc_gpu_memnoc_gfx_clk") ||
++	pg_memnoc_on = pg_branch_enable(pg_gcc, PG_GCC_GPU_MEMNOC, "gcc_gpu_memnoc_gfx_clk");
++	if (!pg_memnoc_on ||
+ 	    !pg_branch_enable(pg_gcc, PG_GCC_GPU_SNOC_DVM, "gcc_gpu_snoc_dvm_gfx_clk")) {
+ 		return false;
+ 	}
+@@ -447,6 +450,177 @@
+ 	return second != first;
+ }
+ 
++/* ---- 6. the GPU's SMMU ----------------------------------------------------------------------------- */
++
++/*
++ * An ARM SMMU v2, the same one the Mi 8 port reads at the same address. It
++ * lives in the CX half, which is why nothing here may run before step 3, and
++ * it needs gcc_gpu_memnoc_gfx_clk from step 4 for its register interface.
++ * Everything in this step only reads: what the stream table and the context
++ * banks say now is what the boot loader (and TrustZone) left behind, and that
++ * is the state an SMMU has to be taken over from, not guessed.
++ */
++#define PG_SMMU_PHYS		0x05040000UL
++#define PG_SMMU_SIZE		0x10000UL
++#define PG_SMMU_SCR0		0x000
++#define PG_SMMU_SCR1		0x004
++#define PG_SMMU_SCR2		0x008
++#define PG_SMMU_SACR		0x010
++#define PG_SMMU_ID0		0x020
++#define PG_SMMU_ID1		0x024
++#define PG_SMMU_ID2		0x028
++#define PG_SMMU_ID7		0x03c
++#define PG_SMMU_SGFSR		0x048
++#define PG_SMMU_SGFSYNR0	0x050
++#define PG_SMMU_SMR(n)		(0x800 + 4 * (n))
++#define PG_SMMU_S2CR(n)		(0xc00 + 4 * (n))
++#define PG_SMMU_GR1		0x1000
++#define PG_SMMU_CBAR(n)		(PG_SMMU_GR1 + 4 * (n))
++#define PG_SMMU_CBA2R(n)	(PG_SMMU_GR1 + 0x800 + 4 * (n))
++#define PG_CB_SCTLR		0x00
++#define PG_CB_TCR2		0x10
++#define PG_CB_TTBR0_LO		0x20
++#define PG_CB_TTBR0_HI		0x24
++#define PG_CB_TCR		0x30
++#define PG_CB_CONTEXTIDR	0x34
++#define PG_CB_MAIR0		0x38
++#define PG_CB_FSR		0x58
++
++static vm_offset_t pg_smmu;
++static uint32_t pg_smmu_cb_base;	/* page offset of the context banks */
++static uint32_t pg_smmu_page_size = 0x1000;
++static uint32_t pg_smmu_num_cb, pg_smmu_num_smr;
++
++static bool
++pg_step_smmu(void)
++{
++	uint32_t id0, id1, id7;
++	unsigned used = 0;
++
++	if (!pg_cx_on || !pg_memnoc_on) {
++		printf("POLARIS GPU: 6 the CX switch or the memory clock is off; the SMMU is not read\n");
++		return false;
++	}
++	pg_smmu = ml_io_map(PG_SMMU_PHYS, PG_SMMU_SIZE);
++	if (pg_smmu == 0) {
++		printf("POLARIS GPU: 6 SMMU map failed\n");
++		return false;
++	}
++	id0 = pg_rd(pg_smmu + PG_SMMU_ID0);
++	id1 = pg_rd(pg_smmu + PG_SMMU_ID1);
++	id7 = pg_rd(pg_smmu + PG_SMMU_ID7);
++	printf("POLARIS GPU: 6 SMMU sCR0 %#010x sCR1 %#010x sCR2 %#010x sACR %#010x\n",
++	    pg_rd(pg_smmu + PG_SMMU_SCR0), pg_rd(pg_smmu + PG_SMMU_SCR1),
++	    pg_rd(pg_smmu + PG_SMMU_SCR2), pg_rd(pg_smmu + PG_SMMU_SACR));
++	printf("POLARIS GPU: 6 SMMU ID0 %#010x ID1 %#010x ID2 %#010x ID7 %#010x (architecture %u.%u)\n",
++	    id0, id1, pg_rd(pg_smmu + PG_SMMU_ID2), id7, (id7 >> 4) & 15, id7 & 15);
++	printf("POLARIS GPU: 6 SMMU fault status sGFSR %#010x sGFSYNR0 %#010x\n",
++	    pg_rd(pg_smmu + PG_SMMU_SGFSR), pg_rd(pg_smmu + PG_SMMU_SGFSYNR0));
++	pg_smmu_num_smr = id0 & 0xff;
++	pg_smmu_num_cb = id1 & 0xff;
++	pg_smmu_page_size = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
++	/*
++	 * The context banks start after 2^(NUMPAGENDXB+1) pages. A guess of a
++	 * half of that reads the implementation's pages in between, and on the
++	 * Mi 8 port that read never came back; the device tree's gpu-offset
++	 * 0x48000 is 0x5040000 + 0x8000, which this gives for NUMPAGENDXB = 2.
++	 */
++	pg_smmu_cb_base = (1u << (((id1 >> 28) & 7) + 1)) * pg_smmu_page_size;
++	if (pg_smmu_cb_base + pg_smmu_page_size * pg_smmu_num_cb > PG_SMMU_SIZE) {
++		printf("POLARIS GPU: 6 the context banks would lie outside the window (%#x + %u pages): stopping\n",
++		    pg_smmu_cb_base, pg_smmu_num_cb);
++		return false;
++	}
++	printf("POLARIS GPU: 6 SMMU: %u stream entries, %u context banks, page size %u, banks from %#x "
++	    "(stage 1 %s, stage 2 %s, stream matching %s)\n",
++	    pg_smmu_num_smr, pg_smmu_num_cb, pg_smmu_page_size, pg_smmu_cb_base,
++	    (id0 & (1u << 30)) ? "yes" : "no", (id0 & (1u << 29)) ? "yes" : "no",
++	    (id0 & (1u << 27)) ? "yes" : "NO");
++	printf("POLARIS GPU: 6 SMMU: unmatched streams %s (sCR0.USFCFG %u)\n",
++	    (pg_rd(pg_smmu + PG_SMMU_SCR0) & (1u << 10)) ? "FAULT" : "pass",
++	    (pg_rd(pg_smmu + PG_SMMU_SCR0) >> 10) & 1);
++	for (uint32_t n = 0; n < pg_smmu_num_smr && n < 64; n++) {
++		uint32_t smr = pg_rd(pg_smmu + PG_SMMU_SMR(n));
++		uint32_t s2cr = pg_rd(pg_smmu + PG_SMMU_S2CR(n));
++
++		if ((smr & (1u << 31)) || s2cr != 0) {
++			printf("POLARIS GPU: 6 SMMU stream %2u: SMR %#010x (id %#x mask %#x%s) S2CR %#010x "
++			    "(type %u, context bank %u)\n", n, smr, smr & 0x7fff, (smr >> 16) & 0x7fff,
++			    (smr & (1u << 31)) ? ", valid" : "", s2cr, (s2cr >> 16) & 3, s2cr & 0xff);
++		}
++	}
++	for (uint32_t n = 0; n < pg_smmu_num_cb && n < 32; n++) {
++		uint32_t cbar = pg_rd(pg_smmu + PG_SMMU_CBAR(n));
++		vm_offset_t cb = pg_smmu + pg_smmu_cb_base + pg_smmu_page_size * n;
++
++		if (cbar == 0 && pg_rd(cb + PG_CB_SCTLR) == 0) {
++			continue;
++		}
++		used++;
++		printf("POLARIS GPU: 6 SMMU bank %u: CBAR %#010x CBA2R %#010x; SCTLR %#010x TTBR0 %#010x%08x "
++		    "TCR %#010x TCR2 %#010x MAIR0 %#010x FSR %#010x\n", n, cbar,
++		    pg_rd(pg_smmu + PG_SMMU_CBA2R(n)), pg_rd(cb + PG_CB_SCTLR), pg_rd(cb + PG_CB_TTBR0_HI),
++		    pg_rd(cb + PG_CB_TTBR0_LO), pg_rd(cb + PG_CB_TCR), pg_rd(cb + PG_CB_TCR2),
++		    pg_rd(cb + PG_CB_MAIR0), pg_rd(cb + PG_CB_FSR));
++	}
++	printf("POLARIS GPU: 6 SMMU: %u of %u context banks are in use\n", used, pg_smmu_num_cb);
++	return true;
++}
++
++/* ---- 7. the GMU's memory --------------------------------------------------------------------------- */
++
++/*
++ * The GMU's processor loads its firmware from its own tightly coupled memory,
++ * so before anything can be written into it the mapping has to be proven:
++ * two words written, read back, and the old words put back. The processor has
++ * to stay in reset while this runs - writing over a running image would be a
++ * corrupted firmware, not a test.
++ *
++ * Instruction memory starts at word 0xc00 of the GMU's place (a6xx_gmu.xml's
++ * GMU_CM3_ITCM_START 0x1b400, less the 0x1a800 the place itself starts at);
++ * data memory 16 KB later.
++ */
++#define PG_GMU_ITCM		PG_GMU_WORD(0xc00)
++#define PG_GMU_DTCM		PG_GMU_WORD(0x1c00)
++
++static bool
++pg_step_gmu_tcm(void)
++{
++	static const uint32_t pattern[2] = { 0xa5a5a5a5u, 0x5a5a5a5au };
++	static const uint32_t offsets[2] = { PG_GMU_ITCM, PG_GMU_DTCM };
++	static const char *const names[2] = { "instruction memory", "data memory" };
++	bool good = true;
++
++	if (!pg_gmu_clk_on || pg_gmu == 0) {
++		printf("POLARIS GPU: 7 the GMU was not read; its memory is not touched\n");
++		return false;
++	}
++	if (pg_rd(pg_gmu + PG_GMU_WORD(0x5000)) != 1) {
++		printf("POLARIS GPU: 7 the processor is not held in reset (CM3_SYSRESET %#010x): "
++		    "its memory is not touched\n", pg_rd(pg_gmu + PG_GMU_WORD(0x5000)));
++		return false;
++	}
++	for (int m = 0; m < 2; m++) {
++		uint32_t old[2], back[2];
++
++		old[0] = pg_rd(pg_gmu + offsets[m]);
++		old[1] = pg_rd(pg_gmu + offsets[m] + 4);
++		pg_wr(pg_gmu + offsets[m], pattern[0]);
++		pg_wr(pg_gmu + offsets[m] + 4, pattern[1]);
++		back[0] = pg_rd(pg_gmu + offsets[m]);
++		back[1] = pg_rd(pg_gmu + offsets[m] + 4);
++		pg_wr(pg_gmu + offsets[m], old[0]);
++		pg_wr(pg_gmu + offsets[m] + 4, old[1]);
++		printf("POLARIS GPU: 7 GMU %s (offset %#06x): was %#010x %#010x; wrote %#010x %#010x, "
++		    "read back %#010x %#010x: %s; restored %#010x %#010x\n",
++		    names[m], offsets[m], old[0], old[1], pattern[0], pattern[1], back[0], back[1],
++		    (back[0] == pattern[0] && back[1] == pattern[1]) ? "same" : "DIFFERENT",
++		    pg_rd(pg_gmu + offsets[m]), pg_rd(pg_gmu + offsets[m] + 4));
++		good = good && back[0] == pattern[0] && back[1] == pattern[1];
++	}
++	return good;
++}
++
+ /* ---- the ladder ------------------------------------------------------------------------------------ */
+ 
+ void
+@@ -488,7 +662,24 @@
+ 	if (upto < 5) {
+ 		return;
+ 	}
+-	(void)pg_step_gmu();
++	if (!pg_step_gmu()) {
++		printf("POLARIS GPU: stop after 5: the GMU's counter is not advancing\n");
++		return;
++	}
++	if (upto < 6) {
++		return;
++	}
++	if (!pg_step_smmu()) {
++		printf("POLARIS GPU: stop after 6: the SMMU was not read\n");
++		return;
++	}
++	if (upto < 7) {
++		return;
++	}
++	if (!pg_step_gmu_tcm()) {
++		printf("POLARIS GPU: stop after 7: the GMU's memory did not take the pattern\n");
++		return;
++	}
+ 	printf("POLARIS GPU: ladder done; the CX half is left powered, nothing may be released yet\n");
+ }
+ 
