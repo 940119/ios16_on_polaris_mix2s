@@ -1,0 +1,176 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1246,6 +1246,37 @@
+ }
+ 
+ /*
++ * The bit that was the bug.
++ *
++ * Proven by the build 0100 bisect, not by reasoning: with GENERAL_CFG at 0x04
++ * (what ABL leaves) a real DEPCFG sat in CMDACT for the full 500 ms; with
++ * GENERAL_CFG set to 0x01 the same command retired on the first poll, and so
++ * did every endpoint command after it. PIPE_UTMI_CLK_SEL is bit 0 on this
++ * SoC - mainline dwc3-qcom says so, and now the hardware says so too - while
++ * this file had carried the msm8996 position (bit 1) and therefore wrote
++ * 0x02, a bit neither generation defines. There is no cleaner example in this
++ * port of a wrong constant outliving nine experiments.
++ */
++static void
++ud_utmi_clk_select(void)
++{
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	uint32_t g0;
++
++	if (qs == 0) {
++		printf("SWEET USB: QSCRATCH map failed (clksel)\n");
++		return;
++	}
++	g0 = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	*(volatile uint32_t *)(qs + QSCRATCH_GENERAL_CFG) =
++	    (g0 & ~PIPE_UTMI_CLK_DIS) | PIPE_UTMI_CLK_SEL;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(500);
++	printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (UTMI clock selected)\n",
++	    g0, usb_rd(qs, QSCRATCH_GENERAL_CFG));
++}
++
++/*
+  * Bisect the clock mux instead of guessing it a third time.
+  *
+  * GENERAL_CFG came up as 0x04, a bit that means PIPE_UTMI_CLK_DIS in the old
+@@ -1274,8 +1305,9 @@
+ 		uint32_t hs;
+ 		const char *name;
+ 	} mux[] = {
+-		{ 0x04, 0,                                 "as ABL left it" },
++		/* The known winner goes first so a regression costs nothing. */
+ 		{ 0x01, 0,                                 "new: UTMI_CLK_SEL" },
++		{ 0x04, 0,                                 "as ABL left it" },
+ 		{ 0x02, 0,                                 "old: UTMI sel, PIPE3 off" },
+ 		{ 0x03, 0,                                 "both select bits" },
+ 		{ 0x01, HS_CLOCK_BITS,                     "UTMI_CLK_SEL + clk enable" },
+@@ -1422,7 +1454,16 @@
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+-	dwc_wr(DEVTEN, 0x7);
++	/*
++	 * DEVTEN off, deliberately. This driver has no interrupt handler at
++	 * all - it polls the event ring from a thread - but it used to enable
++	 * device events here. Those are not masked by GEVNTSIZ bit 31 (that
++	 * one only masks the event-ring interrupt), so as soon as the core saw
++	 * a connect it would hold its IRQ line high with nobody to clear it,
++	 * which is one of the two things that can wedge the boot at exactly
++	 * the point build 0100 stopped.
++	 */
++	dwc_wr(DEVTEN, 0);
+ 	printf("  %s: pre-ep0 GUSB2PHYCFG 0x%08x GSTS 0x%08x DSTS 0x%08x\n",
+ 	    tag, dwc_rd(GUSB2PHYCFG), dwc_rd(GSTS), dwc_rd(DSTS));
+ 
+@@ -1498,13 +1539,16 @@
+ 	ud_fifo_dump();
+ 	ud_ahb2phy_probe();
+ 	ud_qusb2_sweep();
+-	ud_clock_mux_bisect();
++	ud_utmi_clk_select();
++	if (ud_clock_mux_bisect() < 0) {
++		printf("SWEET USB: clock mux bisect found nothing; hoping the direct write held\n");
++	}
+ 
+ 	/*
+-	 * All of them power the PHY up first, because that turned out to be
+-	 * the thing nobody had done: the QUSB2 block was left at 0x23 in
+-	 * PORT_POWERDOWN, i.e. configured but switched off. Everything after
+-	 * it is the old shortlist, ordered cheapest first.
++	 * The order is no longer a guess. Build 0100 proved that GENERAL_CFG
++	 * bit 0 is what the endpoint command engine was missing, and the first
++	 * entry below is the no-reset path that then configured all four
++	 * endpoints on the first poll. The rest stay as regression fallbacks.
+ 	 */
+ 	static const char *names[] = {
+ 		"noreset", "resume+utmi", "resume+utmi+pipe+vbus", "table+utmi"
+@@ -1517,7 +1561,7 @@
+ 	};
+ 	int won = -1;
+ 	for (unsigned s = 0; s < sizeof(order) / sizeof(order[0]); s++) {
+-		if (order[s] & UD_F_NORESET) {
++		if (s > 0 && (order[s] & UD_F_NORESET)) {
+ 			/*
+ 			 * A failed attempt leaves DEPCMD.CMDACT set, and the core
+ 			 * accepts no new command until that clears; only the
+@@ -1535,17 +1579,38 @@
+ 		printf("SWEET USB: endpoint 0 setup failed (all strategies)\n");
+ 		return;
+ 	}
++	/*
++	 * Six checkpoints, in Linux's order: endpoints, DALEPENA, RUN_STOP,
++	 * and only then the two writes that let the host see us. The previous
++	 * build printed "endpoint 0 configured OK" and then nothing, with two
++	 * statements in between and no way to tell which of them it died in.
++	 */
++	printf("SWEET USB: step 1/6 DALEPENA\n");
+ 	dwc_wr(DALEPENA, 0x3);
+-	ud_start_setup();
+-
+-	int i;
+-	ud_vbus_override();
+ 
++	printf("SWEET USB: step 2/6 RUN_STOP\n");
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+ 		delay(1000);
+ 	}
+-	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	printf("SWEET USB: step 2/6 DSTS 0x%08x after %d ms\n", dwc_rd(DSTS), i);
++
++	/*
++	 * Soft connect last: raising the D+ pull-up before the gadget is armed
++	 * invites a bus reset the core is not listening for, because this
++	 * driver deliberately runs without interrupts.
++	 */
++	printf("SWEET USB: step 3/6 connect (VBUS valid + D+ pull-up)\n");
++	ud_vbus_override();
++	ud_hsphy_connect();
++
++	printf("SWEET USB: step 4/6 GEVNTCOUNT 0x%08x DEVTEN 0x%08x DCTL 0x%08x\n",
++	    dwc_rd(GEVNTCOUNT) & 0xffff, dwc_rd(DEVTEN), dwc_rd(DCTL));
++	printf("SWEET USB: step 5/6 start SETUP transfer\n");
++	ud_start_setup();
++
++	printf("SWEET USB: step 6/6 threads, DMA at 0x%llx\n", ud.dma_pa);
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+@@ -1554,5 +1619,7 @@
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	printf("SWEET USB: gadget armed, DSTS 0x%08x GSTS 0x%08x\n",
++	    dwc_rd(DSTS), dwc_rd(GSTS));
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -668,14 +668,16 @@
+ 	polaris_touch_i2c_init();
+ 	polaris_gpu_diag();
+ 	polaris_gpu_init();
+-	sweet_usb_probe();
+ 	/*
+-	 * Last, deliberately: the GPU windows sit behind power domains this
+-	 * kernel never votes for, and a read of a collapsed block can abort or
+-	 * stall the bus. Everything that has to be measured this boot - the USB
+-	 * experiments included - has already run by the time this executes.
++	 * Measured before the USB arm, not after it. Build 0100 wedged the boot
++	 * inside sweet_usb_probe() and this probe never ran, which cost a whole
++	 * cycle - so the reading that is independent of USB now goes first. The
++	 * windows sit behind power domains this kernel never votes for, and a
++	 * read of a collapsed block can abort or stall the bus; each window
++	 * prints its name before the first read so a stall names itself.
+ 	 */
+ 	polaris_gpu_state_probe();
++	sweet_usb_probe();
+ 	return 0;
+ }
+ 
