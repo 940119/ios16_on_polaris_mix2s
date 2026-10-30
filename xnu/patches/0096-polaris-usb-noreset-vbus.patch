@@ -1,0 +1,304 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -897,77 +897,265 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ }
+ 
++/*
++ * Step 2b: why endpoint commands hang.
++ *
++ * The controller is demonstrably alive - GSNPSID reads, the device soft
++ * reset completes, and DEPCMD_DEPSTARTCFG finishes on the first poll - yet
++ * DEPCFG (0x1), DEPXFERCFG (0x2) and DEPSTRTXFER (0x6) never clear CMDACT,
++ * in every command order, with RUN_STOP set or clear, and with the event
++ * buffer in low or high memory. So the shortlist is what Linux
++ * dwc3_core_init() does after a core soft reset that this driver skipped:
++ *
++ *   UD_F_CLKGT     GCTL.DSBLCLKGTNG. GHWPARAMS1 EN_PWROPT is 1 (clock
++ *                  gating present) and the polaris DT sets
++ *                  snps,disable-clk-gating, which is exactly the DT knob
++ *                  that makes Linux set this bit.
++ *   UD_F_DALEPENA  raise DALEPENA before DEPCFG instead of after it.
++ *   UD_F_FULLRESET the Linux dwc3_core_soft_reset() sequence: GCTL
++ *                  CORESOFTRESET plus a USB2/USB3 PHY soft reset with
++ *                  100 ms settling, not just DCTL.CSFTRST.
++ *
++ * And the possibility none of those experiments could see, because each of
++ * them began with a reset:
++ *
++ *   UD_F_NORESET   leave the controller exactly as ABL handed it over.
++ *   UD_F_VBUS      raise the QSCRATCH VBUS override before DEPCFG rather
++ *                  than after it (where it was unreachable dead code).
++ *
++ * Each is tried on its own, then all together, and the log says which one
++ * got endpoint 0 configured.
++ */
++#define GUSB2PHYCFG         0xc200
++#define GUSB3PIPECTL        0xc2c0
++#define GHWPARAMS7          0xc15c
++#define GRXFIFOSIZ          0xc300
++#define GTXFIFOSIZ(n)       (0xc320 + 0x4 * (n))
++
++#define GCTL_CORESOFTRESET  (1u << 11)
++#define GCTL_DSBLCLKGTNG    (1u << 0)
++#define PHYSOFTRST          (1u << 31)
++
++#define AHB2PHY_PA          0x088ee000
++#define AHB2PHY_SIZE        0x00000400
++
++#define UD_F_CLKGT          0x1
++#define UD_F_DALEPENA       0x2
++#define UD_F_FULLRESET      0x4
++#define UD_F_NORESET        0x8     /* do not touch the controller at all */
++#define UD_F_VBUS           0x10    /* force the VBUS override before DEPCFG */
++
+ static void
+-sweet_usb_gadget_start(vm_offset_t dwc)
++ud_fifo_dump(void)
+ {
+-	thread_t thread;
++	printf("SWEET USB: GHWPARAMS7 0x%08x GRXFIFOSIZ 0x%08x GTXFIFOSIZ 0x%08x 0x%08x 0x%08x\n",
++	    dwc_rd(GHWPARAMS7), dwc_rd(GRXFIFOSIZ), dwc_rd(GTXFIFOSIZ(0)),
++	    dwc_rd(GTXFIFOSIZ(1)), dwc_rd(GTXFIFOSIZ(2)));
++}
+ 
+-	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET USB: no DMA memory\n");
+-		return;
+-	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+-	if (!pn) {
++/*
++ * The QUSB2 registers at 0x88e2000 have read back the same four
++ * byte-repeated values (0x64646464 / 0x23232323 / 0x72727272 / 0x90909090)
++ * on every build, including the read-only probe, so the window is not
++ * decoded as PHY registers when we get here. The DT gives the wrapper an
++ * ahb2phy_base of 0x88ee000: poke that bridge and see whether the window
++ * turns into real registers.
++ */
++static void
++ud_ahb2phy_probe(void)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	vm_offset_t br = ml_io_map(AHB2PHY_PA, AHB2PHY_SIZE);
++	if (phy == 0 || br == 0) {
++		printf("SWEET USB: ahb2phy probe map failed (phy %p br %p)\n",
++		    (void *)phy, (void *)br);
+ 		return;
+ 	}
+-	ud.dma_pa = ptoa_64(pn);
+-	printf("SWEET USB: DMA buffer pa 0x%llx (%s 4GiB) UD_SIZE 0x%x UD_EVT 0x%x\n",
+-	    ud.dma_pa, ud.dma_pa >= 0x100000000ULL ? ">=" : "<", (unsigned)UD_SIZE, (unsigned)UD_EVT);
+-	printf("SWEET USB: pre-config GHWPARAMS0 0x%08x GCTL 0x%08x GUSB2PHYCFG 0x%08x DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
+-	    dwc_rd(0xc140), dwc_rd(GCTL), dwc_rd(0xc200), dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS));
+-	ud_if_create();
++	printf("SWEET USB: QUSB2 before: 0x%08x 0x%08x 0x%08x 0x%08x\n",
++	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++	printf("SWEET USB: ahb2phy cfg 0x%08x 0x%08x\n", usb_rd(br, 0x0), usb_rd(br, 0x4));
++	*(volatile uint32_t *)(br + 0x0) = usb_rd(br, 0x0) | 0x1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(1000);
++	printf("SWEET USB: ahb2phy cfg after 0x%08x; QUSB2 0x%08x 0x%08x 0x%08x 0x%08x\n",
++	    usb_rd(br, 0x0), usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240),
++	    usb_rd(phy, 0x254));
++}
+ 
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++static int
++ud_core_reset(unsigned flags)
++{
++	/*
++	 * Save the global setup first: GCTL.CORESOFTRESET (and even
++	 * DCTL.CSFTRST) can drop PRTCAPDIR back to host mode and clear the
++	 * USBTRDTIM/PHY setup, and Linux re-runs dwc3_phy_setup() and
++	 * dwc3_core_setup_global_control() after every reset precisely for
++	 * that reason.
++	 */
++	uint32_t gctl = dwc_rd(GCTL);
++	uint32_t gusb2 = dwc_rd(GUSB2PHYCFG);
++	uint32_t gusb3 = dwc_rd(GUSB3PIPECTL);
++
++	if (flags & UD_F_FULLRESET) {
++		/* Linux dwc3_core_soft_reset(): take the core and both PHYs
++		 * through reset instead of only the device controller. */
++		dwc_wr(GCTL, gctl | GCTL_CORESOFTRESET);
++		dwc_wr(GUSB3PIPECTL, gusb3 | PHYSOFTRST);
++		dwc_wr(GUSB2PHYCFG, gusb2 | PHYSOFTRST);
++		delay(100000);
++		dwc_wr(GUSB3PIPECTL, gusb3 & ~PHYSOFTRST);
++		dwc_wr(GUSB2PHYCFG, gusb2 & ~PHYSOFTRST);
++		delay(100000);
++		dwc_wr(GCTL, gctl & ~GCTL_CORESOFTRESET);
++		delay(100000);
++	}
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+ 		delay(1000);
+ 	}
+-	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+-	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++		printf("  soft reset STUCK after %d ms\n", i);
++		return -1;
++	}
++	dwc_wr(GCTL, gctl);
++	dwc_wr(GUSB2PHYCFG, gusb2);
++	dwc_wr(GUSB3PIPECTL, gusb3);
++	return 0;
++}
++
++/*
++ * Force the wrapper to report a valid VBUS session. Linux's dwc3-qcom does
++ * this at probe time (dwc3_qcom_vbus_override_enable), long before any
++ * endpoint is configured; this driver only did it after endpoint 0 came up,
++ * which is to say never. A device that never sees VBUS never leaves the
++ * disconnected state, and the core has no reason to run the endpoint
++ * command engine.
++ */
++static void
++ud_vbus_override(void)
++{
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	if (qs == 0) {
++		printf("SWEET USB: QSCRATCH map failed\n");
+ 		return;
+ 	}
++	uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
++	uint32_t ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
++	printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
++	    hs, ss, usb_rd(qs, 0x08));
++	*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL;
++	*(volatile uint32_t *)(qs + QSCRATCH_SS_PHY_CTRL) = ss | LANE0_PWR_PRESENT;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(1000);
++	printf("SWEET USB: VBUS override on: HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n",
++	    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
++}
+ 
++static int
++ud_try(const char *tag, unsigned flags)
++{
++	printf("SWEET USB: try %s (flags 0x%x)\n", tag, flags);
++	if (flags & UD_F_NORESET) {
++		/*
++		 * ABL hands over a controller that was working seconds ago,
++		 * halted but with its PHY and global setup intact. Every
++		 * earlier attempt started with DCTL.CSFTRST and then had to
++		 * put that setup back by hand; if the reset is what breaks it,
++		 * no amount of re-programming helps. So leave it untouched.
++		 */
++		printf("  %s: no reset, DCTL 0x%08x DSTS 0x%08x GCTL 0x%08x DALEPENA 0x%08x\n",
++		    tag, dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(GCTL), dwc_rd(DALEPENA));
++	} else if (ud_core_reset(flags)) {
++		printf("  %s: FAILED at reset\n", tag);
++		return -1;
++	}
++	if (flags & UD_F_VBUS) {
++		ud_vbus_override();
++	}
++	if (flags & UD_F_CLKGT) {
++		dwc_wr(GCTL, dwc_rd(GCTL) | GCTL_DSBLCLKGTNG);
++		printf("  %s: GCTL 0x%08x (DSBLCLKGTNG set)\n", tag, dwc_rd(GCTL));
++	}
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+ 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+ 	ud.evt_pos = 0;
+-	printf("SWEET USB: evt buf programmed: ADR 0x%08x%08x SIZ 0x%08x COUNT %u\n",
+-	    dwc_rd(GEVNTADRHI), dwc_rd(GEVNTADRLO), dwc_rd(GEVNTSIZ), dwc_rd(GEVNTCOUNT) & 0xffff);
+ 
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+-	/* Events: disconnect, USB reset, connect done */
+ 	dwc_wr(DEVTEN, 0x7);
+ 
+-	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
++	if (flags & UD_F_DALEPENA) {
++		dwc_wr(DALEPENA, 0x3);
++	}
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+ 	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+ 	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+ 	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+ 	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		printf("SWEET USB: endpoint 0 setup failed\n");
++		printf("  %s: FAILED at endpoint config\n", tag);
++		return -1;
++	}
++	dwc_wr(DALEPENA, 0x3);
++	ud_fifo_dump();
++	printf("  %s: endpoint 0 configured OK\n", tag);
++	return 0;
++}
++
++static void
++sweet_usb_gadget_start(vm_offset_t dwc)
++{
++	thread_t thread;
++
++	ud.dwc = dwc;
++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET USB: no DMA memory\n");
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
++	if (!pn) {
++		return;
++	}
++	ud.dma_pa = ptoa_64(pn);
++	printf("SWEET USB: DMA buffer pa 0x%llx (%s 4GiB) UD_SIZE 0x%x UD_EVT 0x%x\n",
++	    ud.dma_pa, ud.dma_pa >= 0x100000000ULL ? ">=" : "<", (unsigned)UD_SIZE, (unsigned)UD_EVT);
++	printf("SWEET USB: pre-config GHWPARAMS0 0x%08x GCTL 0x%08x GUSB2PHYCFG 0x%08x DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
++	    dwc_rd(0xc140), dwc_rd(GCTL), dwc_rd(0xc200), dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS));
++	ud_if_create();
++
++	ud_fifo_dump();
++	ud_ahb2phy_probe();
++
++	static const char *names[] = {
++		"noreset", "noreset+vbus", "noreset+dalepena", "noreset+vbus+dalepena", "base"
++	};
++	static const unsigned order[] = {
++		UD_F_NORESET,
++		UD_F_NORESET | UD_F_VBUS,
++		UD_F_NORESET | UD_F_DALEPENA,
++		UD_F_NORESET | UD_F_VBUS | UD_F_DALEPENA,
++		0,
++	};
++	int won = -1;
++	for (unsigned s = 0; s < sizeof(order) / sizeof(order[0]); s++) {
++		if (ud_try(names[s], order[s]) == 0) {
++			won = (int)s;
++			break;
++		}
++	}
++	if (won < 0) {
++		printf("SWEET USB: endpoint 0 setup failed (all strategies)\n");
+ 		return;
+ 	}
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+-	if (qs != 0) {
+-		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+-		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+-		    hs, ss, usb_rd(qs, 0x08));
+-		*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL;
+-		*(volatile uint32_t *)(qs + QSCRATCH_SS_PHY_CTRL) = ss | LANE0_PWR_PRESENT;
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		printf("SWEET USB: VBUS override on: HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n",
+-		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+-	}
++	int i;
++	ud_vbus_override();
+ 
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
