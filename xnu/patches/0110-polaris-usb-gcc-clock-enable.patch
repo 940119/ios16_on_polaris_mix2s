@@ -1,0 +1,99 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1263,12 +1263,86 @@
+ #define GCTL_PRTCAP_MASK   0x00003000u
+ #define GCTL_PRTCAP_DEVICE 0x00002000u
+ 
++static void ud_cfg_linestate(void);
++
+ static void
+ ud_cfg_none(void)
+ {
+ 	printf("SWEET USB:   (no change)\n");
+ }
+ 
++/*
++ * Walk the GCC windows that hold the USB clock branches and switch them on.
++ *
++ * The offsets in usb_cbcr[] came from a different SoC and their readings are
++ * not trustworthy (every one of them printed 0x00000001, which as a CBCR means
++ * "halted" - and a halted master clock would make DEPCFG impossible, which it
++ * is not). So stop reading individual guesses and sweep the two windows that
++ * matter: 0x0f000 for the USB30 prim controller clocks and 0x8c000 for the
++ * USB3 PHY reference clock generator, plus 0x6a000 for the AHB2PHY gate.
++ *
++ * Bit 0 is CLK_OFF in a CBCR and CLK_ENABLE in an RCG CMD register, so
++ * clearing it is the enable action in both cases. Every write is printed with
++ * its before and after value so a wrong offset can be spotted and undone.
++ */
++static const struct { uint32_t base, len; const char *name; } ud_clk_win[] = {
++	{ 0x0000f000, 0x40, "usb30_prim" },
++	{ 0x0008c000, 0x40, "usb3_phy_ref" },
++	{ 0x0006a000, 0x10, "ahb2phy" },
++};
++
++static void
++ud_clk_enable(void)
++{
++	vm_offset_t gcc = ml_io_map(0x00100000, 0x00090000);
++	unsigned w, off;
++
++	if (gcc == 0) {
++		printf("SWEET USB:   GCC map failed\n");
++		return;
++	}
++	for (w = 0; w < sizeof(ud_clk_win) / sizeof(ud_clk_win[0]); w++) {
++		printf("SWEET USB:   gcc %s @0x%05x:", ud_clk_win[w].name, ud_clk_win[w].base);
++		for (off = 0; off < ud_clk_win[w].len; off += 4) {
++			printf(" %02x=%08x", off, usb_rd(gcc, ud_clk_win[w].base + off));
++		}
++		printf("\n");
++	}
++	for (w = 0; w < sizeof(ud_clk_win) / sizeof(ud_clk_win[0]); w++) {
++		for (off = 4; off < ud_clk_win[w].len; off += 4) {
++			uint32_t a = ud_clk_win[w].base + off;
++			uint32_t v = usb_rd(gcc, a);
++			/*
++			 * Offset 0 is never written. On a GCC block the first
++			 * register is usually a BCR, whose bit 0 is an active-low
++			 * block reset - clearing it there would assert a reset
++			 * instead of releasing a clock. The branches all sit at
++			 * 0x04 and above.
++			 */
++			if (v & 1u) {
++				*(volatile uint32_t *)(gcc + a) = v & ~1u;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				delay(100);
++				printf("SWEET USB:   gcc %s+%02x 0x%08x -> 0x%08x (enabled)\n",
++				    ud_clk_win[w].name, off, v, usb_rd(gcc, a));
++			}
++		}
++	}
++	delay(5000);
++}
++
++static void
++ud_cfg_clocks(void)
++{
++	ud_clk_enable();
++	/*
++	 * If the reference clock was the missing piece, the PHY's PLL now locks
++	 * and the core starts sampling the wire - which the same power-down
++	 * test shows immediately.
++	 */
++	ud_cfg_linestate();
++}
++
+ /* One line that says everything the core currently believes about the wire. */
+ static void
+ ud_live_state(const char *tag)
+@@ -1907,8 +1981,8 @@
+ 		void (*apply)(void);
+ 	} cfg[] = {
+ 		{ "A-baseline",     ud_cfg_none },
+-		{ "B-linestate",    ud_cfg_linestate },
+ 		{ "C-phy-live",     ud_cfg_phy_live },
++		{ "D-clocks",       ud_cfg_clocks },
+ 	};
+ 	int saw_event = 0;
+ 	for (unsigned k = 0; k < sizeof(cfg) / sizeof(cfg[0]) && !saw_event; k++) {
