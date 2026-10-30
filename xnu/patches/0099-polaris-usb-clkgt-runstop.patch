@@ -1,0 +1,48 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -963,6 +963,7 @@
+ #define UD_F_VBUS           0x10    /* force the VBUS override before DEPCFG */
+ #define UD_F_PHYINIT        0x20    /* run the DT qusb-phy-init-seq first */
+ #define UD_F_PIPE           0x40    /* point the wrapper at the UTMI clock */
++#define UD_F_RUNSTOP        0x80    /* set DCTL.RUN_STOP before endpoint 0 */
+ 
+ static void
+ ud_fifo_dump(void)
+@@ -1198,6 +1199,18 @@
+ 	printf("  %s: pre-ep0 GUSB2PHYCFG 0x%08x GSTS 0x%08x DSTS 0x%08x\n",
+ 	    tag, dwc_rd(GUSB2PHYCFG), dwc_rd(GSTS), dwc_rd(DSTS));
+ 
++	if (flags & UD_F_RUNSTOP) {
++		/*
++		 * Linux sets RUN_STOP only after the endpoints are configured.
++		 * Some cores will not retire an endpoint command while the
++		 * device controller is halted, so try it the other way round.
++		 */
++		dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++		delay(1000);
++		printf("  %s: RUN_STOP first, DCTL 0x%08x DSTS 0x%08x\n",
++		    tag, dwc_rd(DCTL), dwc_rd(DSTS));
++	}
++
+ 	if (flags & UD_F_DALEPENA) {
+ 		dwc_wr(DALEPENA, 0x3);
+ 	}
+@@ -1265,12 +1278,14 @@
+ 	 * it is the old shortlist, ordered cheapest first.
+ 	 */
+ 	static const char *names[] = {
+-		"phy", "phy+pipe+vbus", "phy+noreset+pipe"
++		"phy+clkgt", "phy+clkgt+pipe+vbus", "phy+clkgt+runstop",
++		"phy+clkgt+runstop+pipe+vbus"
+ 	};
+ 	static const unsigned order[] = {
+-		UD_F_PHYINIT,
+-		UD_F_PHYINIT | UD_F_PIPE | UD_F_VBUS,
+-		UD_F_PHYINIT | UD_F_NORESET | UD_F_PIPE,
++		UD_F_PHYINIT | UD_F_CLKGT,
++		UD_F_PHYINIT | UD_F_CLKGT | UD_F_PIPE | UD_F_VBUS,
++		UD_F_PHYINIT | UD_F_CLKGT | UD_F_RUNSTOP,
++		UD_F_PHYINIT | UD_F_CLKGT | UD_F_RUNSTOP | UD_F_PIPE | UD_F_VBUS,
+ 	};
+ 	int won = -1;
+ 	for (unsigned s = 0; s < sizeof(order) / sizeof(order[0]); s++) {
