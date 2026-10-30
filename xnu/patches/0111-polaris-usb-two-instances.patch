@@ -1,0 +1,165 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1263,8 +1263,6 @@
+ #define GCTL_PRTCAP_MASK   0x00003000u
+ #define GCTL_PRTCAP_DEVICE 0x00002000u
+ 
+-static void ud_cfg_linestate(void);
+-
+ static void
+ ud_cfg_none(void)
+ {
+@@ -1285,65 +1283,54 @@
+  * clearing it is the enable action in both cases. Every write is printed with
+  * its before and after value so a wrong offset can be spotted and undone.
+  */
+-static const struct { uint32_t base, len; const char *name; } ud_clk_win[] = {
+-	{ 0x0000f000, 0x40, "usb30_prim" },
+-	{ 0x0008c000, 0x40, "usb3_phy_ref" },
+-	{ 0x0006a000, 0x10, "ahb2phy" },
+-};
++static void ud_live_state(const char *tag);
+ 
++/*
++ * Dump one USB instance: controller, wrapper and PHY, read-only.
++ *
++ * Nothing is written. After 0110 wrote to the wrong GCC bits and darkened the
++ * whole block, the point of this build is to look and not touch.
++ */
+ static void
+-ud_clk_enable(void)
++ud_dump_instance(const char *name, uint32_t core_pa, uint32_t qs_pa, uint32_t phy_pa)
+ {
+-	vm_offset_t gcc = ml_io_map(0x00100000, 0x00090000);
+-	unsigned w, off;
++	vm_offset_t c = ml_io_map(core_pa, DWC3_SIZE);
++	vm_offset_t q = ml_io_map(qs_pa, 0x100);
++	vm_offset_t p = ml_io_map(phy_pa, QUSB2_SIZE);
+ 
+-	if (gcc == 0) {
+-		printf("SWEET USB:   GCC map failed\n");
++	if (c == 0 || q == 0 || p == 0) {
++		printf("SWEET USB:   %s map failed c=%d q=%d p=%d\n", name, !!c, !!q, !!p);
+ 		return;
+ 	}
+-	for (w = 0; w < sizeof(ud_clk_win) / sizeof(ud_clk_win[0]); w++) {
+-		printf("SWEET USB:   gcc %s @0x%05x:", ud_clk_win[w].name, ud_clk_win[w].base);
+-		for (off = 0; off < ud_clk_win[w].len; off += 4) {
+-			printf(" %02x=%08x", off, usb_rd(gcc, ud_clk_win[w].base + off));
+-		}
+-		printf("\n");
+-	}
+-	for (w = 0; w < sizeof(ud_clk_win) / sizeof(ud_clk_win[0]); w++) {
+-		for (off = 4; off < ud_clk_win[w].len; off += 4) {
+-			uint32_t a = ud_clk_win[w].base + off;
+-			uint32_t v = usb_rd(gcc, a);
+-			/*
+-			 * Offset 0 is never written. On a GCC block the first
+-			 * register is usually a BCR, whose bit 0 is an active-low
+-			 * block reset - clearing it there would assert a reset
+-			 * instead of releasing a clock. The branches all sit at
+-			 * 0x04 and above.
+-			 */
+-			if (v & 1u) {
+-				*(volatile uint32_t *)(gcc + a) = v & ~1u;
+-				__asm__ volatile ("dsb sy" ::: "memory");
+-				delay(100);
+-				printf("SWEET USB:   gcc %s+%02x 0x%08x -> 0x%08x (enabled)\n",
+-				    ud_clk_win[w].name, off, v, usb_rd(gcc, a));
+-			}
+-		}
+-	}
+-	delay(5000);
++	printf("SWEET USB:   --- %s core 0x%08x qs 0x%08x phy 0x%08x ---\n",
++	    name, core_pa, qs_pa, phy_pa);
++	printf("SWEET USB:   %s ID 0x%08x HW0 0x%08x GCTL 0x%08x GSTS 0x%08x\n", name,
++	    usb_rd(c, 0xc120), usb_rd(c, 0xc140), usb_rd(c, GCTL), usb_rd(c, GSTS));
++	printf("SWEET USB:   %s GUSB2PHYCFG 0x%08x DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x DEVTEN 0x%08x\n",
++	    name, usb_rd(c, GUSB2PHYCFG), usb_rd(c, DCFG), usb_rd(c, DCTL),
++	    usb_rd(c, DSTS), usb_rd(c, DEVTEN));
++	printf("SWEET USB:   %s GEVNTADR 0x%08x%08x SIZ 0x%08x COUNT 0x%08x DALEPENA 0x%08x\n",
++	    name, usb_rd(c, GEVNTADRHI), usb_rd(c, GEVNTADRLO), usb_rd(c, GEVNTSIZ),
++	    usb_rd(c, GEVNTCOUNT), usb_rd(c, DALEPENA));
++	printf("SWEET USB:   %s QS 00 0x%08x 04 0x%08x 08 0x%08x 0c 0x%08x 10 0x%08x 14 0x%08x 30 0x%08x\n",
++	    name, usb_rd(q, 0x00), usb_rd(q, 0x04), usb_rd(q, 0x08), usb_rd(q, 0x0c),
++	    usb_rd(q, 0x10), usb_rd(q, 0x14), usb_rd(q, 0x30));
++	printf("SWEET USB:   %s PHY 004 0x%02x 1a0 0x%02x 1a4 0x%02x 1b0 0x%02x 210 0x%02x 240 0x%02x 254 0x%02x 2a0 0x%02x\n",
++	    name, (unsigned)(usb_rd(p, 0x004) & 0xff), (unsigned)(usb_rd(p, 0x1a0) & 0xff),
++	    (unsigned)(usb_rd(p, 0x1a4) & 0xff), (unsigned)(usb_rd(p, 0x1b0) & 0xff),
++	    (unsigned)(usb_rd(p, 0x210) & 0xff), (unsigned)(usb_rd(p, 0x240) & 0xff),
++	    (unsigned)(usb_rd(p, 0x254) & 0xff), (unsigned)(usb_rd(p, 0x2a0) & 0xff));
+ }
+ 
+ static void
+-ud_cfg_clocks(void)
+-{
+-	ud_clk_enable();
+-	/*
+-	 * If the reference clock was the missing piece, the PHY's PLL now locks
+-	 * and the core starts sampling the wire - which the same power-down
+-	 * test shows immediately.
+-	 */
+-	ud_cfg_linestate();
++ud_cfg_instances(void)
++{
++	ud_dump_instance("prim", 0x0a600000, 0x0a6f8800, 0x088e2000);
++	ud_dump_instance("sec ", 0x0a800000, 0x0a8f8800, 0x088e3000);
++	ud_live_state("prim");
+ }
+ 
+-/* One line that says everything the core currently believes about the wire. */
++/* One line that says everything the core currently believes about the wire. *//* One line that says everything the core currently believes about the wire. */
+ static void
+ ud_live_state(const char *tag)
+ {
+@@ -1356,41 +1343,6 @@
+ }
+ 
+ /*
+- * The self-contained linestate test.
+- *
+- * Powering the QUSB2 PHY down is a guaranteed disconnect from the PHY's side:
+- * the pull-up goes, the transceiver stops, and any core that is actually
+- * sampling the UTMI linestate has to see it. So run the sequence and print the
+- * core's opinion at each step, then say which of the two cases the readings
+- * support. No cable movement, no timing, no user.
+- */
+-static void
+-ud_cfg_linestate(void)
+-{
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	uint32_t cs_off;
+-
+-	if (phy == 0) {
+-		printf("SWEET USB:   PHY map failed\n");
+-		return;
+-	}
+-	ud_live_state("before");
+-	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, 0x23);
+-	ud_sleep_ms(1500);
+-	printf("SWEET USB:   PHY POWERDOWN 0x%02x\n", qusb2_rd(phy, QUSB2_PORT_POWERDOWN));
+-	ud_live_state("phy-off");
+-	cs_off = dwc_rd(DSTS) & 1;
+-	ud_qusb2_init();
+-	ud_sleep_ms(1000);
+-	ud_live_state("phy-on");
+-	if (cs_off != (dwc_rd(DSTS) & 1)) {
+-		printf("SWEET USB:   VERDICT: linestate is live - CS follows the PHY\n");
+-	} else {
+-		printf("SWEET USB:   VERDICT: linestate is FROZEN - CS did not move when the PHY was powered down\n");
+-	}
+-}
+-
+-/*
+  * Power the PHY down and back up with the core already running, which is the
+  * order a real hot-plug produces. Every earlier power cycle happened while the
+  * core was halted, so the core was not watching when the PHY came back.
+@@ -1982,7 +1934,7 @@
+ 	} cfg[] = {
+ 		{ "A-baseline",     ud_cfg_none },
+ 		{ "C-phy-live",     ud_cfg_phy_live },
+-		{ "D-clocks",       ud_cfg_clocks },
++		{ "D-instances",    ud_cfg_instances },
+ 	};
+ 	int saw_event = 0;
+ 	for (unsigned k = 0; k < sizeof(cfg) / sizeof(cfg[0]) && !saw_event; k++) {
