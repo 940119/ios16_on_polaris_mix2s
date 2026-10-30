@@ -1,0 +1,242 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1130,6 +1130,99 @@
+ 	    g, usb_rd(qs, QSCRATCH_GENERAL_CFG));
+ }
+ 
++/*
++ * Force a real detach.
++ *
++ * Clearing DCTL.RUN_STOP halts the core, and a halted core drives the UTMI
++ * pull-down instead of the D+ pull-up. That matters because a host only
++ * issues a bus reset when it observes a *new* connect: ABL left this port
++ * enumerated for fastboot and never dropped the pull-up on hand-off, so by
++ * the time this driver runs the host has a device it already gave up on and
++ * has no reason to reset it. Build 0105 waited three seconds in exactly that
++ * state and saw zero events.
++ *
++ * power_cycle is the harder version: it takes the QUSB2 PHY itself down and
++ * back up, which changes the D+ line even if the core's halt does not, and
++ * also clears any half-finished HS handshake left over from ABL.
++ */
++static void
++ud_detach(const char *tag, unsigned hold_ms, int power_cycle)
++{
++	vm_offset_t phy;
++	uint32_t d;
++	int i;
++
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	for (i = 0; i < 200; i++) {
++		d = dwc_rd(DSTS);
++		if (d & DSTS_DEVCTRLHLT) {
++			break;
++		}
++		delay(1000);
++	}
++	d = dwc_rd(DSTS);
++	printf("SWEET USB: detach %s: DCTL 0x%08x DSTS 0x%08x (halt %d cs %d after %d ms)\n",
++	    tag, dwc_rd(DCTL), d, !!(d & DSTS_DEVCTRLHLT), !!(d & 1), i);
++	ud_sleep_ms(hold_ms);
++	if (!power_cycle) {
++		return;
++	}
++	phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	if (phy == 0) {
++		printf("SWEET USB: detach %s: PHY map failed, halt only\n", tag);
++		return;
++	}
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN,
++	    qusb2_rd(phy, QUSB2_PORT_POWERDOWN) | QUSB2_POWER_DOWN);
++	ud_sleep_ms(300);
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN,
++	    qusb2_rd(phy, QUSB2_PORT_POWERDOWN) & ~QUSB2_POWER_DOWN);
++	ud_sleep_ms(200);
++	printf("SWEET USB: detach %s: PHY power cycled, POWERDOWN 0x%02x PLL 0x%02x\n",
++	    tag, qusb2_rd(phy, QUSB2_PORT_POWERDOWN),
++	    qusb2_rd(phy, QUSB2_PLL_STATUS));
++}
++
++/*
++ * Raise the pull-up and drain the event ring for up to ms milliseconds.
++ * Returns 1 for DWC3_DEVICE_EVENT_RESET, 0 for other traffic, -1 for silence.
++ * Every event is printed as it is read, so the log shows what the host does
++ * even when it is not the reset we are waiting for.
++ */
++static int
++ud_attach_and_wait(const char *tag, unsigned ms)
++{
++	int seen = 0;
++	int w;
++
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	for (w = 0; w < (int)(ms / 5); w++) {
++		uint32_t cnt;
++		int drained = 0;
++
++		/* The controller writes the ring behind the CPU's back. */
++		ud_sync(UD_EVT, UD_EVT_SIZE);
++		while ((cnt = dwc_rd(GEVNTCOUNT) & 0xffff) != 0 && drained < 16) {
++			uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++			printf("SWEET USB: %s event 0x%08x at %d ms (count %u DSTS 0x%08x)\n",
++			    tag, ev, w * 5, cnt, dwc_rd(DSTS));
++			ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++			dwc_wr(GEVNTCOUNT, 4);
++			seen++;
++			drained++;
++			if ((ev & 0xff) == 1) {
++				printf("SWEET USB: %s BUS RESET at %d ms (DSTS 0x%08x)\n",
++				    tag, w * 5, dwc_rd(DSTS));
++				return 1;
++			}
++		}
++		ud_sleep_ms(5);
++	}
++	printf("SWEET USB: %s nothing in %d ms (DSTS 0x%08x)\n",
++	    tag, (int)ms, dwc_rd(DSTS));
++	return seen ? 0 : -1;
++}
++
+ static void
+ ud_ahb2phy_probe(void)
+ {
+@@ -1666,96 +1759,57 @@
+ 	printf("SWEET USB: step 1/6 DALEPENA\n");
+ 	dwc_wr(DALEPENA, 0x3);
+ 
+-	printf("SWEET USB: step 2/6 RUN_STOP\n");
+-	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+-	int i;
+-	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+-		delay(1000);
+-	}
+-	printf("SWEET USB: step 2/6 DSTS 0x%08x after %d ms\n", dwc_rd(DSTS), i);
+-
+ 	/*
+-	 * Soft connect last: raising the D+ pull-up before the gadget is armed
+-	 * invites a bus reset the core is not listening for, because this
+-	 * driver deliberately runs without interrupts.
++	 * Park the core halted before anything else. Two measured facts put this
++	 * order in place, and build 0105 is where both came from:
++	 *
++	 *  - Step 2 used to *raise* RUN_STOP, and the very first read after it
++	 *    already showed DEVCTRLHLT clear and CS set, i.e. the core had been
++	 *    running with the D+ pull-up up ever since ABL. The host therefore
++	 *    never saw a connect of its own and never reset us.
++	 *  - The old bounce then cleared RUN_STOP to "reconnect", which is a
++	 *    halt, waited for events with the device detached, and left the core
++	 *    halted: DSTS 0x00d20001 at the end of the log.
++	 *
++	 * So: detach, hold it long enough for the host's port state machine to
++	 * notice, arm the ring, then attach and listen.
+ 	 */
+-	printf("SWEET USB: step 3/6 connect (VBUS valid + D+ pull-up)\n");
+-	ud_vbus_override();
+-	ud_hsphy_connect();
++	printf("SWEET USB: step 2/6 detach (drop the D+ pull-up)\n");
++	ud_detach("initial", 800, 0);
++
++	printf("SWEET USB: step 3/6 arm the event ring\n");
++	ud_sync(UD_EVT, UD_EVT_SIZE);
++	ud.evt_pos = 0;
++	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
++	printf("SWEET USB: step 3/6 GEVNTCOUNT 0x%08x GEVNTSIZ 0x%08x DEVTEN 0x%08x\n",
++	    dwc_rd(GEVNTCOUNT) & 0xffff, dwc_rd(GEVNTSIZ), dwc_rd(DEVTEN));
+ 
+-	printf("SWEET USB: step 4/6 GEVNTCOUNT 0x%08x DEVTEN 0x%08x DCTL 0x%08x\n",
+-	    dwc_rd(GEVNTCOUNT) & 0xffff, dwc_rd(DEVTEN), dwc_rd(DCTL));
+ 	/*
+-	 * Nothing may be started until the host has reset the bus.
+-	 *
+-	 * Both previous builds called ud_start_setup() here, i.e. issued
+-	 * DEPCMD_STARTTRANSFER on ep0 against a device the host had not
+-	 * addressed yet, and never returned from it. Instead, poll the event
+-	 * ring and say what the host is actually doing. A device event 1 is
+-	 * DWC3_DEVICE_EVENT_RESET - that is the point a gadget may arm ep0.
++	 * Three attaches, each with a harder detach before it: plain halt, then
++	 * a real QUSB2 power cycle, then power cycle again. If the host is going
++	 * to reset us it will do so within a few milliseconds of the connect,
++	 * so 4 s per attempt is generous; the whole loop is still short enough
++	 * to sit in the boot path.
+ 	 */
+-	printf("SWEET USB: step 5/6 wait for bus activity (DEVTEN 0x%08x)\n", dwc_rd(DEVTEN));
+-	{
+-		int saw_event = 0;
+-		for (int w = 0; w < 300; w++) {
+-			uint32_t cnt = dwc_rd(GEVNTCOUNT) & 0xffff;
+-			if (cnt) {
+-				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+-				printf("SWEET USB: event 0x%08x at %d ms (count %u DSTS 0x%08x)\n",
+-				    ev, w * 10, cnt, dwc_rd(DSTS));
+-				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
+-				dwc_wr(GEVNTCOUNT, 4);
+-				if ((ev & 0xf) == 1) {
+-					saw_event = 1;
+-					break;
+-				}
+-			}
+-			ud_sleep_ms(10);
+-		}
+-		printf("SWEET USB: bus wait done, reset seen %d, DSTS 0x%08x GSTS 0x%08x\n",
+-		    saw_event, dwc_rd(DSTS), dwc_rd(GSTS));
+-		if (!saw_event) {
+-			/*
+-			 * No reset means the host never saw a device appear. The D+
+-			 * pull-up in this core is the complement of DCTL.RUN_STOP,
+-			 * so bounce it: disconnect, wait, reconnect. A host that
+-			 * missed the first attach usually enumerates on the second.
+-			 */
+-			printf("SWEET USB: no reset, bouncing RUN_STOP for a second attach\n");
+-			dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+-			ud_sleep_ms(200);
+-			printf("SWEET USB: disconnected, DSTS 0x%08x\n", dwc_rd(DSTS));
+-			dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
+-			for (int w2 = 0; w2 < 300; w2++) {
+-				uint32_t cnt = dwc_rd(GEVNTCOUNT) & 0xffff;
+-				if (cnt) {
+-					uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+-					printf("SWEET USB: event 0x%08x at %d ms after bounce (DSTS 0x%08x)\n",
+-					    ev, w2 * 10, dwc_rd(DSTS));
+-					ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
+-					dwc_wr(GEVNTCOUNT, 4);
+-					if ((ev & 0xf) == 1) {
+-						saw_event = 1;
+-						break;
+-					}
+-				}
+-				ud_sleep_ms(10);
+-			}
+-			printf("SWEET USB: after bounce, reset seen %d DSTS 0x%08x\n",
+-			    saw_event, dwc_rd(DSTS));
+-		}
+-		/*
+-		 * Only arm endpoint 0 once the host has reset us; doing it earlier
+-		 * is what wedged the two previous boots.
+-		 */
+-		if (saw_event) {
+-			printf("SWEET USB: step 5/6 arming ep0 SETUP after reset\n");
+-			ud_start_setup();
+-		} else {
+-			printf("SWEET USB: step 5/6 skipped: host never reset the bus\n");
++	printf("SWEET USB: step 4/6 attach and wait for a bus reset\n");
++	int saw_event = 0;
++	static const char *const atag[] = { "attach1", "attach2", "attach3" };
++	for (int a2 = 0; a2 < 3 && !saw_event; a2++) {
++		if (a2 > 0) {
++			ud_detach(atag[a2], 600, a2 > 1);
++		}
++		if (ud_attach_and_wait(atag[a2], 4000) > 0) {
++			saw_event = 1;
+ 		}
+ 	}
+ 
++	printf("SWEET USB: step 5/6 %s (DSTS 0x%08x GSTS 0x%08x)\n",
++	    saw_event ? "bus reset seen, arming ep0 SETUP" : "host never reset the bus",
++	    dwc_rd(DSTS), dwc_rd(GSTS));
++	if (saw_event) {
++		ud_start_setup();
++	}
++
+ 	printf("SWEET USB: step 6/6 threads, DMA at 0x%llx\n", ud.dma_pa);
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
