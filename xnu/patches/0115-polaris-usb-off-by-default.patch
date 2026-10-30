@@ -1,0 +1,43 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -76,11 +76,21 @@
+ void
+ sweet_usb_probe(void)
+ {
+-	int enabled = 1;
++	int enabled = 0;
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
++	/*
++	 * sweetusb=0 (default) does nothing at all, 1 reports the controller's
++	 * state from registers that are always powered, 2 also touches the PHY
++	 * and starts the device.
++	 *
++	 * Off by default because this is not a working driver yet, and because
++	 * build 0112 showed what a single untoward access costs: its first PHY
++	 * access was a read, and the core stopped there instead of faulting.
++	 * A phone that boots is worth more than a diagnostic line, so the
++	 * diagnostics have to be asked for.
++	 */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		return;
+@@ -118,6 +128,16 @@
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
++	}
++	/*
++	 * Everything below reads the PHY, which is the one block that has
++	 * stopped this kernel before: it is not clocked the way this code
++	 * assumed, so a read waits instead of returning. Level 1 therefore
++	 * stops here, with the report above it complete, and only level 2 goes
++	 * on to the PHY.
++	 */
++	if (enabled < 2) {
++		return;
+ 	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
