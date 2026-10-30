@@ -1,0 +1,153 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1091,12 +1091,20 @@
+ 		printf("SWEET USB: QUSB2 map failed\n");
+ 		return -1;
+ 	}
++	/*
++	 * Write before reading. 0112 proved this the hard way: the first PHY
++	 * access of that build was a read and the core stopped there, because
++	 * a read to a block that is not answering waits instead of failing.
++	 * 0x23 is the byte ABL runs this port with and the byte that keeps
++	 * PLL_STATUS at 0x64; the old code cleared bit 0 and got 0x17.
++	 */
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, 0x23);
++
+ 	uint32_t pll0 = qusb2_rd(phy, QUSB2_PLL_STATUS);
+ 	uint32_t pd0  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
+ 	printf("SWEET USB: QUSB2 resume in: PLL_STATUS 0x%02x POWERDOWN 0x%02x TUNE1 0x%02x\n",
+ 	    pll0, pd0, qusb2_rd(phy, QUSB2_PORT_TUNE1));
+ 
+-	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, pd0 & ~QUSB2_POWER_DOWN);
+ 	delay(200);
+ 
+ 	uint32_t pd  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
+@@ -1305,44 +1313,25 @@
+ }
+ 
+ /*
+- * Attempt A: write nothing.
++ * Attempt A: one write, no read.
+  *
+- * ABL runs this port at high speed for fastboot, so the PHY it hands over is
+- * a known-good one and the driver's only job is not to spoil it. The two DSTS
+- * reads are there to settle the question 0109 raised: if the core really is
+- * clocked by the PHY, DSTS at least has to be able to change. Reads only.
+- */
+-static void
+-ud_cfg_abl_phy(void)
+-{
+-	uint32_t d1, d2;
+-
+-	ud_phy_state("A-in");
+-	d1 = dwc_rd(DSTS);
+-	ud_sleep_ms(120);
+-	d2 = dwc_rd(DSTS);
+-	printf("SWEET USB:   DSTS 0x%08x then 0x%08x (%s)\n", d1, d2,
+-	    d1 == d2 ? "identical" : "CHANGED");
+-}
+-
+-/*
+- * Attempt B: put back the exact byte ABL was running with.
+- *
+- * This is the controlled version of attempt A's premise. If clear bit 0 is
+- * what killed the lock, then setting it again has to bring the lock back -
+- * and the log will show whether it does.
+- */
+-static void
+-ud_cfg_pd23(void)
++ * 0x23 is the byte ABL was running this port with, and per the 0106 sweep it
++ * is also the byte that keeps the PLL locked: clearing bit 0 dropped
++ * PLL_STATUS from 0x64 to 0x17 and it never came back. So the whole premise
++ * is "stop clearing it" and this write makes that explicit rather than
++ * implicit. It is a write because a read here is what killed 0112.
++ */
++static void
++ud_cfg_keep23(void)
+ {
+ 	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+ 
+ 	if (phy == 0) {
++		printf("SWEET USB:   PHY map failed\n");
+ 		return;
+ 	}
+ 	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, 0x23);
+-	ud_sleep_ms(30);
+-	ud_phy_state("B-out");
++	printf("SWEET USB:   POWERDOWN <- 0x23 (write only)\n");
+ }
+ 
+ /*
+@@ -1370,20 +1359,20 @@
+ 	qusb2_wr(phy, QUSB2_PORT_TUNE1, 0x57);
+ 	qusb2_wr(phy, 0x230, 0x00);             /* pll_bias, as the stock kernel */
+ 	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, powerdown);
+-	ud_sleep_ms(40);
+-	ud_phy_state(powerdown == 0x23 ? "D-out" : "C-out");
++	printf("SWEET USB:   DT table + TUNE1 0x57, POWERDOWN <- 0x%02x (write only)\n",
++	    powerdown);
+ }
+ 
+ static void
+ ud_cfg_table57(void)
+ {
++	ud_phy_table(0x23);
++}
++
++static void
++ud_cfg_table57off(void)
++{
+ 	ud_phy_table(0x22);
+-}
+-
+-static void
+-ud_cfg_table57pd(void)
+-{
+-	ud_phy_table(0x23);
+ }
+ 
+ /* One line that says everything the core currently believes about the wire. *//* One line that says everything the core currently believes about the wire. */
+@@ -1901,7 +1890,6 @@
+ 	 */
+ 	int phy_touch = 0;
+ 	PE_parse_boot_argn("sweetphytouch", &phy_touch, sizeof(phy_touch));
+-	ud_phy_state("handover");
+ 	if (phy_touch) {
+ 		ud_qusb2_sweep();
+ 		ud_utmi_clk_select();
+@@ -1915,7 +1903,7 @@
+ 		 * endpoint engine needs it. It cannot disturb the PLL.
+ 		 */
+ 		ud_utmi_clk_select();
+-		printf("SWEET USB: PHY untouched (sweetphytouch=0), ABL's state stands\n");
++		printf("SWEET USB: sweep and mux bisect skipped (sweetphytouch=0)\n");
+ 	}
+ 
+ 	/*
+@@ -1992,10 +1980,9 @@
+ 		const char *name;
+ 		void (*apply)(void);
+ 	} cfg[] = {
+-		{ "A-abl-phy",      ud_cfg_abl_phy },
+-		{ "B-pd-0x23",      ud_cfg_pd23 },
+-		{ "C-table-57",     ud_cfg_table57 },
+-		{ "D-table-57-23",  ud_cfg_table57pd },
++		{ "A-keep-0x23",    ud_cfg_keep23 },
++		{ "B-table-57-23",  ud_cfg_table57 },
++		{ "C-table-57-22",  ud_cfg_table57off },
+ 	};
+ 	int saw_event = 0;
+ 	for (unsigned k = 0; k < sizeof(cfg) / sizeof(cfg[0]) && !saw_event; k++) {
+@@ -2044,5 +2031,12 @@
+ 	if (kernel_thread_start(ud_mon_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++
++	/*
++	 * The one PHY read in this build, and it is deliberately last: every
++	 * attach has been tried and both threads are up, so if this read parks
++	 * the core it costs nothing that has not already been printed.
++	 */
++	ud_phy_state("final");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
