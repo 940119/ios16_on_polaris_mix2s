@@ -1,0 +1,218 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -284,10 +284,14 @@
+ static int
+ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ {
++	printf("SWEET USB: epcmd ep%u cmd 0x%x PAR 0x%08x 0x%08x 0x%08x writing\n",
++	    ep, cmd & 0xf, p0, p1, p2);
+ 	dwc_wr(DEPCMDPAR0(ep), p0);
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
++	printf("SWEET USB: epcmd ep%u PAR written, firing DEPCMD\n", ep);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
++	printf("SWEET USB: epcmd ep%u DEPCMD 0x%08x, polling\n", ep, dwc_rd(DEPCMD(ep)));
+ 	/*
+ 	 * delay() is in microseconds here (see the soft-reset loop below, which
+ 	 * uses delay(1000) per millisecond). 1000 iterations of delay(1) were
+@@ -354,22 +358,32 @@
+ static uint8_t ud_txbuf[UD_FRAME_MAX];
+ 
+ /* One TRB (at DMA offset trb) on physical endpoint ep. */
++/*
++ * Statement-level trace, because this call has now killed two boots and the
++ * only thing known about it is that it does not come back. Each step prints
++ * before it happens, so whatever is stuck is the line after the last one
++ * that appeared. That is the difference between guessing and measuring.
++ */
+ static void
+ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
+ {
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
+ 	uint64_t bpa = ud.dma_pa + buf;
+ 
++	printf("SWEET USB: trb ep%u begin buf 0x%llx len %u ctl 0x%x\n", ep, bpa, len, ctl);
+ 	t[0] = (uint32_t)bpa;
+ 	t[1] = (uint32_t)(bpa >> 32);
+ 	t[2] = len;
+ 	t[3] = ctl | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
++	printf("SWEET USB: trb written %08x %08x %08x %08x, syncing\n", t[0], t[1], t[2], t[3]);
+ 	ud_sync(trb, 16);
+ 	if (len) {
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
++	printf("SWEET USB: trb synced, STARTTRANSFER ep%u trb 0x%llx\n", ep, tpa);
+ 	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	printf("SWEET USB: trb ep%u returned\n", ep);
+ }
+ 
+ static void
+@@ -1449,21 +1463,32 @@
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+ 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
++	/*
++	 * Read the event buffer pointer back before trusting it. If the high
++	 * half will not hold a value the core is 32-bit-addressing only, and
++	 * anything above 4 GiB silently points somewhere else.
++	 */
++	printf("SWEET USB: GEVNTADR written 0x%08x%08x reads 0x%08x%08x SIZ 0x%08x\n",
++	    (uint32_t)((ud.dma_pa + UD_EVT) >> 32), (uint32_t)(ud.dma_pa + UD_EVT),
++	    dwc_rd(GEVNTADRHI), dwc_rd(GEVNTADRLO), dwc_rd(GEVNTSIZ));
+ 	ud.evt_pos = 0;
+ 
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+ 	/*
+-	 * DEVTEN off, deliberately. This driver has no interrupt handler at
+-	 * all - it polls the event ring from a thread - but it used to enable
+-	 * device events here. Those are not masked by GEVNTSIZ bit 31 (that
+-	 * one only masks the event-ring interrupt), so as soon as the core saw
+-	 * a connect it would hold its IRQ line high with nobody to clear it,
+-	 * which is one of the two things that can wedge the boot at exactly
+-	 * the point build 0100 stopped.
++	 * Device events on, but delivered only to the event ring.
++	 *
++	 * This driver polls, so it needs DEVTEN set or the core queues no
++	 * connect/reset/setup events at all - and a polled GEVNTCOUNT then
++	 * reads 0 forever no matter what the host does. What it must not do is
++	 * raise an interrupt, and that is GINTMSK's job, not DEVTEN's: GINTMSK
++	 * is left at its reset value of 0, so nothing ever sets the INT bit and
++	 * the core's IRQ line stays low. Build 0100 ran with DEVTEN=0x7 and
++	 * build 0103 with DEVTEN=0 and both died at the same statement, so
++	 * DEVTEN was never the fault.
+ 	 */
+-	dwc_wr(DEVTEN, 0);
++	dwc_wr(DEVTEN, 0x7);
+ 	printf("  %s: pre-ep0 GUSB2PHYCFG 0x%08x GSTS 0x%08x DSTS 0x%08x\n",
+ 	    tag, dwc_rd(GUSB2PHYCFG), dwc_rd(GSTS), dwc_rd(DSTS));
+ 
+@@ -1519,14 +1544,41 @@
+ {
+ 	thread_t thread;
+ 
++	/*
++	 * Below 4 GiB, forced.
++	 *
++	 * Every earlier build allocated this buffer wherever the allocator felt
++	 * like and got 0x103598000, i.e. 4.35 GiB, and the only place that
++	 * address is used is GEVNTADR/TRB - registers whose high halves are
++	 * written on the assumption that the core has 64-bit addressing. If it
++	 * does not, the event ring lives at a truncated address and the core
++	 * writes events somewhere else entirely, which would explain a polled
++	 * GEVNTCOUNT that only ever reads 0. Rather than trust GHWPARAMS0, make
++	 * the address small and take the question away. Retry because the
++	 * allocator hands back whatever it finds first.
++	 */
+ 	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET USB: no DMA memory\n");
+-		return;
++	ppnum_t pn = 0;
++	for (int try_ = 0; try_ < 8; try_++) {
++		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET USB: no DMA memory\n");
++			return;
++		}
++		pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
++		if (!pn) {
++			return;
++		}
++		printf("SWEET USB: DMA try %d -> 0x%llx (%s 4GiB)\n", try_,
++		    ptoa_64(pn), ptoa_64(pn) >= 0x100000000ULL ? ">=" : "<");
++		if (ptoa_64(pn) < 0x100000000ULL) {
++			break;
++		}
++		kmem_free(kernel_map, ud.dma, UD_SIZE);
++		ud.dma = 0;
+ 	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+-	if (!pn) {
++	if (ud.dma == 0) {
++		printf("SWEET USB: no DMA memory below 4GiB\n");
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+@@ -1607,8 +1659,76 @@
+ 
+ 	printf("SWEET USB: step 4/6 GEVNTCOUNT 0x%08x DEVTEN 0x%08x DCTL 0x%08x\n",
+ 	    dwc_rd(GEVNTCOUNT) & 0xffff, dwc_rd(DEVTEN), dwc_rd(DCTL));
+-	printf("SWEET USB: step 5/6 start SETUP transfer\n");
+-	ud_start_setup();
++	/*
++	 * Nothing may be started until the host has reset the bus.
++	 *
++	 * Both previous builds called ud_start_setup() here, i.e. issued
++	 * DEPCMD_STARTTRANSFER on ep0 against a device the host had not
++	 * addressed yet, and never returned from it. Instead, poll the event
++	 * ring and say what the host is actually doing. A device event 1 is
++	 * DWC3_DEVICE_EVENT_RESET - that is the point a gadget may arm ep0.
++	 */
++	printf("SWEET USB: step 5/6 wait for bus activity (DEVTEN 0x%08x)\n", dwc_rd(DEVTEN));
++	{
++		int saw_event = 0;
++		for (int w = 0; w < 300; w++) {
++			uint32_t cnt = dwc_rd(GEVNTCOUNT) & 0xffff;
++			if (cnt) {
++				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++				printf("SWEET USB: event 0x%08x at %d ms (count %u DSTS 0x%08x)\n",
++				    ev, w * 10, cnt, dwc_rd(DSTS));
++				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++				dwc_wr(GEVNTCOUNT, 4);
++				if ((ev & 0xf) == 1) {
++					saw_event = 1;
++					break;
++				}
++			}
++			ud_sleep_ms(10);
++		}
++		printf("SWEET USB: bus wait done, reset seen %d, DSTS 0x%08x GSTS 0x%08x\n",
++		    saw_event, dwc_rd(DSTS), dwc_rd(GSTS));
++		if (!saw_event) {
++			/*
++			 * No reset means the host never saw a device appear. The D+
++			 * pull-up in this core is the complement of DCTL.RUN_STOP,
++			 * so bounce it: disconnect, wait, reconnect. A host that
++			 * missed the first attach usually enumerates on the second.
++			 */
++			printf("SWEET USB: no reset, bouncing RUN_STOP for a second attach\n");
++			dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++			ud_sleep_ms(200);
++			printf("SWEET USB: disconnected, DSTS 0x%08x\n", dwc_rd(DSTS));
++			dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++			for (int w2 = 0; w2 < 300; w2++) {
++				uint32_t cnt = dwc_rd(GEVNTCOUNT) & 0xffff;
++				if (cnt) {
++					uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++					printf("SWEET USB: event 0x%08x at %d ms after bounce (DSTS 0x%08x)\n",
++					    ev, w2 * 10, dwc_rd(DSTS));
++					ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++					dwc_wr(GEVNTCOUNT, 4);
++					if ((ev & 0xf) == 1) {
++						saw_event = 1;
++						break;
++					}
++				}
++				ud_sleep_ms(10);
++			}
++			printf("SWEET USB: after bounce, reset seen %d DSTS 0x%08x\n",
++			    saw_event, dwc_rd(DSTS));
++		}
++		/*
++		 * Only arm endpoint 0 once the host has reset us; doing it earlier
++		 * is what wedged the two previous boots.
++		 */
++		if (saw_event) {
++			printf("SWEET USB: step 5/6 arming ep0 SETUP after reset\n");
++			ud_start_setup();
++		} else {
++			printf("SWEET USB: step 5/6 skipped: host never reset the bus\n");
++		}
++	}
+ 
+ 	printf("SWEET USB: step 6/6 threads, DMA at 0x%llx\n", ud.dma_pa);
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
