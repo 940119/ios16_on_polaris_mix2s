@@ -1,0 +1,163 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -106,6 +106,9 @@ public:
+ 	int32_t       fOffX, fOffY;             /* panel origin of the logical display */
+ 	uint32_t      fContentW, fContentH;     /* panel area the logical display fills */
+ 	int           fScale;                   /* scale the logical display into the panel */
++	int32_t       fSrcOffX;                 /* logical column that lands on panel x 0 */
++	uint64_t      fBlitFrames;              /* panel copies in the current window */
++	uint64_t      fBlitMin, fBlitMax, fBlitSum;     /* mach ticks, per copy */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -177,20 +180,34 @@ AppleCLCD::start(IOService *provider)
+ 	fContentW = fWidth;
+ 	fContentH = fHeight;
+ 	fScale = 0;
++	fSrcOffX = 0;
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+ 	if (!native && polaris) {
+ 		/*
+-		 * Polaris is 1080x2160 (18:9). Fit the whole iPhone X logical
+-		 * display by height (998x2160) instead of cropping it, with
+-		 * black 41-pixel bars on the sides.
++		 * Polaris is 1080x2160 (18:9), the iPhone X logical display is
++		 * 1125x2436 (19.5:9), so the panel is filled by cropping and
++		 * squashing rather than by fitting the whole frame:
++		 *
++		 *   horizontal  1125 -> 1080, cropped 1:1 (22 columns per side,
++		 *               under 8 points, no resampling at all)
++		 *   vertical    2436 -> 2160, nearest row (the same 11.3%
++		 *               squeeze the old fit-by-height scale applied)
++		 *
++		 * The point is that the horizontal mapping is now the identity,
++		 * so every destination row is a single memcpy. The old code
++		 * walked 998x2160 pixels doing 64-bit multiply/shift arithmetic
++		 * on each one, into panel memory that is mapped uncached: that
++		 * is what the comment above AppleCLCD::swap() means by "copying
++		 * 10 MB into the panel on every swap took the whole CPU".
+ 		 */
+-		fContentW = (fLogicalW * fHeight + fLogicalH / 2) / fLogicalH;
++		fContentW = fWidth;
+ 		fContentH = fHeight;
+-		fOffX = (int32_t)(fWidth - fContentW) / 2;
++		fOffX = 0;
+ 		fOffY = 0;
++		fSrcOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 		fScale = 1;
+ 	} else {
+ 		fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+@@ -208,7 +225,8 @@ AppleCLCD::start(IOService *provider)
+ 		return false;
+ 	}
+ 	if (fScale) {
+-		/* Hide the boot splash behind the side bars before the first swap. */
++		/* Clear the boot splash: the panel is now filled edge to edge, so
++		 * nothing outside the first frame's dirty rect may survive. */
+ 		for (uint32_t y = 0; y < fHeight; y++) {
+ 			memset((void *)(fPixels + (uint64_t)y * fRowBytes), 0, (size_t)fWidth * 4);
+ 		}
+@@ -229,8 +247,8 @@ AppleCLCD::start(IOService *provider)
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+-	IOLog("SWEET FB: %s %ux%u content at %d,%d\n", fScale ? "scaling to" : "cropping at",
+-	    fContentW, fContentH, fOffX, fOffY);
++	IOLog("SWEET FB: %s content %ux%u at %d,%d, logical column %d -> panel column 0\n",
++	    fScale ? "filling" : "cropping at", fContentW, fContentH, fOffX, fOffY, fSrcOffX);
+ 	return true;
+ }
+ 
+@@ -441,43 +459,62 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4 && fScale) {
+-			/* Scale the logical rectangle into the panel content area. */
+-			int32_t px0 = fOffX + (int32_t)(((int64_t)dx * fContentW) / fLogicalW);
+-			int32_t py0 = fOffY + (int32_t)(((int64_t)dy * fContentH) / fLogicalH);
+-			int32_t px1 = fOffX + (int32_t)(((int64_t)(dx + w) * fContentW) / fLogicalW);
+-			int32_t py1 = fOffY + (int32_t)(((int64_t)(dy + h) * fContentH) / fLogicalH);
+-			if (px0 < 0) {
+-				px0 = 0;
++			/*
++			 * Fill the panel one destination row at a time. Horizontally
++			 * the logical frame is cropped 1:1, so a row is a plain
++			 * memcpy of wc pixels; vertically 2436 logical rows are
++			 * squeezed into 2160 panel rows, which costs one multiply
++			 * per row instead of one per pixel.
++			 */
++			uint64_t t0 = mach_absolute_time();
++			int32_t sxc = sx;
++			int32_t wc = w;
++			int32_t dx0 = dx - fSrcOffX;
++			if (dx0 < 0) {
++				sxc -= dx0;
++				wc += dx0;
++				dx0 = 0;
+ 			}
++			if (dx0 + wc > (int32_t)fWidth) {
++				wc = (int32_t)fWidth - dx0;
++			}
++			int32_t py0 = (int32_t)(((int64_t)dy * fHeight) / fLogicalH);
++			int32_t py1 = (int32_t)(((int64_t)(dy + h) * fHeight) / fLogicalH);
+ 			if (py0 < 0) {
+ 				py0 = 0;
+ 			}
+-			if (px1 > (int32_t)fWidth) {
+-				px1 = (int32_t)fWidth;
+-			}
+ 			if (py1 > (int32_t)fHeight) {
+ 				py1 = (int32_t)fHeight;
+ 			}
+-			uint64_t xstep = ((uint64_t)fLogicalW << 16) / fContentW;
+-			for (int32_t y = py0; y < py1; y++) {
+-				int32_t ly = (int32_t)(((int64_t)(y - fOffY) * fLogicalH) / fContentH);
+-				int32_t syy = sy + ly - dy;
+-				if (syy < sy || syy >= sy + h) {
+-					continue;
+-				}
+-				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
+-				const uint32_t *srow = (const uint32_t *)(src + s->offset +
+-				    (uint64_t)syy * s->bytesPerRow);
+-				uint64_t xpos = (uint64_t)(px0 - fOffX) * xstep;
+-				for (int32_t x = px0; x < px1; x++) {
+-					int32_t lx = (int32_t)(xpos >> 16);
+-					xpos += xstep;
+-					if (lx < dx || lx >= dx + w) {
++			if (wc > 0) {
++				for (int32_t y = py0; y < py1; y++) {
++					int32_t ly = (int32_t)(((int64_t)y * fLogicalH) / fHeight);
++					int32_t syy = sy + ly - dy;
++					if (syy < sy || syy >= sy + h) {
+ 						continue;
+ 					}
+-					drow[x] = srow[sx + lx - dx];
++					memcpy((void *)(fPixels + (uint64_t)y * fRowBytes + (uint64_t)dx0 * 4),
++					    (const void *)(src + s->offset +
++					    (uint64_t)syy * s->bytesPerRow + (uint64_t)sxc * 4),
++					    (size_t)wc * 4);
+ 				}
+ 			}
++			uint64_t dt = mach_absolute_time() - t0;
++			if (fBlitFrames == 0 || dt < fBlitMin) {
++				fBlitMin = dt;
++			}
++			if (dt > fBlitMax) {
++				fBlitMax = dt;
++			}
++			fBlitSum += dt;
++			if ((++fBlitFrames % 300) == 0 && fBlitSum != 0) {
++				IOLog("SWEET FB: blit over %llu frames: min %llu us, avg %llu us, max %llu us\n",
++				    fBlitFrames, absolutetime_to_nanoseconds(fBlitMin) / 1000,
++				    absolutetime_to_nanoseconds(fBlitSum / fBlitFrames) / 1000,
++				    absolutetime_to_nanoseconds(fBlitMax) / 1000);
++				fBlitFrames = 0;
++				fBlitMin = fBlitMax = fBlitSum = 0;
++			}
+ 		} else if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
