@@ -1,0 +1,177 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1223,6 +1223,97 @@
+ 	return seen ? 0 : -1;
+ }
+ 
++/*
++ * The attach bisect. Each entry changes one more thing on a halted core, then
++ * ud_attach_and_wait() raises the pull-up and listens. The winner is whichever
++ * one makes the host reset the bus.
++ */
++#define GCTL_PRTCAP_MASK   0x00003000u
++#define GCTL_PRTCAP_DEVICE 0x00002000u
++
++static void
++ud_cfg_none(void)
++{
++	printf("SWEET USB:   (no change)\n");
++}
++
++static void
++ud_cfg_device(void)
++{
++	uint32_t g = dwc_rd(GCTL);
++	dwc_wr(GCTL, (g & ~GCTL_PRTCAP_MASK) | GCTL_PRTCAP_DEVICE);
++	printf("SWEET USB:   GCTL 0x%08x -> 0x%08x (PrtCapDir device)\n",
++	    g, dwc_rd(GCTL));
++}
++
++static void
++ud_cfg_hs(void)
++{
++	uint32_t d = dwc_rd(DCFG);
++	dwc_wr(DCFG, d & ~0x7u);
++	printf("SWEET USB:   DCFG 0x%08x -> 0x%08x (DevSpd high-speed)\n",
++	    d, dwc_rd(DCFG));
++}
++
++static void
++ud_cfg_wrapper(void)
++{
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	uint32_t g, h;
++	if (qs == 0) {
++		printf("SWEET USB:   QSCRATCH map failed\n");
++		return;
++	}
++	g = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	*(volatile uint32_t *)(qs + QSCRATCH_GENERAL_CFG) =
++	    (g & ~PIPE_UTMI_CLK_DIS) | PIPE_UTMI_CLK_SEL | (1u << 3);
++	h = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
++	*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = h | (1u << 20) | (1u << 28);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(1000);
++	printf("SWEET USB:   GENERAL_CFG 0x%08x -> 0x%08x HS_PHY_CTRL 0x%08x -> 0x%08x\n",
++	    g, usb_rd(qs, QSCRATCH_GENERAL_CFG), h, usb_rd(qs, QSCRATCH_HS_PHY_CTRL));
++}
++
++static void
++ud_cfg_phy(void)
++{
++	uint32_t g2 = dwc_rd(GUSB2PHYCFG);
++	dwc_wr(GUSB2PHYCFG, g2 | PHYSOFTRST);
++	delay(1000);
++	dwc_wr(GUSB2PHYCFG, (g2 & ~PHYSOFTRST) & ~(1u << 6));
++	delay(1000);
++	printf("SWEET USB:   GUSB2PHYCFG 0x%08x -> 0x%08x (PHY soft reset, SUSPHY off)\n",
++	    g2, dwc_rd(GUSB2PHYCFG));
++	printf("SWEET USB:   QUSB2 PLL 0x%02x POWERDOWN 0x%02x\n",
++	    (unsigned)(usb_rd(ml_io_map(QUSB2_PA, QUSB2_SIZE), QUSB2_PLL_STATUS) & 0xff),
++	    (unsigned)(usb_rd(ml_io_map(QUSB2_PA, QUSB2_SIZE), QUSB2_PORT_POWERDOWN) & 0xff));
++}
++
++static void
++ud_cfg_device_hs(void)
++{
++	ud_cfg_device();
++	ud_cfg_hs();
++}
++
++static void
++ud_cfg_all(void)
++{
++	ud_cfg_device();
++	ud_cfg_hs();
++	ud_cfg_wrapper();
++}
++
++static void
++ud_cfg_everything(void)
++{
++	ud_cfg_device();
++	ud_cfg_hs();
++	ud_cfg_wrapper();
++	ud_cfg_phy();
++}
++
+ static void
+ ud_ahb2phy_probe(void)
+ {
+@@ -1760,22 +1851,20 @@
+ 	dwc_wr(DALEPENA, 0x3);
+ 
+ 	/*
+-	 * Park the core halted before anything else. Two measured facts put this
+-	 * order in place, and build 0105 is where both came from:
++	 * Park the core halted, then run the attach bisect.
+ 	 *
+-	 *  - Step 2 used to *raise* RUN_STOP, and the very first read after it
+-	 *    already showed DEVCTRLHLT clear and CS set, i.e. the core had been
+-	 *    running with the D+ pull-up up ever since ABL. The host therefore
+-	 *    never saw a connect of its own and never reset us.
+-	 *  - The old bounce then cleared RUN_STOP to "reconnect", which is a
+-	 *    halt, waited for events with the device detached, and left the core
+-	 *    halted: DSTS 0x00d20001 at the end of the log.
++	 * Builds 0105 and 0106 established two things by measurement: the event
++	 * ring stays empty because the host never resets us, and the host never
++	 * resets us because it never sees a connect - the phone vanishes from the
++	 * PC's USB tree at reboot and no device ever appears again. So the pull-up
++	 * is not being driven, and the two registers that would explain that are
++	 * ABL's leftovers: GCTL.PrtCapDir = 3 (OTG) and DCFG.DevSpd = 4 (SS).
+ 	 *
+-	 * So: detach, hold it long enough for the host's port state machine to
+-	 * notice, arm the ring, then attach and listen.
++	 * Each attempt: detach, apply one more change, attach, listen 4 s. The one
++	 * that produces a bus reset is the answer, and the log names it.
+ 	 */
+ 	printf("SWEET USB: step 2/6 detach (drop the D+ pull-up)\n");
+-	ud_detach("initial", 800, 0);
++	ud_detach("initial", 600, 0);
+ 
+ 	printf("SWEET USB: step 3/6 arm the event ring\n");
+ 	ud_sync(UD_EVT, UD_EVT_SIZE);
+@@ -1784,22 +1873,29 @@
+ 	printf("SWEET USB: step 3/6 GEVNTCOUNT 0x%08x GEVNTSIZ 0x%08x DEVTEN 0x%08x\n",
+ 	    dwc_rd(GEVNTCOUNT) & 0xffff, dwc_rd(GEVNTSIZ), dwc_rd(DEVTEN));
+ 
+-	/*
+-	 * Three attaches, each with a harder detach before it: plain halt, then
+-	 * a real QUSB2 power cycle, then power cycle again. If the host is going
+-	 * to reset us it will do so within a few milliseconds of the connect,
+-	 * so 4 s per attempt is generous; the whole loop is still short enough
+-	 * to sit in the boot path.
+-	 */
+-	printf("SWEET USB: step 4/6 attach and wait for a bus reset\n");
++	printf("SWEET USB: step 4/6 attach bisect\n");
++	static const struct {
++		const char *name;
++		void (*apply)(void);
++	} cfg[] = {
++		{ "A-baseline",     ud_cfg_none },
++		{ "B-device-mode",  ud_cfg_device },
++		{ "C-hs-speed",     ud_cfg_hs },
++		{ "D-both",         ud_cfg_device_hs },
++		{ "E-D+wrapper",    ud_cfg_all },
++		{ "F-E+phyreset",   ud_cfg_everything },
++	};
+ 	int saw_event = 0;
+-	static const char *const atag[] = { "attach1", "attach2", "attach3" };
+-	for (int a2 = 0; a2 < 3 && !saw_event; a2++) {
+-		if (a2 > 0) {
+-			ud_detach(atag[a2], 600, a2 > 1);
+-		}
+-		if (ud_attach_and_wait(atag[a2], 4000) > 0) {
++	for (unsigned k = 0; k < sizeof(cfg) / sizeof(cfg[0]) && !saw_event; k++) {
++		ud_detach(cfg[k].name, 600, 0);
++		printf("SWEET USB: attempt %u/%u %s\n", k + 1,
++		    (unsigned)(sizeof(cfg) / sizeof(cfg[0])), cfg[k].name);
++		cfg[k].apply();
++		printf("SWEET USB:   attach with GCTL 0x%08x DCFG 0x%08x GUSB2PHYCFG 0x%08x DSTS 0x%08x\n",
++		    dwc_rd(GCTL), dwc_rd(DCFG), dwc_rd(GUSB2PHYCFG), dwc_rd(DSTS));
++		if (ud_attach_and_wait(cfg[k].name, 4000) > 0) {
+ 			saw_event = 1;
++			printf("SWEET USB: attempt %u %s WON\n", k + 1, cfg[k].name);
+ 		}
+ 	}
+ 
