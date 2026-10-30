@@ -72,7 +72,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	return true;
  }
  
-@@ -441,43 +459,70 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -441,43 +459,72 @@ AppleCLCD::present(const uint8_t *rec)
  			src = 0;
  		}
  		if (src != 0 && bpe == 4 && fScale) {
@@ -159,10 +159,12 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			}
 +			fBlitSum += dt;
 +			if ((++fBlitFrames % 300) == 0 && fBlitSum != 0) {
++				uint64_t nmin = 0, navg = 0, nmax = 0;
++				absolutetime_to_nanoseconds(fBlitMin, &nmin);
++				absolutetime_to_nanoseconds(fBlitSum / fBlitFrames, &navg);
++				absolutetime_to_nanoseconds(fBlitMax, &nmax);
 +				IOLog("SWEET FB: blit over %llu frames: min %llu us, avg %llu us, max %llu us\n",
-+				    fBlitFrames, absolutetime_to_nanoseconds(fBlitMin) / 1000,
-+				    absolutetime_to_nanoseconds(fBlitSum / fBlitFrames) / 1000,
-+				    absolutetime_to_nanoseconds(fBlitMax) / 1000);
++				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000);
 +				fBlitFrames = 0;
 +				fBlitMin = fBlitMax = fBlitSum = 0;
 +			}
