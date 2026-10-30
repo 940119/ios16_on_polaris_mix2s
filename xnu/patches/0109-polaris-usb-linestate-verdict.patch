@@ -1,0 +1,110 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1207,7 +1207,7 @@
+ 	(void)wr;
+ 	ud_sleep_ms(3000);
+ 	printf("SWEET USB: monitor start, unplug and replug the cable now\n");
+-	for (m = 0; m < 90; m++) {
++	for (m = 0; m < 20; m++) {
+ 		uint32_t d = dwc_rd(DSTS);
+ 		printf("SWEET USB: mon %2d cs=%d spd=%u susp=%d hlt=%d DSTS 0x%08x GSTS 0x%08x ev 0x%08x\n",
+ 		    m, !!(d & 1), (d >> 1) & 7u, !!(d & (1u << 8)), !!(d & DSTS_DEVCTRLHLT),
+@@ -1269,6 +1269,53 @@
+ 	printf("SWEET USB:   (no change)\n");
+ }
+ 
++/* One line that says everything the core currently believes about the wire. */
++static void
++ud_live_state(const char *tag)
++{
++	uint32_t d = dwc_rd(DSTS);
++	uint32_t g = dwc_rd(GSTS);
++
++	printf("SWEET USB:   %-8s cs=%d spd=%u susp=%d hlt=%d bsessvld=%d DSTS 0x%08x GSTS 0x%08x ev 0x%08x\n",
++	    tag, !!(d & 1), (d >> 1) & 7u, !!(d & (1u << 8)), !!(d & DSTS_DEVCTRLHLT),
++	    !!(g & (1u << 30)), d, g, dwc_rd(GEVNTCOUNT) & 0xffff);
++}
++
++/*
++ * The self-contained linestate test.
++ *
++ * Powering the QUSB2 PHY down is a guaranteed disconnect from the PHY's side:
++ * the pull-up goes, the transceiver stops, and any core that is actually
++ * sampling the UTMI linestate has to see it. So run the sequence and print the
++ * core's opinion at each step, then say which of the two cases the readings
++ * support. No cable movement, no timing, no user.
++ */
++static void
++ud_cfg_linestate(void)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	uint32_t cs_off;
++
++	if (phy == 0) {
++		printf("SWEET USB:   PHY map failed\n");
++		return;
++	}
++	ud_live_state("before");
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, 0x23);
++	ud_sleep_ms(1500);
++	printf("SWEET USB:   PHY POWERDOWN 0x%02x\n", qusb2_rd(phy, QUSB2_PORT_POWERDOWN));
++	ud_live_state("phy-off");
++	cs_off = dwc_rd(DSTS) & 1;
++	ud_qusb2_init();
++	ud_sleep_ms(1000);
++	ud_live_state("phy-on");
++	if (cs_off != (dwc_rd(DSTS) & 1)) {
++		printf("SWEET USB:   VERDICT: linestate is live - CS follows the PHY\n");
++	} else {
++		printf("SWEET USB:   VERDICT: linestate is FROZEN - CS did not move when the PHY was powered down\n");
++	}
++}
++
+ /*
+  * Power the PHY down and back up with the core already running, which is the
+  * order a real hot-plug produces. Every earlier power cycle happened while the
+@@ -1293,35 +1340,6 @@
+ 	    dwc_rd(DSTS));
+ }
+ 
+-/*
+- * The two wrapper bits that would let the PHY be un-suspended by software:
+- * bit 23 (SUSPEND_N_SEL) has to be set before bit 22 (SUSPEND_N) means
+- * anything. Writing both at once was tried in 0106 and read back unchanged;
+- * this writes them one at a time and prints after each.
+- */
+-static void
+-ud_cfg_suspend(void)
+-{
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+-	uint32_t h;
+-	if (qs == 0) {
+-		printf("SWEET USB:   QSCRATCH map failed\n");
+-		return;
+-	}
+-	h = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
+-	*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = h | (1u << 23);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	delay(1000);
+-	printf("SWEET USB:   HS_PHY_CTRL 0x%08x -> 0x%08x (SUSPEND_N_SEL)\n",
+-	    h, usb_rd(qs, QSCRATCH_HS_PHY_CTRL));
+-	h = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
+-	*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = h | (1u << 22);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	delay(1000);
+-	printf("SWEET USB:   HS_PHY_CTRL 0x%08x -> 0x%08x (SUSPEND_N)\n",
+-	    h, usb_rd(qs, QSCRATCH_HS_PHY_CTRL));
+-}
+-
+ static void
+ ud_ahb2phy_probe(void)
+ {
+@@ -1889,7 +1907,7 @@
+ 		void (*apply)(void);
+ 	} cfg[] = {
+ 		{ "A-baseline",     ud_cfg_none },
+-		{ "B-suspend",      ud_cfg_suspend },
++		{ "B-linestate",    ud_cfg_linestate },
+ 		{ "C-phy-live",     ud_cfg_phy_live },
+ 	};
+ 	int saw_event = 0;
