@@ -1,0 +1,434 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1,12 +1,21 @@
+ /*
+- * Polaris A630 bring-up gate. This is NOT a GPU power driver.
+- * Deliberately does not map registers or pass command buffers to the GPU.
+- * Never replace the CPU framebuffer unless a fence and presentation work.
++ * Polaris A630 bring-up gate, plus a switch-on ladder for the half of the
++ * block that is not the 3D core.
++ *
++ * The gate came first and still decides what happens by default: nothing is
++ * touched, no command buffer is ever handed to the GPU, and the CPU
++ * framebuffer is never replaced. The ladder runs only under
++ * `polarisgpu=1 polarisgpuup=N`, one step at a time, and it stops before the
++ * 3D core: no GMU firmware, no SMMU, no rings.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ extern bool polaris_touch_i2c_board(void);
+ 
+@@ -92,15 +101,406 @@
+ 	ctx->state = POLARIS_GPU_OFF;
+ }
+ 
++/* ---- register access ------------------------------------------------------------------------------ */
++
++/*
++ * ldr/str, not a volatile C loop: clang turns a read loop into post-indexed
++ * loads, and the boot loader's trap for MMIO need not emulate those.
++ */
++static inline uint32_t
++pg_rd(vm_offset_t address)
++{
++	uint32_t value;
++
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
++	return value;
++}
++
++static inline void
++pg_wr(vm_offset_t address, uint32_t value)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r" (value), "r" (address) : "memory");
++}
++
++/* delay() counts microseconds. */
++static void
++pg_sleep_us(uint32_t us)
++{
++	delay(us);
++}
++
++/* ---- 1. the global clock controller ---------------------------------------------------------------- */
++
++/* The USB driver already maps this window at this base and reads it; same numbers. */
++#define PG_GCC_PHYS		0x00100000UL
++#define PG_GCC_SIZE		0x00090000UL
++#define PG_CBCR_OFF		(1u << 31)	/* the branch is halted */
++#define PG_CBCR_ENABLE		(1u << 0)
++#define PG_GCC_APPS_VOTE_0	0x52004		/* bit 15: GPLL0 to the GPU, bit 16: its /2 */
++#define PG_GCC_GPU_CFG_AHB	0x71004		/* the GPU's register bus */
++#define PG_GCC_GPU_MEMNOC	0x7100c
++#define PG_GCC_GPU_SNOC_DVM	0x71018
++
++static vm_offset_t pg_gcc;
++static bool pg_ahb_on;
++
++static const struct {
++	const char *name;
++	uint32_t reg;
++} pg_gcc_branches[] = {
++	{ "gcc_gpu_cfg_ahb_clk",	PG_GCC_GPU_CFG_AHB },
++	{ "gcc_gpu_memnoc_gfx_clk",	PG_GCC_GPU_MEMNOC },
++	{ "gcc_gpu_snoc_dvm_gfx_clk",	PG_GCC_GPU_SNOC_DVM },
++	{ "gcc_gpu_iref_clk",		0x8c010 },
++	{ "gcc_gpu_vs_clk",		0x7a04c },
++	{ "gcc_ddrss_gpu_axi_clk",	0x44038 },
++};
++
++/*
++ * GCC never loses power here, so reading it is safe whatever the GPU is
++ * doing. That is why this step cannot fail: it reports, and it makes one
++ * attempt at the register bus rather than giving up on it.
++ */
++static bool
++pg_step_gcc(void)
++{
++	uint32_t votes;
++
++	pg_gcc = ml_io_map(PG_GCC_PHYS, PG_GCC_SIZE);
++	if (pg_gcc == 0) {
++		printf("POLARIS GPU: 1 GCC map failed\n");
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(pg_gcc_branches) / sizeof(pg_gcc_branches[0]); i++) {
++		uint32_t v = pg_rd(pg_gcc + pg_gcc_branches[i].reg);
++
++		printf("POLARIS GPU: 1 %-24s %#07x = %#010x %s\n", pg_gcc_branches[i].name,
++		    pg_gcc_branches[i].reg, v, (v & PG_CBCR_OFF) ? "OFF" : "on");
++		if (pg_gcc_branches[i].reg == PG_GCC_GPU_CFG_AHB) {
++			pg_ahb_on = !(v & PG_CBCR_OFF);
++		}
++	}
++	votes = pg_rd(pg_gcc + PG_GCC_APPS_VOTE_0);
++	printf("POLARIS GPU: 1 apps votes %#x = %#010x: GPLL0 %s, /2 %s\n",
++	    PG_GCC_APPS_VOTE_0, votes, (votes & (1u << 15)) ? "voted" : "not voted",
++	    (votes & (1u << 16)) ? "voted" : "not voted");
++
++	/*
++	 * The boot loader is not obliged to leave the GPU's register bus
++	 * running. Nothing is being read across it yet, so the branch is simply
++	 * switched on here, the same way the clock driver would, and then
++	 * asked whether it really runs.
++	 */
++	if (!pg_ahb_on) {
++		printf("POLARIS GPU: 1 the register bus is OFF; switching it on\n");
++		pg_wr(pg_gcc + PG_GCC_GPU_CFG_AHB,
++		    pg_rd(pg_gcc + PG_GCC_GPU_CFG_AHB) | PG_CBCR_ENABLE);
++		pg_sleep_us(10);
++		pg_ahb_on = !(pg_rd(pg_gcc + PG_GCC_GPU_CFG_AHB) & PG_CBCR_OFF);
++		printf("POLARIS GPU: 1 the register bus is now %#010x: %s\n",
++		    pg_rd(pg_gcc + PG_GCC_GPU_CFG_AHB),
++		    pg_ahb_on ? "on" : "STILL OFF");
++	}
++	printf("POLARIS GPU: 1 the register bus is %s\n",
++	    pg_ahb_on ? "on, GPUCC may be read" : "OFF, GPUCC will not be touched");
++	return true;
++}
++
++/* ---- 2. the GPU's own clock controller ------------------------------------------------------------ */
++
++#define PG_GPUCC_PHYS		0x05090000UL
++#define PG_GPUCC_SIZE		0x9000UL
++#define PG_GPUCC_GX_GDSCR	0x100c
++#define PG_GPUCC_CX_GDSCR	0x106c
++#define PG_GPUCC_CX_HWCTRL	0x1540	/* gpu_cx_gdsc's status lives here, bit 31 */
++#define PG_GPUCC_CXO_CBCR	0x109c
++#define PG_GPUCC_CX_GMU_CBCR	0x1098
++#define PG_GPUCC_GMU_RCG_CMD	0x1120
++#define PG_GPUCC_GMU_RCG_CFG	0x1124
++#define PG_GDSC_PWR_ON		(1u << 31)
++
++static vm_offset_t pg_gpucc;
++
++static bool
++pg_step_gpucc(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t reg;
++	} regs[] = {
++		{ "GX GDSCR (gpu_gx_gdsc)",	PG_GPUCC_GX_GDSCR },
++		{ "CX GDSCR (gpu_cx_gdsc)",	PG_GPUCC_CX_GDSCR },
++		{ "gpu_cc_cx_gmu_clk",		PG_GPUCC_CX_GMU_CBCR },
++		{ "gpu_cc_cxo_clk",		PG_GPUCC_CXO_CBCR },
++		{ "GMU clock src CMD",		PG_GPUCC_GMU_RCG_CMD },
++		{ "GMU clock src CFG",		PG_GPUCC_GMU_RCG_CFG },
++		{ "CX hardware control",	PG_GPUCC_CX_HWCTRL },
++	};
++
++	if (!pg_ahb_on) {
++		printf("POLARIS GPU: 2 gcc_gpu_cfg_ahb_clk is off; GPUCC not read\n");
++		return false;
++	}
++	pg_gpucc = ml_io_map(PG_GPUCC_PHYS, PG_GPUCC_SIZE);
++	if (pg_gpucc == 0) {
++		printf("POLARIS GPU: 2 GPUCC map failed\n");
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		uint32_t v = pg_rd(pg_gpucc + regs[i].reg);
++		bool gdsc = regs[i].reg == PG_GPUCC_GX_GDSCR ||
++		    regs[i].reg == PG_GPUCC_CX_GDSCR;
++
++		printf("POLARIS GPU: 2 %-22s %#06x = %#010x%s\n", regs[i].name, regs[i].reg, v,
++		    !gdsc ? "" : ((v & PG_GDSC_PWR_ON) ? " power ON" : " power off"));
++	}
++	return true;
++}
++
++/* ---- 3. the CX power switch ------------------------------------------------------------------------ */
++
++#define PG_GDSCR_SW_COLLAPSE		(1u << 0)
++#define PG_GDSCR_CLK_DIS_WAIT_MASK	(0xfu << 12)
++#define PG_GDSCR_CLK_DIS_WAIT(x)	((uint32_t)(x) << 12)
++#define PG_CX_CLK_DIS_WAIT_VAL		8	/* the device tree's qcom,clk-dis-wait-val */
++#define PG_GDSC_POLL_US			2000
++
++static bool pg_cx_on;
++static bool pg_gmu_clk_on;
++
++static bool
++pg_cx_wait(bool on)
++{
++	for (uint32_t waited = 0; waited <= PG_GDSC_POLL_US; waited += 10) {
++		if (!!(pg_rd(pg_gpucc + PG_GPUCC_CX_HWCTRL) & PG_GDSC_PWR_ON) == on) {
++			return true;
++		}
++		pg_sleep_us(10);
++	}
++	return false;
++}
++
++static bool
++pg_step_cx_on(void)
++{
++	uint32_t v;
++
++	if (pg_gpucc == 0) {
++		printf("POLARIS GPU: 3 GPUCC was not read; the CX switch is not touched\n");
++		return false;
++	}
++	v = pg_rd(pg_gpucc + PG_GPUCC_CX_GDSCR);
++	printf("POLARIS GPU: 3 CX GDSCR before %#010x, control %#010x\n", v,
++	    pg_rd(pg_gpucc + PG_GPUCC_CX_HWCTRL));
++	if (v & PG_GDSC_PWR_ON) {
++		printf("POLARIS GPU: 3 the CX switch is already on: left alone\n");
++		pg_cx_on = true;
++		return true;
++	}
++	/* gdsc_init() then gdsc_toggle_logic(ON): the delay field first, then the switch. */
++	pg_wr(pg_gpucc + PG_GPUCC_CX_GDSCR,
++	    (v & ~PG_GDSCR_CLK_DIS_WAIT_MASK) | PG_GDSCR_CLK_DIS_WAIT(PG_CX_CLK_DIS_WAIT_VAL));
++	v = pg_rd(pg_gpucc + PG_GPUCC_CX_GDSCR);
++	pg_wr(pg_gpucc + PG_GPUCC_CX_GDSCR, v & ~PG_GDSCR_SW_COLLAPSE);
++	pg_sleep_us(1);		/* about 8 XO cycles before the status bit updates */
++	pg_cx_on = pg_cx_wait(true);
++	printf("POLARIS GPU: 3 CX GDSCR after %#010x, control %#010x: %s\n",
++	    pg_rd(pg_gpucc + PG_GPUCC_CX_GDSCR), pg_rd(pg_gpucc + PG_GPUCC_CX_HWCTRL),
++	    pg_cx_on ? "ON" : "STILL OFF after 2 ms");
++	return pg_cx_on;
++}
++
++/* ---- 4. the clocks of the CX half ------------------------------------------------------------------ */
++
++#define PG_RCG_CMD_UPDATE	(1u << 0)
++#define PG_RCG_CMD_ROOT_EN	(1u << 1)
++#define PG_RCG_CMD_ROOT_OFF	(1u << 31)
++#define PG_CX_GMU_CBCR_WS	((0xfu << 8) | (0xfu << 4))
++
++static bool
++pg_branch_enable(vm_offset_t base, uint32_t reg, const char *name)
++{
++	pg_wr(base + reg, pg_rd(base + reg) | PG_CBCR_ENABLE);
++	for (uint32_t waited = 0; waited <= 1000; waited += 5) {
++		if (!(pg_rd(base + reg) & PG_CBCR_OFF)) {
++			printf("POLARIS GPU: 4 %s on: %#010x\n", name, pg_rd(base + reg));
++			return true;
++		}
++		pg_sleep_us(5);
++	}
++	printf("POLARIS GPU: 4 %s does not come on: %#010x\n", name, pg_rd(base + reg));
++	return false;
++}
++
++static bool
++pg_step_clocks(void)
++{
++	uint32_t v;
++	bool done = false;
++
++	if (!pg_cx_on) {
++		printf("POLARIS GPU: 4 the CX switch is off; clocks not touched\n");
++		return false;
++	}
++	if (!pg_branch_enable(pg_gcc, PG_GCC_GPU_MEMNOC, "gcc_gpu_memnoc_gfx_clk") ||
++	    !pg_branch_enable(pg_gcc, PG_GCC_GPU_SNOC_DVM, "gcc_gpu_snoc_dvm_gfx_clk")) {
++		return false;
++	}
++	/* The GMU's clock source: crystal, undivided (parent 0, divider 0), then the update bit. */
++	v = pg_rd(pg_gpucc + PG_GPUCC_GMU_RCG_CFG);
++	pg_wr(pg_gpucc + PG_GPUCC_GMU_RCG_CFG, v & ~((7u << 8) | 0x1fu));
++	pg_wr(pg_gpucc + PG_GPUCC_GMU_RCG_CMD,
++	    pg_rd(pg_gpucc + PG_GPUCC_GMU_RCG_CMD) | PG_RCG_CMD_ROOT_EN | PG_RCG_CMD_UPDATE);
++	for (uint32_t waited = 0; waited <= 1000 && !done; waited += 5) {
++		v = pg_rd(pg_gpucc + PG_GPUCC_GMU_RCG_CMD);
++		done = !(v & PG_RCG_CMD_UPDATE) && !(v & PG_RCG_CMD_ROOT_OFF);
++		if (!done) {
++			pg_sleep_us(5);
++		}
++	}
++	printf("POLARIS GPU: 4 GMU clock src CMD %#010x CFG %#010x: %s\n",
++	    pg_rd(pg_gpucc + PG_GPUCC_GMU_RCG_CMD), pg_rd(pg_gpucc + PG_GPUCC_GMU_RCG_CFG),
++	    done ? "updated, root on" : "NOT UPDATED");
++	if (!done) {
++		return false;
++	}
++	pg_wr(pg_gpucc + PG_GPUCC_CX_GMU_CBCR,
++	    (pg_rd(pg_gpucc + PG_GPUCC_CX_GMU_CBCR) & ~PG_CX_GMU_CBCR_WS) | PG_CX_GMU_CBCR_WS);
++	return pg_branch_enable(pg_gpucc, PG_GPUCC_CXO_CBCR, "gpu_cc_cxo_clk") &&
++	    (pg_gmu_clk_on = pg_branch_enable(pg_gpucc, PG_GPUCC_CX_GMU_CBCR, "gpu_cc_cx_gmu_clk"));
++}
++
++/* ---- 5. the GMU's registers ------------------------------------------------------------------------ */
++
++#define PG_GMU_PHYS		0x0506a000UL
++#define PG_GMU_SIZE		0x30000UL
++/* Word numbers, not byte offsets: the offsets in Linux's a6xx_gmu.xml are 4 bytes apart. */
++#define PG_GMU_WORD(w)		((uint32_t)(w) * 4u)
++
++static vm_offset_t pg_gmu;
++
++static bool
++pg_step_gmu(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t word;
++	} regs[] = {
++		{ "GMU_CM3_SYSRESET",			0x5000 },
++		{ "GMU_CM3_BOOT_CONFIG",		0x5001 },
++		{ "GMU_CM3_FW_INIT_RESULT",		0x501c },
++		{ "GMU_CM3_CFG",			0x502d },
++		{ "GMU_CX_GMU_POWER_COUNTER_ENABLE",	0x5040 },
++		{ "GMU_GMU_PWR_COL_KEEPALIVE",		0x50c3 },
++		{ "GMU_RPMH_CTRL",			0x50e8 },
++		{ "GMU_HFI_CTRL_STATUS",		0x5180 },
++		{ "GMU_GENERAL_0",			0x51c5 },
++	};
++	uint32_t first, second, high;
++	uint64_t start, now, ns;
++
++	if (!pg_gmu_clk_on) {
++		printf("POLARIS GPU: 5 the GMU's clock is not running; the GMU is not read\n");
++		return false;
++	}
++	if (pg_gmu == 0) {
++		pg_gmu = ml_io_map(PG_GMU_PHYS, PG_GMU_SIZE);
++	}
++	if (pg_gmu == 0) {
++		printf("POLARIS GPU: 5 GMU map failed\n");
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		printf("POLARIS GPU: 5 %-34s word %#06x off %#07x = %#010x\n", regs[i].name,
++		    regs[i].word, PG_GMU_WORD(regs[i].word), pg_rd(pg_gmu + PG_GMU_WORD(regs[i].word)));
++	}
++	/*
++	 * The always-on block counts while its clock is alive, so two reads a
++	 * millisecond apart are the cheapest proof that the clock above really
++	 * reaches the GMU rather than merely reporting itself on.
++	 */
++	first = pg_rd(pg_gmu + PG_GMU_WORD(0x5088));
++	start = mach_absolute_time();
++	pg_sleep_us(1000);
++	second = pg_rd(pg_gmu + PG_GMU_WORD(0x5088));
++	now = mach_absolute_time();
++	high = pg_rd(pg_gmu + PG_GMU_WORD(0x5089));
++	absolutetime_to_nanoseconds(now - start, &ns);
++	printf("POLARIS GPU: 5 always-on counter %u then %u (high %u) over %llu us: %llu kHz\n",
++	    first, second, high, ns / 1000,
++	    ns ? (uint64_t)(second - first) * 1000000 / ns : 0);
++	return second != first;
++}
++
++/* ---- the ladder ------------------------------------------------------------------------------------ */
++
++void
++polaris_gpu_up(int upto)
++{
++	bool ok;
++
++	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
++
++	ok = pg_step_gcc();
++	if (!ok) {
++		printf("POLARIS GPU: stop after 1: GCC could not be mapped at all\n");
++		return;
++	}
++	if (upto < 2) {
++		return;
++	}
++	ok = pg_step_gpucc();
++	if (!ok) {
++		printf("POLARIS GPU: stop after 2: GPUCC was not read\n");
++		return;
++	}
++	if (upto < 3) {
++		return;
++	}
++	ok = pg_step_cx_on();
++	if (!ok) {
++		printf("POLARIS GPU: stop after 3: the CX switch did not come on\n");
++		return;
++	}
++	if (upto < 4) {
++		return;
++	}
++	ok = pg_step_clocks();
++	if (!ok) {
++		printf("POLARIS GPU: stop after 4: a clock did not come on\n");
++		return;
++	}
++	if (upto < 5) {
++		return;
++	}
++	(void)pg_step_gmu();
++	printf("POLARIS GPU: ladder done; the CX half is left powered, nothing may be released yet\n");
++}
++
+ void
+ polaris_gpu_init(void)
+ {
+ 	int optin = 0;
++	int upto = 0;
++
+ 	if (!polaris_touch_i2c_board()) {
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("polarisgpu", &optin, sizeof(optin));
+ 	if (optin != 1 || polaris_gpu.state != POLARIS_GPU_OFF) {
++		return;
++	}
++	/*
++	 * The ladder runs only when asked for, and stops where it is told to.
++	 * It leaves the CX half powered with no release path, so the context is
++	 * quarantined afterwards rather than pretending the GPU is idle.
++	 */
++	(void)PE_parse_boot_argn("polarisgpuup", &upto, sizeof(upto));
++	if (upto > 0) {
++		polaris_gpu.state = POLARIS_GPU_STARTING;
++		polaris_gpu_up(upto);
++		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
++		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
+ 		return;
+ 	}
+ 	polaris_gpu.state = POLARIS_GPU_STARTING;
