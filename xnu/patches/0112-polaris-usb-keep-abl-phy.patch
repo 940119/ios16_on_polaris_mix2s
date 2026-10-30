@@ -1,0 +1,262 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1035,7 +1035,7 @@
+ } qusb2_init_seq[] = {
+ 	{ 0x210, 0x23 }, { 0x004, 0x03 }, { 0x18c, 0x7c }, { 0x02c, 0x80 },
+ 	{ 0x184, 0x0a }, { 0x0b4, 0x19 }, { 0x194, 0x40 }, { 0x198, 0x20 },
+-	{ 0x214, 0x21 }, { 0x220, 0x08 }, { 0x224, 0x58 }, { 0x240, 0x07 },
++	{ 0x214, 0x21 }, { 0x220, 0x00 }, { 0x224, 0x58 }, { 0x240, 0x20 },
+ 	{ 0x244, 0x29 }, { 0x248, 0xca }, { 0x24c, 0x04 }, { 0x250, 0x03 },
+ 	{ 0x23c, 0x00 }, { 0x210, 0x22 },
+ };
+@@ -1263,11 +1263,6 @@
+ #define GCTL_PRTCAP_MASK   0x00003000u
+ #define GCTL_PRTCAP_DEVICE 0x00002000u
+ 
+-static void
+-ud_cfg_none(void)
+-{
+-	printf("SWEET USB:   (no change)\n");
+-}
+ 
+ /*
+  * Walk the GCC windows that hold the USB clock branches and switch them on.
+@@ -1285,49 +1280,110 @@
+  */
+ static void ud_live_state(const char *tag);
+ 
+-/*
+- * Dump one USB instance: controller, wrapper and PHY, read-only.
++
++/*
++ * The PHY, in one line: is the PLL locked, is the port powered, what is the
++ * transmit tuning. Every attempt prints this before and after so the log
++ * says which write cost the lock, rather than only that it went away.
++ */
++static void
++ud_phy_state(const char *tag)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	uint32_t pll, pd, t1, t2;
++
++	if (phy == 0) {
++		printf("SWEET USB:   %-12s PHY map failed\n", tag);
++		return;
++	}
++	pll = qusb2_rd(phy, QUSB2_PLL_STATUS);
++	pd  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
++	t1  = qusb2_rd(phy, QUSB2_PORT_TUNE1);
++	t2  = qusb2_rd(phy, 0x244);
++	printf("SWEET USB:   %-12s PLL 0x%02x %-10s POWERDOWN 0x%02x TUNE1 0x%02x TUNE2 0x%02x\n",
++	    tag, pll, (pll & QUSB2_PLL_LOCKED) ? "locked" : "NOT-locked", pd, t1, t2);
++}
++
++/*
++ * Attempt A: write nothing.
+  *
+- * Nothing is written. After 0110 wrote to the wrong GCC bits and darkened the
+- * whole block, the point of this build is to look and not touch.
+- */
+-static void
+-ud_dump_instance(const char *name, uint32_t core_pa, uint32_t qs_pa, uint32_t phy_pa)
+-{
+-	vm_offset_t c = ml_io_map(core_pa, DWC3_SIZE);
+-	vm_offset_t q = ml_io_map(qs_pa, 0x100);
+-	vm_offset_t p = ml_io_map(phy_pa, QUSB2_SIZE);
+-
+-	if (c == 0 || q == 0 || p == 0) {
+-		printf("SWEET USB:   %s map failed c=%d q=%d p=%d\n", name, !!c, !!q, !!p);
+-		return;
+-	}
+-	printf("SWEET USB:   --- %s core 0x%08x qs 0x%08x phy 0x%08x ---\n",
+-	    name, core_pa, qs_pa, phy_pa);
+-	printf("SWEET USB:   %s ID 0x%08x HW0 0x%08x GCTL 0x%08x GSTS 0x%08x\n", name,
+-	    usb_rd(c, 0xc120), usb_rd(c, 0xc140), usb_rd(c, GCTL), usb_rd(c, GSTS));
+-	printf("SWEET USB:   %s GUSB2PHYCFG 0x%08x DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x DEVTEN 0x%08x\n",
+-	    name, usb_rd(c, GUSB2PHYCFG), usb_rd(c, DCFG), usb_rd(c, DCTL),
+-	    usb_rd(c, DSTS), usb_rd(c, DEVTEN));
+-	printf("SWEET USB:   %s GEVNTADR 0x%08x%08x SIZ 0x%08x COUNT 0x%08x DALEPENA 0x%08x\n",
+-	    name, usb_rd(c, GEVNTADRHI), usb_rd(c, GEVNTADRLO), usb_rd(c, GEVNTSIZ),
+-	    usb_rd(c, GEVNTCOUNT), usb_rd(c, DALEPENA));
+-	printf("SWEET USB:   %s QS 00 0x%08x 04 0x%08x 08 0x%08x 0c 0x%08x 10 0x%08x 14 0x%08x 30 0x%08x\n",
+-	    name, usb_rd(q, 0x00), usb_rd(q, 0x04), usb_rd(q, 0x08), usb_rd(q, 0x0c),
+-	    usb_rd(q, 0x10), usb_rd(q, 0x14), usb_rd(q, 0x30));
+-	printf("SWEET USB:   %s PHY 004 0x%02x 1a0 0x%02x 1a4 0x%02x 1b0 0x%02x 210 0x%02x 240 0x%02x 254 0x%02x 2a0 0x%02x\n",
+-	    name, (unsigned)(usb_rd(p, 0x004) & 0xff), (unsigned)(usb_rd(p, 0x1a0) & 0xff),
+-	    (unsigned)(usb_rd(p, 0x1a4) & 0xff), (unsigned)(usb_rd(p, 0x1b0) & 0xff),
+-	    (unsigned)(usb_rd(p, 0x210) & 0xff), (unsigned)(usb_rd(p, 0x240) & 0xff),
+-	    (unsigned)(usb_rd(p, 0x254) & 0xff), (unsigned)(usb_rd(p, 0x2a0) & 0xff));
+-}
+-
+-static void
+-ud_cfg_instances(void)
+-{
+-	ud_dump_instance("prim", 0x0a600000, 0x0a6f8800, 0x088e2000);
+-	ud_dump_instance("sec ", 0x0a800000, 0x0a8f8800, 0x088e3000);
+-	ud_live_state("prim");
++ * ABL runs this port at high speed for fastboot, so the PHY it hands over is
++ * a known-good one and the driver's only job is not to spoil it. The two DSTS
++ * reads are there to settle the question 0109 raised: if the core really is
++ * clocked by the PHY, DSTS at least has to be able to change. Reads only.
++ */
++static void
++ud_cfg_abl_phy(void)
++{
++	uint32_t d1, d2;
++
++	ud_phy_state("A-in");
++	d1 = dwc_rd(DSTS);
++	ud_sleep_ms(120);
++	d2 = dwc_rd(DSTS);
++	printf("SWEET USB:   DSTS 0x%08x then 0x%08x (%s)\n", d1, d2,
++	    d1 == d2 ? "identical" : "CHANGED");
++}
++
++/*
++ * Attempt B: put back the exact byte ABL was running with.
++ *
++ * This is the controlled version of attempt A's premise. If clear bit 0 is
++ * what killed the lock, then setting it again has to bring the lock back -
++ * and the log will show whether it does.
++ */
++static void
++ud_cfg_pd23(void)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++
++	if (phy == 0) {
++		return;
++	}
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, 0x23);
++	ud_sleep_ms(30);
++	ud_phy_state("B-out");
++}
++
++/*
++ * Attempts C and D: the DT table, correctly, then the efuse TUNE1.
++ *
++ * 0x57 is not a guess. The stock kernel on this same board prints
++ * "qusb_phy_init(): Programming TUNE1 parameter as:57" and
++ * "Programming pll_bias parameter as:0", so those are the values a working
++ * boot uses. The table's own TUNE1 is 0x20 and ABL runs with 0x72; the
++ * sequence writes 0x57 and then, for D, the port power byte is 0x23 instead
++ * of the table's 0x22.
++ */
++static void
++ud_phy_table(uint32_t powerdown)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	unsigned i;
++
++	if (phy == 0) {
++		return;
++	}
++	for (i = 0; i < sizeof(qusb2_init_seq) / sizeof(qusb2_init_seq[0]); i++) {
++		qusb2_wr(phy, qusb2_init_seq[i].off, qusb2_init_seq[i].val);
++	}
++	qusb2_wr(phy, QUSB2_PORT_TUNE1, 0x57);
++	qusb2_wr(phy, 0x230, 0x00);             /* pll_bias, as the stock kernel */
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, powerdown);
++	ud_sleep_ms(40);
++	ud_phy_state(powerdown == 0x23 ? "D-out" : "C-out");
++}
++
++static void
++ud_cfg_table57(void)
++{
++	ud_phy_table(0x22);
++}
++
++static void
++ud_cfg_table57pd(void)
++{
++	ud_phy_table(0x23);
+ }
+ 
+ /* One line that says everything the core currently believes about the wire. *//* One line that says everything the core currently believes about the wire. */
+@@ -1342,29 +1398,6 @@
+ 	    !!(g & (1u << 30)), d, g, dwc_rd(GEVNTCOUNT) & 0xffff);
+ }
+ 
+-/*
+- * Power the PHY down and back up with the core already running, which is the
+- * order a real hot-plug produces. Every earlier power cycle happened while the
+- * core was halted, so the core was not watching when the PHY came back.
+- */
+-static void
+-ud_cfg_phy_live(void)
+-{
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		printf("SWEET USB:   PHY map failed\n");
+-		return;
+-	}
+-	qusb2_wr(phy, QUSB2_PORT_POWERDOWN,
+-	    qusb2_rd(phy, QUSB2_PORT_POWERDOWN) | QUSB2_POWER_DOWN);
+-	ud_sleep_ms(2000);
+-	qusb2_wr(phy, QUSB2_PORT_POWERDOWN,
+-	    qusb2_rd(phy, QUSB2_PORT_POWERDOWN) & ~QUSB2_POWER_DOWN);
+-	ud_sleep_ms(200);
+-	printf("SWEET USB:   PHY cycled live: POWERDOWN 0x%02x PLL 0x%02x DSTS 0x%08x\n",
+-	    qusb2_rd(phy, QUSB2_PORT_POWERDOWN), qusb2_rd(phy, QUSB2_PLL_STATUS),
+-	    dwc_rd(DSTS));
+-}
+ 
+ static void
+ ud_ahb2phy_probe(void)
+@@ -1852,10 +1885,37 @@
+ 
+ 	ud_fifo_dump();
+ 	ud_ahb2phy_probe();
+-	ud_qusb2_sweep();
+-	ud_utmi_clk_select();
+-	if (ud_clock_mux_bisect() < 0) {
+-		printf("SWEET USB: clock mux bisect found nothing; hoping the direct write held\n");
++	/*
++	 * 0112: the PHY is left alone here on purpose.
++	 *
++	 * This used to call ud_qusb2_sweep() (a full power cycle) and then
++	 * ud_clock_mux_bisect() (five core resets, each with another
++	 * ud_qusb2_resume() in front of it). By the time the first attach was
++	 * tried, the locked PLL that ABL handed over had already been dropped
++	 * four times over - which is why every build since 0106 has been
++	 * measuring a dead PHY and blaming the wire.
++	 *
++	 * Both stay in the source, behind a boot arg, because they are the
++	 * only path that ever made the endpoint command engine report
++	 * "ok polls 0" and they may be needed again once the PHY survives.
++	 */
++	int phy_touch = 0;
++	PE_parse_boot_argn("sweetphytouch", &phy_touch, sizeof(phy_touch));
++	ud_phy_state("handover");
++	if (phy_touch) {
++		ud_qusb2_sweep();
++		ud_utmi_clk_select();
++		if (ud_clock_mux_bisect() < 0) {
++			printf("SWEET USB: clock mux bisect found nothing; hoping the direct write held\n");
++		}
++	} else {
++		/*
++		 * Only the wrapper's clock mux is written: that is a QSCRATCH
++		 * register, not a PHY register, and build 0100 proved the
++		 * endpoint engine needs it. It cannot disturb the PLL.
++		 */
++		ud_utmi_clk_select();
++		printf("SWEET USB: PHY untouched (sweetphytouch=0), ABL's state stands\n");
+ 	}
+ 
+ 	/*
+@@ -1932,9 +1992,10 @@
+ 		const char *name;
+ 		void (*apply)(void);
+ 	} cfg[] = {
+-		{ "A-baseline",     ud_cfg_none },
+-		{ "C-phy-live",     ud_cfg_phy_live },
+-		{ "D-instances",    ud_cfg_instances },
++		{ "A-abl-phy",      ud_cfg_abl_phy },
++		{ "B-pd-0x23",      ud_cfg_pd23 },
++		{ "C-table-57",     ud_cfg_table57 },
++		{ "D-table-57-23",  ud_cfg_table57pd },
+ 	};
+ 	int saw_event = 0;
+ 	for (unsigned k = 0; k < sizeof(cfg) / sizeof(cfg[0]) && !saw_event; k++) {
