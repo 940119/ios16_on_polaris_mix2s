@@ -1,0 +1,55 @@
+--- a/bsd/dev/polaris_gpu_diag.c
++++ b/bsd/dev/polaris_gpu_diag.c
+@@ -203,16 +203,32 @@
+ 	    name, changed, GPU_SAMPLE);
+ }
+ 
++/*
++ * Measured once, and it cost a whole boot: build 0102 with polarisgpuprobe=1
++ * printed "gpucc 5090000 reading" and then never printed another character
++ * from that thread. The touch workloop kept running on another CPU for the
++ * next 55 seconds, so the machine was alive - the init thread was simply
++ * parked inside the first MMIO read and never came back. Reading a register
++ * block whose power domain is collapsed does not return 0 on this SoC; the
++ * interconnect never answers and the accessor waits forever.
++ *
++ * So this is now opt-in at level 2 and never on a normal boot. What it proved
++ * stands: the GPU blocks are behind a domain this kernel does not vote for,
++ * and until something raises the GPU CX rail and its GDSC, any access wedges
++ * the calling CPU. That is driver work - regulator, GDSC, GMU firmware, SMMU,
++ * ringbuffer - not a bit to flip, and it is not what "no GPU driver in this
++ * tree" was ever meant to deny.
++ */
+ void
+ polaris_gpu_state_probe(void)
+ {
+ 	int optin = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarisgpuprobe", &optin, sizeof(optin));
+-	if (optin != 1) {
++	if (optin != 2) {
+ 		return;
+ 	}
+-	printf("POLARIS GPU: register probe, read only\n");
++	printf("POLARIS GPU: register probe, read only (will hang if the domain is off)\n");
+ 	gpu_state_window("gpucc", GPUCC_PA, GPUCC_N);
+ 	gpu_state_window("gpu-3d0", GPU_3D0_PA, GPU_3D0_N);
+ 	gpu_state_window("gpu-gmu", GPU_GMU_PA, GPU_GMU_N);
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -676,8 +676,14 @@
+ 	 * read of a collapsed block can abort or stall the bus; each window
+ 	 * prints its name before the first read so a stall names itself.
+ 	 */
+-	polaris_gpu_state_probe();
+ 	sweet_usb_probe();
++	/*
++	 * Last, and off unless polarisgpuprobe=2. Build 0102 showed why: the
++	 * first read of the GPU clock controller parks the calling thread in the
++	 * interconnect for good while the rest of the system keeps running, so
++	 * putting it before the USB arm silently costs the whole boot.
++	 */
++	polaris_gpu_state_probe();
+ 	return 0;
+ }
+ 
