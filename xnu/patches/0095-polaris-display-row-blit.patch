@@ -72,7 +72,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	return true;
  }
  
-@@ -441,43 +459,62 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -441,43 +459,70 @@ AppleCLCD::present(const uint8_t *rec)
  			src = 0;
  		}
  		if (src != 0 && bpe == 4 && fScale) {
@@ -102,8 +102,16 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			if (dx0 + wc > (int32_t)fWidth) {
 +				wc = (int32_t)fWidth - dx0;
 +			}
++			/*
++			 * Panel rows whose source row falls in [dy, dy+h). py0 may be
++			 * one row early (the syy test below drops it), but py1 must be
++			 * rounded up or the last row of every dirty rectangle is left
++			 * stale: the squeeze maps 1.128 panel rows onto one logical
++			 * row, so the bottom row of a small rectangle often has no
++			 * exact floor.
++			 */
 +			int32_t py0 = (int32_t)(((int64_t)dy * fHeight) / fLogicalH);
-+			int32_t py1 = (int32_t)(((int64_t)(dy + h) * fHeight) / fLogicalH);
++			int32_t py1 = (int32_t)(((int64_t)(dy + h) * fHeight) / fLogicalH) + 1;
  			if (py0 < 0) {
  				py0 = 0;
  			}
