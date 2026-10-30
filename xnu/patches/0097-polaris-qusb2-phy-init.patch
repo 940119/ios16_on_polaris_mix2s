@@ -1,0 +1,333 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -173,6 +173,10 @@
+ #define   SW_SESSVLD_SEL        (1u << 28)
+ #define QSCRATCH_SS_PHY_CTRL    0x30
+ #define   LANE0_PWR_PRESENT     (1u << 24)
++#define QSCRATCH_GENERAL_CFG    0x08
++#define   PIPE_UTMI_CLK_DIS     (1u << 0)
++#define   PIPE_UTMI_CLK_SEL     (1u << 1)
++#define   PIPE3_SEL             (1u << 2)
+ 
+ #define DCTL_RUN_STOP   (1u << 31)
+ #define DCTL_CSFTRST    (1u << 30)
+@@ -273,7 +277,16 @@
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 1000; i++) {
++	/*
++	 * delay() is in microseconds here (see the soft-reset loop below, which
++	 * uses delay(1000) per millisecond). 1000 iterations of delay(1) were
++	 * therefore a 1 ms timeout, while Linux's dwc3_wait_gadget_ep_cmd allows
++	 * 500 ms: DEPCMD_SETEPCONFIG never cleared CMDACT inside that window even
++	 * though the command engine was alive (DEPCMD_DEPSTARTCFG kept
++	 * completing right after), so it only looked like a hardware failure.
++	 */
++	int i;
++	for (i = 0; i < 5000; i++) {
+ 		uint32_t v = dwc_rd(DEPCMD(ep));
+ 		if (!(v & DEPCMD_CMDACT)) {
+ 			uint32_t status = (v >> 12) & 0xf;
+@@ -285,10 +298,10 @@
+ 			printf("SWEET USB: ep%u cmd 0x%x ok polls %d\n", ep, cmd & 0xf, i);
+ 			return 0;
+ 		}
+-		delay(1);
++		delay(100);
+ 	}
+-	printf("SWEET USB: ep%u cmd 0x%x timeout: DEPCMD 0x%08x status %u PAR0 0x%08x PAR1 0x%08x PAR2 0x%08x\n",
+-	    ep, cmd & 0xf, dwc_rd(DEPCMD(ep)), (dwc_rd(DEPCMD(ep)) >> 12) & 0xf,
++	printf("SWEET USB: ep%u cmd 0x%x timeout after %d polls (%d ms): DEPCMD 0x%08x status %u PAR0 0x%08x PAR1 0x%08x PAR2 0x%08x\n",
++	    ep, cmd & 0xf, i, i / 10, dwc_rd(DEPCMD(ep)), (dwc_rd(DEPCMD(ep)) >> 12) & 0xf,
+ 	    dwc_rd(DEPCMDPAR0(ep)), dwc_rd(DEPCMDPAR1(ep)), dwc_rd(DEPCMDPAR2(ep)));
+ 	flush_dcache64((addr64_t)(ud.dma_pa + UD_EVT), 64, TRUE);
+ 	{
+@@ -305,6 +318,30 @@
+ 	return -1;
+ }
+ 
++/*
++ * The low DMA window is mapped as device memory (ml_io_map): bulk copies must
++ * not use NEON/block loads there, only naturally aligned 32-bit accesses.
++ */
++static void
++ud_copy32(void *dst, const void *src, uint32_t n)
++{
++	uint8_t *d = (uint8_t *)dst;
++	const uint8_t *s = (const uint8_t *)src;
++
++	while (n >= 4) {
++		*(uint32_t *)d = *(const uint32_t *)s;
++		d += 4;
++		s += 4;
++		n -= 4;
++	}
++	while (n) {
++		*d++ = *s++;
++		n--;
++	}
++}
++
++static uint8_t ud_txbuf[UD_FRAME_MAX];
++
+ /* One TRB (at DMA offset trb) on physical endpoint ep. */
+ static void
+ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
+@@ -452,8 +489,8 @@
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+-		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 1: ud_copy32(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
++		case 2: ud_copy32(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
+ 		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
+ 		default: ok = false; break;
+ 		}
+@@ -529,7 +566,7 @@
+ 		    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+ 		    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
+ 			struct ifnet_stat_increment_param stats = {};
+-			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
++			ud_copy32(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
+ 			mbuf_setlen(m, len);
+ 			mbuf_pkthdr_setlen(m, len);
+ 			void *frame_header = mbuf_data(m);
+@@ -561,7 +598,8 @@
+ 			mbuf_freem(m);
+ 			continue;
+ 		}
+-		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
++		mbuf_copydata(m, 0, len, ud_txbuf);
++		ud_copy32((void *)(ud.dma + UD_TX), ud_txbuf, (uint32_t)len);
+ 		mbuf_freem(m);
+ 		/* A frame of a multiple of 512 bytes would need a zero-length
+ 		 * packet to end it; one pad byte does the same (IP ignores it). */
+@@ -890,9 +928,21 @@
+  *   UD_F_VBUS      raise the QSCRATCH VBUS override before DEPCFG rather
+  *                  than after it (where it was unreachable dead code).
+  *
+- * Each is tried on its own, then all together, and the log says which one
+- * got endpoint 0 configured.
++ * All of those were wrong, and the log finally said why. A QUSB2 register is
++ * one byte wide but the AHB slave repeats it on every lane, so the four
++ * "garbage" reads were really PLL_STATUS 0x64 (PLL_LOCKED set), TUNE1 0x72
++ * and PORT_POWERDOWN 0x23 - and 0x23 is exactly Linux's qusb2_v2
++ * disable_ctrl mask, POWER_DOWN included. The PHY was configured and then
++ * left switched off, so the controller had no UTMI clock, so the endpoint
++ * command engine - the part that runs off that clock - accepted DEPCFG,
++ * raised CMDACT and never finished it, while DEPSTARTCFG (bus clock only)
++ * completed instantly. Endpoint 0 could not have worked under any of the
++ * earlier hypotheses, because the fault was upstream of the controller.
++ *
++ * So now every strategy runs the DT qcom,qusb-phy-init-seq first, which
++ * ends by clearing POWER_DOWN, and the log prints the PLL lock bit.
+  */
++#define GSTS                0xc118
+ #define GUSB2PHYCFG         0xc200
+ #define GUSB3PIPECTL        0xc2c0
+ #define GHWPARAMS7          0xc15c
+@@ -911,6 +961,8 @@
+ #define UD_F_FULLRESET      0x4
+ #define UD_F_NORESET        0x8     /* do not touch the controller at all */
+ #define UD_F_VBUS           0x10    /* force the VBUS override before DEPCFG */
++#define UD_F_PHYINIT        0x20    /* run the DT qusb-phy-init-seq first */
++#define UD_F_PIPE           0x40    /* point the wrapper at the UTMI clock */
+ 
+ static void
+ ud_fifo_dump(void)
+@@ -921,32 +973,113 @@
+ }
+ 
+ /*
+- * The QUSB2 registers at 0x88e2000 have read back the same four
+- * byte-repeated values (0x64646464 / 0x23232323 / 0x72727272 / 0x90909090)
+- * on every build, including the read-only probe, so the window is not
+- * decoded as PHY registers when we get here. The DT gives the wrapper an
+- * ahb2phy_base of 0x88ee000: poke that bridge and see whether the window
+- * turns into real registers.
++ * A QUSB2 register is one byte wide. The AHB slave drives that byte onto
++ * every data lane, so a 32-bit read of 0x210 returning 0x23232323 means the
++ * register holds 0x23 - which is what made the first four reads look like
++ * noise. Writes stay 32-bit (the vendor init table is applied with writel())
++ * and only the low lane is decoded.
+  */
++static uint32_t
++qusb2_rd(vm_offset_t phy, uint32_t off)
++{
++	return usb_rd(phy, off) & 0xff;
++}
++
+ static void
+-ud_ahb2phy_probe(void)
++qusb2_wr(vm_offset_t phy, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(phy + off) = val & 0xff;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * /soc/qusb@88e2000 in the polaris DT, qcom,qusb-phy-init-seq, as
++ * (offset, value) pairs. The list starts by forcing PORT_POWERDOWN to 0x23
++ * and ends by writing 0x22 to it, i.e. it clears POWER_DOWN and turns the
++ * PHY on. The hardware was still sitting at 0x23, so this table had never
++ * been run: the PHY was configured but held powered down, which is why it
++ * never produced a UTMI clock and why the controller's endpoint command
++ * engine - the part that runs off that clock - never cleared CMDACT.
++ */
++static const struct {
++	uint16_t off;
++	uint8_t  val;
++} qusb2_init_seq[] = {
++	{ 0x210, 0x23 }, { 0x004, 0x03 }, { 0x18c, 0x7c }, { 0x02c, 0x80 },
++	{ 0x184, 0x0a }, { 0x0b4, 0x19 }, { 0x194, 0x40 }, { 0x198, 0x20 },
++	{ 0x214, 0x21 }, { 0x220, 0x08 }, { 0x224, 0x58 }, { 0x240, 0x07 },
++	{ 0x244, 0x29 }, { 0x248, 0xca }, { 0x24c, 0x04 }, { 0x250, 0x03 },
++	{ 0x23c, 0x00 }, { 0x210, 0x22 },
++};
++
++#define QUSB2_PLL_STATUS    0x1a0
++#define QUSB2_PORT_POWERDOWN 0x210
++#define QUSB2_PORT_TUNE1    0x240
++#define QUSB2_PLL_LOCKED    (1u << 5)
++#define QUSB2_POWER_DOWN    (1u << 0)
++
++static int
++ud_qusb2_init(void)
+ {
+ 	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	vm_offset_t br = ml_io_map(AHB2PHY_PA, AHB2PHY_SIZE);
+-	if (phy == 0 || br == 0) {
+-		printf("SWEET USB: ahb2phy probe map failed (phy %p br %p)\n",
+-		    (void *)phy, (void *)br);
++
++	if (phy == 0) {
++		printf("SWEET USB: QUSB2 map failed\n");
++		return -1;
++	}
++	printf("SWEET USB: QUSB2 in: PLL_STATUS 0x%02x POWERDOWN 0x%02x TUNE1 0x%02x REG04 0x%02x\n",
++	    qusb2_rd(phy, QUSB2_PLL_STATUS), qusb2_rd(phy, QUSB2_PORT_POWERDOWN),
++	    qusb2_rd(phy, QUSB2_PORT_TUNE1), qusb2_rd(phy, 0x004));
++
++	for (unsigned i = 0; i < sizeof(qusb2_init_seq) / sizeof(qusb2_init_seq[0]); i++) {
++		qusb2_wr(phy, qusb2_init_seq[i].off, qusb2_init_seq[i].val);
++	}
++	/* The last entry clears POWER_DOWN; the PLL needs ~150 us after that
++	 * before PLL_STATUS means anything. */
++	delay(200);
++
++	uint32_t pd  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
++	uint32_t pll = qusb2_rd(phy, QUSB2_PLL_STATUS);
++	printf("SWEET USB: QUSB2 out: PLL_STATUS 0x%02x (%s) POWERDOWN 0x%02x (%s) TUNE1 0x%02x\n",
++	    pll, (pll & QUSB2_PLL_LOCKED) ? "locked" : "NOT locked",
++	    pd, (pd & QUSB2_POWER_DOWN) ? "still powered down" : "enabled",
++	    qusb2_rd(phy, QUSB2_PORT_TUNE1));
++	return (pd & QUSB2_POWER_DOWN) ? -1 : 0;
++}
++
++/*
++ * Hand the wrapper the high-speed PHY's UTMI clock. The controller is wired
++ * for both PHYs and GENERAL_CFG selects which one feeds the core; the DT
++ * says maximum-speed = high-speed, and the register came up with PIPE3_SEL
++ * set, i.e. pointing at the unused SuperSpeed PHY.
++ */
++static void
++ud_pipe_select(void)
++{
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	if (qs == 0) {
++		printf("SWEET USB: QSCRATCH map failed (pipe)\n");
+ 		return;
+ 	}
+-	printf("SWEET USB: QUSB2 before: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+-	printf("SWEET USB: ahb2phy cfg 0x%08x 0x%08x\n", usb_rd(br, 0x0), usb_rd(br, 0x4));
+-	*(volatile uint32_t *)(br + 0x0) = usb_rd(br, 0x0) | 0x1;
++	uint32_t g = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	*(volatile uint32_t *)(qs + QSCRATCH_GENERAL_CFG) =
++	    (g & ~(PIPE3_SEL | PIPE_UTMI_CLK_DIS)) | PIPE_UTMI_CLK_SEL;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	delay(1000);
+-	printf("SWEET USB: ahb2phy cfg after 0x%08x; QUSB2 0x%08x 0x%08x 0x%08x 0x%08x\n",
+-	    usb_rd(br, 0x0), usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240),
+-	    usb_rd(phy, 0x254));
++	printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (UTMI clk sel)\n",
++	    g, usb_rd(qs, QSCRATCH_GENERAL_CFG));
++}
++
++static void
++ud_ahb2phy_probe(void)
++{
++	vm_offset_t br = ml_io_map(AHB2PHY_PA, AHB2PHY_SIZE);
++
++	if (br == 0) {
++		printf("SWEET USB: ahb2phy map failed\n");
++		return;
++	}
++	printf("SWEET USB: ahb2phy cfg 0x%08x 0x%08x\n", usb_rd(br, 0x0), usb_rd(br, 0x4));
+ }
+ 
+ static int
+@@ -1040,6 +1173,14 @@
+ 	if (flags & UD_F_VBUS) {
+ 		ud_vbus_override();
+ 	}
++	if (flags & UD_F_PHYINIT) {
++		if (ud_qusb2_init() != 0) {
++			printf("  %s: PHY stayed in power-down\n", tag);
++		}
++	}
++	if (flags & UD_F_PIPE) {
++		ud_pipe_select();
++	}
+ 	if (flags & UD_F_CLKGT) {
+ 		dwc_wr(GCTL, dwc_rd(GCTL) | GCTL_DSBLCLKGTNG);
+ 		printf("  %s: GCTL 0x%08x (DSBLCLKGTNG set)\n", tag, dwc_rd(GCTL));
+@@ -1054,6 +1195,8 @@
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+ 	dwc_wr(DEVTEN, 0x7);
++	printf("  %s: pre-ep0 GUSB2PHYCFG 0x%08x GSTS 0x%08x DSTS 0x%08x\n",
++	    tag, dwc_rd(GUSB2PHYCFG), dwc_rd(GSTS), dwc_rd(DSTS));
+ 
+ 	if (flags & UD_F_DALEPENA) {
+ 		dwc_wr(DALEPENA, 0x3);
+@@ -1097,18 +1240,31 @@
+ 	ud_fifo_dump();
+ 	ud_ahb2phy_probe();
+ 
++	/*
++	 * All of them power the PHY up first, because that turned out to be
++	 * the thing nobody had done: the QUSB2 block was left at 0x23 in
++	 * PORT_POWERDOWN, i.e. configured but switched off. Everything after
++	 * it is the old shortlist, ordered cheapest first.
++	 */
+ 	static const char *names[] = {
+-		"noreset", "noreset+vbus", "noreset+dalepena", "noreset+vbus+dalepena", "base"
++		"phy", "phy+pipe+vbus", "phy+noreset+pipe"
+ 	};
+ 	static const unsigned order[] = {
+-		UD_F_NORESET,
+-		UD_F_NORESET | UD_F_VBUS,
+-		UD_F_NORESET | UD_F_DALEPENA,
+-		UD_F_NORESET | UD_F_VBUS | UD_F_DALEPENA,
+-		0,
++		UD_F_PHYINIT,
++		UD_F_PHYINIT | UD_F_PIPE | UD_F_VBUS,
++		UD_F_PHYINIT | UD_F_NORESET | UD_F_PIPE,
+ 	};
+ 	int won = -1;
+ 	for (unsigned s = 0; s < sizeof(order) / sizeof(order[0]); s++) {
++		if (order[s] & UD_F_NORESET) {
++			/*
++			 * A failed attempt leaves DEPCMD.CMDACT set, and the core
++			 * accepts no new command until that clears; only the
++			 * device soft reset clears it. So unstick the command
++			 * engine, then leave the rest of the controller alone.
++			 */
++			ud_core_reset(0);
++		}
+ 		if (ud_try(names[s], order[s]) == 0) {
+ 			won = (int)s;
+ 			break;
