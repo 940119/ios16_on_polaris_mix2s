@@ -1,0 +1,214 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1189,6 +1189,38 @@
+  * Every event is printed as it is read, so the log shows what the host does
+  * even when it is not the reset we are waiting for.
+  */
++/*
++ * The line-state witness.
++ *
++ * Runs for 90 s and prints the core's own view of the wire once a second, so
++ * one unplug during boot is enough to tell the two remaining cases apart: if
++ * CS follows the cable the PHY's receiver and VBUS comparator are alive and
++ * only the pull-up is missing; if nothing ever moves, the PHY front end is not
++ * connected to the port and no register in this driver can fix it.
++ */
++static void
++ud_mon_thread(void *arg, wait_result_t wr)
++{
++	int m;
++
++	(void)arg;
++	(void)wr;
++	ud_sleep_ms(3000);
++	printf("SWEET USB: monitor start, unplug and replug the cable now\n");
++	for (m = 0; m < 90; m++) {
++		uint32_t d = dwc_rd(DSTS);
++		printf("SWEET USB: mon %2d cs=%d spd=%u susp=%d hlt=%d DSTS 0x%08x GSTS 0x%08x ev 0x%08x\n",
++		    m, !!(d & 1), (d >> 1) & 7u, !!(d & (1u << 8)), !!(d & DSTS_DEVCTRLHLT),
++		    d, dwc_rd(GSTS), dwc_rd(GEVNTCOUNT) & 0xffff);
++		ud_sleep_ms(1000);
++	}
++	printf("SWEET USB: monitor done\n");
++	/* A kernel thread may not return; park it out of the way. */
++	for (;;) {
++		ud_sleep_ms(60000);
++	}
++}
++
+ static int
+ ud_attach_and_wait(const char *tag, unsigned ms)
+ {
+@@ -1237,81 +1269,57 @@
+ 	printf("SWEET USB:   (no change)\n");
+ }
+ 
++/*
++ * Power the PHY down and back up with the core already running, which is the
++ * order a real hot-plug produces. Every earlier power cycle happened while the
++ * core was halted, so the core was not watching when the PHY came back.
++ */
+ static void
+-ud_cfg_device(void)
+-{
+-	uint32_t g = dwc_rd(GCTL);
+-	dwc_wr(GCTL, (g & ~GCTL_PRTCAP_MASK) | GCTL_PRTCAP_DEVICE);
+-	printf("SWEET USB:   GCTL 0x%08x -> 0x%08x (PrtCapDir device)\n",
+-	    g, dwc_rd(GCTL));
+-}
+-
+-static void
+-ud_cfg_hs(void)
++ud_cfg_phy_live(void)
+ {
+-	uint32_t d = dwc_rd(DCFG);
+-	dwc_wr(DCFG, d & ~0x7u);
+-	printf("SWEET USB:   DCFG 0x%08x -> 0x%08x (DevSpd high-speed)\n",
+-	    d, dwc_rd(DCFG));
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	if (phy == 0) {
++		printf("SWEET USB:   PHY map failed\n");
++		return;
++	}
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN,
++	    qusb2_rd(phy, QUSB2_PORT_POWERDOWN) | QUSB2_POWER_DOWN);
++	ud_sleep_ms(2000);
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN,
++	    qusb2_rd(phy, QUSB2_PORT_POWERDOWN) & ~QUSB2_POWER_DOWN);
++	ud_sleep_ms(200);
++	printf("SWEET USB:   PHY cycled live: POWERDOWN 0x%02x PLL 0x%02x DSTS 0x%08x\n",
++	    qusb2_rd(phy, QUSB2_PORT_POWERDOWN), qusb2_rd(phy, QUSB2_PLL_STATUS),
++	    dwc_rd(DSTS));
+ }
+ 
++/*
++ * The two wrapper bits that would let the PHY be un-suspended by software:
++ * bit 23 (SUSPEND_N_SEL) has to be set before bit 22 (SUSPEND_N) means
++ * anything. Writing both at once was tried in 0106 and read back unchanged;
++ * this writes them one at a time and prints after each.
++ */
+ static void
+-ud_cfg_wrapper(void)
++ud_cfg_suspend(void)
+ {
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+-	uint32_t g, h;
++	uint32_t h;
+ 	if (qs == 0) {
+ 		printf("SWEET USB:   QSCRATCH map failed\n");
+ 		return;
+ 	}
+-	g = usb_rd(qs, QSCRATCH_GENERAL_CFG);
+-	*(volatile uint32_t *)(qs + QSCRATCH_GENERAL_CFG) =
+-	    (g & ~PIPE_UTMI_CLK_DIS) | PIPE_UTMI_CLK_SEL | (1u << 3);
+ 	h = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
+-	*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = h | (1u << 20) | (1u << 28);
++	*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = h | (1u << 23);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	delay(1000);
+-	printf("SWEET USB:   GENERAL_CFG 0x%08x -> 0x%08x HS_PHY_CTRL 0x%08x -> 0x%08x\n",
+-	    g, usb_rd(qs, QSCRATCH_GENERAL_CFG), h, usb_rd(qs, QSCRATCH_HS_PHY_CTRL));
+-}
+-
+-static void
+-ud_cfg_phy(void)
+-{
+-	uint32_t g2 = dwc_rd(GUSB2PHYCFG);
+-	dwc_wr(GUSB2PHYCFG, g2 | PHYSOFTRST);
+-	delay(1000);
+-	dwc_wr(GUSB2PHYCFG, (g2 & ~PHYSOFTRST) & ~(1u << 6));
++	printf("SWEET USB:   HS_PHY_CTRL 0x%08x -> 0x%08x (SUSPEND_N_SEL)\n",
++	    h, usb_rd(qs, QSCRATCH_HS_PHY_CTRL));
++	h = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
++	*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = h | (1u << 22);
++	__asm__ volatile ("dsb sy" ::: "memory");
+ 	delay(1000);
+-	printf("SWEET USB:   GUSB2PHYCFG 0x%08x -> 0x%08x (PHY soft reset, SUSPHY off)\n",
+-	    g2, dwc_rd(GUSB2PHYCFG));
+-	printf("SWEET USB:   QUSB2 PLL 0x%02x POWERDOWN 0x%02x\n",
+-	    (unsigned)(usb_rd(ml_io_map(QUSB2_PA, QUSB2_SIZE), QUSB2_PLL_STATUS) & 0xff),
+-	    (unsigned)(usb_rd(ml_io_map(QUSB2_PA, QUSB2_SIZE), QUSB2_PORT_POWERDOWN) & 0xff));
+-}
+-
+-static void
+-ud_cfg_device_hs(void)
+-{
+-	ud_cfg_device();
+-	ud_cfg_hs();
+-}
+-
+-static void
+-ud_cfg_all(void)
+-{
+-	ud_cfg_device();
+-	ud_cfg_hs();
+-	ud_cfg_wrapper();
+-}
+-
+-static void
+-ud_cfg_everything(void)
+-{
+-	ud_cfg_device();
+-	ud_cfg_hs();
+-	ud_cfg_wrapper();
+-	ud_cfg_phy();
++	printf("SWEET USB:   HS_PHY_CTRL 0x%08x -> 0x%08x (SUSPEND_N)\n",
++	    h, usb_rd(qs, QSCRATCH_HS_PHY_CTRL));
+ }
+ 
+ static void
+@@ -1857,8 +1865,10 @@
+ 	 * ring stays empty because the host never resets us, and the host never
+ 	 * resets us because it never sees a connect - the phone vanishes from the
+ 	 * PC's USB tree at reboot and no device ever appears again. So the pull-up
+-	 * is not being driven, and the two registers that would explain that are
+-	 * ABL's leftovers: GCTL.PrtCapDir = 3 (OTG) and DCFG.DevSpd = 4 (SS).
++	 * is not being driven. Build 0107 then ruled out both register suspects
++	 * by writing them back: GCTL 0x00102000 already reads back as
++	 * PrtCapDir = 2 (device) and DCFG as DevSpd = 0 (high speed), so ABL
++	 * handed over a correct core and the fault is on the analog side.
+ 	 *
+ 	 * Each attempt: detach, apply one more change, attach, listen 4 s. The one
+ 	 * that produces a bus reset is the answer, and the log names it.
+@@ -1879,11 +1889,8 @@
+ 		void (*apply)(void);
+ 	} cfg[] = {
+ 		{ "A-baseline",     ud_cfg_none },
+-		{ "B-device-mode",  ud_cfg_device },
+-		{ "C-hs-speed",     ud_cfg_hs },
+-		{ "D-both",         ud_cfg_device_hs },
+-		{ "E-D+wrapper",    ud_cfg_all },
+-		{ "F-E+phyreset",   ud_cfg_everything },
++		{ "B-suspend",      ud_cfg_suspend },
++		{ "C-phy-live",     ud_cfg_phy_live },
+ 	};
+ 	int saw_event = 0;
+ 	for (unsigned k = 0; k < sizeof(cfg) / sizeof(cfg[0]) && !saw_event; k++) {
+@@ -1906,6 +1913,18 @@
+ 		ud_start_setup();
+ 	}
+ 
++	/*
++	 * Drop the pull-up and leave it up; then watch the wire for 90 s.
++	 *
++	 * The PC side already proved it never sees a connect: during a whole
++	 * boot the phone does not reappear in the USB tree at all. The one
++	 * thing that still separates "the PHY is not driving D+" from "the PHY
++	 * is not connected to the port" is whether the core's own line-state
++	 * sensing follows the cable. One unplug during the window answers it.
++	 */
++	printf("SWEET USB: leaving the pull-up up, monitor thread starts below\n");
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++
+ 	printf("SWEET USB: step 6/6 threads, DMA at 0x%llx\n", ud.dma_pa);
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+@@ -1917,5 +1936,8 @@
+ 	}
+ 	printf("SWEET USB: gadget armed, DSTS 0x%08x GSTS 0x%08x\n",
+ 	    dwc_rd(DSTS), dwc_rd(GSTS));
++	if (kernel_thread_start(ud_mon_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
