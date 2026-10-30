@@ -1,0 +1,215 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -169,15 +169,25 @@
+  */
+ #define QSCRATCH_PA             0x0a6f8800
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+-#define   UTMI_PHY_SUSPEND_N    (1u << 0)
++#define   VBUSVLDEXT0           (1u << 13)  /* D+ pull-up */
++#define   VBUSVLDEXTSEL0        (1u << 14)
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
++#define   USB2_UTMI_CLK_EN      (1u << 21)
++#define   USB2_SUSPEND_N        (1u << 22)
++#define   USB2_SUSPEND_N_SEL    (1u << 23)
+ #define   SW_SESSVLD_SEL        (1u << 28)
+ #define QSCRATCH_SS_PHY_CTRL    0x30
+ #define   LANE0_PWR_PRESENT     (1u << 24)
++/*
++ * Bits from mainline drivers/usb/dwc3/dwc3-qcom.c, which is the driver this
++ * SoC's "qcom,sdm845-dwc3" node binds to. The msm8996-era encoding this file
++ * used to carry (SEL bit 1, PIPE3 bit 2, DIS bit 0) put the clock select
++ * somewhere the hardware does not define it.
++ */
+ #define QSCRATCH_GENERAL_CFG    0x08
+-#define   PIPE_UTMI_CLK_DIS     (1u << 0)
+-#define   PIPE_UTMI_CLK_SEL     (1u << 1)
+-#define   PIPE3_SEL             (1u << 2)
++#define   PIPE_UTMI_CLK_SEL     (1u << 0)
++#define   PIPE3_PHYSTATUS_SW    (1u << 3)
++#define   PIPE_UTMI_CLK_DIS     (1u << 8)
+ 
+ #define DCTL_RUN_STOP   (1u << 31)
+ #define DCTL_CSFTRST    (1u << 30)
+@@ -966,7 +976,7 @@
+ #define UD_F_PIPE           0x40    /* point the wrapper at the UTMI clock */
+ #define UD_F_RUNSTOP        0x80    /* set DCTL.RUN_STOP before endpoint 0 */
+ #define UD_F_RESUME         0x100   /* only clear POWER_DOWN, keep ABL config */
+-#define UD_F_UTMI           0x200   /* deassert QSCRATCH UTMI_PHY_SUSPEND_N */
++#define UD_F_UTMI           0x200   /* HS_PHY_CTRL: D+ pull-up, UTMI clock on */
+ 
+ static void
+ ud_fifo_dump(void)
+@@ -1086,8 +1096,8 @@
+ /*
+  * Hand the wrapper the high-speed PHY's UTMI clock. The controller is wired
+  * for both PHYs and GENERAL_CFG selects which one feeds the core; the DT
+- * says maximum-speed = high-speed, and the register came up with PIPE3_SEL
+- * set, i.e. pointing at the unused SuperSpeed PHY.
++ * says maximum-speed = high-speed. Written with the bit numbers mainline
++ * dwc3-qcom uses for this SoC - which is not what this function did before.
+  */
+ static void
+ ud_pipe_select(void)
+@@ -1099,7 +1109,7 @@
+ 	}
+ 	uint32_t g = usb_rd(qs, QSCRATCH_GENERAL_CFG);
+ 	*(volatile uint32_t *)(qs + QSCRATCH_GENERAL_CFG) =
+-	    (g & ~(PIPE3_SEL | PIPE_UTMI_CLK_DIS)) | PIPE_UTMI_CLK_SEL;
++	    (g & ~PIPE_UTMI_CLK_DIS) | PIPE_UTMI_CLK_SEL;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	delay(1000);
+ 	printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (UTMI clk sel)\n",
+@@ -1189,34 +1199,120 @@
+ }
+ 
+ /*
+- * The wrapper register that nobody had written.
++ * The wrapper state a working high-speed gadget sits in.
++ *
++ * HS_PHY_CTRL read 0x10000000 at handover: SW_SESSVLD_SEL and nothing else.
++ * USB2_UTMI_CLK_EN (bit 21) is clear, so the wrapper is not enabling the
++ * PHY's UTMI clock, and USB2_SUSPEND_N (bit 22) is clear, so the interface
++ * is in suspend as well. A controller with no UTMI clock still retires
++ * DEPSTARTCFG, which runs off the bus clock, but can never finish DEPCFG,
++ * which is exactly the split the last nine builds logged.
+  *
+- * QSCRATCH_HS_PHY_CTRL read 0x10000000 at handover: SW_SESSVLD_SEL only.
+- * Bit 0 of that register is UTMI_PHY_SUSPEND_N, and it was clear, i.e. the
+- * wrapper was holding the high-speed PHY's UTMI interface in suspend. That
+- * sits upstream of every hypothesis tried so far. A suspended UTMI block
+- * hands the controller no UTMI clock; a controller with no UTMI clock still
+- * retires DEPSTARTCFG, which is driven by the bus clock, but never finishes
+- * DEPCFG, which needs the PHY clock - and that is precisely the split the
+- * logs have shown in all nine builds. The VBUS override wrote bit 20 of this
+- * same register and never touched bit 0.
++ * The bits below are the connect sequence from phy-msm-usb's
++ * msm_hsphy_notify_connect (VBUSVLDEXTSEL0, then VBUSVLDEXT0 to raise the
++ * D+ pull-up, then UTMI_OTG_VBUS_VALID, then SW_SESSVLD_SEL) plus the two
++ * clock bits. It reports each group separately so a later build can tell
++ * which one actually mattered.
+  */
++#define HS_CONNECT_BITS  (VBUSVLDEXT0 | VBUSVLDEXTSEL0 | UTMI_OTG_VBUS_VALID | \
++			  SW_SESSVLD_SEL)
++#define HS_CLOCK_BITS    (USB2_UTMI_CLK_EN | USB2_SUSPEND_N | USB2_SUSPEND_N_SEL)
++
+ static void
+-ud_utmi_unsuspend(void)
++ud_hsphy_state(const char *tag, uint32_t hs)
++{
++	printf("SWEET USB: %s HS_PHY_CTRL 0x%08x (vbusseld %d dp_pullup %d vbus_valid %d "
++	    "utmi_clk_en %d suspend_n %d suspend_sel %d sessvld %d)\n", tag, hs,
++	    !!(hs & VBUSVLDEXTSEL0), !!(hs & VBUSVLDEXT0), !!(hs & UTMI_OTG_VBUS_VALID),
++	    !!(hs & USB2_UTMI_CLK_EN), !!(hs & USB2_SUSPEND_N),
++	    !!(hs & USB2_SUSPEND_N_SEL), !!(hs & SW_SESSVLD_SEL));
++}
++
++static void
++ud_hsphy_connect(void)
+ {
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 
+ 	if (qs == 0) {
+-		printf("SWEET USB: QSCRATCH map failed (utmi)\n");
++		printf("SWEET USB: QSCRATCH map failed (hsphy)\n");
+ 		return;
+ 	}
+ 	uint32_t hs0 = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
+-	*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs0 | UTMI_PHY_SUSPEND_N;
++	ud_hsphy_state("before", hs0);
++	*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs0 | HS_CONNECT_BITS | HS_CLOCK_BITS;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	delay(1000);
+-	uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
+-	printf("SWEET USB: HS_PHY_CTRL 0x%08x -> 0x%08x (UTMI suspend %s)\n",
+-	    hs0, hs, (hs & UTMI_PHY_SUSPEND_N) ? "deasserted" : "STILL HELD");
++	ud_hsphy_state("after ", usb_rd(qs, QSCRATCH_HS_PHY_CTRL));
++}
++
++/*
++ * Bisect the clock mux instead of guessing it a third time.
++ *
++ * GENERAL_CFG came up as 0x04, a bit that means PIPE_UTMI_CLK_DIS in the old
++ * encoding and nothing at all in the new one, while the bit that does mean
++ * PIPE_UTMI_CLK_SEL in the new encoding (bit 0) was clear. Rather than pick
++ * an encoding, write each candidate, then run a real DEPSTARTCFG + DEPCFG
++ * and see whether the endpoint command engine retires it. The first value
++ * that works is the answer; if none works, the mux is not what is missing
++ * and the next suspects are the USB30_PRIM GDSC and the PHY reference clock.
++ */
++static int
++ud_depcfg_ok(void)
++{
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0)) {
++		return -1;
++	}
++	return ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3),
++	    (1u << 8) | (1u << 10), 0);
++}
++
++static int
++ud_clock_mux_bisect(void)
++{
++	static const struct {
++		uint32_t gen;
++		uint32_t hs;
++		const char *name;
++	} mux[] = {
++		{ 0x04, 0,                                 "as ABL left it" },
++		{ 0x01, 0,                                 "new: UTMI_CLK_SEL" },
++		{ 0x02, 0,                                 "old: UTMI sel, PIPE3 off" },
++		{ 0x03, 0,                                 "both select bits" },
++		{ 0x01, HS_CLOCK_BITS,                     "UTMI_CLK_SEL + clk enable" },
++	};
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	int won = -1;
++
++	if (qs == 0) {
++		printf("SWEET USB: QSCRATCH map failed (mux)\n");
++		return -1;
++	}
++	printf("SWEET USB: clock mux bisect, %u candidates\n",
++	    (unsigned)(sizeof(mux) / sizeof(mux[0])));
++	for (unsigned i = 0; i < sizeof(mux) / sizeof(mux[0]); i++) {
++		ud_core_reset(0);
++		ud_qusb2_resume();
++		if (mux[i].hs) {
++			uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
++			*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs | mux[i].hs;
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++		*(volatile uint32_t *)(qs + QSCRATCH_GENERAL_CFG) = mux[i].gen;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(1000);
++		if (ud_depcfg_ok() == 0) {
++			printf("SWEET USB: mux 0x%02x (%s) -> endpoint 0 OK\n",
++			    mux[i].gen, mux[i].name);
++			won = (int)i;
++			break;
++		}
++		printf("SWEET USB: mux 0x%02x (%s) -> still stuck (GENERAL_CFG reads 0x%08x)\n",
++		    mux[i].gen, mux[i].name, usb_rd(qs, QSCRATCH_GENERAL_CFG));
++	}
++	if (won < 0) {
++		printf("SWEET USB: no wrapper state retires DEPCFG; mux is not the fault\n");
++	}
++	return won;
+ }
+ 
+ /*
+@@ -1308,7 +1404,7 @@
+ 		}
+ 	}
+ 	if (flags & UD_F_UTMI) {
+-		ud_utmi_unsuspend();
++		ud_hsphy_connect();
+ 	}
+ 	if (flags & UD_F_PIPE) {
+ 		ud_pipe_select();
+@@ -1402,6 +1498,7 @@
+ 	ud_fifo_dump();
+ 	ud_ahb2phy_probe();
+ 	ud_qusb2_sweep();
++	ud_clock_mux_bisect();
+ 
+ 	/*
+ 	 * All of them power the PHY up first, because that turned out to be
