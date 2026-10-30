@@ -25,7 +25,7 @@
  
  extern bool polaris_touch_i2c_board(void);
  
-@@ -92,15 +101,406 @@
+@@ -92,15 +101,421 @@
  	ctx->state = POLARIS_GPU_OFF;
  }
  
@@ -197,10 +197,25 @@
 +static bool pg_gmu_clk_on;
 +
 +static bool
++pg_cx_is_on(void)
++{
++	/*
++	 * Two places can report the state of this switch: the hardware-control
++	 * register at 0x1540, and the domain's own GDSCR. The device tree gives
++	 * hw-ctrl-addr = 0x1a and the Mi 8 port reads 0x1540; rather than bet
++	 * on one, accept whichever reports the switch closed.
++	 */
++	bool hwctrl = !!(pg_rd(pg_gpucc + PG_GPUCC_CX_HWCTRL) & PG_GDSC_PWR_ON);
++	bool gdscr = !!(pg_rd(pg_gpucc + PG_GPUCC_CX_GDSCR) & PG_GDSC_PWR_ON);
++
++	return hwctrl || gdscr;
++}
++
++static bool
 +pg_cx_wait(bool on)
 +{
 +	for (uint32_t waited = 0; waited <= PG_GDSC_POLL_US; waited += 10) {
-+		if (!!(pg_rd(pg_gpucc + PG_GPUCC_CX_HWCTRL) & PG_GDSC_PWR_ON) == on) {
++		if (pg_cx_is_on() == on) {
 +			return true;
 +		}
 +		pg_sleep_us(10);
@@ -220,7 +235,7 @@
 +	v = pg_rd(pg_gpucc + PG_GPUCC_CX_GDSCR);
 +	printf("POLARIS GPU: 3 CX GDSCR before %#010x, control %#010x\n", v,
 +	    pg_rd(pg_gpucc + PG_GPUCC_CX_HWCTRL));
-+	if (v & PG_GDSC_PWR_ON) {
++	if (pg_cx_is_on()) {
 +		printf("POLARIS GPU: 3 the CX switch is already on: left alone\n");
 +		pg_cx_on = true;
 +		return true;
