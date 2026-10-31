@@ -1,0 +1,409 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -488,10 +488,16 @@
+ #define PG_CB_TCR2		0x10
+ #define PG_CB_TTBR0_LO		0x20
+ #define PG_CB_TTBR0_HI		0x24
++#define PG_CB_TTBR1_LO		0x28
++#define PG_CB_TTBR1_HI		0x2c
+ #define PG_CB_TCR		0x30
+ #define PG_CB_CONTEXTIDR	0x34
+ #define PG_CB_MAIR0		0x38
++#define PG_CB_MAIR1		0x3c
+ #define PG_CB_FSR		0x58
++#define PG_CB_TLBIASID		0x610
++#define PG_CB_TLBSYNC		0x7f0
++#define PG_CB_TLBSTATUS		0x7f4
+ 
+ static vm_offset_t pg_smmu;
+ static uint32_t pg_smmu_cb_base;	/* page offset of the context banks */
+@@ -921,6 +927,60 @@
+ #define PG_RESERVED_PHYS	0x8c400000ull
+ #define PG_RESERVED_PAGES	8u
+ 
++/*
++ * ---- the address the firmware will use ---------------------------------------------------------------
++ *
++ * The GMU is not a free master on the bus: it sits behind the GPU's SMMU. The
++ * device tree says which stream it is -
++ *
++ *     /soc/qcom,gmu/gmu_kernel     iommus = <&smmu-kgsl 5>
++ *     /soc/qcom,gmu/gmu_user       iommus = <&smmu-kgsl 4>
++ *     /soc/qcom,kgsl-iommu/gfx3d_user  iommus = <&smmu-kgsl 0>
++ *
++ * - and this phone's SMMU is in a state that explains step 13 exactly: sCR0
++ * reads 0x00200626, whose bit 10 is USFCFG ("unmatched streams fault"), while
++ * every one of the five stream entries is invalid (SMR 0, S2CR 0x000200ff).
++ * Stream 5 is therefore unmatched, and the first system-memory read the
++ * firmware ever makes - the queue table HFI_CTRL_INIT asks for - faults inside
++ * the SMMU instead of reaching memory. Nothing before step 13 gets that far,
++ * because the firmware and its TCM are entirely inside the GPU.
++ *
++ * So step 10 gives stream 5 a valid entry, one of two ways:
++ *
++ *  - polarisgpumap=0, the default: the entry says BYPASS, like the four the boot
++ *    loader configured. The firmware then uses physical addresses, which have to
++ *    be below 4 GB - on this phone that means the reserved IPS region, because
++ *    the allocator returns nothing below the boundary in any shape it accepts.
++ *  - polarisgpumap=1: entry 0 sends stream 5 to context bank 2, whose tables map
++ *    0x6000_0000 upward onto ordinary kernel pages wherever they land. This is
++ *    what Linux and the Mi 8 port do, and it is the only way to hand the
++ *    firmware memory this kernel actually owns.
++ */
++#define PG_GMU_IOVA_BASE	0x60000000ull	/* a630: one 2 MB window covers every region */
++#define PG_GMU_IOVA_DEBUG	0x60001000ull
++#define PG_GMU_IOVA_LOG		0x60005000ull
++#define PG_GMU_IOVA_HFI		0x60009000ull
++#define PG_GMU_STREAM		5u		/* /soc/qcom,gmu/gmu_kernel */
++#define PG_GMU_SMR_ENTRY	0u		/* entry 0's SMR is invalid, so nothing owns it */
++#define PG_GMU_CTX		2u		/* bank 0 belongs to the 3D core, which never starts */
++#define PG_S2CR_BYPASS		0x000200ffu	/* type 2 = bypass, context bank 255 */
++#define PG_SMR_VALID		(1u << 31)
++#define PG_CBAR_STAGE1		(1u << 16 | 3u << 8 | 0xfu << 12)
++					/* arm-smmu.h: TYPE 1 = stage 1 translates and stage 2
++					 * bypasses; 0xf in MEMATTR is write-back for the
++					 * walks, 3 in BPSHCFG is non-shareable. The Mi 8
++					 * port runs the same three fields on this SoC. */
++#define PG_CBA2R_64BIT		1u
++
++#define PG_PTE_TABLE		3ull
++#define PG_PTE_PAGE		3ull
++#define PG_PTE_ATTR		((2ull << 8) | (1ull << 10) | (1ull << 11))	/* shareable, accessed, not global */
++#define PG_PTE_ADDR		0x0000fffffffff000ull
++#define PG_SCTLR_ON		(1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12)
++#define PG_TCR_39_BITS		(25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
++#define PG_TCR2_36_BITS		(1u | 1u << 4 | 7u << 15)
++#define PG_MAIR0_LINUX		0xf404ff44u	/* index 0 is normal memory, not cached: what the PTEs pick */
++
+ struct pg_hfi_table {
+ 	uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
+ };
+@@ -934,6 +994,10 @@
+ static uint64_t pg_log_pa, pg_hfi_pa, pg_dbg_pa;
+ static vm_offset_t pg_queue_va[PG_GMU_HFI_QUEUES];	/* one data page per queue */
+ static uint64_t pg_queue_pa[PG_GMU_HFI_QUEUES];
++static uint64_t pg_log_iova, pg_hfi_iova, pg_dbg_iova;	/* what the firmware is told */
++static uint64_t pg_queue_iova[PG_GMU_HFI_QUEUES];
++static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
++static bool pg_smmu_mode;			/* polarisgpumap=1: translate instead of bypass */
+ static unsigned pg_region_count;		/* 0 while neither region exists */
+ static bool pg_boot_configured;
+ static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
+@@ -964,16 +1028,16 @@
+ 
+ /*
+  * The firmware reads its HFI table, its three queues, its log and its debug
+- * buffer out of DRAM with its own bus master, which is 32 bits wide - and the
+- * last run showed what happens when they are not reachable: HFI_CTRL_INIT was
+- * written, the console stopped in the middle of the next line and the machine
+- * never came back, which is a bus that neither completes nor errors.
++ * buffer with its own bus master. Two things it needs from us: a page each, and
++ * an address it can put on that bus. Which address depends on the entry step 10
++ * writes into the SMMU's stream table - physical when the entry bypasses, an
++ * iovar when it translates - so the allocation is the same and only the fallback
++ * rules differ.
+  *
+- * Those four regions used to come from the reserved IPS firmware region. This
+- * allocates one page each instead, from the kernel's own DRAM below 4 GB, so
+- * the firmware's first DMA target is ordinary memory this kernel already
+- * writes to. Queues do not have to be contiguous: each one carries its own
+- * address in the table, so a page each is exactly enough.
++ * In bypass mode the address is 32 bits wide, so a page above 4 GB is useless.
++ * The allocator gives nothing else (see above), so the reserved IPS firmware
++ * region is what is left; in translate mode the page may be anywhere and comes
++ * from the kernel's own memory.
+  */
+ static bool
+ pg_gmu_region(vm_offset_t *va, uint64_t *pa, const char *name)
+@@ -981,6 +1045,16 @@
+ 	unsigned index = pg_region_count;
+ 
+ 	if (*va != 0) {
++		return true;
++	}
++	if (pg_smmu_mode) {
++		if (kmem_alloc(kernel_map, va, PG_GMU_PAGE_SIZE,
++		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("POLARIS GPU: 10 the allocator has no page at all for the %s\n", name);
++			return false;
++		}
++		*pa = kvtophys(*va);
++		printf("POLARIS GPU: 10 %s: a kernel page at %#llx\n", name, *pa);
+ 		return true;
+ 	}
+ 	for (int attempt = 0; attempt < 4; attempt++) {
+@@ -1019,6 +1093,132 @@
+ 	}
+ 	printf("POLARIS GPU: 10 no memory at all for the %s\n", name);
+ 	return false;
++}
++
++/* ---- the SMMU's context bank 2 and the tables behind it --------------------------------------------- */
++
++static vm_offset_t
++pg_smmu_cb(uint32_t n)
++{
++	return pg_smmu + pg_smmu_cb_base + pg_smmu_page_size * n;
++}
++
++/* One table of 4 KB pages, three levels. Every region lies inside the single
++ * 2 MB window 0x6000_0000 opens, so one page per level is all it takes. */
++static bool
++pg_smmu_tables(void)
++{
++	if (pg_l3_va != 0) {
++		return true;
++	}
++	if (kmem_alloc(kernel_map, &pg_l1_va, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    kmem_alloc(kernel_map, &pg_l2_va, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    kmem_alloc(kernel_map, &pg_l3_va, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("POLARIS GPU: 10 no memory for the SMMU's tables\n");
++		return false;
++	}
++	((uint64_t *)pg_l1_va)[(PG_GMU_IOVA_BASE >> 30) & 0x1ff] =
++	    kvtophys(pg_l2_va) | PG_PTE_TABLE;
++	((uint64_t *)pg_l2_va)[(PG_GMU_IOVA_BASE >> 21) & 0x1ff] =
++	    kvtophys(pg_l3_va) | PG_PTE_TABLE;
++	pg_to_memory(pg_l1_va, PAGE_SIZE);
++	pg_to_memory(pg_l2_va, PAGE_SIZE);
++	printf("POLARIS GPU: 10 SMMU tables: level 1 %#llx, level 2 %#llx, level 3 %#llx\n",
++	    kvtophys(pg_l1_va), kvtophys(pg_l2_va), kvtophys(pg_l3_va));
++	return true;
++}
++
++static bool
++pg_smmu_map(uint64_t iova, vm_offset_t va, uint32_t pages, const char *name)
++{
++	uint64_t *l3 = (uint64_t *)pg_l3_va;
++
++	if (!pg_smmu_tables()) {
++		return false;
++	}
++	if ((iova >> 21) != (PG_GMU_IOVA_BASE >> 21)) {
++		printf("POLARIS GPU: 10 %s at %#llx is outside the 2 MB the tables cover\n", name, iova);
++		return false;
++	}
++	for (uint32_t i = 0; i < pages; i++) {
++		l3[((iova >> 12) + i) & 0x1ff] =
++		    (kvtophys(va + (vm_offset_t)PG_GMU_PAGE_SIZE * i) & PG_PTE_ADDR) |
++		    PG_PTE_ATTR | PG_PTE_PAGE;
++	}
++	pg_to_memory(pg_l3_va, PAGE_SIZE);
++	printf("POLARIS GPU: 10 %s: %#llx -> %#llx\n", name, iova, kvtophys(va));
++	return true;
++}
++
++/*
++ * Entry 0 of the stream table, made valid for stream 5. Bypass writes no
++ * context bank at all, which is exactly what the four entries the boot loader
++ * configured look like; translate brings up bank 2 first, tag and translate the
++ * tables, and only then sends the stream to it (arm-smmu.c's order).
++ */
++static bool
++pg_smmu_arm(void)
++{
++	uint32_t s2cr = pg_smmu_mode ? PG_GMU_CTX : PG_S2CR_BYPASS;
++	uint32_t smr = PG_SMR_VALID | PG_GMU_STREAM;
++	uint32_t back;
++
++	if (pg_smmu == 0) {
++		printf("POLARIS GPU: 10 the SMMU was never mapped: stream 5 stays unmatched\n");
++		return false;
++	}
++	if (pg_smmu_mode) {
++		vm_offset_t cb = pg_smmu_cb(PG_GMU_CTX);
++		uint64_t root;
++
++		if (!pg_smmu_tables()) {
++			return false;
++		}
++		root = (kvtophys(pg_l1_va) & PG_PTE_ADDR) | ((uint64_t)PG_GMU_CTX << 48);
++		pg_wr(cb + PG_CB_SCTLR, 0);
++		pg_wr(pg_smmu + PG_SMMU_CBA2R(PG_GMU_CTX), PG_CBA2R_64BIT);
++		pg_wr(pg_smmu + PG_SMMU_CBAR(PG_GMU_CTX), PG_CBAR_STAGE1);
++		pg_wr(cb + PG_CB_TCR2, PG_TCR2_36_BITS);
++		pg_wr(cb + PG_CB_TCR, PG_TCR_39_BITS);
++		pg_wr(cb + PG_CB_TTBR0_LO, (uint32_t)root);
++		pg_wr(cb + PG_CB_TTBR0_HI, (uint32_t)(root >> 32));
++		pg_wr(cb + PG_CB_TTBR1_LO, 0);
++		pg_wr(cb + PG_CB_TTBR1_HI, 0);
++		pg_wr(cb + PG_CB_MAIR0, PG_MAIR0_LINUX);
++		pg_wr(cb + PG_CB_MAIR1, 0);
++		pg_wr(cb + PG_CB_FSR, 0xffffffffu);	/* one to clear, every reason */
++		pg_wr(cb + PG_CB_TLBIASID, PG_GMU_CTX);
++		pg_wr(cb + PG_CB_TLBSYNC, 1);
++		for (int i = 0; i < 100 && (pg_rd(cb + PG_CB_TLBSTATUS) & 1); i++) {
++			pg_sleep_us(10);
++		}
++		printf("POLARIS GPU: 10 context bank %u: CBAR %#010x CBA2R %#x TCR %#010x TCR2 %#010x "
++		    "TTBR0 %#010x%08x MAIR0 %#010x TLB status %#x\n", PG_GMU_CTX,
++		    pg_rd(pg_smmu + PG_SMMU_CBAR(PG_GMU_CTX)), pg_rd(pg_smmu + PG_SMMU_CBA2R(PG_GMU_CTX)),
++		    pg_rd(cb + PG_CB_TCR), pg_rd(cb + PG_CB_TCR2), pg_rd(cb + PG_CB_TTBR0_HI),
++		    pg_rd(cb + PG_CB_TTBR0_LO), pg_rd(cb + PG_CB_MAIR0), pg_rd(cb + PG_CB_TLBSTATUS));
++		pg_wr(cb + PG_CB_SCTLR, PG_SCTLR_ON);
++		if (pg_rd(cb + PG_CB_SCTLR) != PG_SCTLR_ON) {
++			printf("POLARIS GPU: 10 the context bank would not switch on\n");
++			return false;
++		}
++	}
++	pg_wr(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY), s2cr);
++	pg_wr(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY), smr);
++	back = pg_rd(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY));
++	if (back != smr || pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY)) != s2cr) {
++		printf("POLARIS GPU: 10 the SMMU did not keep entry %u: wrote %#010x/%#010x read "
++		    "%#010x/%#010x\n", PG_GMU_SMR_ENTRY, smr, s2cr, back,
++		    pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY)));
++		return false;
++	}
++	printf("POLARIS GPU: 10 SMMU entry %u: stream %u -> %s (SMR %#010x S2CR %#010x); sCR0 %#010x, "
++	    "the other streams are as the boot loader left them\n", PG_GMU_SMR_ENTRY, PG_GMU_STREAM,
++	    pg_smmu_mode ? "context bank 2" : "bypass", smr, s2cr, pg_rd(pg_smmu + PG_SMMU_SCR0));
++	return true;
+ }
+ 
+ static bool
+@@ -1045,12 +1245,18 @@
+ 		{ "GPU_GMU_CX_GMU_PWR_COL_CP_RESP",	0x5101, 0x0 },
+ 	};
+ 	bool good = true;
++	int map = 0;
+ 
+ 	if (pg_gmu == 0 || pg_rd(pg_gmu + PG_GMU_WORD(0x5000)) != 1) {
+ 		printf("POLARIS GPU: 10 the GMU is not mapped or its processor is not held in reset: "
+ 		    "no boot configuration\n");
+ 		return false;
+ 	}
++	(void)PE_parse_boot_argn("polarisgpumap", &map, sizeof(map));
++	pg_smmu_mode = (map == 1);
++	printf("POLARIS GPU: 10 the firmware's regions are %s\n", pg_smmu_mode ?
++	    "behind the SMMU's translation (polarisgpumap=1)" :
++	    "addressed physically with stream 5 bypassing the SMMU (polarisgpumap=0)");
+ 	if (!pg_gmu_region(&pg_log_va, &pg_log_pa, "the firmware's log")) {
+ 		return false;
+ 	}
+@@ -1062,9 +1268,36 @@
+ 			return false;
+ 		}
+ 	}
+-	printf("POLARIS GPU: 10 log %#llx, HFI table %#llx, queues %#llx %#llx %#llx "
+-	    "(physical, the SMMU is bypass)\n", pg_log_pa, pg_hfi_pa,
+-	    pg_queue_pa[0], pg_queue_pa[1], pg_queue_pa[2]);
++	if (pg_smmu_mode) {
++		pg_log_iova = PG_GMU_IOVA_LOG;
++		pg_hfi_iova = PG_GMU_IOVA_HFI;
++		pg_dbg_iova = PG_GMU_IOVA_DEBUG;
++		if (!pg_smmu_map(pg_log_iova, pg_log_va, 1, "the firmware's log") ||
++		    !pg_smmu_map(pg_hfi_iova, pg_hfi_va, 1, "the HFI queue table")) {
++			return false;
++		}
++		for (uint32_t i = 0; i < PG_GMU_HFI_QUEUES; i++) {
++			pg_queue_iova[i] = PG_GMU_IOVA_HFI + PG_GMU_PAGE_SIZE * (i + 1ull);
++			if (!pg_smmu_map(pg_queue_iova[i], pg_queue_va[i], 1, "an HFI queue")) {
++				return false;
++			}
++		}
++	} else {
++		pg_log_iova = pg_log_pa;
++		pg_hfi_iova = pg_hfi_pa;
++		pg_dbg_iova = 0;
++		for (uint32_t i = 0; i < PG_GMU_HFI_QUEUES; i++) {
++			pg_queue_iova[i] = pg_queue_pa[i];
++		}
++	}
++	if (!pg_smmu_arm()) {
++		printf("POLARIS GPU: 10 without a stream entry the firmware's next memory read faults: "
++		    "stopping here\n");
++		return false;
++	}
++	printf("POLARIS GPU: 10 log %#llx (physical %#llx), HFI table %#llx (%#llx), queues %#llx %#llx %#llx\n",
++	    pg_log_iova, pg_log_pa, pg_hfi_iova, pg_hfi_pa,
++	    pg_queue_iova[0], pg_queue_iova[1], pg_queue_iova[2]);
+ 
+ 	table = (struct pg_hfi_table *)pg_hfi_va;
+ 	queue = (struct pg_hfi_queue *)(pg_hfi_va + sizeof(*table));
+@@ -1075,7 +1308,7 @@
+ 	table->num_queues = table->active_queues = PG_GMU_HFI_QUEUES;
+ 	for (uint32_t i = 0; i < PG_GMU_HFI_QUEUES; i++) {
+ 		queue[i].status = 1;
+-		queue[i].iova = (uint32_t)pg_queue_pa[i];
++		queue[i].iova = (uint32_t)pg_queue_iova[i];
+ 		queue[i].type = (10u << 8) | ids[i];
+ 		queue[i].size = PG_GMU_PAGE_SIZE / 4;
+ 		queue[i].rx_watermark = queue[i].tx_watermark = queue[i].rx_request = 1;
+@@ -1089,14 +1322,14 @@
+ 	}
+ 
+ 	/* the three that carry an address the firmware will actually use */
+-	pg_wr(pg_gmu + PG_GMU_WORD(0x5185), (uint32_t)pg_hfi_pa);		/* HFI_QTBL_ADDR */
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5185), (uint32_t)pg_hfi_iova);		/* HFI_QTBL_ADDR */
+ 	pg_wr(pg_gmu + PG_GMU_WORD(0x5182), PG_GMU_CHIPID);			/* HFI_SFR_ADDR: the chip id */
+ 	pg_wr(pg_gmu + PG_GMU_WORD(0x5100),					/* PWR_COL_CP_MSG */
+-	    (uint32_t)pg_log_pa | (PG_GMU_PAGE_SIZE / 0x1000u - 1u));		/* the log and its size in 4 KB */
++	    (uint32_t)pg_log_iova | (PG_GMU_PAGE_SIZE / 0x1000u - 1u));		/* the log and its size in 4 KB */
+ 	printf("POLARIS GPU: 10 HFI_QTBL_ADDR %#010x HFI_SFR_ADDR %#010x CP_MSG %#010x (were %#010x %#010x %#010x)\n",
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x5185)), pg_rd(pg_gmu + PG_GMU_WORD(0x5182)),
+-	    pg_rd(pg_gmu + PG_GMU_WORD(0x5100)), (uint32_t)pg_hfi_pa, PG_GMU_CHIPID,
+-	    (uint32_t)pg_log_pa | (PG_GMU_PAGE_SIZE / 0x1000u - 1u));
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5100)), (uint32_t)pg_hfi_iova, PG_GMU_CHIPID,
++	    (uint32_t)pg_log_iova | (PG_GMU_PAGE_SIZE / 0x1000u - 1u));
+ 
+ 	for (unsigned i = 0; i < sizeof(boot) / sizeof(boot[0]); i++) {
+ 		uint32_t old = pg_rd(pg_gmu + PG_GMU_WORD(boot[i].word));
+@@ -1119,10 +1352,10 @@
+ 		    old, old | 0xf11u, pg_rd(pg_gmu + PG_GMU_WORD(0x50e8)));
+ 	}
+ 	pg_boot_configured = good;
+-	if (pg_rd(pg_gmu + PG_GMU_WORD(0x5185)) != (uint32_t)pg_hfi_pa ||
++	if (pg_rd(pg_gmu + PG_GMU_WORD(0x5185)) != (uint32_t)pg_hfi_iova ||
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x5182)) != PG_GMU_CHIPID ||
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x5100)) !=
+-	    ((uint32_t)pg_log_pa | (PG_GMU_PAGE_SIZE / 0x1000u - 1u))) {
++	    ((uint32_t)pg_log_iova | (PG_GMU_PAGE_SIZE / 0x1000u - 1u))) {
+ 		printf("POLARIS GPU: 10 the address registers do not hold what was written: "
+ 		    "the firmware would read elsewhere\n");
+ 		good = pg_boot_configured = false;
+@@ -1934,17 +2167,29 @@
+ 		}
+ 		pg_zero(pg_dbg_va, PG_GMU_PAGE_SIZE);
+ 		pg_to_memory(pg_dbg_va, PG_GMU_PAGE_SIZE);
++		if (pg_smmu_mode) {
++			if (!pg_smmu_map(pg_dbg_iova, pg_dbg_va, 1, "the debug buffer")) {
++				ok = false;
++				goto out;
++			}
++		} else {
++			pg_dbg_iova = pg_dbg_pa;
++		}
+ 	}
+ 	/* nothing left over from the last two steps may be mistaken for an answer */
+ 	pg_wr(pg_gmu + PG_GMU_WORD(PG_AO_INTR_CLR), 0xffffffffu);
+ 	printf("POLARIS GPU: 13 before HFI_CTRL_INIT: STATUS %#010x INIT %#010x QTBL_INFO %#010x "
+-	    "QTBL_ADDR %#010x SFR %#010x CP_MSG %#010x debug %#010x AO %#010x\n",
++	    "QTBL_ADDR %#010x SFR %#010x CP_MSG %#010x debug %#llx AO %#010x\n",
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_STATUS)), pg_rd(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_INIT)),
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x5184)), pg_rd(pg_gmu + PG_GMU_WORD(0x5185)),
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x5182)), pg_rd(pg_gmu + PG_GMU_WORD(0x5100)),
+-	    pg_rd(pg_gmu + PG_GMU_WORD(PG_HFI_QTBL_INFO)), pg_rd(pg_gmu + PG_GMU_WORD(PG_AO_INTR_STATUS)));
++	    pg_dbg_iova, pg_rd(pg_gmu + PG_GMU_WORD(PG_AO_INTR_STATUS)));
++	printf("POLARIS GPU: 13 the SMMU has seen: global fault %#010x, stream entry %u SMR %#010x "
++	    "S2CR %#010x\n", pg_rd(pg_smmu + PG_SMMU_SGFSR), PG_GMU_SMR_ENTRY,
++	    pg_rd(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY)),
++	    pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY)));
+ 	printf("POLARIS GPU: 13 writing HFI_CTRL_INIT; if that is the last line, the wedge is in the "
+-	    "firmware's first read of the table at %#x\n", (uint32_t)pg_hfi_pa);
++	    "firmware's first read of the table at %#llx\n", pg_hfi_iova);
+ 	pg_wr(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_INIT), 1);
+ 	printf("POLARIS GPU: 13 HFI_CTRL_INIT was written; reading the status back\n");
+ 	ok = pg_poll(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_STATUS), 1, 1, 100, 100);
+@@ -1953,7 +2198,7 @@
+ 	if (!ok) {
+ 		goto out;
+ 	}
+-	init[2] = (uint32_t)pg_dbg_pa;
++	init[2] = (uint32_t)pg_dbg_iova;
+ 	init[3] = PG_GMU_PAGE_SIZE;
+ 	init[4] = 1;				/* GMU_COLD_BOOT */
+ 	printf("POLARIS GPU: 13 GMU_INIT: segment %#010x size %#x, cold boot\n", init[2], init[3]);
