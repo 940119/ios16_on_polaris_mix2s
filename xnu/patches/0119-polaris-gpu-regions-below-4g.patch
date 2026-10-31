@@ -1,0 +1,76 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -877,6 +877,17 @@
+ #define PG_GMU_HFI_QUEUES	3u
+ #define PG_DTCM_LAST_WORD	0xff8u		/* a6xx_gmu_start() reads the dword at this index */
+ 
++/*
++ * The GMU's boot configuration carries the addresses of its regions in 32-bit
++ * registers, so a region above 4 GB is not addressable at all: the register
++ * would keep the low half and the firmware would read somewhere else. This
++ * phone has 6 GB, and the first attempt at this step landed at 0x1_035a0000.
++ * The allocation is therefore capped below the boundary and every region is
++ * checked again after it is mapped.
++ */
++#define PG_ADDRESS_LIMIT	0x100000000ull
++#define PG_MAX_PAGE_BELOW_4G	0xfffffu	/* page numbers the allocation may use */
++
+ struct pg_hfi_table {
+ 	uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
+ };
+@@ -908,13 +919,23 @@
+ 	if (*va != 0) {
+ 		return true;
+ 	}
+-	if (kmem_alloc_contig(kernel_map, va, PG_GMU_REGION_SIZE, PG_GMU_REGION_SIZE - 1, 0, 0,
+-	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	for (int attempt = 0; attempt < 4; attempt++) {
++		if (kmem_alloc_contig(kernel_map, va, PG_GMU_REGION_SIZE, PG_GMU_REGION_SIZE - 1,
++		    0, PG_MAX_PAGE_BELOW_4G, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			*va = 0;
++			return false;
++		}
++		*pa = kvtophys(*va);
++		if (*pa != 0 && *pa + PG_GMU_REGION_SIZE <= PG_ADDRESS_LIMIT) {
++			return true;
++		}
++		printf("POLARIS GPU: 10 that region came back at %#llx, above the 32-bit "
++		    "boundary the firmware can address: given back\n", *pa);
++		kmem_free(kernel_map, *va, PG_GMU_REGION_SIZE);
+ 		*va = 0;
+-		return false;
+-	}
+-	*pa = kvtophys(*va);
+-	return *pa != 0;
++	}
++	return false;
+ }
+ 
+ static bool
+@@ -955,8 +976,9 @@
+ 		printf("POLARIS GPU: 10 no contiguous 16 KB for the HFI queue table\n");
+ 		return false;
+ 	}
+-	printf("POLARIS GPU: 10 log %#llx, HFI table %#llx (physical, the SMMU is bypass)\n",
+-	    pg_log_pa, pg_hfi_pa);
++	printf("POLARIS GPU: 10 log %#llx -> %#010x, HFI table %#llx -> %#010x "
++	    "(physical, the SMMU is bypass)\n", pg_log_pa, (uint32_t)pg_log_pa,
++	    pg_hfi_pa, (uint32_t)pg_hfi_pa);
+ 
+ 	table = (struct pg_hfi_table *)pg_hfi_va;
+ 	queue = (struct pg_hfi_queue *)(pg_hfi_va + sizeof(*table));
+@@ -1007,6 +1029,13 @@
+ 		    old, old | 0xf11u, pg_rd(pg_gmu + PG_GMU_WORD(0x50e8)));
+ 	}
+ 	pg_boot_configured = good;
++	if (pg_rd(pg_gmu + PG_GMU_WORD(0x5185)) != (uint32_t)pg_hfi_pa ||
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5182)) != (uint32_t)(pg_log_pa + 0x100) ||
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5100)) != ((uint32_t)pg_log_pa | 3u)) {
++		printf("POLARIS GPU: 10 the address registers do not hold what was written: "
++		    "the firmware would read elsewhere\n");
++		good = pg_boot_configured = false;
++	}
+ 	printf("POLARIS GPU: 10 boot configuration %s; SYSRESET %#x INIT_RESULT %#x GX %#010x (not released)\n",
+ 	    good ? "written" : "INCOMPLETE", pg_rd(pg_gmu + PG_GMU_WORD(0x5000)),
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x501c)), pg_rd(pg_gpucc + PG_GPUCC_GX_GDSCR));
