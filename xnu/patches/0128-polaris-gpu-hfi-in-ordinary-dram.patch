@@ -1,0 +1,337 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -873,7 +873,10 @@
+  * does install a context. The addresses themselves are the driver's choice:
+  * they sit in the boot configuration registers below.
+  */
+-#define PG_GMU_REGION_SIZE	0x4000u		/* 16 KB each, Linux's sizes */
++#define PG_GMU_PAGE_SIZE	0x1000u		/* one page per region, six in all */
++#define PG_GMU_CHIPID		0x06030100u	/* core 6 major 3 minor 0 patch 1: what HFI_SFR_ADDR
++						 * carries, spelled out by a6xx_gmu_fw_start() and
++						 * the same word the Mi 8 port writes */
+ #define PG_GMU_HFI_QUEUES	3u
+ #define PG_DTCM_LAST_WORD	0xff8u		/* a6xx_gmu_start() reads the dword at this index */
+ 
+@@ -899,19 +902,24 @@
+ #define PG_MAX_PAGE_BELOW_4G	0xfffffu	/* the last page number wholly below 4 GB */
+ 
+ /*
+- * Even asked that way the allocator has nothing to give: four adjacent pages
+- * low in the first DRAM window are all taken by the time this probe runs, so
+- * the request comes back KERN_RESOURCE_SHORTAGE at once. The last resort is
+- * memory the boot loader already reserved below the boundary and that nothing
+- * in this kernel ever touches: the IPS firmware region, 64 KB at 0x8c400000.
+- * The device tree marks it no-map, so the VM does not manage those pages and
+- * cannot hand them to anyone else, and IPS firmware belongs to the modem and
+- * IPA subsystems, which this kernel never starts. Three of its 16 KB blocks
+- * hold the log, the HFI queue table and the debug buffer the firmware asks for
+- * in its first HFI message.
++ * The first version of this step asked for four adjacent pages and got
++ * KERN_RESOURCE_SHORTAGE: by the time the probe runs, the low DRAM window has
++ * no run of four free pages left. It fell back to the IPS firmware region, 64 KB
++ * at 0x8c400000, which is no-map in the device tree and belongs to the modem
++ * and IPA subsystems - and step 13 then showed what that memory is worth to the
++ * firmware: the first DRAM transaction it ever makes, the read of the queue
++ * table HFI_CTRL_INIT asks for, wedged the whole machine. The addresses are in
++ * a region protected from masters that are not the modem or IPA, so the read
++ * neither completes nor errors.
++ *
++ * So: one page per region, asked for one at a time. Adjacency was never needed
++ * - every queue carries its own address in the table - and a single free page
++ * below 4 GB always exists. Six in all: the log, the queue table (which also
++ * holds the three queue headers) and one data page per queue, plus the debug
++ * buffer step 13 asks for.
+  */
+ #define PG_RESERVED_PHYS	0x8c400000ull
+-#define PG_RESERVED_REGIONS	3u
++#define PG_RESERVED_PAGES	8u
+ 
+ struct pg_hfi_table {
+ 	uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
+@@ -924,6 +932,8 @@
+ 
+ static vm_offset_t pg_log_va, pg_hfi_va, pg_dbg_va;
+ static uint64_t pg_log_pa, pg_hfi_pa, pg_dbg_pa;
++static vm_offset_t pg_queue_va[PG_GMU_HFI_QUEUES];	/* one data page per queue */
++static uint64_t pg_queue_pa[PG_GMU_HFI_QUEUES];
+ static unsigned pg_region_count;		/* 0 while neither region exists */
+ static bool pg_boot_configured;
+ static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
+@@ -952,50 +962,62 @@
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
+-static bool
+-pg_gmu_region(vm_offset_t *va, uint64_t *pa)
++/*
++ * The firmware reads its HFI table, its three queues, its log and its debug
++ * buffer out of DRAM with its own bus master, which is 32 bits wide - and the
++ * last run showed what happens when they are not reachable: HFI_CTRL_INIT was
++ * written, the console stopped in the middle of the next line and the machine
++ * never came back, which is a bus that neither completes nor errors.
++ *
++ * Those four regions used to come from the reserved IPS firmware region. This
++ * allocates one page each instead, from the kernel's own DRAM below 4 GB, so
++ * the firmware's first DMA target is ordinary memory this kernel already
++ * writes to. Queues do not have to be contiguous: each one carries its own
++ * address in the table, so a page each is exactly enough.
++ */
++static bool
++pg_gmu_region(vm_offset_t *va, uint64_t *pa, const char *name)
+ {
+ 	unsigned index = pg_region_count;
+ 
+ 	if (*va != 0) {
+ 		return true;
+ 	}
+-	/* the kernel's own pages first: page aligned is all the firmware needs */
+ 	for (int attempt = 0; attempt < 4; attempt++) {
+-		if (kmem_alloc_contig(kernel_map, va, PG_GMU_REGION_SIZE, PAGE_MASK,
+-		    PG_MAX_PAGE_BELOW_4G, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+-		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		if (kmem_alloc_contig(kernel_map, va, PG_GMU_PAGE_SIZE, 0, PG_MAX_PAGE_BELOW_4G, 0,
++		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 			*va = 0;
+-			printf("POLARIS GPU: 10 the allocator has no 16 KB below 4 GB (attempt %d)\n",
+-			    attempt + 1);
++			printf("POLARIS GPU: 10 the allocator has no page below 4 GB for the %s "
++			    "(attempt %d)\n", name, attempt + 1);
+ 			break;		/* the reserved region may still do */
+ 		}
+ 		*pa = kvtophys(*va);
+-		if (*pa != 0 && *pa + PG_GMU_REGION_SIZE <= PG_ADDRESS_LIMIT) {
+-			printf("POLARIS GPU: 10 region %u from the allocator: %#llx\n", index, *pa);
++		if (*pa != 0 && *pa + PG_GMU_PAGE_SIZE <= PG_ADDRESS_LIMIT) {
++			printf("POLARIS GPU: 10 %s from the allocator: %#llx\n", name, *pa);
+ 			pg_region_count = index + 1;
+ 			return true;
+ 		}
+-		printf("POLARIS GPU: 10 that region came back at %#llx, above the 32-bit "
+-		    "boundary the firmware can address: given back\n", *pa);
+-		kmem_free(kernel_map, *va, PG_GMU_REGION_SIZE);
++		printf("POLARIS GPU: 10 the %s page came back at %#llx, above the 32-bit "
++		    "boundary the firmware can address: given back\n", name, *pa);
++		kmem_free(kernel_map, *va, PG_GMU_PAGE_SIZE);
+ 		*va = 0;
+ 	}
+-	if (index < PG_RESERVED_REGIONS) {
+-		uint64_t phys = PG_RESERVED_PHYS + (uint64_t)index * PG_GMU_REGION_SIZE;
+-		vm_offset_t mapped = ml_io_map((vm_offset_t)phys, PG_GMU_REGION_SIZE);
++	if (index < PG_RESERVED_PAGES) {
++		uint64_t phys = PG_RESERVED_PHYS + (uint64_t)index * PG_GMU_PAGE_SIZE;
++		vm_offset_t mapped = ml_io_map((vm_offset_t)phys, PG_GMU_PAGE_SIZE);
+ 
+ 		if (mapped != 0) {
+ 			*va = mapped;
+ 			*pa = phys;
+-			pg_zero(mapped, PG_GMU_REGION_SIZE);
+-			printf("POLARIS GPU: 10 region %u from the reserved IPS firmware memory "
+-			    "at %#llx instead, mapped uncached\n", index, phys);
++			pg_zero(mapped, PG_GMU_PAGE_SIZE);
++			printf("POLARIS GPU: 10 %s from the reserved IPS firmware memory at %#llx "
++			    "instead, mapped uncached\n", name, phys);
+ 			pg_region_count = index + 1;
+ 			return true;
+ 		}
+-		printf("POLARIS GPU: 10 the reserved region at %#llx could not be mapped\n", phys);
+-	}
++		printf("POLARIS GPU: 10 the reserved page at %#llx could not be mapped\n", phys);
++	}
++	printf("POLARIS GPU: 10 no memory at all for the %s\n", name);
+ 	return false;
+ }
+ 
+@@ -1029,17 +1051,20 @@
+ 		    "no boot configuration\n");
+ 		return false;
+ 	}
+-	if (!pg_gmu_region(&pg_log_va, &pg_log_pa)) {
+-		printf("POLARIS GPU: 10 no contiguous 16 KB for the firmware's log\n");
+-		return false;
+-	}
+-	if (!pg_gmu_region(&pg_hfi_va, &pg_hfi_pa)) {
+-		printf("POLARIS GPU: 10 no contiguous 16 KB for the HFI queue table\n");
+-		return false;
+-	}
+-	printf("POLARIS GPU: 10 log %#llx -> %#010x, HFI table %#llx -> %#010x "
+-	    "(physical, the SMMU is bypass)\n", pg_log_pa, (uint32_t)pg_log_pa,
+-	    pg_hfi_pa, (uint32_t)pg_hfi_pa);
++	if (!pg_gmu_region(&pg_log_va, &pg_log_pa, "the firmware's log")) {
++		return false;
++	}
++	if (!pg_gmu_region(&pg_hfi_va, &pg_hfi_pa, "the HFI queue table")) {
++		return false;
++	}
++	for (uint32_t i = 0; i < PG_GMU_HFI_QUEUES; i++) {
++		if (!pg_gmu_region(&pg_queue_va[i], &pg_queue_pa[i], "an HFI queue")) {
++			return false;
++		}
++	}
++	printf("POLARIS GPU: 10 log %#llx, HFI table %#llx, queues %#llx %#llx %#llx "
++	    "(physical, the SMMU is bypass)\n", pg_log_pa, pg_hfi_pa,
++	    pg_queue_pa[0], pg_queue_pa[1], pg_queue_pa[2]);
+ 
+ 	table = (struct pg_hfi_table *)pg_hfi_va;
+ 	queue = (struct pg_hfi_queue *)(pg_hfi_va + sizeof(*table));
+@@ -1050,24 +1075,28 @@
+ 	table->num_queues = table->active_queues = PG_GMU_HFI_QUEUES;
+ 	for (uint32_t i = 0; i < PG_GMU_HFI_QUEUES; i++) {
+ 		queue[i].status = 1;
+-		queue[i].iova = (uint32_t)pg_hfi_pa + 0x1000 * (i + 1);
++		queue[i].iova = (uint32_t)pg_queue_pa[i];
+ 		queue[i].type = (10u << 8) | ids[i];
+-		queue[i].size = 0x1000 / 4;
++		queue[i].size = PG_GMU_PAGE_SIZE / 4;
+ 		queue[i].rx_watermark = queue[i].tx_watermark = queue[i].rx_request = 1;
+ 		printf("POLARIS GPU: 10 HFI queue %u id %u at %#x, capacity %u words\n",
+ 		    i, ids[i], queue[i].iova, queue[i].size);
+ 	}
+-	pg_to_memory(pg_hfi_va, PG_GMU_REGION_SIZE);
+-	pg_to_memory(pg_log_va, PG_GMU_REGION_SIZE);
++	pg_to_memory(pg_hfi_va, PG_GMU_PAGE_SIZE);
++	pg_to_memory(pg_log_va, PG_GMU_PAGE_SIZE);
++	for (uint32_t i = 0; i < PG_GMU_HFI_QUEUES; i++) {
++		pg_to_memory(pg_queue_va[i], PG_GMU_PAGE_SIZE);
++	}
+ 
+ 	/* the three that carry an address the firmware will actually use */
+ 	pg_wr(pg_gmu + PG_GMU_WORD(0x5185), (uint32_t)pg_hfi_pa);		/* HFI_QTBL_ADDR */
+-	pg_wr(pg_gmu + PG_GMU_WORD(0x5182), (uint32_t)(pg_log_pa + 0x100));	/* HFI_SFR_ADDR */
+-	pg_wr(pg_gmu + PG_GMU_WORD(0x5100), (uint32_t)(pg_log_pa) | 3u);	/* PWR_COL_CP_MSG */
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5182), PG_GMU_CHIPID);			/* HFI_SFR_ADDR: the chip id */
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5100),					/* PWR_COL_CP_MSG */
++	    (uint32_t)pg_log_pa | (PG_GMU_PAGE_SIZE / 0x1000u - 1u));		/* the log and its size in 4 KB */
+ 	printf("POLARIS GPU: 10 HFI_QTBL_ADDR %#010x HFI_SFR_ADDR %#010x CP_MSG %#010x (were %#010x %#010x %#010x)\n",
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x5185)), pg_rd(pg_gmu + PG_GMU_WORD(0x5182)),
+-	    pg_rd(pg_gmu + PG_GMU_WORD(0x5100)), (uint32_t)pg_hfi_pa, (uint32_t)(pg_log_pa + 0x100),
+-	    (uint32_t)pg_log_pa | 3u);
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5100)), (uint32_t)pg_hfi_pa, PG_GMU_CHIPID,
++	    (uint32_t)pg_log_pa | (PG_GMU_PAGE_SIZE / 0x1000u - 1u));
+ 
+ 	for (unsigned i = 0; i < sizeof(boot) / sizeof(boot[0]); i++) {
+ 		uint32_t old = pg_rd(pg_gmu + PG_GMU_WORD(boot[i].word));
+@@ -1091,8 +1120,9 @@
+ 	}
+ 	pg_boot_configured = good;
+ 	if (pg_rd(pg_gmu + PG_GMU_WORD(0x5185)) != (uint32_t)pg_hfi_pa ||
+-	    pg_rd(pg_gmu + PG_GMU_WORD(0x5182)) != (uint32_t)(pg_log_pa + 0x100) ||
+-	    pg_rd(pg_gmu + PG_GMU_WORD(0x5100)) != ((uint32_t)pg_log_pa | 3u)) {
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5182)) != PG_GMU_CHIPID ||
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5100)) !=
++	    ((uint32_t)pg_log_pa | (PG_GMU_PAGE_SIZE / 0x1000u - 1u))) {
+ 		printf("POLARIS GPU: 10 the address registers do not hold what was written: "
+ 		    "the firmware would read elsewhere\n");
+ 		good = pg_boot_configured = false;
+@@ -1225,6 +1255,7 @@
+ 
+ #define PG_HFI_CTRL_STATUS	0x5180u		/* the firmware's HFI is up when bit 0 reads 1 */
+ #define PG_HFI_CTRL_INIT	0x5186u
++#define PG_HFI_QTBL_INFO	0x5184u
+ #define PG_H2G_INTR_SET		0x5194u		/* the host kicks the GMU here */
+ #define PG_G2H_INTR_INFO	0x5192u
+ #define PG_G2H_INTR_CLR		0x5191u
+@@ -1770,7 +1801,17 @@
+ static volatile uint32_t *
+ pg_hfi_data(uint32_t q)
+ {
+-	return (volatile uint32_t *)(pg_hfi_va + 0x1000 * (q + 1));
++	return (volatile uint32_t *)pg_queue_va[q];
++}
++
++/* Both the indices in the table page and the words in the queue page have to
++ * travel between the two masters by way of memory, so both are cleaned on the
++ * way out and invalidated on the way in. */
++static void
++pg_hfi_sync(uint32_t q)
++{
++	pg_to_memory(pg_hfi_va, PG_GMU_PAGE_SIZE);
++	pg_to_memory(pg_queue_va[q], PG_GMU_PAGE_SIZE);
+ }
+ 
+ /*
+@@ -1786,7 +1827,7 @@
+ 	volatile struct pg_hfi_queue *cq = pg_hfi_header(0), *rq = pg_hfi_header(1);
+ 	uint32_t seq = ++pg_hfi_seq % 0xfff, index, space;
+ 
+-	pg_to_memory(pg_hfi_va, PG_GMU_REGION_SIZE);
++	pg_hfi_sync(0);
+ 	index = cq->write_index;
+ 	space = (cq->read_index - index - 1) & (PG_HFI_QUEUE_WORDS - 1);
+ 	if (space < dwords) {
+@@ -1799,9 +1840,9 @@
+ 		pg_hfi_data(0)[index] = msg[i];
+ 		index = (index + 1) & (PG_HFI_QUEUE_WORDS - 1);
+ 	}
+-	pg_to_memory((vm_offset_t)pg_hfi_data(0), 0x1000);
++	pg_to_memory(pg_queue_va[0], PG_GMU_PAGE_SIZE);
+ 	cq->write_index = index;
+-	pg_to_memory(pg_hfi_va, PG_GMU_REGION_SIZE);
++	pg_to_memory(pg_hfi_va, PG_GMU_PAGE_SIZE);
+ 	pg_wr(pg_gmu + PG_GMU_WORD(PG_H2G_INTR_SET), 1);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 
+@@ -1816,7 +1857,7 @@
+ 		for (;;) {
+ 			uint32_t resp[19], hdr, n, ri;
+ 
+-			pg_to_memory(pg_hfi_va, PG_GMU_REGION_SIZE);
++			pg_hfi_sync(1);
+ 			if (rq->read_index == rq->write_index) {
+ 				break;
+ 			}
+@@ -1832,7 +1873,7 @@
+ 				ri = (ri + 1) & (PG_HFI_QUEUE_WORDS - 1);
+ 			}
+ 			rq->read_index = ri;
+-			pg_to_memory(pg_hfi_va, PG_GMU_REGION_SIZE);
++			pg_to_memory(pg_hfi_va, PG_GMU_PAGE_SIZE);
+ 			if ((hdr & 0xff) == PG_HFI_MSG_ERROR) {
+ 				printf("POLARIS GPU: 13 the firmware reports an error, code %u\n", resp[1]);
+ 				continue;
+@@ -1882,9 +1923,28 @@
+ 		printf("POLARIS GPU: 13 the processor is still running from the step before\n");
+ 	}
+ 
+-	printf("POLARIS GPU: 13 before HFI_CTRL_INIT: STATUS %#010x INIT %#010x QTBL_INFO %#010x QTBL_ADDR %#010x\n",
++	/* The debug buffer the firmware keeps its own messages in. Allocated before
++	 * the channel opens, because asking the page allocator for memory while the
++	 * firmware is waiting on its first answer is a good way to lose the answer. */
++	if (pg_dbg_va == 0) {
++		if (!pg_gmu_region(&pg_dbg_va, &pg_dbg_pa, "the debug buffer")) {
++			printf("POLARIS GPU: 13 no region for the debug buffer\n");
++			ok = false;
++			goto out;
++		}
++		pg_zero(pg_dbg_va, PG_GMU_PAGE_SIZE);
++		pg_to_memory(pg_dbg_va, PG_GMU_PAGE_SIZE);
++	}
++	/* nothing left over from the last two steps may be mistaken for an answer */
++	pg_wr(pg_gmu + PG_GMU_WORD(PG_AO_INTR_CLR), 0xffffffffu);
++	printf("POLARIS GPU: 13 before HFI_CTRL_INIT: STATUS %#010x INIT %#010x QTBL_INFO %#010x "
++	    "QTBL_ADDR %#010x SFR %#010x CP_MSG %#010x debug %#010x AO %#010x\n",
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_STATUS)), pg_rd(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_INIT)),
+-	    pg_rd(pg_gmu + PG_GMU_WORD(0x5184)), pg_rd(pg_gmu + PG_GMU_WORD(0x5185)));
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5184)), pg_rd(pg_gmu + PG_GMU_WORD(0x5185)),
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5182)), pg_rd(pg_gmu + PG_GMU_WORD(0x5100)),
++	    pg_rd(pg_gmu + PG_GMU_WORD(PG_HFI_QTBL_INFO)), pg_rd(pg_gmu + PG_GMU_WORD(PG_AO_INTR_STATUS)));
++	printf("POLARIS GPU: 13 writing HFI_CTRL_INIT; if that is the last line, the wedge is in the "
++	    "firmware's first read of the table at %#x\n", (uint32_t)pg_hfi_pa);
+ 	pg_wr(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_INIT), 1);
+ 	printf("POLARIS GPU: 13 HFI_CTRL_INIT was written; reading the status back\n");
+ 	ok = pg_poll(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_STATUS), 1, 1, 100, 100);
+@@ -1893,14 +1953,8 @@
+ 	if (!ok) {
+ 		goto out;
+ 	}
+-	/* the debug region the firmware keeps its own messages in */
+-	if (pg_dbg_va == 0 && !pg_gmu_region(&pg_dbg_va, &pg_dbg_pa)) {
+-		printf("POLARIS GPU: 13 no region for the debug buffer\n");
+-		ok = false;
+-		goto out;
+-	}
+ 	init[2] = (uint32_t)pg_dbg_pa;
+-	init[3] = PG_GMU_REGION_SIZE;
++	init[3] = PG_GMU_PAGE_SIZE;
+ 	init[4] = 1;				/* GMU_COLD_BOOT */
+ 	printf("POLARIS GPU: 13 GMU_INIT: segment %#010x size %#x, cold boot\n", init[2], init[3]);
+ 	ok = pg_hfi_send(PG_HFI_MSG_INIT, init, 5, NULL, 0);
