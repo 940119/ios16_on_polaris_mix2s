@@ -1,0 +1,397 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1052,6 +1052,7 @@
+ static uint64_t pg_log_iova, pg_hfi_iova, pg_dbg_iova;	/* what the firmware is told */
+ static uint64_t pg_queue_iova[PG_GMU_HFI_QUEUES];
+ static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
++static bool pg_keep_running;		/* the ladder continues past step 13 */
+ static bool pg_smmu_mode;			/* polarisgpumap=1: translate instead of bypass */
+ static int pg_mmu_way;				/* polarisgpummu: 0 auto, 1 entry, 2 unmatched, 3 off */
+ static int pg_mem_way;				/* polarisgpumem: 0 ips, 1 ramdump, 2 splash */
+@@ -2724,12 +2725,351 @@
+ 		printf("POLARIS GPU: 13 log[0..7] = %#010x %#010x %#010x %#010x %#010x %#010x %#010x %#010x\n",
+ 		    log[0], log[1], log[2], log[3], log[4], log[5], log[6], log[7]);
+ 	}
+-	pg_gmu_hold();
++	if (!pg_keep_running) {
++		pg_gmu_hold();
++	}
+ 	printf("POLARIS GPU: 13 processor %s (SYSRESET %#x)\n",
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x5000)) == 1 ? "HELD in reset again" : "NOT HALTED",
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x5000)));
+ 	pg_gmu_unmask();
+ 	return ok;
++}
++
++/* ---- step 14: the 3D core's static initialisation ------------------------------------------------ */
++
++/*
++ * A630 hw_init, replayed from the Mi 8 port's mi8_a630_hw_init.inc, which is
++ * Linux's a6xx_gpu.c hw_init() projected onto SDM845's UBWC profile. The table
++ * is those 180 words in the same order and split into the same ranges, because
++ * here the order is the part that matters: the address-mode words land before
++ * HWCG, HWCG before its commit, and the core defaults after both.
++ *
++ * Two pieces are the caller's rather than the table's:
++ *
++ *  - the SECVID registers, which TrustZone lets be written once. The device
++ *    tree says qcom,gpu-quirk-secvid-set-once and the port's notes record that
++ *    a second write resets the phone, so this reads RBBM_SECVID_TRUST_CNTL
++ *    first: 0 means they are set already and they are not touched. This is the
++ *    only write in the ladder that can reboot the phone by itself.
++ *  - the GMU clock-gating words and GX_SPTPRAC_CLOCK_CONTROL, which are
++ *    read-modify-writes wrapped around the HWCG block. HWCG is skipped
++ *    entirely when RBBM_CLOCK_CNTL already reads 0x8aa8aa02, as Linux does.
++ *
++ * PROTECT and the interrupt mask are deliberately not written here: both
++ * belong with an interrupt path this kernel does not have yet.
++ */
++#define PG_GPU3D_PHYS		0x05000000ull	/* dt: reg 0x5000000 0x40000 */
++#define PG_GPU3D_SIZE		0x00040000u
++
++#define PG_INIT_ADDRESS_BEGIN		0
++#define PG_INIT_ADDRESS_END		11
++#define PG_INIT_HWCG_BEGIN		11
++#define PG_INIT_HWCG_END		116
++#define PG_INIT_HWCG_COMMIT_BEGIN	116
++#define PG_INIT_HWCG_COMMIT_END		117
++#define PG_INIT_CORE_BEGIN		117
++#define PG_INIT_CORE_END		146
++
++#define PG_RBBM_CLOCK_CNTL	0x00aeu
++#define PG_SECVID_TRUST_CNTL	0xf400u
++#define PG_GMU_AO_CGC_MODE	0x9309u
++#define PG_GMU_AO_CGC_DELAY	0x930au
++#define PG_GMU_AO_CGC_HYST	0x930bu
++#define PG_GMU_GX_SPTPRAC_CLK	0x0080u
++
++static vm_offset_t pg_gpu3d;
++
++/* word = offset in 32-bit words from the 3D core window, as the port stores it */
++static const struct {
++	uint32_t word;
++	uint32_t value;
++	const char *name;
++} pg_hw_init_table[] = {
++	{ 0x00842u, 0x00000001u, "REG_A6XX_CP_ADDR_MODE_CNTL" },
++	{ 0x00c01u, 0x00000001u, "REG_A6XX_VSC_ADDR_MODE_CNTL" },
++	{ 0x08601u, 0x00000001u, "REG_A6XX_GRAS_ADDR_MODE_CNTL" },
++	{ 0x08e05u, 0x00000001u, "REG_A6XX_RB_ADDR_MODE_CNTL" },
++	{ 0x09e01u, 0x00000001u, "REG_A6XX_PC_ADDR_MODE_CNTL" },
++	{ 0x0be05u, 0x00000001u, "REG_A6XX_HLSQ_ADDR_MODE_CNTL" },
++	{ 0x0a601u, 0x00000001u, "REG_A6XX_VFD_ADDR_MODE_CNTL" },
++	{ 0x09601u, 0x00000001u, "REG_A6XX_VPC_ADDR_MODE_CNTL" },
++	{ 0x00e00u, 0x00000001u, "REG_A6XX_UCHE_ADDR_MODE_CNTL" },
++	{ 0x0ae01u, 0x00000001u, "REG_A6XX_SP_ADDR_MODE_CNTL" },
++	{ 0x0b601u, 0x00000001u, "REG_A6XX_TPL1_ADDR_MODE_CNTL" },
++	{ 0x000b0u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL_SP0" },
++	{ 0x000b1u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL_SP1" },
++	{ 0x000b2u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL_SP2" },
++	{ 0x000b3u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL_SP3" },
++	{ 0x000b4u, 0x02022220u, "REG_A6XX_RBBM_CLOCK_CNTL2_SP0" },
++	{ 0x000b5u, 0x02022220u, "REG_A6XX_RBBM_CLOCK_CNTL2_SP1" },
++	{ 0x000b6u, 0x02022220u, "REG_A6XX_RBBM_CLOCK_CNTL2_SP2" },
++	{ 0x000b7u, 0x02022220u, "REG_A6XX_RBBM_CLOCK_CNTL2_SP3" },
++	{ 0x000b8u, 0x00000080u, "REG_A6XX_RBBM_CLOCK_DELAY_SP0" },
++	{ 0x000b9u, 0x00000080u, "REG_A6XX_RBBM_CLOCK_DELAY_SP1" },
++	{ 0x000bau, 0x00000080u, "REG_A6XX_RBBM_CLOCK_DELAY_SP2" },
++	{ 0x000bbu, 0x00000080u, "REG_A6XX_RBBM_CLOCK_DELAY_SP3" },
++	{ 0x000bcu, 0x0000f3cfu, "REG_A6XX_RBBM_CLOCK_HYST_SP0" },
++	{ 0x000bdu, 0x0000f3cfu, "REG_A6XX_RBBM_CLOCK_HYST_SP1" },
++	{ 0x000beu, 0x0000f3cfu, "REG_A6XX_RBBM_CLOCK_HYST_SP2" },
++	{ 0x000bfu, 0x0000f3cfu, "REG_A6XX_RBBM_CLOCK_HYST_SP3" },
++	{ 0x000c0u, 0x02222222u, "REG_A6XX_RBBM_CLOCK_CNTL_TP0" },
++	{ 0x000c1u, 0x02222222u, "REG_A6XX_RBBM_CLOCK_CNTL_TP1" },
++	{ 0x000c2u, 0x02222222u, "REG_A6XX_RBBM_CLOCK_CNTL_TP2" },
++	{ 0x000c3u, 0x02222222u, "REG_A6XX_RBBM_CLOCK_CNTL_TP3" },
++	{ 0x000c4u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL2_TP0" },
++	{ 0x000c5u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL2_TP1" },
++	{ 0x000c6u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL2_TP2" },
++	{ 0x000c7u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL2_TP3" },
++	{ 0x000c8u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL3_TP0" },
++	{ 0x000c9u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL3_TP1" },
++	{ 0x000cau, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL3_TP2" },
++	{ 0x000cbu, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL3_TP3" },
++	{ 0x000ccu, 0x00022222u, "REG_A6XX_RBBM_CLOCK_CNTL4_TP0" },
++	{ 0x000cdu, 0x00022222u, "REG_A6XX_RBBM_CLOCK_CNTL4_TP1" },
++	{ 0x000ceu, 0x00022222u, "REG_A6XX_RBBM_CLOCK_CNTL4_TP2" },
++	{ 0x000cfu, 0x00022222u, "REG_A6XX_RBBM_CLOCK_CNTL4_TP3" },
++	{ 0x000e0u, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST_TP0" },
++	{ 0x000e1u, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST_TP1" },
++	{ 0x000e2u, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST_TP2" },
++	{ 0x000e3u, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST_TP3" },
++	{ 0x000e4u, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST2_TP0" },
++	{ 0x000e5u, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST2_TP1" },
++	{ 0x000e6u, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST2_TP2" },
++	{ 0x000e7u, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST2_TP3" },
++	{ 0x000e8u, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST3_TP0" },
++	{ 0x000e9u, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST3_TP1" },
++	{ 0x000eau, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST3_TP2" },
++	{ 0x000ebu, 0x77777777u, "REG_A6XX_RBBM_CLOCK_HYST3_TP3" },
++	{ 0x000ecu, 0x00077777u, "REG_A6XX_RBBM_CLOCK_HYST4_TP0" },
++	{ 0x000edu, 0x00077777u, "REG_A6XX_RBBM_CLOCK_HYST4_TP1" },
++	{ 0x000eeu, 0x00077777u, "REG_A6XX_RBBM_CLOCK_HYST4_TP2" },
++	{ 0x000efu, 0x00077777u, "REG_A6XX_RBBM_CLOCK_HYST4_TP3" },
++	{ 0x000d0u, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY_TP0" },
++	{ 0x000d1u, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY_TP1" },
++	{ 0x000d2u, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY_TP2" },
++	{ 0x000d3u, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY_TP3" },
++	{ 0x000d4u, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY2_TP0" },
++	{ 0x000d5u, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY2_TP1" },
++	{ 0x000d6u, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY2_TP2" },
++	{ 0x000d7u, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY2_TP3" },
++	{ 0x000d8u, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY3_TP0" },
++	{ 0x000d9u, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY3_TP1" },
++	{ 0x000dau, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY3_TP2" },
++	{ 0x000dbu, 0x11111111u, "REG_A6XX_RBBM_CLOCK_DELAY3_TP3" },
++	{ 0x000dcu, 0x00011111u, "REG_A6XX_RBBM_CLOCK_DELAY4_TP0" },
++	{ 0x000ddu, 0x00011111u, "REG_A6XX_RBBM_CLOCK_DELAY4_TP1" },
++	{ 0x000deu, 0x00011111u, "REG_A6XX_RBBM_CLOCK_DELAY4_TP2" },
++	{ 0x000dfu, 0x00011111u, "REG_A6XX_RBBM_CLOCK_DELAY4_TP3" },
++	{ 0x0010bu, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL_UCHE" },
++	{ 0x0010cu, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL2_UCHE" },
++	{ 0x0010du, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL3_UCHE" },
++	{ 0x0010eu, 0x00222222u, "REG_A6XX_RBBM_CLOCK_CNTL4_UCHE" },
++	{ 0x00110u, 0x00000004u, "REG_A6XX_RBBM_CLOCK_HYST_UCHE" },
++	{ 0x0010fu, 0x00000002u, "REG_A6XX_RBBM_CLOCK_DELAY_UCHE" },
++	{ 0x000f0u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL_RB0" },
++	{ 0x000f1u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL_RB1" },
++	{ 0x000f2u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL_RB2" },
++	{ 0x000f3u, 0x22222222u, "REG_A6XX_RBBM_CLOCK_CNTL_RB3" },
++	{ 0x000f4u, 0x00002222u, "REG_A6XX_RBBM_CLOCK_CNTL2_RB0" },
++	{ 0x000f5u, 0x00002222u, "REG_A6XX_RBBM_CLOCK_CNTL2_RB1" },
++	{ 0x000f6u, 0x00002222u, "REG_A6XX_RBBM_CLOCK_CNTL2_RB2" },
++	{ 0x000f7u, 0x00002222u, "REG_A6XX_RBBM_CLOCK_CNTL2_RB3" },
++	{ 0x000f8u, 0x00002220u, "REG_A6XX_RBBM_CLOCK_CNTL_CCU0" },
++	{ 0x000f9u, 0x00002220u, "REG_A6XX_RBBM_CLOCK_CNTL_CCU1" },
++	{ 0x000fau, 0x00002220u, "REG_A6XX_RBBM_CLOCK_CNTL_CCU2" },
++	{ 0x000fbu, 0x00002220u, "REG_A6XX_RBBM_CLOCK_CNTL_CCU3" },
++	{ 0x00100u, 0x00040f00u, "REG_A6XX_RBBM_CLOCK_HYST_RB_CCU0" },
++	{ 0x00101u, 0x00040f00u, "REG_A6XX_RBBM_CLOCK_HYST_RB_CCU1" },
++	{ 0x00102u, 0x00040f00u, "REG_A6XX_RBBM_CLOCK_HYST_RB_CCU2" },
++	{ 0x00103u, 0x00040f00u, "REG_A6XX_RBBM_CLOCK_HYST_RB_CCU3" },
++	{ 0x00104u, 0x05022022u, "REG_A6XX_RBBM_CLOCK_CNTL_RAC" },
++	{ 0x00105u, 0x00005555u, "REG_A6XX_RBBM_CLOCK_CNTL2_RAC" },
++	{ 0x00106u, 0x00000011u, "REG_A6XX_RBBM_CLOCK_DELAY_RAC" },
++	{ 0x00107u, 0x00445044u, "REG_A6XX_RBBM_CLOCK_HYST_RAC" },
++	{ 0x00108u, 0x04222222u, "REG_A6XX_RBBM_CLOCK_CNTL_TSE_RAS_RBBM" },
++	{ 0x00114u, 0x00222222u, "REG_A6XX_RBBM_CLOCK_MODE_GPC" },
++	{ 0x00111u, 0x00002222u, "REG_A6XX_RBBM_CLOCK_MODE_VFD" },
++	{ 0x0010au, 0x00000000u, "REG_A6XX_RBBM_CLOCK_HYST_TSE_RAS_RBBM" },
++	{ 0x00116u, 0x04104004u, "REG_A6XX_RBBM_CLOCK_HYST_GPC" },
++	{ 0x00113u, 0x00000000u, "REG_A6XX_RBBM_CLOCK_HYST_VFD" },
++	{ 0x0011cu, 0x00000000u, "REG_A6XX_RBBM_CLOCK_DELAY_HLSQ" },
++	{ 0x00109u, 0x00004000u, "REG_A6XX_RBBM_CLOCK_DELAY_TSE_RAS_RBBM" },
++	{ 0x00115u, 0x00000200u, "REG_A6XX_RBBM_CLOCK_DELAY_GPC" },
++	{ 0x00112u, 0x00002222u, "REG_A6XX_RBBM_CLOCK_DELAY_VFD" },
++	{ 0x00117u, 0x00000002u, "REG_A6XX_RBBM_CLOCK_DELAY_HLSQ_2" },
++	{ 0x0011bu, 0x00002222u, "REG_A6XX_RBBM_CLOCK_MODE_HLSQ" },
++	{ 0x00118u, 0x00000222u, "REG_A6XX_RBBM_CLOCK_CNTL_GMU_GX" },
++	{ 0x00119u, 0x00000111u, "REG_A6XX_RBBM_CLOCK_DELAY_GMU_GX" },
++	{ 0x0011au, 0x00000555u, "REG_A6XX_RBBM_CLOCK_HYST_GMU_GX" },
++	{ 0x000aeu, 0x8aa8aa02u, "REG_A6XX_RBBM_CLOCK_CNTL" },
++	{ 0x00010u, 0x00000003u, "REG_A6XX_RBBM_VBIF_CLIENT_QOS_CNTL" },
++	{ 0x0302au, 0x00000009u, "REG_A6XX_VBIF_GATE_OFF_WRREQ_EN" },
++	{ 0x0050bu, 0xffffffffu, "REG_A6XX_RBBM_PERFCTR_GPU_BUSY_MASKED" },
++	{ 0x00e05u, 0xffffffc0u, "REG_A6XX_UCHE_WRITE_RANGE_MAX_LO" },
++	{ 0x00e06u, 0x0001ffffu, "REG_A6XX_UCHE_WRITE_RANGE_MAX_HI" },
++	{ 0x00e09u, 0xfffff000u, "REG_A6XX_UCHE_TRAP_BASE_LO" },
++	{ 0x00e0au, 0x0001ffffu, "REG_A6XX_UCHE_TRAP_BASE_HI" },
++	{ 0x00e07u, 0xfffff000u, "REG_A6XX_UCHE_WRITE_THRU_BASE_LO" },
++	{ 0x00e08u, 0x0001ffffu, "REG_A6XX_UCHE_WRITE_THRU_BASE_HI" },
++	{ 0x00e0bu, 0x00100000u, "REG_A6XX_UCHE_GMEM_RANGE_MIN_LO" },
++	{ 0x00e0cu, 0x00000000u, "REG_A6XX_UCHE_GMEM_RANGE_MIN_HI" },
++	{ 0x00e0du, 0x001fffffu, "REG_A6XX_UCHE_GMEM_RANGE_MAX_LO" },
++	{ 0x00e0eu, 0x00000000u, "REG_A6XX_UCHE_GMEM_RANGE_MAX_HI" },
++	{ 0x00e18u, 0x00000804u, "REG_A6XX_UCHE_FILTER_CNTL" },
++	{ 0x00e17u, 0x00000004u, "REG_A6XX_UCHE_CACHE_WAYS" },
++	{ 0x008c2u, 0x010000c0u, "REG_A6XX_CP_ROQ_THRESHOLDS_2" },
++	{ 0x008c1u, 0x8040362cu, "REG_A6XX_CP_ROQ_THRESHOLDS_1" },
++	{ 0x008c3u, 0x00000080u, "REG_A6XX_CP_MEM_POOL_SIZE" },
++	{ 0x09e00u, 0x00180000u, "REG_A6XX_PC_DBG_ECO_CNTL" },
++	{ 0x0098du, 0x00000001u, "REG_A6XX_CP_AHB_CNTL" },
++	{ 0x00500u, 0x00000001u, "REG_A6XX_RBBM_PERFCTR_CNTL" },
++	{ 0x008d0u, 0x00000000u, "REG_A6XX_CP_PERFCTR_CP_SEL(0)" },
++	{ 0x08e08u, 0x00000004u, "REG_A6XX_RB_NC_MODE_CNTL" },
++	{ 0x0b604u, 0x00000004u, "REG_A6XX_TPL1_NC_MODE_CNTL" },
++	{ 0x0ae02u, 0x00000004u, "REG_A6XX_SP_NC_MODE_CNTL" },
++	{ 0x00e01u, 0x00400000u, "REG_A6XX_UCHE_MODE_CNTL" },
++	{ 0x00534u, 0x00000000u, "REG_A6XX_RBBM_NC_MODE_CNTL" },
++	{ 0x0001fu, 0x401fffffu, "REG_A6XX_RBBM_INTERFACE_HANG_INT_CNTL" },
++	{ 0x00e19u, 0x00000081u, "REG_A6XX_UCHE_CLIENT_PF" },
++	{ 0x0084fu, 0x0000000bu, "REG_A6XX_CP_PROTECT_CNTL" },
++	{ 0x00850u, 0x13fc0000u, "REG_A6XX_CP_PROTECT(0)" },
++	{ 0x00851u, 0x00140501u, "REG_A6XX_CP_PROTECT(1)" },
++	{ 0x00852u, 0x0bd0050bu, "REG_A6XX_CP_PROTECT(2)" },
++	{ 0x00853u, 0x8000050eu, "REG_A6XX_CP_PROTECT(3)" },
++	{ 0x00854u, 0x80000510u, "REG_A6XX_CP_PROTECT(4)" },
++	{ 0x00855u, 0x80000534u, "REG_A6XX_CP_PROTECT(5)" },
++	{ 0x00856u, 0x82080800u, "REG_A6XX_CP_PROTECT(6)" },
++	{ 0x00857u, 0x802008a0u, "REG_A6XX_CP_PROTECT(7)" },
++	{ 0x00858u, 0x809008abu, "REG_A6XX_CP_PROTECT(8)" },
++	{ 0x00859u, 0x02b808deu, "REG_A6XX_CP_PROTECT(9)" },
++	{ 0x0085au, 0x81340900u, "REG_A6XX_CP_PROTECT(10)" },
++	{ 0x0085bu, 0x89c8098du, "REG_A6XX_CP_PROTECT(11)" },
++	{ 0x0085cu, 0x80040e00u, "REG_A6XX_CP_PROTECT(12)" },
++	{ 0x0085du, 0x80300e03u, "REG_A6XX_CP_PROTECT(13)" },
++	{ 0x0085eu, 0x830c3c00u, "REG_A6XX_CP_PROTECT(14)" },
++	{ 0x0085fu, 0x7ffc3cc4u, "REG_A6XX_CP_PROTECT(15)" },
++	{ 0x00860u, 0x873c8630u, "REG_A6XX_CP_PROTECT(16)" },
++	{ 0x00861u, 0x80008e00u, "REG_A6XX_CP_PROTECT(17)" },
++	{ 0x00862u, 0x80008e08u, "REG_A6XX_CP_PROTECT(18)" },
++	{ 0x00863u, 0x807c8e50u, "REG_A6XX_CP_PROTECT(19)" },
++	{ 0x00864u, 0x876c9624u, "REG_A6XX_CP_PROTECT(20)" },
++	{ 0x00865u, 0x80049e70u, "REG_A6XX_CP_PROTECT(21)" },
++	{ 0x00866u, 0x861c9e78u, "REG_A6XX_CP_PROTECT(22)" },
++	{ 0x00867u, 0x873ca630u, "REG_A6XX_CP_PROTECT(23)" },
++	{ 0x00868u, 0x8000ae02u, "REG_A6XX_CP_PROTECT(24)" },
++	{ 0x00869u, 0x8cbcae50u, "REG_A6XX_CP_PROTECT(25)" },
++	{ 0x0086au, 0x8000b604u, "REG_A6XX_CP_PROTECT(26)" },
++	{ 0x0086bu, 0x8004be02u, "REG_A6XX_CP_PROTECT(27)" },
++	{ 0x0086cu, 0xdf7cbe20u, "REG_A6XX_CP_PROTECT(28)" },
++	{ 0x0086du, 0xaffcf000u, "REG_A6XX_CP_PROTECT(29)" },
++	{ 0x0086eu, 0x7ffcfc00u, "REG_A6XX_CP_PROTECT(30)" },
++	{ 0x0086fu, 0x80011c00u, "REG_A6XX_CP_PROTECT(31)" },
++	{ 0x00038u, 0x03d0e242u, "REG_A6XX_RBBM_INT_0_MASK" },
++};
++
++static const struct {
++	uint32_t word;
++	uint32_t value;
++	const char *name;
++} pg_security_table[] = {
++	{ 0x0f803u, 0x00000000u, "REG_A6XX_RBBM_SECVID_TSB_CNTL" },
++	{ 0x0f800u, 0x00000000u, "REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE_LO" },
++	{ 0x0f801u, 0x00000000u, "REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE_HI" },
++	{ 0x0f802u, 0x00000000u, "REG_A6XX_RBBM_SECVID_TSB_TRUSTED_SIZE" },
++	{ 0x0f810u, 0x00000001u, "REG_A6XX_RBBM_SECVID_TSB_ADDR_MODE_CNTL" },
++};
++
++static uint32_t
++pg_hw_write(uint32_t word, uint32_t value, const char *name)
++{
++	uint32_t back;
++
++	pg_wr(pg_gpu3d + 4u * word, value);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	back = pg_rd(pg_gpu3d + 4u * word);
++	if (back != value) {
++		printf("POLARIS GPU: 14 %s (word %#x): wrote %#010x read %#010x\n", name, word,
++		    value, back);
++		return 1;
++	}
++	return 0;
++}
++
++static uint32_t
++pg_hw_range(const char *what, uint32_t first, uint32_t end)
++{
++	uint32_t differs = 0;
++
++	for (uint32_t i = first; i < end; i++) {
++		differs += pg_hw_write(pg_hw_init_table[i].word, pg_hw_init_table[i].value,
++		    pg_hw_init_table[i].name);
++	}
++	printf("POLARIS GPU: 14 %s: %u words, %u read back different\n", what, end - first,
++	    differs);
++	return differs;
++}
++
++static bool
++pg_step_hw_init(void)
++{
++	uint32_t trust, clock_cntl, differs = 0;
++	bool set_once;
++
++	if (pg_gpu3d == 0) {
++		pg_gpu3d = ml_io_map(PG_GPU3D_PHYS, PG_GPU3D_SIZE);
++	}
++	if (pg_gpu3d == 0) {
++		printf("POLARIS GPU: 14 the 3D core window did not map\n");
++		return false;
++	}
++	PG_CHECK("14: the 3D core is mapped");
++	trust = pg_rd(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL);
++	set_once = (trust == 0);
++	printf("POLARIS GPU: 14 RBBM_SECVID_TRUST_CNTL %#010x: %s\n", trust,
++	    set_once ? "already set (set-once): not written again" :
++	    "not set: writing the trusted buffer registers once");
++	if (!set_once) {
++		for (unsigned i = 0; i < 4; i++) {
++			differs += pg_hw_write(pg_security_table[i].word, pg_security_table[i].value,
++			    pg_security_table[i].name);
++		}
++	}
++	differs += pg_hw_range("ADDRESS", PG_INIT_ADDRESS_BEGIN, PG_INIT_ADDRESS_END);
++	if (!set_once) {
++		differs += pg_hw_write(pg_security_table[4].word, pg_security_table[4].value,
++		    pg_security_table[4].name);
++	}
++	PG_CHECK("14: the address mode words are in");
++	/* a6xx_set_hwcg: the GMU's clock gating mode, delay and hysteresis */
++	pg_wr(pg_gmu + PG_GMU_WORD(PG_GMU_AO_CGC_MODE), 0x20202u);
++	pg_wr(pg_gmu + PG_GMU_WORD(PG_GMU_AO_CGC_DELAY), 0x10111u);
++	pg_wr(pg_gmu + PG_GMU_WORD(PG_GMU_AO_CGC_HYST), 0x5555u);
++	printf("POLARIS GPU: 14 GMU clock gating %#x/%#x/%#x\n",
++	    pg_rd(pg_gmu + PG_GMU_WORD(PG_GMU_AO_CGC_MODE)),
++	    pg_rd(pg_gmu + PG_GMU_WORD(PG_GMU_AO_CGC_DELAY)),
++	    pg_rd(pg_gmu + PG_GMU_WORD(PG_GMU_AO_CGC_HYST)));
++	clock_cntl = pg_rd(pg_gpu3d + 4u * PG_RBBM_CLOCK_CNTL);
++	printf("POLARIS GPU: 14 RBBM_CLOCK_CNTL %#010x: %s\n", clock_cntl,
++	    clock_cntl == 0x8aa8aa02u ? "clock gating is on already: HWCG skipped" :
++	    "cold state: writing HWCG and its commit");
++	if (clock_cntl != 0x8aa8aa02u) {
++		uint32_t v = pg_rd(pg_gmu + PG_GMU_WORD(PG_GMU_GX_SPTPRAC_CLK));
++
++		printf("POLARIS GPU: 14 GX_SPTPRAC_CLOCK_CONTROL %#x: clearing bit 0\n", v);
++		pg_wr(pg_gmu + PG_GMU_WORD(PG_GMU_GX_SPTPRAC_CLK), v & ~1u);
++		differs += pg_hw_range("HWCG", PG_INIT_HWCG_BEGIN, PG_INIT_HWCG_END);
++		pg_wr(pg_gmu + PG_GMU_WORD(PG_GMU_GX_SPTPRAC_CLK),
++		    pg_rd(pg_gmu + PG_GMU_WORD(PG_GMU_GX_SPTPRAC_CLK)) | 1u);
++		printf("POLARIS GPU: 14 GX_SPTPRAC_CLOCK_CONTROL now %#x\n",
++		    pg_rd(pg_gmu + PG_GMU_WORD(PG_GMU_GX_SPTPRAC_CLK)));
++		differs += pg_hw_range("HWCG_COMMIT", PG_INIT_HWCG_COMMIT_BEGIN,
++		    PG_INIT_HWCG_COMMIT_END);
++	}
++	PG_CHECK("14: HWCG is done, the core defaults next");
++	differs += pg_hw_range("CORE", PG_INIT_CORE_BEGIN, PG_INIT_CORE_END);
++	printf("POLARIS GPU: 14 the 3D core has the table: %u of 146 words read back different\n",
++	    differs);
++	return true;
+ }
+ 
+ /* ---- the ladder ------------------------------------------------------------------------------------ */
+@@ -2749,7 +3089,7 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0138 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0139 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
+@@ -2854,12 +3194,23 @@
+ 	if (upto < 13) {
+ 		return;
+ 	}
++	pg_keep_running = upto >= 14;
+ 	PG_CHECK("step 13: the HFI channel");
+ 	if (!pg_step_hfi()) {
+ 		printf("POLARIS GPU: stop after 13: the firmware did not answer over HFI\n");
+ 		return;
+ 	}
+-	printf("POLARIS GPU: ladder done; the CX half is left powered, nothing may be released yet\n");
++	if (upto < 14) {
++		printf("POLARIS GPU: ladder done; the CX half is left powered, nothing may be "
++		    "released yet\n");
++		return;
++	}
++	PG_CHECK("step 14: the 3D core");
++	if (!pg_step_hw_init()) {
++		printf("POLARIS GPU: stop after 14: the 3D core did not take the table\n");
++		return;
++	}
++	printf("POLARIS GPU: ladder done at 14; the firmware and the 3D core are left running\n");
+ }
+ 
+ void
