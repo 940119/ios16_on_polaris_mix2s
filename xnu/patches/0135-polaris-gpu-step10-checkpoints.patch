@@ -1,0 +1,65 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1419,7 +1419,9 @@
+ 		printf("POLARIS GPU: 10 the SMMU was never mapped: stream 5 stays unmatched\n");
+ 		return false;
+ 	}
++	PG_CHECK("10: probing the stream table");
+ 	pg_smmu_probe();
++	PG_CHECK("10: the stream table is probed, halting the SMMU");
+ 	if (pg_smmu_halt()) {
+ 		(void)pg_smmu_impl_defs();
+ 		pg_smmu_resume();
+@@ -1592,27 +1594,35 @@
+ 	printf("POLARIS GPU: 10 the firmware's regions are %s\n", pg_smmu_mode ?
+ 	    "behind the SMMU's translation (polarisgpumap=1)" :
+ 	    "addressed physically with stream 5 bypassing the SMMU (polarisgpumap=0)");
++	PG_CHECK("10: the mode is parsed, nothing has been allocated yet");
+ 	printf("POLARIS GPU: 10 polarisgpummu=%d, polarisgpumem=%d (%s)\n",
+ 	    pg_mmu_way, pg_mem_way, pg_reserved_name());
++	PG_CHECK("10: allocating the firmware's log");
+ 	if (!pg_gmu_region(&pg_log_va, &pg_log_pa, "the firmware's log")) {
+ 		return false;
+ 	}
++	PG_CHECK("10: the firmware's log is in place");
++	PG_CHECK("10: allocating the HFI queue table");
+ 	if (!pg_gmu_region(&pg_hfi_va, &pg_hfi_pa, "the HFI queue table")) {
+ 		return false;
+ 	}
++	PG_CHECK("10: the HFI queue table is in place");
+ 	for (uint32_t i = 0; i < PG_GMU_HFI_QUEUES; i++) {
+ 		if (!pg_gmu_region(&pg_queue_va[i], &pg_queue_pa[i], "an HFI queue")) {
+ 			return false;
+ 		}
+ 	}
++	PG_CHECK("10: allocating the HFI queues");
+ 	if (pg_smmu_mode) {
+ 		pg_log_iova = PG_GMU_IOVA_LOG;
+ 		pg_hfi_iova = PG_GMU_IOVA_HFI;
+ 		pg_dbg_iova = PG_GMU_IOVA_DEBUG;
++		PG_CHECK("10: building the SMMU's tables");
+ 		if (!pg_smmu_map(pg_log_iova, pg_log_va, 1, "the firmware's log") ||
+ 		    !pg_smmu_map(pg_hfi_iova, pg_hfi_va, 1, "the HFI queue table")) {
+ 			return false;
+ 		}
++		PG_CHECK("10: the log and the table are mapped");
+ 		for (uint32_t i = 0; i < PG_GMU_HFI_QUEUES; i++) {
+ 			pg_queue_iova[i] = PG_GMU_IOVA_HFI + PG_GMU_PAGE_SIZE * (i + 1ull);
+ 			if (!pg_smmu_map(pg_queue_iova[i], pg_queue_va[i], 1, "an HFI queue")) {
+@@ -1627,6 +1637,7 @@
+ 			pg_queue_iova[i] = pg_queue_pa[i];
+ 		}
+ 	}
++	PG_CHECK("10: arming the SMMU");
+ 	if (!pg_smmu_arm()) {
+ 		printf("POLARIS GPU: 10 without a stream entry the firmware's next memory read faults: "
+ 		    "stopping here\n");
+@@ -2700,7 +2711,7 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0134 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0135 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
