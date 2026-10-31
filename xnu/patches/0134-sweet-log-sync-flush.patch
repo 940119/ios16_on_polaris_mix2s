@@ -139,7 +139,32 @@
  
 --- a/bsd/dev/polaris_gpu.c
 +++ b/bsd/dev/polaris_gpu.c
-@@ -1428,23 +1428,27 @@
+@@ -108,6 +108,24 @@
+ #include "polaris_a630_fw.h"
+ 
+ extern uint64_t kvtophys(vm_offset_t va);
++
++/*
++ * Put the console on the disk before the next thing that might stop the machine.
++ *
++ * The ring is flushed by a thread every sweet_log_secs seconds, which is far too
++ * slow for a ladder whose thirteen steps take microseconds: a step that hangs the
++ * whole SoC leaves nothing on the disk, and the boot that produced no log cannot
++ * be told apart from a boot that never happened. A flush costs one polled UFS
++ * write, so the ladder can afford to do it before every step and around every
++ * register write in the SMMU's translation path.
++ */
++extern void sweet_log_flush_now(void);
++
++#define PG_CHECK(what)	do { \
++	printf("POLARIS GPU: -- at %s\n", (what)); \
++	sweet_log_flush_now(); \
++} while (0)
++
+ 
+ /* ---- register access ------------------------------------------------------------------------------ */
+ 
+@@ -1428,23 +1446,27 @@
  		    pg_rd(cb + PG_CB_TCR), pg_rd(cb + PG_CB_TCR2), pg_rd(cb + PG_CB_FSR),
  		    pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY)), pg_rd(pg_smmu + PG_SMMU_SCR0),
  		    pg_rd(pg_smmu + PG_SMMU_SGFSR));
@@ -167,7 +192,7 @@
  		pg_wr(cb + PG_CB_TLBIASID, PG_GMU_CTX);
  		pg_wr(cb + PG_CB_TLBSYNC, 1);
  		for (int i = 0; i < 100 && (pg_rd(cb + PG_CB_TLBSTATUS) & 1); i++) {
-@@ -1455,6 +1459,7 @@
+@@ -1455,6 +1477,7 @@
  		    pg_rd(pg_smmu + PG_SMMU_CBAR(PG_GMU_CTX)), pg_rd(pg_smmu + PG_SMMU_CBA2R(PG_GMU_CTX)),
  		    pg_rd(cb + PG_CB_TCR), pg_rd(cb + PG_CB_TCR2), pg_rd(cb + PG_CB_TTBR0_HI),
  		    pg_rd(cb + PG_CB_TTBR0_LO), pg_rd(cb + PG_CB_MAIR0), pg_rd(cb + PG_CB_TLBSTATUS));
@@ -175,7 +200,7 @@
  		pg_wr(cb + PG_CB_SCTLR, PG_SCTLR_ON);
  		if (pg_rd(cb + PG_CB_SCTLR) != PG_SCTLR_ON) {
  			printf("POLARIS GPU: 10 the context bank would not switch on\n");
-@@ -1482,6 +1487,7 @@
+@@ -1482,6 +1505,7 @@
  		uint32_t smr_back, s2cr_back, scr0, scr0_after;
  
  		if (want_entry) {
@@ -183,7 +208,7 @@
  			pg_wr(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY), smr);
  			pg_wr(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY), s2cr);
  			smr_back = pg_rd(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY));
-@@ -2549,7 +2555,9 @@
+@@ -2549,7 +2573,9 @@
  	    pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY)));
  	printf("POLARIS GPU: 13 writing HFI_CTRL_INIT; if that is the last line, the wedge is in the "
  	    "firmware's first read of the table at %#llx\n", pg_hfi_iova);
@@ -193,31 +218,7 @@
  	printf("POLARIS GPU: 13 HFI_CTRL_INIT was written; reading the status back\n");
  	ok = pg_poll(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_STATUS), 1, 1, 100, 100);
  	printf("POLARIS GPU: 13 HFI_CTRL_INIT: HFI_CTRL_STATUS %#010x (%s)\n",
-@@ -2657,6 +2665,23 @@
- 	return ok;
- }
- 
-+/*
-+ * Put the console on the disk before the next thing that might stop the machine.
-+ *
-+ * The ring is flushed by a thread every sweet_log_secs seconds, which is far too
-+ * slow for a ladder whose thirteen steps take microseconds: a step that hangs the
-+ * whole SoC leaves nothing on the disk, and the boot that produced no log cannot
-+ * be told apart from a boot that never happened. A flush costs one polled UFS
-+ * write, so the ladder can afford to do it before every step and around every
-+ * register write in the SMMU's translation path.
-+ */
-+extern void sweet_log_flush_now(void);
-+
-+#define PG_CHECK(what)	do { \
-+	printf("POLARIS GPU: -- at %s\n", (what)); \
-+	sweet_log_flush_now(); \
-+} while (0)
-+
- /* ---- the ladder ------------------------------------------------------------------------------------ */
- 
- void
-@@ -2674,11 +2699,12 @@
+@@ -2674,11 +2700,12 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
  	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
@@ -231,7 +232,7 @@
  	ok = pg_step_gcc();
  	if (!ok) {
  		printf("POLARIS GPU: stop after 1: GCC could not be mapped at all\n");
-@@ -2687,6 +2713,7 @@
+@@ -2687,6 +2714,7 @@
  	if (upto < 2) {
  		return;
  	}
@@ -239,7 +240,7 @@
  	ok = pg_step_gpucc();
  	if (!ok) {
  		printf("POLARIS GPU: stop after 2: GPUCC was not read\n");
-@@ -2695,6 +2722,7 @@
+@@ -2695,6 +2723,7 @@
  	if (upto < 3) {
  		return;
  	}
@@ -247,7 +248,7 @@
  	ok = pg_step_cx_on();
  	if (!ok) {
  		printf("POLARIS GPU: stop after 3: the CX switch did not come on\n");
-@@ -2703,6 +2731,7 @@
+@@ -2703,6 +2732,7 @@
  	if (upto < 4) {
  		return;
  	}
@@ -255,7 +256,7 @@
  	ok = pg_step_clocks();
  	if (!ok) {
  		printf("POLARIS GPU: stop after 4: a clock did not come on\n");
-@@ -2711,6 +2740,7 @@
+@@ -2711,6 +2741,7 @@
  	if (upto < 5) {
  		return;
  	}
@@ -263,7 +264,7 @@
  	if (!pg_step_gmu()) {
  		printf("POLARIS GPU: stop after 5: the GMU's counter is not advancing\n");
  		return;
-@@ -2718,6 +2748,7 @@
+@@ -2718,6 +2749,7 @@
  	if (upto < 6) {
  		return;
  	}
@@ -271,7 +272,7 @@
  	if (!pg_step_smmu()) {
  		printf("POLARIS GPU: stop after 6: the SMMU was not read\n");
  		return;
-@@ -2725,6 +2756,7 @@
+@@ -2725,6 +2757,7 @@
  	if (upto < 7) {
  		return;
  	}
@@ -279,7 +280,7 @@
  	if (!pg_step_gmu_tcm()) {
  		printf("POLARIS GPU: stop after 7: the GMU's memory did not take the pattern\n");
  		return;
-@@ -2732,6 +2764,7 @@
+@@ -2732,6 +2765,7 @@
  	if (upto < 8) {
  		return;
  	}
@@ -287,7 +288,7 @@
  	if (!pg_step_gmu_firmware()) {
  		printf("POLARIS GPU: stop after 8: the firmware did not land in the GMU's memory\n");
  		return;
-@@ -2739,6 +2772,7 @@
+@@ -2739,6 +2773,7 @@
  	if (upto < 9) {
  		return;
  	}
@@ -295,7 +296,7 @@
  	if (!pg_step_rsc_pdc()) {
  		printf("POLARIS GPU: stop after 9: the PDC's tables did not take\n");
  		return;
-@@ -2746,6 +2780,7 @@
+@@ -2746,6 +2781,7 @@
  	if (upto < 10) {
  		return;
  	}
@@ -303,7 +304,7 @@
  	if (!pg_step_gmu_boot_config()) {
  		printf("POLARIS GPU: stop after 10: the boot configuration did not take\n");
  		return;
-@@ -2753,6 +2788,7 @@
+@@ -2753,6 +2789,7 @@
  	if (upto < 11) {
  		return;
  	}
@@ -311,7 +312,7 @@
  	if (!pg_step_gmu_start(upto < 12)) {
  		printf("POLARIS GPU: stop after 11: the firmware did not announce itself\n");
  		return;
-@@ -2760,6 +2796,7 @@
+@@ -2760,6 +2797,7 @@
  	if (upto < 12) {
  		return;
  	}
@@ -319,7 +320,7 @@
  	if (!pg_step_gx_rail_on(upto < 13)) {
  		printf("POLARIS GPU: stop after 12: the GX rail did not come up\n");
  		return;
-@@ -2767,6 +2804,7 @@
+@@ -2767,6 +2805,7 @@
  	if (upto < 13) {
  		return;
  	}
