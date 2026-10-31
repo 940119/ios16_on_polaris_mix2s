@@ -1,0 +1,58 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1030,7 +1030,20 @@
+ 
+ #define PG_PTE_TABLE		3ull
+ #define PG_PTE_PAGE		3ull
+-#define PG_PTE_ATTR		((2ull << 8) | (1ull << 10) | (1ull << 11))	/* shareable, accessed, not global */
++/*
++ * Lower attributes of a stage 1 page descriptor:
++ *   bits  9:8  SH   = 2, outer shareable
++ *   bit  10    AF   = 1, accessed
++ *   bit  11    nG   = 1, not global
++ *   bits  7:6  AP[2:1]
++ *
++ * AP is the one that cost the Mi 8 port a whole experiment (its EXP-0108): with
++ * AP[2:1] = 00 the page is privileged-access-only, and the 3D core issues its
++ * fetches from an unprivileged context, so the first SQE read stopped with a
++ * fault at FAR 0x10000000 - the exact address and the exact behaviour build
++ * 0141 showed here. AP[1] = 1 lets an unprivileged read and write through.
++ */
++#define PG_PTE_ATTR		((2ull << 8) | (1ull << 10) | (1ull << 11) | (1ull << 6))
+ #define PG_PTE_ADDR		0x0000fffffffff000ull
+ #define PG_SCTLR_ON		(1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12)
+ #define PG_TCR_39_BITS		(25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
+@@ -3228,9 +3241,21 @@
+ 		}
+ 	}
+ 	pg_to_memory(pg_l3b_va, PG_GMU_PAGE_SIZE);
+-	printf("POLARIS GPU: 15 mapped %#llx-%#llx and %#llx-%#llx in the CP's window\n",
+-	    PG_CP_SQE_IOVA, PG_CP_SQE_IOVA + PG_CP_REGION - 1,
+-	    PG_CP_RING_IOVA, PG_CP_RING_IOVA + PG_CP_REGION - 1);
++	{
++		uint64_t *l3 = (uint64_t *)pg_smmu_l3(PG_CP_SQE_IOVA);
++
++		printf("POLARIS GPU: 15 mapped %#llx-%#llx and %#llx-%#llx in the CP's window\n",
++		    PG_CP_SQE_IOVA, PG_CP_SQE_IOVA + PG_CP_REGION - 1,
++		    PG_CP_RING_IOVA, PG_CP_RING_IOVA + PG_CP_REGION - 1);
++		printf("POLARIS GPU: 15 tables: L1[0] %#llx L1[1] %#llx L2[%#x] %#llx L2[%#x] %#llx\n",
++		    ((uint64_t *)pg_l1_va)[0], ((uint64_t *)pg_l1_va)[1],
++		    PG_CP_WINDOW_L2, ((uint64_t *)pg_l2_va)[PG_CP_WINDOW_L2],
++		    (uint32_t)((PG_GMU_IOVA_BASE >> 21) & 0x1ff),
++		    ((uint64_t *)pg_l2_va)[(PG_GMU_IOVA_BASE >> 21) & 0x1ff]);
++		printf("POLARIS GPU: 15 SQE slot 0 %#llx -> page %#llx, slot 8 %#llx -> %#llx\n",
++		    l3[0], kvtophys(pg_sqe_va[0]) & PG_PTE_ADDR, l3[8],
++		    kvtophys(pg_ring_va[0]) & PG_PTE_ADDR);
++	}
+ 	PG_CHECK("15: both regions are mapped");
+ 	pg_wr(pg_smmu + PG_SMMU_SMR(1), PG_SMR_VALID);
+ 	pg_wr(pg_smmu + PG_SMMU_S2CR(1),
+@@ -3309,7 +3334,7 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0141 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0142 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
