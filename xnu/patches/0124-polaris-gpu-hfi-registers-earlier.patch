@@ -1,0 +1,35 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1223,6 +1223,16 @@
+ 	return started;
+ }
+ 
++#define PG_HFI_CTRL_STATUS	0x5180u		/* the firmware's HFI is up when bit 0 reads 1 */
++#define PG_HFI_CTRL_INIT	0x5186u
++#define PG_H2G_INTR_SET		0x5194u		/* the host kicks the GMU here */
++#define PG_G2H_INTR_INFO	0x5192u
++#define PG_G2H_INTR_CLR		0x5191u
++#define PG_HFI_MSG_INIT		0u
++#define PG_HFI_MSG_FW_VERSION	1u
++#define PG_HFI_MSG_ERROR	100u
++#define PG_HFI_QUEUE_WORDS	1024u
++
+ static bool
+ pg_poll(vm_offset_t reg, uint32_t mask, uint32_t want, uint32_t tries, uint32_t step_us)
+ {
+@@ -1315,15 +1325,6 @@
+ 
+ /* ---- HFI: the host's command queue is 0, the GMU's response queue is 1 ------------------------------ */
+ 
+-#define PG_HFI_CTRL_STATUS	0x5180u		/* the firmware's HFI is up when bit 0 reads 1 */
+-#define PG_HFI_CTRL_INIT	0x5186u
+-#define PG_H2G_INTR_SET		0x5194u		/* the host kicks the GMU here */
+-#define PG_G2H_INTR_INFO	0x5192u
+-#define PG_G2H_INTR_CLR		0x5191u
+-#define PG_HFI_MSG_INIT		0u
+-#define PG_HFI_MSG_FW_VERSION	1u
+-#define PG_HFI_MSG_ERROR	100u
+-#define PG_HFI_QUEUE_WORDS	1024u
+ 
+ static uint32_t pg_hfi_seq;
+ 
