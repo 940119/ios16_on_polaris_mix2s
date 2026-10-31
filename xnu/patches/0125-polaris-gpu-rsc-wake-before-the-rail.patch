@@ -1,0 +1,69 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1256,6 +1256,37 @@
+ #define PG_OOB_BOOT_SLUMBER_SET	22u		/* legacy out-of-band bits */
+ #define PG_OOB_BOOT_SLUMBER_ACK	30u
+ 
++#define PG_RSCC_OFFSET		0x23000u	/* the RSC block inside the GMU's window */
++#define PG_RSCC_REQ		0x9307u		/* GMU_RSCC_CONTROL_REQ */
++#define PG_RSCC_ACK		0x9308u
++#define PG_RSCC_STATUS0		0x4u		/* GPU_RSCC_RSC_STATUS0_DRV0, word in the RSC block */
++#define PG_RSCC_SEQ_BUSY	0x101u
++
++/*
++ * a6xx_rpmh_start(): the RSC is the block that turns the firmware's votes into
++ * RPMh traffic. Until it is awake the firmware can ring for the GX rail as
++ * often as it likes and nothing on the other side acts on it - which is what
++ * the previous run showed: the doorbell was rung and GX_GDSCR never moved.
++ */
++static bool
++pg_rsc_wake(void)
++{
++	vm_offset_t rscc = pg_gmu + PG_RSCC_OFFSET;
++	bool ack, idle;
++
++	pg_wr(pg_gmu + PG_GMU_WORD(PG_RSCC_REQ), 1u << 1);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ack = pg_poll(pg_gmu + PG_GMU_WORD(PG_RSCC_ACK), 1u << 1, 1u << 1, 100, 100);
++	printf("POLARIS GPU: 12 RSC wake: CONTROL_ACK %#010x (bit 1 %s)\n",
++	    pg_rd(pg_gmu + PG_GMU_WORD(PG_RSCC_ACK)), ack ? "set" : "NOT set within 10 ms");
++	idle = ack && pg_poll(rscc + 4 * PG_RSCC_SEQ_BUSY, ~0u, 0, 100, 100);
++	printf("POLARIS GPU: 12 RSC wake: SEQ_BUSY_DRV0 %#010x (%s), RSC_STATUS0_DRV0 %#010x\n",
++	    pg_rd(rscc + 4 * PG_RSCC_SEQ_BUSY), idle ? "idle" : "busy or not reached",
++	    pg_rd(rscc + 4 * PG_RSCC_STATUS0));
++	pg_wr(pg_gmu + PG_GMU_WORD(PG_RSCC_REQ), 0);
++	return ack && idle;
++}
++
+ /*
+  * a6xx_gmu_gfx_rail_on(): the legacy firmware powers the GX domain itself. The
+  * host names the level in gfx.lvl and mx.lvl, sets BOOT_SLUMBER_OPTION to 0 and
+@@ -1286,6 +1317,10 @@
+ 	    "GMU2HOST %#010x\n", before, pg_rd(pg_gmu + PG_GMU_WORD(PG_RPMH_POWER_STATE)),
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(PG_SPTPRAC_STATUS)), pg_rd(pg_gmu + PG_GMU_WORD(PG_G2H_INTR_INFO)));
+ 
++	if (!pg_rsc_wake()) {
++		printf("POLARIS GPU: 12 the RSC did not come awake; the rail is asked for anyway\n");
++	}
++
+ 	pg_wr(pg_gmu + PG_GMU_WORD(PG_BOOT_SLUMBER_OPTION), 0);
+ 	pg_wr(pg_gmu + PG_GMU_WORD(PG_GX_VOTE_IDX), 0);
+ 	pg_wr(pg_gmu + PG_GMU_WORD(PG_MX_VOTE_IDX), 0);
+@@ -1294,8 +1329,15 @@
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(PG_MX_VOTE_IDX)), PG_OOB_BOOT_SLUMBER_SET);
+ 	pg_wr(pg_gmu + PG_GMU_WORD(PG_H2G_INTR_SET), 1u << PG_OOB_BOOT_SLUMBER_SET);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	ack = pg_poll(pg_gmu + PG_GMU_WORD(PG_G2H_INTR_INFO), 1u << PG_OOB_BOOT_SLUMBER_ACK,
+-	    1u << PG_OOB_BOOT_SLUMBER_ACK, 1000, 100);
++	/* watch the answer arrive (or not) instead of only its absence at the end */
++	ack = false;
++	for (unsigned round = 0; round < 4 && !ack; round++) {
++		ack = pg_poll(pg_gmu + PG_GMU_WORD(PG_G2H_INTR_INFO), 1u << PG_OOB_BOOT_SLUMBER_ACK,
++		    1u << PG_OOB_BOOT_SLUMBER_ACK, 100, 100);
++		printf("POLARIS GPU: 12 about %u ms after the doorbell: GMU2HOST_INTR_INFO %#010x%s\n",
++		    (round + 1) * 10, pg_rd(pg_gmu + PG_GMU_WORD(PG_G2H_INTR_INFO)),
++		    ack ? "  <- ack" : "");
++	}
+ 	printf("POLARIS GPU: 12 GMU2HOST_INTR_INFO %#010x: ack bit %u %s\n",
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(PG_G2H_INTR_INFO)), PG_OOB_BOOT_SLUMBER_ACK,
+ 	    ack ? "set, the rail is up" : "NOT set within 100 ms");
