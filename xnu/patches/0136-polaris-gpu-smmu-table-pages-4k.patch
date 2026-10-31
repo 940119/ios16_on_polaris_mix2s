@@ -1,0 +1,65 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1220,24 +1220,42 @@
+ static bool
+ pg_smmu_tables(void)
+ {
++	/*
++	 * One 4 KB page is exactly what 512 descriptors need, and 4 KB is the size
++	 * the five region pages were just allocated at. Build 0135 asked for
++	 * PAGE_SIZE (16 KB) and the machine stopped dead inside this function,
++	 * so the size is the only thing that changed; the checkpoint says which
++	 * of the three allocations it is if it happens again.
++	 */
+ 	if (pg_l3_va != 0) {
+ 		return true;
+ 	}
+-	if (kmem_alloc(kernel_map, &pg_l1_va, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+-	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
+-	    kmem_alloc(kernel_map, &pg_l2_va, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+-	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
+-	    kmem_alloc(kernel_map, &pg_l3_va, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+-	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("POLARIS GPU: 10 no memory for the SMMU's tables\n");
+-		return false;
+-	}
++	PG_CHECK("tables: the level 1 page");
++	if (kmem_alloc(kernel_map, &pg_l1_va, PG_GMU_PAGE_SIZE,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("POLARIS GPU: 10 no memory for the SMMU's level 1 table\n");
++		return false;
++	}
++	PG_CHECK("tables: the level 2 page");
++	if (kmem_alloc(kernel_map, &pg_l2_va, PG_GMU_PAGE_SIZE,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("POLARIS GPU: 10 no memory for the SMMU's level 2 table\n");
++		return false;
++	}
++	PG_CHECK("tables: the level 3 page");
++	if (kmem_alloc(kernel_map, &pg_l3_va, PG_GMU_PAGE_SIZE,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("POLARIS GPU: 10 no memory for the SMMU's level 3 table\n");
++		return false;
++	}
++	PG_CHECK("tables: all three pages are in place");
+ 	((uint64_t *)pg_l1_va)[(PG_GMU_IOVA_BASE >> 30) & 0x1ff] =
+ 	    kvtophys(pg_l2_va) | PG_PTE_TABLE;
+ 	((uint64_t *)pg_l2_va)[(PG_GMU_IOVA_BASE >> 21) & 0x1ff] =
+ 	    kvtophys(pg_l3_va) | PG_PTE_TABLE;
+-	pg_to_memory(pg_l1_va, PAGE_SIZE);
+-	pg_to_memory(pg_l2_va, PAGE_SIZE);
++	PG_CHECK("tables: the descriptors are written, flushing");
++	pg_to_memory(pg_l1_va, PG_GMU_PAGE_SIZE);
++	pg_to_memory(pg_l2_va, PG_GMU_PAGE_SIZE);
+ 	printf("POLARIS GPU: 10 SMMU tables: level 1 %#llx, level 2 %#llx, level 3 %#llx\n",
+ 	    kvtophys(pg_l1_va), kvtophys(pg_l2_va), kvtophys(pg_l3_va));
+ 	return true;
+@@ -2711,7 +2729,7 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0135 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0136 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
