@@ -1,0 +1,156 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -223,6 +223,8 @@
+ #define PG_GPUCC_CX_HWCTRL	0x1540	/* gpu_cx_gdsc's status lives here, bit 31 */
+ #define PG_GPUCC_CXO_CBCR	0x109c
+ #define PG_GPUCC_CX_GMU_CBCR	0x1098
++#define PG_GPUCC_CX_APB_CBCR	0x1088	/* gpu_cc_cx_apb_clk: the CX half's APB port */
++#define PG_GPUCC_CX_SNOC_DVM_CBCR 0x108c
+ #define PG_GPUCC_GMU_RCG_CMD	0x1120
+ #define PG_GPUCC_GMU_RCG_CFG	0x1124
+ #define PG_GDSC_PWR_ON		(1u << 31)
+@@ -391,6 +393,15 @@
+ 	}
+ 	pg_wr(pg_gpucc + PG_GPUCC_CX_GMU_CBCR,
+ 	    (pg_rd(pg_gpucc + PG_GPUCC_CX_GMU_CBCR) & ~PG_CX_GMU_CBCR_WS) | PG_CX_GMU_CBCR_WS);
++	/*
++	 * The two branches the CX half's register port runs on. The vendor driver
++	 * enables them with the rest of the SMMU's clocks, and without them a
++	 * write into the SMMU can be dropped while the read still answers from the
++	 * flops - which is exactly what log 0131 showed (SMR took, S2CR kept its
++	 * type, sCR0 ignored everything). Not fatal: the report is what matters.
++	 */
++	(void)pg_branch_enable(pg_gpucc, PG_GPUCC_CX_APB_CBCR, "gpu_cc_cx_apb_clk");
++	(void)pg_branch_enable(pg_gpucc, PG_GPUCC_CX_SNOC_DVM_CBCR, "gpu_cc_cx_snoc_dvm_clk");
+ 	return pg_branch_enable(pg_gpucc, PG_GPUCC_CXO_CBCR, "gpu_cc_cxo_clk") &&
+ 	    (pg_gmu_clk_on = pg_branch_enable(pg_gpucc, PG_GPUCC_CX_GMU_CBCR, "gpu_cc_cx_gmu_clk"));
+ }
+@@ -988,6 +999,7 @@
+  * SMMU out of the path) and USFCFG is bit 10.
+  */
+ #define PG_SCR0_CLIENTPD	(1u << 0)
++#define PG_SCR0_GFRE		(1u << 1)	/* global fault reporting enable */
+ #define PG_SCR0_USFCFG		(1u << 10)
+ #define PG_SMR_VALID		(1u << 31)
+ #define PG_CBAR_STAGE1		(1u << 16 | 3u << 8 | 0xfu << 12)
+@@ -1237,6 +1249,93 @@
+ }
+ 
+ /*
++ * IMPL_DEF1 is at base + 6 pages, and its first word is the micro MMU's
++ * control word. The vendor driver halts the SMMU around the
++ * implementation-defined writes and resumes it afterwards:
++ *
++ *     qsmmuv2_halt(smmu);
++ *     for (i = 0; i < smmu->num_impl_def_attach_registers; ++i)
++ *             writel_relaxed(regs[i].value, ARM_SMMU_GR0(smmu) + regs[i].offset);
++ *     qsmmuv2_resume(smmu);
++ *
++ * with LOCAL_HALT_REQ = bit 2 and IDLE = bit 3. Log 0131 wrote the twelve pairs
++ * without halting first, and one of them was refused.
++ */
++#define PG_SMMU_IMPL_DEF1	0x6000u
++#define PG_SMMU_MICRO_CTRL	0x0000u
++#define PG_MICRO_HALT_REQ	(1u << 2)
++#define PG_MICRO_IDLE		(1u << 3)
++
++static bool
++pg_smmu_halt(void)
++{
++	uint32_t ctl = pg_rd(pg_smmu + PG_SMMU_IMPL_DEF1 + PG_SMMU_MICRO_CTRL);
++
++	pg_wr(pg_smmu + PG_SMMU_IMPL_DEF1 + PG_SMMU_MICRO_CTRL, ctl | PG_MICRO_HALT_REQ);
++	for (int i = 0; i < 300; i++) {
++		if (pg_rd(pg_smmu + PG_SMMU_IMPL_DEF1 + PG_SMMU_MICRO_CTRL) & PG_MICRO_IDLE) {
++			printf("POLARIS GPU: 10 the SMMU halted: micro control %#010x -> %#010x "
++			    "after %d us\n", ctl,
++			    pg_rd(pg_smmu + PG_SMMU_IMPL_DEF1 + PG_SMMU_MICRO_CTRL), i * 100);
++			return true;
++		}
++		pg_sleep_us(100);
++	}
++	printf("POLARIS GPU: 10 the SMMU would not halt: micro control %#010x -> %#010x\n", ctl,
++	    pg_rd(pg_smmu + PG_SMMU_IMPL_DEF1 + PG_SMMU_MICRO_CTRL));
++	return false;
++}
++
++static void
++pg_smmu_resume(void)
++{
++	uint32_t ctl = pg_rd(pg_smmu + PG_SMMU_IMPL_DEF1 + PG_SMMU_MICRO_CTRL);
++
++	pg_wr(pg_smmu + PG_SMMU_IMPL_DEF1 + PG_SMMU_MICRO_CTRL, ctl & ~PG_MICRO_HALT_REQ);
++	printf("POLARIS GPU: 10 the SMMU resumed: micro control %#010x -> %#010x\n", ctl,
++	    pg_rd(pg_smmu + PG_SMMU_IMPL_DEF1 + PG_SMMU_MICRO_CTRL));
++}
++
++/*
++ * What the stream table will and will not take. Entry 1 is the one to ask with:
++ * nothing uses it (the GPU's streams are 0, 1, 2, 4 and 5), and the value is
++ * put back afterwards. If only bits 7:0 come back, the type field is locked and
++ * no amount of retrying will change it; if the whole word comes back, the write
++ * path is fine and log 0131's failure was somewhere else.
++ */
++static void
++pg_smmu_probe(void)
++{
++	uint32_t scr0 = pg_rd(pg_smmu + PG_SMMU_SCR0);
++	uint32_t old_s2cr = pg_rd(pg_smmu + PG_SMMU_S2CR(1));
++	uint32_t old_smr = pg_rd(pg_smmu + PG_SMMU_SMR(1));
++	uint32_t back;
++
++	printf("POLARIS GPU: 10 before anything: micro %#010x impl_def0 %#010x %#010x sACR %#010x "
++	    "ID7 %#010x\n", pg_rd(pg_smmu + PG_SMMU_IMPL_DEF1),
++	    pg_rd(pg_smmu + 0x2000), pg_rd(pg_smmu + 0x2004), pg_rd(pg_smmu + PG_SMMU_SACR),
++	    pg_rd(pg_smmu + PG_SMMU_ID7));
++
++	pg_wr(pg_smmu + PG_SMMU_S2CR(1), 0xffffffffu);
++	back = pg_rd(pg_smmu + PG_SMMU_S2CR(1));
++	printf("POLARIS GPU: 10 S2CR[1] was %#010x, wrote ffffffff, reads %#010x: writable mask "
++	    "%#010x\n", old_s2cr, back, back);
++	pg_wr(pg_smmu + PG_SMMU_S2CR(1), old_s2cr);
++
++	pg_wr(pg_smmu + PG_SMMU_SMR(1), 0xffffffffu);
++	back = pg_rd(pg_smmu + PG_SMMU_SMR(1));
++	printf("POLARIS GPU: 10 SMR[1] was %#010x, wrote ffffffff, reads %#010x\n", old_smr, back);
++	pg_wr(pg_smmu + PG_SMMU_SMR(1), old_smr);
++
++	pg_wr(pg_smmu + PG_SMMU_SCR0, scr0 ^ PG_SCR0_GFRE);
++	back = pg_rd(pg_smmu + PG_SMMU_SCR0);
++	printf("POLARIS GPU: 10 sCR0 %#010x, flipped bit 1, reads %#010x: %s\n", scr0, back,
++	    (back & PG_SCR0_GFRE) != (scr0 & PG_SCR0_GFRE) ? "writable" : "IGNORED, read-only");
++	pg_wr(pg_smmu + PG_SMMU_SCR0, scr0);
++	printf("POLARIS GPU: 10 sCR0 restored to %#010x\n", pg_rd(pg_smmu + PG_SMMU_SCR0));
++}
++
++/*
+  * Qualcomm's implementation-defined block, straight out of the device tree:
+  *
+  *     /soc/arm,smmu-kgsl@5040000  ...  attach-impl-defs = <0x6000 0x2378
+@@ -1302,7 +1401,16 @@
+ 		printf("POLARIS GPU: 10 the SMMU was never mapped: stream 5 stays unmatched\n");
+ 		return false;
+ 	}
+-	(void)pg_smmu_impl_defs();
++	pg_smmu_probe();
++	if (pg_smmu_halt()) {
++		(void)pg_smmu_impl_defs();
++		pg_smmu_resume();
++	} else {
++		(void)pg_smmu_impl_defs();
++	}
++	printf("POLARIS GPU: 10 after the implementation registers: sCR0 %#010x S2CR[0] %#010x "
++	    "micro %#010x\n", pg_rd(pg_smmu + PG_SMMU_SCR0),
++	    pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY)), pg_rd(pg_smmu + PG_SMMU_IMPL_DEF1));
+ 	if (pg_smmu_mode) {
+ 		vm_offset_t cb = pg_smmu_cb(PG_GMU_CTX);
+ 		uint64_t root;
+@@ -2448,7 +2556,7 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0131 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0132 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
