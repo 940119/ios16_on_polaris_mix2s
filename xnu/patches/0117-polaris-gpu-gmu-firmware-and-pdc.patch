@@ -1,17 +1,21 @@
 diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
 --- a/bsd/dev/polaris_gpu.c
 +++ b/bsd/dev/polaris_gpu.c
-@@ -101,6 +101,9 @@
+@@ -101,6 +101,13 @@
  	ctx->completed = 0;
  	ctx->state = POLARIS_GPU_OFF;
  }
 +
++#include <mach/mach_types.h>
++#include <vm/vm_kern.h>
++
 +#include "polaris_a630_fw.h"
 +
++extern uint64_t kvtophys(vm_offset_t va);
  
  /* ---- register access ------------------------------------------------------------------------------ */
  
-@@ -621,6 +624,229 @@
+@@ -621,6 +628,473 @@
  	return good;
  }
  
@@ -45,10 +49,18 @@ diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
 +	printf("POLARIS GPU: 8 %u words (%u bytes) from this phone's own a630_gmu.bin, "
 +	    "first words %#010x %#010x\n", POLARIS_A630_GMU_WORDS, POLARIS_A630_GMU_WORDS * 4,
 +	    polaris_a630_gmu_bin[0], polaris_a630_gmu_bin[1]);
++	/*
++	 * Both loops stay loops. The image is 8192 words and every store is an
++	 * MMIO write to the GMU; left to itself clang unrolls this into eight
++	 * thousand inline stores, which took the CI build from thirteen minutes
++	 * to over forty and had to be cancelled.
++	 */
++#pragma clang loop unroll(disable)
 +	for (uint32_t i = 0; i < POLARIS_A630_GMU_WORDS; i++) {
 +		pg_wr(pg_gmu + PG_GMU_ITCM + 4 * i, polaris_a630_gmu_bin[i]);
 +		sum += polaris_a630_gmu_bin[i];
 +	}
++#pragma clang loop unroll(disable)
 +	for (uint32_t i = 0; i < POLARIS_A630_GMU_WORDS; i++) {
 +		if (pg_rd(pg_gmu + PG_GMU_ITCM + 4 * i) != polaris_a630_gmu_bin[i]) {
 +			if (wrong++ == 0) {
@@ -238,10 +250,246 @@ diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
 +	return different == 0;
 +}
 +
++/* ---- 10. the memory the firmware will use, and its boot configuration -------------------------------- */
++
++/*
++ * The GMU is not started with a page table here. Step 6 showed what the boot
++ * loader leaves: five stream entries, every one of them bypass, five context
++ * banks unused. In that state the address the firmware puts on its bus *is*
++ * the physical address, so the two regions it needs - a log and the HFI
++ * queue table - only have to be allocated by us and handed over by their
++ * physical addresses. No translation, nothing to unmap afterwards.
++ *
++ * The Mi 8 port hands the firmware iovars (0x60005000, 0x60009000) because it
++ * does install a context. The addresses themselves are the driver's choice:
++ * they sit in the boot configuration registers below.
++ */
++#define PG_GMU_REGION_SIZE	0x4000u		/* 16 KB each, Linux's sizes */
++#define PG_GMU_HFI_QUEUES	3u
++#define PG_DTCM_LAST_WORD	0xff8u		/* a6xx_gmu_start() reads the dword at this index */
++
++struct pg_hfi_table {
++	uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
++};
++
++struct pg_hfi_queue {
++	uint32_t status, iova, type, size, msg_size, dropped;
++	uint32_t rx_watermark, tx_watermark, rx_request, tx_request, read_index, write_index;
++};
++
++static vm_offset_t pg_log_va, pg_hfi_va;
++static uint64_t pg_log_pa, pg_hfi_pa;
++static bool pg_boot_configured;
++static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
++static bool pg_masks_saved;
++
++/* The GMU reads from memory, not from this processor's cache. */
++static void
++pg_to_memory(vm_offset_t start, vm_size_t size)
++{
++	for (vm_offset_t line = start & ~(vm_offset_t)63; line < start + size; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++pg_gmu_region(vm_offset_t *va, uint64_t *pa)
++{
++	if (*va != 0) {
++		return true;
++	}
++	if (kmem_alloc_contig(kernel_map, va, PG_GMU_REGION_SIZE, PG_GMU_REGION_SIZE - 1, 0, 0,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		*va = 0;
++		return false;
++	}
++	*pa = kvtophys(*va);
++	return *pa != 0;
++}
++
++static bool
++pg_step_gmu_boot_config(void)
++{
++	static const uint32_t ids[PG_GMU_HFI_QUEUES] = { 0, 4, 5 };	/* legacy response/debug ids */
++	struct pg_hfi_table *table;
++	struct pg_hfi_queue *queue;
++	static const struct {
++		const char *name;
++		uint32_t word;
++		uint32_t value;
++	} boot[] = {
++		{ "GMU_GENERAL_7",			0x51cc, 0x1 },
++		{ "GMU_CM3_FW_INIT_RESULT",		0x501c, 0x0 },
++		{ "GMU_CM3_BOOT_CONFIG",		0x5001, 0x2 },
++		{ "GMU_HFI_QTBL_INFO",			0x5184, 0x1 },
++		{ "GMU_AHB_FENCE_RANGE_0",		0x9311, 0x802800a0 },
++		{ "GMU_CM3_CFG",			0x502d, 0x4052 },
++		{ "GMU_SYS_BUS_CONFIG",			0x4c0f, 0x1 },
++		{ "GMU_ICACHE_CONFIG",			0x4c00, 0x1 },
++		{ "GMU_DCACHE_CONFIG",			0x4c01, 0x1 },
++		{ "GMU_PWR_COL_INTER_FRAME_CTRL",	0x50c0, 0x9c40400 },
++		{ "GPU_GMU_CX_GMU_PWR_COL_CP_RESP",	0x5101, 0x0 },
++	};
++	bool good = true;
++
++	if (pg_gmu == 0 || pg_rd(pg_gmu + PG_GMU_WORD(0x5000)) != 1) {
++		printf("POLARIS GPU: 10 the GMU is not mapped or its processor is not held in reset: "
++		    "no boot configuration\n");
++		return false;
++	}
++	if (!pg_gmu_region(&pg_log_va, &pg_log_pa)) {
++		printf("POLARIS GPU: 10 no contiguous 16 KB for the firmware's log\n");
++		return false;
++	}
++	if (!pg_gmu_region(&pg_hfi_va, &pg_hfi_pa)) {
++		printf("POLARIS GPU: 10 no contiguous 16 KB for the HFI queue table\n");
++		return false;
++	}
++	printf("POLARIS GPU: 10 log %#llx, HFI table %#llx (physical, the SMMU is bypass)\n",
++	    pg_log_pa, pg_hfi_pa);
++
++	table = (struct pg_hfi_table *)pg_hfi_va;
++	queue = (struct pg_hfi_queue *)(pg_hfi_va + sizeof(*table));
++	table->version = 0;
++	table->size = sizeof(*table) + PG_GMU_HFI_QUEUES * sizeof(*queue);
++	table->qhdr0_offset = sizeof(*table) / 4;
++	table->qhdr_size = sizeof(*queue) / 4;
++	table->num_queues = table->active_queues = PG_GMU_HFI_QUEUES;
++	for (uint32_t i = 0; i < PG_GMU_HFI_QUEUES; i++) {
++		queue[i].status = 1;
++		queue[i].iova = (uint32_t)pg_hfi_pa + 0x1000 * (i + 1);
++		queue[i].type = (10u << 8) | ids[i];
++		queue[i].size = 0x1000 / 4;
++		queue[i].rx_watermark = queue[i].tx_watermark = queue[i].rx_request = 1;
++		printf("POLARIS GPU: 10 HFI queue %u id %u at %#x, capacity %u words\n",
++		    i, ids[i], queue[i].iova, queue[i].size);
++	}
++	pg_to_memory(pg_hfi_va, PG_GMU_REGION_SIZE);
++	pg_to_memory(pg_log_va, PG_GMU_REGION_SIZE);
++
++	/* the three that carry an address the firmware will actually use */
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5185), (uint32_t)pg_hfi_pa);		/* HFI_QTBL_ADDR */
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5182), (uint32_t)(pg_log_pa + 0x100));	/* HFI_SFR_ADDR */
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5100), (uint32_t)(pg_log_pa) | 3u);	/* PWR_COL_CP_MSG */
++	printf("POLARIS GPU: 10 HFI_QTBL_ADDR %#010x HFI_SFR_ADDR %#010x CP_MSG %#010x (were %#010x %#010x %#010x)\n",
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5185)), pg_rd(pg_gmu + PG_GMU_WORD(0x5182)),
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5100)), (uint32_t)pg_hfi_pa, (uint32_t)(pg_log_pa + 0x100),
++	    (uint32_t)pg_log_pa | 3u);
++
++	for (unsigned i = 0; i < sizeof(boot) / sizeof(boot[0]); i++) {
++		uint32_t old = pg_rd(pg_gmu + PG_GMU_WORD(boot[i].word));
++		uint32_t value = boot[i].value, back;
++
++		pg_wr(pg_gmu + PG_GMU_WORD(boot[i].word), value);
++		back = pg_rd(pg_gmu + PG_GMU_WORD(boot[i].word));
++		printf("POLARIS GPU: 10 %-32s was %#010x wrote %#010x read %#010x%s\n",
++		    boot[i].name, old, value, back, back == value ? "" : "  DIFFERENT");
++		if (back != value) {
++			good = false;
++		}
++	}
++	/* RPMH_CTRL keeps what ABL left and gains the bits Linux sets. */
++	{
++		uint32_t old = pg_rd(pg_gmu + PG_GMU_WORD(0x50e8));
++
++		pg_wr(pg_gmu + PG_GMU_WORD(0x50e8), old | 0xf11u);
++		printf("POLARIS GPU: 10 %-32s was %#010x wrote %#010x read %#010x\n", "GMU_RPMH_CTRL",
++		    old, old | 0xf11u, pg_rd(pg_gmu + PG_GMU_WORD(0x50e8)));
++	}
++	pg_boot_configured = good;
++	printf("POLARIS GPU: 10 boot configuration %s; SYSRESET %#x INIT_RESULT %#x GX %#010x (not released)\n",
++	    good ? "written" : "INCOMPLETE", pg_rd(pg_gmu + PG_GMU_WORD(0x5000)),
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x501c)), pg_rd(pg_gpucc + PG_GPUCC_GX_GDSCR));
++	return good;
++}
++
++/* ---- 11. releasing the GMU's processor ------------------------------------------------------------------ */
++
++/*
++ * a6xx_gmu_start(): mask both interrupt paths, clear the two result registers,
++ * drop the reset, and wait for the firmware to announce itself. The word it
++ * announces with depends on its own build, which it leaves in the last dword
++ * of its data memory - so that word is read first and decides what to wait
++ * for, rather than guessing one and timing out on the other.
++ *
++ * The processor is put back into reset whatever the outcome: this is a
++ * measured release, not a boot. What it answers is whether the 32 KB in step
++ * 8 runs at all.
++ */
++static bool
++pg_step_gmu_start(void)
++{
++	uint32_t tcm, mask, want, result = 0, old_ao, old_h2h;
++	bool started = false;
++
++	if (!pg_boot_configured || pg_gmu == 0) {
++		printf("POLARIS GPU: 11 the boot configuration was not written; the processor is not released\n");
++		return false;
++	}
++	if (pg_rd(pg_gmu + PG_GMU_WORD(0x5000)) != 1) {
++		printf("POLARIS GPU: 11 the processor is not held in reset; nothing released\n");
++		return false;
++	}
++	tcm = pg_rd(pg_gmu + PG_GMU_DTCM + 4 * PG_DTCM_LAST_WORD);
++	if (tcm <= 0x20010004u) {
++		mask = 0xffffffffu;
++		want = 0xbabefaceu;		/* a legacy firmware */
++	} else {
++		mask = 0x1ffu;
++		want = 0x100u;
++	}
++	printf("POLARIS GPU: 11 last DTCM word %#010x: FW_INIT_RESULT & %#x must become %#x\n", tcm, mask, want);
++
++	old_ao = pg_rd(pg_gmu + PG_GMU_WORD(0x9306));
++	old_h2h = pg_rd(pg_gmu + PG_GMU_WORD(0x5193));
++	pg_wr(pg_gmu + PG_GMU_WORD(0x9306), ~0u);
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5193), ~0u);
++	pg_old_ao_mask = old_ao;
++	pg_old_h2h_mask = old_h2h;
++	pg_masks_saved = true;
++	printf("POLARIS GPU: 11 interrupts masked (AO was %#010x, GMU2HOST was %#010x)\n", old_ao, old_h2h);
++
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5101), 0);
++	pg_wr(pg_gmu + PG_GMU_WORD(0x501c), 0);
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	printf("POLARIS GPU: 11 releasing the reset (SYSRESET 1 -> 0)\n");
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5000), 0);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < 200; i++) {
++		result = pg_rd(pg_gmu + PG_GMU_WORD(0x501c));
++		if ((result & mask) == want) {
++			started = true;
++			break;
++		}
++		pg_sleep_us(100);
++	}
++	printf("POLARIS GPU: 11 firmware init %s: FW_INIT_RESULT %#010x CP_RESP %#010x GENERAL_7 %#x SYSRESET %#x\n",
++	    started ? "DONE" : "TIMED OUT after 20 ms", result, pg_rd(pg_gmu + PG_GMU_WORD(0x5101)),
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x51cc)), pg_rd(pg_gmu + PG_GMU_WORD(0x5000)));
++	if (pg_log_va != 0) {
++		const uint32_t *log = (const uint32_t *)pg_log_va;
++
++		printf("POLARIS GPU: 11 log[0..7] = %#010x %#010x %#010x %#010x %#010x %#010x %#010x %#010x\n",
++		    log[0], log[1], log[2], log[3], log[4], log[5], log[6], log[7]);
++	}
++
++	/* Back into reset, whatever it said: nothing stays running unowned. */
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5000), 1);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("POLARIS GPU: 11 processor %s (SYSRESET %#x)\n",
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5000)) == 1 ? "HELD in reset again" : "NOT HALTED",
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5000)));
++	pg_wr(pg_gmu + PG_GMU_WORD(0x9306), old_ao);
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5193), old_h2h);
++	return started;
++}
++
  /* ---- the ladder ------------------------------------------------------------------------------------ */
  
  void
-@@ -678,6 +904,20 @@
+@@ -678,6 +1152,34 @@
  	}
  	if (!pg_step_gmu_tcm()) {
  		printf("POLARIS GPU: stop after 7: the GMU's memory did not take the pattern\n");
@@ -259,6 +507,20 @@ diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
 +	}
 +	if (!pg_step_rsc_pdc()) {
 +		printf("POLARIS GPU: stop after 9: the PDC's tables did not take\n");
++		return;
++	}
++	if (upto < 10) {
++		return;
++	}
++	if (!pg_step_gmu_boot_config()) {
++		printf("POLARIS GPU: stop after 10: the boot configuration did not take\n");
++		return;
++	}
++	if (upto < 11) {
++		return;
++	}
++	if (!pg_step_gmu_start()) {
++		printf("POLARIS GPU: stop after 11: the firmware did not announce itself\n");
  		return;
  	}
  	printf("POLARIS GPU: ladder done; the CX half is left powered, nothing may be released yet\n");
