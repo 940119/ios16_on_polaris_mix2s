@@ -1,0 +1,297 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -905,7 +905,15 @@
+  * belongs in max_pnum: 4 GB / 4 KB - 1.
+  */
+ #define PG_ADDRESS_LIMIT	0x100000000ull
+-#define PG_MAX_PAGE_BELOW_4G	0xfffffu	/* the last page number wholly below 4 GB */
++/*
++ * The bound is in pages of this kernel's page size, and this kernel runs 16 KB
++ * pages - which is how the earlier 0xfffff came to mean 16 GB, let every
++ * allocation above 4 GB through, and made the boundary check dead code. The
++ * 0x4000 steps in log 0130's "came back at 0x102864000, ..." lines are the
++ * proof: one page per call.
++ */
++#define PG_MAX_PAGE_BELOW_4G	((ppnum_t)((PG_ADDRESS_LIMIT / (uint64_t)PAGE_SIZE) - 1u))
++#define PG_PAGE			((vm_size_t)PAGE_SIZE)
+ 
+ /*
+  * The first version of this step asked for four adjacent pages and got
+@@ -973,6 +981,14 @@
+ #define PG_S2CR_TRANS		0u
+ #define PG_S2CR_BYPASS		1u
+ #define PG_S2CR_FAULT		2u
++
++/*
++ * sCR0, the two bits that decide what happens to a stream nobody has mapped.
++ * arm-smmu.h: CLIENTPD is bit 0 (the client port off, which takes the whole
++ * SMMU out of the path) and USFCFG is bit 10.
++ */
++#define PG_SCR0_CLIENTPD	(1u << 0)
++#define PG_SCR0_USFCFG		(1u << 10)
+ #define PG_SMR_VALID		(1u << 31)
+ #define PG_CBAR_STAGE1		(1u << 16 | 3u << 8 | 0xfu << 12)
+ 					/* arm-smmu.h: TYPE 1 = stage 1 translates and stage 2
+@@ -1007,6 +1023,8 @@
+ static uint64_t pg_queue_iova[PG_GMU_HFI_QUEUES];
+ static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
+ static bool pg_smmu_mode;			/* polarisgpumap=1: translate instead of bypass */
++static int pg_mmu_way;				/* polarisgpummu: 0 auto, 1 entry, 2 unmatched, 3 off */
++static int pg_mem_way;				/* polarisgpumem: 0 ips, 1 ramdump, 2 splash */
+ static unsigned pg_region_count;		/* 0 while neither region exists */
+ static bool pg_boot_configured;
+ static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
+@@ -1033,6 +1051,49 @@
+ 		p[i] = 0;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * Where the firmware's regions come from when the allocator cannot help. All
++ * three are plain DRAM below 4 GB that no live driver owns, and all three are
++ * listed in the device tree's reserved-memory node:
++ *
++ *   ips_fw_region@0x8c400000      64 KB   no-map, removed-dma-pool
++ *   cont_splash_region@0x9d400000 36 MB   the boot logo buffer, dead after sweetfb
++ *   ramdump_fb_region@0xaf000000  16 MB   written only by the crash dump
++ *
++ * The first is the one the ladder has been using. It is also the one whose read
++ * the firmware never survived - but that read was made through a stream entry
++ * the hardware had rewritten into a fault, so the verdict is not in yet. The
++ * other two are selected with polarisgpumem=1 and =2.
++ */
++static const struct {
++	uint64_t base;
++	const char *what;
++} pg_mem_regions[] = {
++	{ 0x8c400000ull, "the IPS firmware region" },
++	{ 0xaf000000ull, "the ramdump framebuffer" },
++	{ 0x9d400000ull, "the continuous splash region" },
++};
++
++static uint64_t
++pg_reserved_base(void)
++{
++	unsigned i = (pg_mem_way >= 0 &&
++	    pg_mem_way < (int)(sizeof(pg_mem_regions) / sizeof(pg_mem_regions[0]))) ?
++	    (unsigned)pg_mem_way : 0u;
++
++	return pg_mem_regions[i].base;
++}
++
++static const char *
++pg_reserved_name(void)
++{
++	unsigned i = (pg_mem_way >= 0 &&
++	    pg_mem_way < (int)(sizeof(pg_mem_regions) / sizeof(pg_mem_regions[0]))) ?
++	    (unsigned)pg_mem_way : 0u;
++
++	return pg_mem_regions[i].what;
+ }
+ 
+ /*
+@@ -1097,15 +1158,16 @@
+ 		*va = 0;
+ 	}
+ 	if (index < PG_RESERVED_PAGES) {
+-		uint64_t phys = PG_RESERVED_PHYS + (uint64_t)index * PG_GMU_PAGE_SIZE;
+-		vm_offset_t mapped = ml_io_map((vm_offset_t)phys, PG_GMU_PAGE_SIZE);
++		uint64_t base = pg_reserved_base();
++		uint64_t phys = base + (uint64_t)index * PG_GMU_PAGE_SIZE;
++		vm_offset_t mapped = ml_io_map((vm_offset_t)phys, PG_PAGE);
+ 
+ 		if (mapped != 0) {
+ 			*va = mapped;
+ 			*pa = phys;
+-			pg_zero(mapped, PG_GMU_PAGE_SIZE);
+-			printf("POLARIS GPU: 10 %s from the reserved IPS firmware memory at %#llx "
+-			    "instead, mapped uncached\n", name, phys);
++			pg_zero(mapped, PG_PAGE);
++			printf("POLARIS GPU: 10 %s at %#llx, out of %s, mapped uncached\n",
++			    name, phys, pg_reserved_name());
+ 			pg_region_count = index + 1;
+ 			return true;
+ 		}
+@@ -1175,6 +1237,54 @@
+ }
+ 
+ /*
++ * Qualcomm's implementation-defined block, straight out of the device tree:
++ *
++ *     /soc/arm,smmu-kgsl@5040000  ...  attach-impl-defs = <0x6000 0x2378
++ *         0x6060 0x1055 0x678c 0x8 0x6794 0x28 0x6800 0x6 0x6900 0x3ff
++ *         0x6924 0x204 0x6928 0x11000 0x6930 0x800 0x6960 0xffffffff
++ *         0x6b64 0x1a5551 0x6b68 0x9a82a382>;
++ *
++ * The vendor driver writes every pair once when it attaches to the SMMU, and
++ * the offsets are far outside the architectural map (above 0x6000), so this is
++ * the translation buffer unit and its timing. Log 0130 is why it matters: a
++ * write of BYPASS into S2CR[0] came back as FAULT with only the low byte taken,
++ * which is what a configuration register that has not had this step done looks
++ * like.
++ */
++static const struct {
++	uint32_t off;
++	uint32_t value;
++} pg_smmu_impl[] = {
++	{ 0x6000, 0x2378 }, { 0x6060, 0x1055 }, { 0x678c, 0x8 }, { 0x6794, 0x28 },
++	{ 0x6800, 0x6 }, { 0x6900, 0x3ff }, { 0x6924, 0x204 }, { 0x6928, 0x11000 },
++	{ 0x6930, 0x800 }, { 0x6960, 0xffffffff }, { 0x6b64, 0x1a5551 },
++	{ 0x6b68, 0x9a82a382 },
++};
++
++static bool
++pg_smmu_impl_defs(void)
++{
++	unsigned wrong = 0;
++
++	for (unsigned i = 0; i < sizeof(pg_smmu_impl) / sizeof(pg_smmu_impl[0]); i++) {
++		uint32_t off = pg_smmu_impl[i].off;
++		uint32_t want = pg_smmu_impl[i].value;
++		uint32_t got;
++
++		pg_wr(pg_smmu + off, want);
++		got = pg_rd(pg_smmu + off);
++		if (got != want) {
++			printf("POLARIS GPU: 10 impl %#06x took %#010x, wanted %#010x\n",
++			    off, got, want);
++			wrong++;
++		}
++	}
++	printf("POLARIS GPU: 10 attach-impl-defs: %u of %u registers did not take\n", wrong,
++	    (unsigned)(sizeof(pg_smmu_impl) / sizeof(pg_smmu_impl[0])));
++	return wrong == 0;
++}
++
++/*
+  * Entry 0 of the stream table, made valid for stream 5. Bypass writes no
+  * context bank at all, which is exactly what the four entries the boot loader
+  * configured look like; translate brings up bank 2 first, tag and translate the
+@@ -1187,12 +1297,12 @@
+ 	    (PG_GMU_CTX | (PG_S2CR_TRANS << PG_S2CR_TYPE_SHIFT)) :
+ 	    (PG_S2CR_BYPASS << PG_S2CR_TYPE_SHIFT);
+ 	uint32_t smr = PG_SMR_VALID | PG_GMU_STREAM;
+-	uint32_t back;
+ 
+ 	if (pg_smmu == 0) {
+ 		printf("POLARIS GPU: 10 the SMMU was never mapped: stream 5 stays unmatched\n");
+ 		return false;
+ 	}
++	(void)pg_smmu_impl_defs();
+ 	if (pg_smmu_mode) {
+ 		vm_offset_t cb = pg_smmu_cb(PG_GMU_CTX);
+ 		uint64_t root;
+@@ -1243,19 +1353,71 @@
+ 			return false;
+ 		}
+ 	}
+-	pg_wr(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY), s2cr);
+-	pg_wr(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY), smr);
+-	back = pg_rd(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY));
+-	if (back != smr || pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY)) != s2cr) {
+-		printf("POLARIS GPU: 10 the SMMU did not keep entry %u: wrote %#010x/%#010x read "
+-		    "%#010x/%#010x\n", PG_GMU_SMR_ENTRY, smr, s2cr, back,
++	/*
++	 * How hard to push, from the boot arg, because one of these may work
++	 * where another does not and each costs a reboot to try:
++	 *
++	 *   polarisgpummu=0  auto: an entry of its own, then let unmatched
++	 *                    streams through, then take the SMMU out of the path
++	 *   polarisgpummu=1  only the entry
++	 *   polarisgpummu=2  only "unmatched streams do not fault"
++	 *   polarisgpummu=3  only sCR0.CLIENTPD
++	 *
++	 * The entry is the right answer and the one Linux uses; the other two are
++	 * only here because log 0130 showed the entry write being edited by the
++	 * hardware into a fault.
++	 */
++	{
++		bool want_entry = pg_mmu_way == 0 || pg_mmu_way == 1;
++		bool want_unmatched = !pg_smmu_mode && (pg_mmu_way == 0 || pg_mmu_way == 2);
++		bool want_off = !pg_smmu_mode && (pg_mmu_way == 0 || pg_mmu_way == 3);
++		uint32_t smr_back, s2cr_back, scr0, scr0_after;
++
++		if (want_entry) {
++			pg_wr(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY), smr);
++			pg_wr(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY), s2cr);
++			smr_back = pg_rd(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY));
++			s2cr_back = pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY));
++			printf("POLARIS GPU: 10 entry %u: wrote SMR %#010x S2CR %#010x, read back "
++			    "SMR %#010x S2CR %#010x\n", PG_GMU_SMR_ENTRY, smr, s2cr, smr_back,
++			    s2cr_back);
++			if (smr_back == smr && s2cr_back == s2cr) {
++				printf("POLARIS GPU: 10 stream %u has %s\n", PG_GMU_STREAM,
++				    pg_smmu_mode ? "context bank 2 behind it" : "a bypass entry");
++				return true;
++			}
++			if (pg_smmu_mode || pg_mmu_way == 1) {
++				printf("POLARIS GPU: 10 the entry will not take %#010x\n", s2cr);
++				return false;
++			}
++			pg_wr(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY), 0);
++		}
++		if (want_unmatched) {
++			scr0 = pg_rd(pg_smmu + PG_SMMU_SCR0);
++			pg_wr(pg_smmu + PG_SMMU_SCR0, scr0 & ~PG_SCR0_USFCFG);
++			scr0_after = pg_rd(pg_smmu + PG_SMMU_SCR0);
++			printf("POLARIS GPU: 10 stream %u left unmatched, sCR0 %#010x -> %#010x "
++			    "(USFCFG cleared: unmatched streams no longer fault)\n", PG_GMU_STREAM,
++			    scr0, scr0_after);
++			if (!(scr0_after & PG_SCR0_USFCFG)) {
++				return true;
++			}
++		}
++		if (want_off) {
++			scr0 = pg_rd(pg_smmu + PG_SMMU_SCR0);
++			pg_wr(pg_smmu + PG_SMMU_SCR0, scr0 | PG_SCR0_CLIENTPD);
++			scr0_after = pg_rd(pg_smmu + PG_SMMU_SCR0);
++			printf("POLARIS GPU: 10 sCR0 %#010x -> %#010x (CLIENTPD: the SMMU off the "
++			    "path, every stream bypassed)\n", scr0, scr0_after);
++			if (scr0_after & PG_SCR0_CLIENTPD) {
++				return true;
++			}
++		}
++		printf("POLARIS GPU: 10 nothing would take: sCR0 %#010x entry SMR %#010x S2CR %#010x\n",
++		    pg_rd(pg_smmu + PG_SMMU_SCR0), pg_rd(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY)),
+ 		    pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY)));
+ 		return false;
+ 	}
+-	printf("POLARIS GPU: 10 SMMU entry %u: stream %u -> %s (SMR %#010x S2CR %#010x); sCR0 %#010x, "
+-	    "the other streams are as the boot loader left them\n", PG_GMU_SMR_ENTRY, PG_GMU_STREAM,
+-	    pg_smmu_mode ? "context bank 2" : "bypass", smr, s2cr, pg_rd(pg_smmu + PG_SMMU_SCR0));
+-	return true;
+ }
+ 
+ static bool
+@@ -1291,9 +1453,15 @@
+ 	}
+ 	(void)PE_parse_boot_argn("polarisgpumap", &map, sizeof(map));
+ 	pg_smmu_mode = (map == 1);
++	pg_mmu_way = 0;
++	pg_mem_way = 0;
++	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
++	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+ 	printf("POLARIS GPU: 10 the firmware's regions are %s\n", pg_smmu_mode ?
+ 	    "behind the SMMU's translation (polarisgpumap=1)" :
+ 	    "addressed physically with stream 5 bypassing the SMMU (polarisgpumap=0)");
++	printf("POLARIS GPU: 10 polarisgpummu=%d, polarisgpumem=%d (%s)\n",
++	    pg_mmu_way, pg_mem_way, pg_reserved_name());
+ 	if (!pg_gmu_region(&pg_log_va, &pg_log_pa, "the firmware's log")) {
+ 		return false;
+ 	}
+@@ -2278,9 +2446,11 @@
+ 	 */
+ 	(void)PE_parse_boot_argn("polarisgpumap", &map, sizeof(map));
+ 	pg_smmu_mode = (map == 1);
+-	printf("POLARIS GPU: build 0130 up=%d regions=%s\n", upto,
+-	    pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+-	    "physical, low DRAM, stream 5 bypass (polarisgpumap=0)");
++	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
++	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
++	printf("POLARIS GPU: build 0131 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
++	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
+ 
+ 	ok = pg_step_gcc();
