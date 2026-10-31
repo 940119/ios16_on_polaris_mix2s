@@ -1,0 +1,360 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -906,11 +906,12 @@
+  * in this kernel ever touches: the IPS firmware region, 64 KB at 0x8c400000.
+  * The device tree marks it no-map, so the VM does not manage those pages and
+  * cannot hand them to anyone else, and IPS firmware belongs to the modem and
+- * IPA subsystems, which this kernel never starts. Its two 16 KB halves hold
+- * the log and the HFI queue table.
++ * IPA subsystems, which this kernel never starts. Three of its 16 KB blocks
++ * hold the log, the HFI queue table and the debug buffer the firmware asks for
++ * in its first HFI message.
+  */
+ #define PG_RESERVED_PHYS	0x8c400000ull
+-#define PG_RESERVED_REGIONS	2u
++#define PG_RESERVED_REGIONS	3u
+ 
+ struct pg_hfi_table {
+ 	uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
+@@ -921,8 +922,8 @@
+ 	uint32_t rx_watermark, tx_watermark, rx_request, tx_request, read_index, write_index;
+ };
+ 
+-static vm_offset_t pg_log_va, pg_hfi_va;
+-static uint64_t pg_log_pa, pg_hfi_pa;
++static vm_offset_t pg_log_va, pg_hfi_va, pg_dbg_va;
++static uint64_t pg_log_pa, pg_hfi_pa, pg_dbg_pa;
+ static unsigned pg_region_count;		/* 0 while neither region exists */
+ static bool pg_boot_configured;
+ static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
+@@ -1115,20 +1116,34 @@
+  * measured release, not a boot. What it answers is whether the 32 KB in step
+  * 8 runs at all.
+  */
+-static bool
+-pg_step_gmu_start(void)
+-{
+-	uint32_t tcm, mask, want, result = 0, old_ao, old_h2h;
+-	bool started = false;
+-
+-	if (!pg_boot_configured || pg_gmu == 0) {
+-		printf("POLARIS GPU: 11 the boot configuration was not written; the processor is not released\n");
+-		return false;
+-	}
+-	if (pg_rd(pg_gmu + PG_GMU_WORD(0x5000)) != 1) {
+-		printf("POLARIS GPU: 11 the processor is not held in reset; nothing released\n");
+-		return false;
+-	}
++/* Back into reset: nothing stays running unowned. */
++static void
++pg_gmu_hold(void)
++{
++	pg_wr(pg_gmu + PG_GMU_WORD(0x5000), 1);
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++pg_gmu_unmask(void)
++{
++	if (pg_masks_saved) {
++		pg_wr(pg_gmu + PG_GMU_WORD(0x9306), pg_old_ao_mask);
++		pg_wr(pg_gmu + PG_GMU_WORD(0x5193), pg_old_h2h_mask);
++	}
++}
++
++/*
++ * a6xx_gmu_start(): mask both interrupt paths, clear what an earlier run left
++ * in FW_INIT_RESULT and CP_RESP, drop SYSRESET and wait for the firmware to
++ * announce itself. The word at DTCM+0xff8 selects which signature to expect;
++ * the image this phone carries is a legacy one, so 0xbabeface exactly.
++ */
++static bool
++pg_gmu_release(const char *tag)
++{
++	uint32_t tcm, mask, want, result;
++
+ 	tcm = pg_rd(pg_gmu + PG_GMU_DTCM + 4 * PG_DTCM_LAST_WORD);
+ 	if (tcm <= 0x20010004u) {
+ 		mask = 0xffffffffu;
+@@ -1137,51 +1152,248 @@
+ 		mask = 0x1ffu;
+ 		want = 0x100u;
+ 	}
+-	printf("POLARIS GPU: 11 last DTCM word %#010x: FW_INIT_RESULT & %#x must become %#x\n", tcm, mask, want);
+-
+-	old_ao = pg_rd(pg_gmu + PG_GMU_WORD(0x9306));
+-	old_h2h = pg_rd(pg_gmu + PG_GMU_WORD(0x5193));
++	printf("POLARIS GPU: %s last DTCM word %#010x: FW_INIT_RESULT & %#x must become %#x\n", tag, tcm, mask, want);
++
++	pg_old_ao_mask = pg_rd(pg_gmu + PG_GMU_WORD(0x9306));
++	pg_old_h2h_mask = pg_rd(pg_gmu + PG_GMU_WORD(0x5193));
+ 	pg_wr(pg_gmu + PG_GMU_WORD(0x9306), ~0u);
+ 	pg_wr(pg_gmu + PG_GMU_WORD(0x5193), ~0u);
+-	pg_old_ao_mask = old_ao;
+-	pg_old_h2h_mask = old_h2h;
+ 	pg_masks_saved = true;
+-	printf("POLARIS GPU: 11 interrupts masked (AO was %#010x, GMU2HOST was %#010x)\n", old_ao, old_h2h);
++	printf("POLARIS GPU: %s interrupts masked (AO was %#010x, GMU2HOST was %#010x)\n", tag, pg_old_ao_mask,
++	    pg_old_h2h_mask);
+ 
+ 	pg_wr(pg_gmu + PG_GMU_WORD(0x5101), 0);
+ 	pg_wr(pg_gmu + PG_GMU_WORD(0x501c), 0);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 
+-	printf("POLARIS GPU: 11 releasing the reset (SYSRESET 1 -> 0)\n");
++	printf("POLARIS GPU: %s releasing the reset (SYSRESET 1 -> 0)\n", tag);
+ 	pg_wr(pg_gmu + PG_GMU_WORD(0x5000), 0);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	for (uint32_t i = 0; i < 200; i++) {
+ 		result = pg_rd(pg_gmu + PG_GMU_WORD(0x501c));
+ 		if ((result & mask) == want) {
+-			started = true;
+-			break;
++			printf("POLARIS GPU: %s firmware init DONE: FW_INIT_RESULT %#010x CP_RESP %#010x "
++			    "GENERAL_7 %#x SYSRESET %#x\n", tag, result, pg_rd(pg_gmu + PG_GMU_WORD(0x5101)),
++			    pg_rd(pg_gmu + PG_GMU_WORD(0x51cc)), pg_rd(pg_gmu + PG_GMU_WORD(0x5000)));
++			return true;
+ 		}
+ 		pg_sleep_us(100);
+ 	}
+-	printf("POLARIS GPU: 11 firmware init %s: FW_INIT_RESULT %#010x CP_RESP %#010x GENERAL_7 %#x SYSRESET %#x\n",
+-	    started ? "DONE" : "TIMED OUT after 20 ms", result, pg_rd(pg_gmu + PG_GMU_WORD(0x5101)),
++	printf("POLARIS GPU: %s firmware init TIMED OUT after 20 ms: FW_INIT_RESULT %#010x CP_RESP %#010x "
++	    "GENERAL_7 %#x SYSRESET %#x\n", tag, result, pg_rd(pg_gmu + PG_GMU_WORD(0x5101)),
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x51cc)), pg_rd(pg_gmu + PG_GMU_WORD(0x5000)));
++	return false;
++}
++
++static bool
++pg_step_gmu_start(void)
++{
++	bool started;
++
++	if (!pg_boot_configured || pg_gmu == 0) {
++		printf("POLARIS GPU: 11 the boot configuration was not written; the processor is not released\n");
++		return false;
++	}
++	if (pg_rd(pg_gmu + PG_GMU_WORD(0x5000)) != 1) {
++		printf("POLARIS GPU: 11 the processor is not held in reset; nothing released\n");
++		return false;
++	}
++	started = pg_gmu_release("11");
+ 	if (pg_log_va != 0) {
+-		const uint32_t *log = (const uint32_t *)pg_log_va;
++		const volatile uint32_t *log = (const volatile uint32_t *)pg_log_va;
+ 
+ 		printf("POLARIS GPU: 11 log[0..7] = %#010x %#010x %#010x %#010x %#010x %#010x %#010x %#010x\n",
+ 		    log[0], log[1], log[2], log[3], log[4], log[5], log[6], log[7]);
+ 	}
+-
+-	/* Back into reset, whatever it said: nothing stays running unowned. */
+-	pg_wr(pg_gmu + PG_GMU_WORD(0x5000), 1);
+-	__asm__ volatile ("dsb sy" ::: "memory");
++	pg_gmu_hold();
+ 	printf("POLARIS GPU: 11 processor %s (SYSRESET %#x)\n",
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x5000)) == 1 ? "HELD in reset again" : "NOT HALTED",
+ 	    pg_rd(pg_gmu + PG_GMU_WORD(0x5000)));
+-	pg_wr(pg_gmu + PG_GMU_WORD(0x9306), old_ao);
+-	pg_wr(pg_gmu + PG_GMU_WORD(0x5193), old_h2h);
++	pg_gmu_unmask();
+ 	return started;
++}
++
++/* ---- HFI: the host's command queue is 0, the GMU's response queue is 1 ------------------------------ */
++
++#define PG_HFI_CTRL_STATUS	0x5180u		/* the firmware's HFI is up when bit 0 reads 1 */
++#define PG_HFI_CTRL_INIT	0x5186u
++#define PG_H2G_INTR_SET		0x5194u		/* the host kicks the GMU here */
++#define PG_G2H_INTR_INFO	0x5192u
++#define PG_G2H_INTR_CLR		0x5191u
++#define PG_HFI_MSG_INIT		0u
++#define PG_HFI_MSG_FW_VERSION	1u
++#define PG_HFI_MSG_ERROR	100u
++#define PG_HFI_QUEUE_WORDS	1024u
++
++static uint32_t pg_hfi_seq;
++
++static bool
++pg_poll(vm_offset_t reg, uint32_t mask, uint32_t want, uint32_t tries, uint32_t step_us)
++{
++	for (uint32_t i = 0; i < tries; i++) {
++		if ((pg_rd(reg) & mask) == want) {
++			return true;
++		}
++		pg_sleep_us(step_us);
++	}
++	return (pg_rd(reg) & mask) == want;
++}
++
++static volatile struct pg_hfi_queue *
++pg_hfi_header(uint32_t q)
++{
++	return (volatile struct pg_hfi_queue *)(pg_hfi_va + sizeof(struct pg_hfi_table)) + q;
++}
++
++static volatile uint32_t *
++pg_hfi_data(uint32_t q)
++{
++	return (volatile uint32_t *)(pg_hfi_va + 0x1000 * (q + 1));
++}
++
++/*
++ * a6xx_hfi_send_msg(): a header word - sequence in bits 31:20, length in 15:8,
++ * message id in 7:0 - written into queue 0, then one interrupt, then the
++ * answer read out of queue 1. The queue indices live in the table in shared
++ * memory, so both sides see them; the data area is written before the index
++ * that publishes it.
++ */
++static bool
++pg_hfi_send(uint32_t id, uint32_t *msg, uint32_t dwords, uint32_t *payload, uint32_t payload_words)
++{
++	volatile struct pg_hfi_queue *cq = pg_hfi_header(0), *rq = pg_hfi_header(1);
++	uint32_t seq = ++pg_hfi_seq % 0xfff, index, space;
++
++	pg_to_memory(pg_hfi_va, PG_GMU_REGION_SIZE);
++	index = cq->write_index;
++	space = (cq->read_index - index - 1) & (PG_HFI_QUEUE_WORDS - 1);
++	if (space < dwords) {
++		printf("POLARIS GPU: 12 HFI command queue full (%u of %u words used)\n",
++		    PG_HFI_QUEUE_WORDS - 1 - space, PG_HFI_QUEUE_WORDS - 1);
++		return false;
++	}
++	msg[0] = (seq << 20) | (0u << 16) | (dwords << 8) | id;
++	for (uint32_t i = 0; i < dwords; i++) {
++		pg_hfi_data(0)[index] = msg[i];
++		index = (index + 1) & (PG_HFI_QUEUE_WORDS - 1);
++	}
++	pg_to_memory((vm_offset_t)pg_hfi_data(0), 0x1000);
++	cq->write_index = index;
++	pg_to_memory(pg_hfi_va, PG_GMU_REGION_SIZE);
++	pg_wr(pg_gmu + PG_GMU_WORD(PG_H2G_INTR_SET), 1);
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	for (unsigned round = 0; round < 3; round++) {
++		if (!pg_poll(pg_gmu + PG_GMU_WORD(PG_G2H_INTR_INFO), 1, 1, 10000, 100)) {
++			printf("POLARIS GPU: 12 HFI message %u seq %u: no interrupt within 1 s "
++			    "(INTR_INFO %#010x, the queue says write %u read %u)\n", id, seq,
++			    pg_rd(pg_gmu + PG_GMU_WORD(PG_G2H_INTR_INFO)), cq->write_index, cq->read_index);
++			return false;
++		}
++		pg_wr(pg_gmu + PG_GMU_WORD(PG_G2H_INTR_CLR), 1);
++		for (;;) {
++			uint32_t resp[19], hdr, n, ri;
++
++			pg_to_memory(pg_hfi_va, PG_GMU_REGION_SIZE);
++			if (rq->read_index == rq->write_index) {
++				break;
++			}
++			ri = rq->read_index;
++			hdr = pg_hfi_data(1)[ri];
++			n = (hdr >> 8) & 0xff;
++			if (n == 0 || n > 19) {
++				printf("POLARIS GPU: 12 HFI response header %#010x claims %u words\n", hdr, n);
++				return false;
++			}
++			for (uint32_t i = 0; i < n; i++) {
++				resp[i] = pg_hfi_data(1)[ri];
++				ri = (ri + 1) & (PG_HFI_QUEUE_WORDS - 1);
++			}
++			rq->read_index = ri;
++			pg_to_memory(pg_hfi_va, PG_GMU_REGION_SIZE);
++			if ((hdr & 0xff) == PG_HFI_MSG_ERROR) {
++				printf("POLARIS GPU: 12 the firmware reports an error, code %u\n", resp[1]);
++				continue;
++			}
++			if (n < 3 || ((resp[1] >> 20) & 0xfff) != seq) {
++				printf("POLARIS GPU: 12 unexpected HFI response (header %#010x, seq %#x): waiting on\n",
++				    hdr, n > 1 ? (resp[1] >> 20) & 0xfff : 0);
++				continue;
++			}
++			printf("POLARIS GPU: 12 HFI message %u seq %u answered: error %u%s\n", id, seq, resp[2],
++			    n > 3 ? "" : " (no payload word)");
++			if (resp[2] != 0) {
++				return false;
++			}
++			if (payload != NULL) {
++				for (uint32_t i = 0; i < payload_words && 3 + i < n; i++) {
++					payload[i] = resp[3 + i];
++				}
++			}
++			return true;
++		}
++	}
++	printf("POLARIS GPU: 12 HFI message %u: the response queue stayed empty\n", id);
++	return false;
++}
++
++/* a6xx_gmu_hfi_start(): open the channel, then the two messages every a6xx boot sends. */
++static bool
++pg_step_hfi(void)
++{
++	uint32_t init[5] = { 0 }, ver[2] = { 0 }, version = 0;
++	bool ok = true;
++
++	if (!pg_boot_configured || pg_gmu == 0 || pg_hfi_va == 0) {
++		printf("POLARIS GPU: 12 no boot configuration or no HFI table: the channel is not opened\n");
++		return false;
++	}
++	if (pg_rd(pg_gmu + PG_GMU_WORD(0x5000)) == 1 && !pg_gmu_release("12")) {
++		printf("POLARIS GPU: 12 the firmware did not come up a second time\n");
++		pg_gmu_hold();
++		pg_gmu_unmask();
++		return false;
++	}
++
++	pg_wr(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_INIT), 1);
++	ok = pg_poll(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_STATUS), 1, 1, 100, 100);
++	printf("POLARIS GPU: 12 HFI_CTRL_INIT: HFI_CTRL_STATUS %#010x (%s)\n",
++	    pg_rd(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_STATUS)), ok ? "the channel is up" : "NOT up");
++	if (!ok) {
++		goto out;
++	}
++	/* the debug region the firmware keeps its own messages in */
++	if (pg_dbg_va == 0 && !pg_gmu_region(&pg_dbg_va, &pg_dbg_pa)) {
++		printf("POLARIS GPU: 12 no region for the debug buffer\n");
++		ok = false;
++		goto out;
++	}
++	init[2] = (uint32_t)pg_dbg_pa;
++	init[3] = PG_GMU_REGION_SIZE;
++	init[4] = 1;				/* GMU_COLD_BOOT */
++	printf("POLARIS GPU: 12 GMU_INIT: segment %#010x size %#x, cold boot\n", init[2], init[3]);
++	ok = pg_hfi_send(PG_HFI_MSG_INIT, init, 5, NULL, 0);
++	if (!ok) {
++		goto out;
++	}
++	ver[1] = (1u << 28) | (1u << 19) | (1u << 17);	/* the version a6xx asks for, 1.10 */
++	ok = pg_hfi_send(PG_HFI_MSG_FW_VERSION, ver, 2, &version, 1);
++	if (ok) {
++		printf("POLARIS GPU: 12 the firmware reports HFI version %#x\n", version);
++	}
++out:
++	if (pg_log_va != 0) {
++		const volatile uint32_t *log = (const volatile uint32_t *)pg_log_va;
++
++		printf("POLARIS GPU: 12 log[0..7] = %#010x %#010x %#010x %#010x %#010x %#010x %#010x %#010x\n",
++		    log[0], log[1], log[2], log[3], log[4], log[5], log[6], log[7]);
++	}
++	pg_gmu_hold();
++	printf("POLARIS GPU: 12 processor %s (SYSRESET %#x)\n",
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5000)) == 1 ? "HELD in reset again" : "NOT HALTED",
++	    pg_rd(pg_gmu + PG_GMU_WORD(0x5000)));
++	pg_gmu_unmask();
++	return ok;
+ }
+ 
+ /* ---- the ladder ------------------------------------------------------------------------------------ */
+@@ -1269,6 +1481,13 @@
+ 	}
+ 	if (!pg_step_gmu_start()) {
+ 		printf("POLARIS GPU: stop after 11: the firmware did not announce itself\n");
++		return;
++	}
++	if (upto < 12) {
++		return;
++	}
++	if (!pg_step_hfi()) {
++		printf("POLARIS GPU: stop after 12: the firmware did not answer over HFI\n");
+ 		return;
+ 	}
+ 	printf("POLARIS GPU: ladder done; the CX half is left powered, nothing may be released yet\n");
