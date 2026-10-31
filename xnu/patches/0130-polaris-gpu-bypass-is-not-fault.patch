@@ -1,0 +1,148 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -963,7 +963,16 @@
+ #define PG_GMU_STREAM		5u		/* /soc/qcom,gmu/gmu_kernel */
+ #define PG_GMU_SMR_ENTRY	0u		/* entry 0's SMR is invalid, so nothing owns it */
+ #define PG_GMU_CTX		2u		/* bank 0 belongs to the 3D core, which never starts */
+-#define PG_S2CR_BYPASS		0x000200ffu	/* type 2 = bypass, context bank 255 */
++/*
++ * S2CR_TYPE is bits 17:16 and the enum is TRANS = 0, BYPASS = 1, FAULT = 2.
++ * 0x000200ff is the fault entry the boot loader leaves in all five slots, and
++ * writing it back is what step 0129 did by mistake: it made the GMU's very
++ * first read fail instead of passing through. Bypass carries no context bank.
++ */
++#define PG_S2CR_TYPE_SHIFT	16
++#define PG_S2CR_TRANS		0u
++#define PG_S2CR_BYPASS		1u
++#define PG_S2CR_FAULT		2u
+ #define PG_SMR_VALID		(1u << 31)
+ #define PG_CBAR_STAGE1		(1u << 16 | 3u << 8 | 0xfu << 12)
+ 					/* arm-smmu.h: TYPE 1 = stage 1 translates and stage 2
+@@ -1050,29 +1059,40 @@
+ 	if (pg_smmu_mode) {
+ 		if (kmem_alloc(kernel_map, va, PG_GMU_PAGE_SIZE,
+ 		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-			printf("POLARIS GPU: 10 the allocator has no page at all for the %s\n", name);
++			printf("POLARIS GPU: 10 the allocator has no page at all for %s\n", name);
+ 			return false;
+ 		}
+ 		*pa = kvtophys(*va);
+ 		printf("POLARIS GPU: 10 %s: a kernel page at %#llx\n", name, *pa);
+ 		return true;
+ 	}
++	/*
++	 * KMA_LOMEM is what makes this work at all. kmem_alloc_contig walks the
++	 * page array from a remembered index and stops at the first page above
++	 * max_pnum ("no more low pages"), so after the machine has handed out
++	 * memory once the scan starts high and gives up immediately - that is why
++	 * every page used to come back at 0x1_035a8000 and be given back. The
++	 * LOMEM flag selects a second cursor (vm_page_lomem_find_contiguous_last_idx)
++	 * that starts at page 0, so the scan really does begin in low DRAM.
++	 */
+ 	for (int attempt = 0; attempt < 4; attempt++) {
+ 		if (kmem_alloc_contig(kernel_map, va, PG_GMU_PAGE_SIZE, 0, PG_MAX_PAGE_BELOW_4G, 0,
+-		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		    KMA_KOBJECT | KMA_ZERO | KMA_DATA | KMA_LOMEM,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 			*va = 0;
+-			printf("POLARIS GPU: 10 the allocator has no page below 4 GB for the %s "
++			printf("POLARIS GPU: 10 the allocator has no page below 4 GB for %s "
+ 			    "(attempt %d)\n", name, attempt + 1);
+ 			break;		/* the reserved region may still do */
+ 		}
+ 		*pa = kvtophys(*va);
+ 		if (*pa != 0 && *pa + PG_GMU_PAGE_SIZE <= PG_ADDRESS_LIMIT) {
+-			printf("POLARIS GPU: 10 %s from the allocator: %#llx\n", name, *pa);
++			printf("POLARIS GPU: 10 %s: ordinary DRAM from the allocator at %#llx\n",
++			    name, *pa);
+ 			pg_region_count = index + 1;
+ 			return true;
+ 		}
+-		printf("POLARIS GPU: 10 the %s page came back at %#llx, above the 32-bit "
+-		    "boundary the firmware can address: given back\n", name, *pa);
++		printf("POLARIS GPU: 10 %s came back at %#llx, above the 32-bit boundary the "
++		    "firmware can address: given back\n", name, *pa);
+ 		kmem_free(kernel_map, *va, PG_GMU_PAGE_SIZE);
+ 		*va = 0;
+ 	}
+@@ -1091,7 +1111,7 @@
+ 		}
+ 		printf("POLARIS GPU: 10 the reserved page at %#llx could not be mapped\n", phys);
+ 	}
+-	printf("POLARIS GPU: 10 no memory at all for the %s\n", name);
++	printf("POLARIS GPU: 10 no memory at all for %s\n", name);
+ 	return false;
+ }
+ 
+@@ -1149,7 +1169,8 @@
+ 		    PG_PTE_ATTR | PG_PTE_PAGE;
+ 	}
+ 	pg_to_memory(pg_l3_va, PAGE_SIZE);
+-	printf("POLARIS GPU: 10 %s: %#llx -> %#llx\n", name, iova, kvtophys(va));
++	printf("POLARIS GPU: 10 %s: %#llx -> %#llx, descriptor %#llx in slot %u\n", name, iova,
++	    kvtophys(va), l3[((iova >> 12) & 0x1ff)], (uint32_t)((iova >> 12) & 0x1ff));
+ 	return true;
+ }
+ 
+@@ -1162,7 +1183,9 @@
+ static bool
+ pg_smmu_arm(void)
+ {
+-	uint32_t s2cr = pg_smmu_mode ? PG_GMU_CTX : PG_S2CR_BYPASS;
++	uint32_t s2cr = pg_smmu_mode ?
++	    (PG_GMU_CTX | (PG_S2CR_TRANS << PG_S2CR_TYPE_SHIFT)) :
++	    (PG_S2CR_BYPASS << PG_S2CR_TYPE_SHIFT);
+ 	uint32_t smr = PG_SMR_VALID | PG_GMU_STREAM;
+ 	uint32_t back;
+ 
+@@ -1178,9 +1201,21 @@
+ 			return false;
+ 		}
+ 		root = (kvtophys(pg_l1_va) & PG_PTE_ADDR) | ((uint64_t)PG_GMU_CTX << 48);
++		printf("POLARIS GPU: 10 bank %u as the boot loader left it: CBAR %#010x CBA2R %#010x "
++		    "SCTLR %#010x TTBR0 %#010x%08x TCR %#010x TCR2 %#010x FSR %#010x S2CR %#010x; "
++		    "sCR0 %#010x sGFSR %#010x\n", PG_GMU_CTX,
++		    pg_rd(pg_smmu + PG_SMMU_CBAR(PG_GMU_CTX)),
++		    pg_rd(pg_smmu + PG_SMMU_CBA2R(PG_GMU_CTX)),
++		    pg_rd(cb + PG_CB_SCTLR), pg_rd(cb + PG_CB_TTBR0_HI), pg_rd(cb + PG_CB_TTBR0_LO),
++		    pg_rd(cb + PG_CB_TCR), pg_rd(cb + PG_CB_TCR2), pg_rd(cb + PG_CB_FSR),
++		    pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY)), pg_rd(pg_smmu + PG_SMMU_SCR0),
++		    pg_rd(pg_smmu + PG_SMMU_SGFSR));
+ 		pg_wr(cb + PG_CB_SCTLR, 0);
+ 		pg_wr(pg_smmu + PG_SMMU_CBA2R(PG_GMU_CTX), PG_CBA2R_64BIT);
+ 		pg_wr(pg_smmu + PG_SMMU_CBAR(PG_GMU_CTX), PG_CBAR_STAGE1);
++		printf("POLARIS GPU: 10 bank %u: CBAR %#010x CBA2R %#010x (stage 1 translate, "
++		    "64-bit TTBR)\n", PG_GMU_CTX, pg_rd(pg_smmu + PG_SMMU_CBAR(PG_GMU_CTX)),
++		    pg_rd(pg_smmu + PG_SMMU_CBA2R(PG_GMU_CTX)));
+ 		pg_wr(cb + PG_CB_TCR2, PG_TCR2_36_BITS);
+ 		pg_wr(cb + PG_CB_TCR, PG_TCR_39_BITS);
+ 		pg_wr(cb + PG_CB_TTBR0_LO, (uint32_t)root);
+@@ -1190,6 +1225,8 @@
+ 		pg_wr(cb + PG_CB_MAIR0, PG_MAIR0_LINUX);
+ 		pg_wr(cb + PG_CB_MAIR1, 0);
+ 		pg_wr(cb + PG_CB_FSR, 0xffffffffu);	/* one to clear, every reason */
++		printf("POLARIS GPU: 10 bank %u: the descriptors are written; invalidating the TLB\n",
++		    PG_GMU_CTX);
+ 		pg_wr(cb + PG_CB_TLBIASID, PG_GMU_CTX);
+ 		pg_wr(cb + PG_CB_TLBSYNC, 1);
+ 		for (int i = 0; i < 100 && (pg_rd(cb + PG_CB_TLBSTATUS) & 1); i++) {
+@@ -2232,7 +2269,18 @@
+ polaris_gpu_up(int upto)
+ {
+ 	bool ok;
+-
++	int map = -1;
++
++	/*
++	 * The mode has to be known before step 10 allocates anything, and the
++	 * banner has to say which build ran: a ring buffer read after a crash is
++	 * worthless if the first line cannot be tied to an image.
++	 */
++	(void)PE_parse_boot_argn("polarisgpumap", &map, sizeof(map));
++	pg_smmu_mode = (map == 1);
++	printf("POLARIS GPU: build 0130 up=%d regions=%s\n", upto,
++	    pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
++	    "physical, low DRAM, stream 5 bypass (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
+ 
+ 	ok = pg_step_gcc();
