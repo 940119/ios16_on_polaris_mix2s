@@ -1,0 +1,150 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1806,6 +1806,9 @@
+ #define PG_G2H_INTR_INFO	0x5192u
+ #define PG_G2H_INTR_CLR		0x5191u
+ #define PG_HFI_MSG_INIT		0u
++#define PG_HFI_MSG_BW_TABLE	3u
++#define PG_HFI_MSG_PERF_TABLE	4u
++#define PG_HFI_MSG_TEST		5u
+ #define PG_HFI_MSG_FW_VERSION	1u
+ #define PG_HFI_MSG_ERROR	100u
+ #define PG_HFI_QUEUE_WORDS	1024u
+@@ -2446,6 +2449,49 @@
+ 	return false;
+ }
+ 
++/*
++ * The vote word a level selects: the level itself in bits 31:16, the mx.lvl
++ * index in 15:8 and the gfx.lvl (or cx.lvl) index in 7:0. This is the packing
++ * the firmware's PERF_TABLE takes, and it is the Mi 8 port's arc_vote() word
++ * for word - including the difference from the doorbell above: level 0 selects
++ * the first entry, not the last, because level 0 is the table's off row.
++ */
++static bool
++pg_perf_vote(const char *name, uint32_t level, uint32_t *vote)
++{
++	const uint16_t *pri, *sec;
++	uint32_t pc = 0, sc = 0, pindex = 0, sindex = 0, j;
++
++	if (!pg_cmd_db_map()) {
++		return false;
++	}
++	pri = pg_cmd_db_levels(name, &pc);
++	sec = pg_cmd_db_levels("mx.lvl", &sc);
++	if (pri == NULL || sec == NULL || pc == 0 || sc == 0) {
++		return false;
++	}
++	for (j = 0; j < pc; j++) {
++		if (pri[j] >= level) {
++			pindex = j;
++			break;
++		}
++	}
++	if (j == pc) {
++		printf("POLARIS GPU: 13 %s has no entry at or above %u (top %u)\n", name, level, pri[pc - 1]);
++		return false;
++	}
++	for (j = 0; j < sc; j++) {
++		if (sec[j] >= pri[pindex]) {
++			sindex = j;
++			break;
++		} else if (sec[j] != 0) {
++			sindex = j;
++		}
++	}
++	*vote = ((pri[pindex] & 0xffffu) << 16) | (sindex << 8) | pindex;
++	return true;
++}
++
+ /* a6xx_gmu_hfi_start(): open the channel, then the two messages every a6xx boot sends. */
+ static bool
+ pg_step_hfi(void)
+@@ -2523,6 +2569,78 @@
+ 	ok = pg_hfi_send(PG_HFI_MSG_FW_VERSION, ver, 2, &version, 1);
+ 	if (ok) {
+ 		printf("POLARIS GPU: 13 the firmware reports HFI version %#x\n", version);
++	} else {
++		goto out;
++	}
++	/* a6xx_hfi_send_perf_table_v1(): one row per GPU level and one per GMU level,
++	 * each carrying the RPMh vote word that level selects. The GPU's rows use
++	 * gfx.lvl and mx.lvl, the GMU's use cx.lvl and mx.lvl. */
++	{
++		static const struct {
++			uint32_t khz, level;
++		} gpu_perf[] = {
++			{ 0, 0 }, { 257000, 64 }, { 342000, 128 }, { 414000, 192 },
++			{ 520000, 256 }, { 596000, 320 }, { 675000, 384 }, { 710000, 416 },
++		}, gmu_perf[] = {
++			{ 0, 0 }, { 200000, 48 }, { 400000, 128 },
++		};
++		uint32_t perf[43] = { 0 };
++		bool table = true;
++
++		perf[1] = sizeof(gpu_perf) / sizeof(gpu_perf[0]);
++		perf[2] = sizeof(gmu_perf) / sizeof(gmu_perf[0]);
++		for (uint32_t i = 0; i < perf[1] && table; i++) {
++			table = pg_perf_vote("gfx.lvl", gpu_perf[i].level, &perf[3 + 2 * i]);
++			perf[4 + 2 * i] = gpu_perf[i].khz;
++			printf("POLARIS GPU: 13 perf GX[%u] %u kHz level %u vote %#010x%s\n", i,
++			    gpu_perf[i].khz, gpu_perf[i].level, perf[3 + 2 * i], table ? "" : " NO VOTE");
++		}
++		for (uint32_t i = 0; i < perf[2] && table; i++) {
++			table = pg_perf_vote("cx.lvl", gmu_perf[i].level, &perf[35 + 2 * i]);
++			perf[36 + 2 * i] = gmu_perf[i].khz;
++			printf("POLARIS GPU: 13 perf CX[%u] %u kHz level %u vote %#010x%s\n", i,
++			    gmu_perf[i].khz, gmu_perf[i].level, perf[35 + 2 * i], table ? "" : " NO VOTE");
++		}
++		if (!table) {
++			ok = false;
++			goto out;
++		}
++		ok = pg_hfi_send(PG_HFI_MSG_PERF_TABLE, perf, 43, NULL, 0);
++		if (!ok) {
++			goto out;
++		}
++	}
++	/* a6xx_build_bw_table(): the A630's GMU does not scale the bus, so one level
++	 * with three fixed CXC commands and three DDR commands, all waiting on
++	 * nothing. Every number below is the Mi 8 port's, message-identical. */
++	{
++		uint32_t bw[160] = { 0 };
++
++		bw[1] = 1;					/* levels */
++		bw[2] = 3;					/* CXC commands */
++		bw[3] = 3;					/* DDR commands */
++		bw[4] = 0x05;					/* CXC wait bits */
++		bw[5] = 0x07;					/* DDR wait bits */
++		bw[6] = 0x50034; bw[7] = 0x5007c; bw[8] = 0x5004c;	/* the CXC command registers */
++		bw[12] = 0x40000000; bw[14] = 0x40000000;		/* level 0, commands 0..2 */
++		bw[18] = 0x60000001; bw[19] = 0x20000001; bw[20] = 0x60000001;
++		bw[24] = 0x50000; bw[25] = 0x5005c; bw[26] = 0x5000c;	/* the DDR command registers */
++		bw[32] = 0x40000000; bw[33] = 0x40000000; bw[34] = 0x40000000;
++		printf("POLARIS GPU: 13 BW_TABLE: %u level, %u CXC and %u DDR commands, no scaling\n",
++		    bw[1], bw[2], bw[3]);
++		ok = pg_hfi_send(PG_HFI_MSG_BW_TABLE, bw, 160, NULL, 0);
++		if (!ok) {
++			goto out;
++		}
++	}
++	{
++		uint32_t test[1] = { 0 };
++
++		ok = pg_hfi_send(PG_HFI_MSG_TEST, test, 1, NULL, 0);
++		if (ok) {
++			printf("POLARIS GPU: 13 the firmware has taken INIT, FW_VERSION, PERF_TABLE, "
++			    "BW_TABLE and TEST: the channel is a working channel\n");
++		}
+ 	}
+ out:
+ 	if (pg_log_va != 0) {
+@@ -2556,7 +2674,7 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0132 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0133 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
