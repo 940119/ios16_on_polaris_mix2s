@@ -1,0 +1,329 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -692,6 +692,10 @@
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
++/* How far the ring has been copied out. File scope, so the thread and a
++ * synchronous flush cannot each believe a different position. */
++static uint64_t sweet_log_flushed;
++static uint64_t sweet_log_seq;
+ 
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+@@ -744,53 +748,89 @@
+ 	uint64_t total, seq;
+ };
+ 
++/*
++ * One flush: everything the ring has that the disk does not, then the header that
++ * says how far it got. Returns false when the disk refused.
++ */
++static bool
++sweet_log_drain(void)
++{
++	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	uint64_t pos;
++	int error = 0;
++
++	if (total == sweet_log_flushed) {
++		return true;
++	}
++	pos = total - sweet_log_flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : sweet_log_flushed;
++	lck_mtx_lock(&sweet_ufs_lock);
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		error = ufs_write_blocks(base + 1 + blk, n);
++		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++	}
++	if (!error) {
++		struct sweet_log_header h = {
++			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++			.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++sweet_log_seq,
++		};
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &h, sizeof(h));
++		error = ufs_write_blocks(base, 1);
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		return false;
++	}
++	sweet_log_flushed = total;
++	return true;
++}
++
++/*
++ * Put the console on the disk now, from whatever context asks.
++ *
++ * The thread below flushes every sweet_log_secs seconds, which is right for a
++ * running system and useless for a bring-up ladder: thirteen register steps take
++ * microseconds, so a step that hangs the SoC leaves the whole boot in memory
++ * while the disk still holds the PREVIOUS boot's log - and a boot that produced
++ * no log cannot be told apart from a boot that never happened. polaris_gpu.c
++ * calls this before every step for exactly that reason.
++ *
++ * Safe from a context that must not block: ufs_scsi masks the interrupt and polls
++ * the doorbell, and the mutex is only ever held for one polled command.
++ */
++void
++sweet_log_flush_now(void)
++{
++	if (!su.writable || !su.nblocks || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		return;
++	}
++	(void)sweet_log_drain();
++}
++
+ static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+-	uint64_t flushed = 0, seq = 0;
+-	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 
+ 	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+ 	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+ 	for (;;) {
+ 		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
+-		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+-		if (total == flushed) {
+-			continue;
+-		}
+-		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
+-		int error = 0;
+-
+-		lck_mtx_lock(&sweet_ufs_lock);
+-		while (pos < total && !error) {
+-			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
+-			uint32_t blk = off / UFS_BLOCK;
+-			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
+-			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
+-			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+-			memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-			error = ufs_write_blocks(base + 1 + blk, n);
+-			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+-		}
+-		if (!error) {
+-			struct sweet_log_header h = {
+-				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
+-				.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
+-			};
+-			bzero(bounce, UFS_BLOCK);
+-			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1);
+-		}
+-		if (!error) {
+-			error = ufs_sync_cache();
+-		}
+-		lck_mtx_unlock(&sweet_ufs_lock);
+-		if (error) {
+-			printf("SWEET LOG: write failed (%d), stopping\n", error);
++		if (!sweet_log_drain()) {
++			printf("SWEET LOG: write failed, stopping\n");
+ 			return;
+ 		}
+-		flushed = total;
+ 	}
+ }
+ 
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1428,23 +1428,27 @@
+ 		    pg_rd(cb + PG_CB_TCR), pg_rd(cb + PG_CB_TCR2), pg_rd(cb + PG_CB_FSR),
+ 		    pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY)), pg_rd(pg_smmu + PG_SMMU_SCR0),
+ 		    pg_rd(pg_smmu + PG_SMMU_SGFSR));
++		PG_CHECK("bank 2: before the context bank is touched");
+ 		pg_wr(cb + PG_CB_SCTLR, 0);
+ 		pg_wr(pg_smmu + PG_SMMU_CBA2R(PG_GMU_CTX), PG_CBA2R_64BIT);
+ 		pg_wr(pg_smmu + PG_SMMU_CBAR(PG_GMU_CTX), PG_CBAR_STAGE1);
+ 		printf("POLARIS GPU: 10 bank %u: CBAR %#010x CBA2R %#010x (stage 1 translate, "
+ 		    "64-bit TTBR)\n", PG_GMU_CTX, pg_rd(pg_smmu + PG_SMMU_CBAR(PG_GMU_CTX)),
+ 		    pg_rd(pg_smmu + PG_SMMU_CBA2R(PG_GMU_CTX)));
++		PG_CHECK("bank 2: CBAR and CBA2R written");
+ 		pg_wr(cb + PG_CB_TCR2, PG_TCR2_36_BITS);
+ 		pg_wr(cb + PG_CB_TCR, PG_TCR_39_BITS);
+ 		pg_wr(cb + PG_CB_TTBR0_LO, (uint32_t)root);
+ 		pg_wr(cb + PG_CB_TTBR0_HI, (uint32_t)(root >> 32));
+ 		pg_wr(cb + PG_CB_TTBR1_LO, 0);
+ 		pg_wr(cb + PG_CB_TTBR1_HI, 0);
++		PG_CHECK("bank 2: TTBR0 and TCR written");
+ 		pg_wr(cb + PG_CB_MAIR0, PG_MAIR0_LINUX);
+ 		pg_wr(cb + PG_CB_MAIR1, 0);
+ 		pg_wr(cb + PG_CB_FSR, 0xffffffffu);	/* one to clear, every reason */
+ 		printf("POLARIS GPU: 10 bank %u: the descriptors are written; invalidating the TLB\n",
+ 		    PG_GMU_CTX);
++		PG_CHECK("bank 2: MAIR and FSR written, invalidating the TLB");
+ 		pg_wr(cb + PG_CB_TLBIASID, PG_GMU_CTX);
+ 		pg_wr(cb + PG_CB_TLBSYNC, 1);
+ 		for (int i = 0; i < 100 && (pg_rd(cb + PG_CB_TLBSTATUS) & 1); i++) {
+@@ -1455,6 +1459,7 @@
+ 		    pg_rd(pg_smmu + PG_SMMU_CBAR(PG_GMU_CTX)), pg_rd(pg_smmu + PG_SMMU_CBA2R(PG_GMU_CTX)),
+ 		    pg_rd(cb + PG_CB_TCR), pg_rd(cb + PG_CB_TCR2), pg_rd(cb + PG_CB_TTBR0_HI),
+ 		    pg_rd(cb + PG_CB_TTBR0_LO), pg_rd(cb + PG_CB_MAIR0), pg_rd(cb + PG_CB_TLBSTATUS));
++		PG_CHECK("bank 2: TLB invalidated, switching the bank on");
+ 		pg_wr(cb + PG_CB_SCTLR, PG_SCTLR_ON);
+ 		if (pg_rd(cb + PG_CB_SCTLR) != PG_SCTLR_ON) {
+ 			printf("POLARIS GPU: 10 the context bank would not switch on\n");
+@@ -1482,6 +1487,7 @@
+ 		uint32_t smr_back, s2cr_back, scr0, scr0_after;
+ 
+ 		if (want_entry) {
++			PG_CHECK("the stream table: writing the entry");
+ 			pg_wr(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY), smr);
+ 			pg_wr(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY), s2cr);
+ 			smr_back = pg_rd(pg_smmu + PG_SMMU_SMR(PG_GMU_SMR_ENTRY));
+@@ -2549,7 +2555,9 @@
+ 	    pg_rd(pg_smmu + PG_SMMU_S2CR(PG_GMU_SMR_ENTRY)));
+ 	printf("POLARIS GPU: 13 writing HFI_CTRL_INIT; if that is the last line, the wedge is in the "
+ 	    "firmware's first read of the table at %#llx\n", pg_hfi_iova);
++	PG_CHECK("step 13: about to write HFI_CTRL_INIT");
+ 	pg_wr(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_INIT), 1);
++	PG_CHECK("step 13: HFI_CTRL_INIT has been written");
+ 	printf("POLARIS GPU: 13 HFI_CTRL_INIT was written; reading the status back\n");
+ 	ok = pg_poll(pg_gmu + PG_GMU_WORD(PG_HFI_CTRL_STATUS), 1, 1, 100, 100);
+ 	printf("POLARIS GPU: 13 HFI_CTRL_INIT: HFI_CTRL_STATUS %#010x (%s)\n",
+@@ -2657,6 +2665,23 @@
+ 	return ok;
+ }
+ 
++/*
++ * Put the console on the disk before the next thing that might stop the machine.
++ *
++ * The ring is flushed by a thread every sweet_log_secs seconds, which is far too
++ * slow for a ladder whose thirteen steps take microseconds: a step that hangs the
++ * whole SoC leaves nothing on the disk, and the boot that produced no log cannot
++ * be told apart from a boot that never happened. A flush costs one polled UFS
++ * write, so the ladder can afford to do it before every step and around every
++ * register write in the SMMU's translation path.
++ */
++extern void sweet_log_flush_now(void);
++
++#define PG_CHECK(what)	do { \
++	printf("POLARIS GPU: -- at %s\n", (what)); \
++	sweet_log_flush_now(); \
++} while (0)
++
+ /* ---- the ladder ------------------------------------------------------------------------------------ */
+ 
+ void
+@@ -2674,11 +2699,12 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0133 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0134 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
+ 
++	PG_CHECK("step 1: the GCC block");
+ 	ok = pg_step_gcc();
+ 	if (!ok) {
+ 		printf("POLARIS GPU: stop after 1: GCC could not be mapped at all\n");
+@@ -2687,6 +2713,7 @@
+ 	if (upto < 2) {
+ 		return;
+ 	}
++	PG_CHECK("step 2: the GPUCC block");
+ 	ok = pg_step_gpucc();
+ 	if (!ok) {
+ 		printf("POLARIS GPU: stop after 2: GPUCC was not read\n");
+@@ -2695,6 +2722,7 @@
+ 	if (upto < 3) {
+ 		return;
+ 	}
++	PG_CHECK("step 3: the CX switch");
+ 	ok = pg_step_cx_on();
+ 	if (!ok) {
+ 		printf("POLARIS GPU: stop after 3: the CX switch did not come on\n");
+@@ -2703,6 +2731,7 @@
+ 	if (upto < 4) {
+ 		return;
+ 	}
++	PG_CHECK("step 4: the CX clocks");
+ 	ok = pg_step_clocks();
+ 	if (!ok) {
+ 		printf("POLARIS GPU: stop after 4: a clock did not come on\n");
+@@ -2711,6 +2740,7 @@
+ 	if (upto < 5) {
+ 		return;
+ 	}
++	PG_CHECK("step 5: the GMU registers");
+ 	if (!pg_step_gmu()) {
+ 		printf("POLARIS GPU: stop after 5: the GMU's counter is not advancing\n");
+ 		return;
+@@ -2718,6 +2748,7 @@
+ 	if (upto < 6) {
+ 		return;
+ 	}
++	PG_CHECK("step 6: the SMMU, read only");
+ 	if (!pg_step_smmu()) {
+ 		printf("POLARIS GPU: stop after 6: the SMMU was not read\n");
+ 		return;
+@@ -2725,6 +2756,7 @@
+ 	if (upto < 7) {
+ 		return;
+ 	}
++	PG_CHECK("step 7: the GMU memory");
+ 	if (!pg_step_gmu_tcm()) {
+ 		printf("POLARIS GPU: stop after 7: the GMU's memory did not take the pattern\n");
+ 		return;
+@@ -2732,6 +2764,7 @@
+ 	if (upto < 8) {
+ 		return;
+ 	}
++	PG_CHECK("step 8: the firmware");
+ 	if (!pg_step_gmu_firmware()) {
+ 		printf("POLARIS GPU: stop after 8: the firmware did not land in the GMU's memory\n");
+ 		return;
+@@ -2739,6 +2772,7 @@
+ 	if (upto < 9) {
+ 		return;
+ 	}
++	PG_CHECK("step 9: the RSC and PDC");
+ 	if (!pg_step_rsc_pdc()) {
+ 		printf("POLARIS GPU: stop after 9: the PDC's tables did not take\n");
+ 		return;
+@@ -2746,6 +2780,7 @@
+ 	if (upto < 10) {
+ 		return;
+ 	}
++	PG_CHECK("step 10: the boot configuration");
+ 	if (!pg_step_gmu_boot_config()) {
+ 		printf("POLARIS GPU: stop after 10: the boot configuration did not take\n");
+ 		return;
+@@ -2753,6 +2788,7 @@
+ 	if (upto < 11) {
+ 		return;
+ 	}
++	PG_CHECK("step 11: the CM3 release");
+ 	if (!pg_step_gmu_start(upto < 12)) {
+ 		printf("POLARIS GPU: stop after 11: the firmware did not announce itself\n");
+ 		return;
+@@ -2760,6 +2796,7 @@
+ 	if (upto < 12) {
+ 		return;
+ 	}
++	PG_CHECK("step 12: the GX rail");
+ 	if (!pg_step_gx_rail_on(upto < 13)) {
+ 		printf("POLARIS GPU: stop after 12: the GX rail did not come up\n");
+ 		return;
+@@ -2767,6 +2804,7 @@
+ 	if (upto < 13) {
+ 		return;
+ 	}
++	PG_CHECK("step 13: the HFI channel");
+ 	if (!pg_step_hfi()) {
+ 		printf("POLARIS GPU: stop after 13: the firmware did not answer over HFI\n");
+ 		return;
