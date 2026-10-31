@@ -1,0 +1,50 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1264,9 +1264,21 @@
+ static bool
+ pg_smmu_map(uint64_t iova, vm_offset_t va, uint32_t pages, const char *name)
+ {
+-	uint64_t *l3 = (uint64_t *)pg_l3_va;
+-
++	uint64_t *l3;
++
++	/*
++	 * The pointer has to be taken AFTER the tables exist. Builds 0136 and 0137
++	 * read it first, so on the very first mapping pg_l3_va was still 0 and the
++	 * descriptor store went to address zero plus the slot offset - the kernel
++	 * data abort with far 0x20/0x28 that both builds died on, one instruction
++	 * after pg_smmu_tables() returned.
++	 */
+ 	if (!pg_smmu_tables()) {
++		return false;
++	}
++	l3 = (uint64_t *)pg_l3_va;
++	if (l3 == NULL) {
++		printf("POLARIS GPU: 10 %s: the level 3 table is not there\n", name);
+ 		return false;
+ 	}
+ 	if ((iova >> 21) != (PG_GMU_IOVA_BASE >> 21)) {
+@@ -1279,10 +1291,10 @@
+ 		    PG_PTE_ATTR | PG_PTE_PAGE;
+ 	}
+ 	/*
+-	 * Flush exactly what was allocated. Build 0136 flushed PAGE_SIZE (16 KB)
+-	 * from a 4 KB allocation and the dc civac on the twelve kilobytes past it
+-	 * - unmapped in kernel_map - was an immediate kernel data abort with
+-	 * far 0x20. Every buffer in this file is PG_GMU_PAGE_SIZE for that reason.
++	 * Flush exactly what was allocated: every buffer in this file is
++	 * PG_GMU_PAGE_SIZE, so the cache maintenance length has to be too.
++	 * Flushing PAGE_SIZE from a 4 KB allocation reaches twelve kilobytes of
++	 * unmapped kernel_map, and dc civac on that is a data abort.
+ 	 */
+ 	PG_CHECK("map: the descriptor is written, flushing the level 3 page");
+ 	pg_to_memory(pg_l3_va, PG_GMU_PAGE_SIZE);
+@@ -2737,7 +2749,7 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0137 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0138 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
