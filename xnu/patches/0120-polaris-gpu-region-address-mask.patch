@@ -1,0 +1,68 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -882,11 +882,14 @@
+  * registers, so a region above 4 GB is not addressable at all: the register
+  * would keep the low half and the firmware would read somewhere else. This
+  * phone has 6 GB, and the first attempt at this step landed at 0x1_035a0000.
+- * The allocation is therefore capped below the boundary and every region is
+- * checked again after it is mapped.
++ *
++ * kmem_alloc_contig() reads its fifth argument as "no bit of the physical
++ * address may be in this mask", so naming the upper half of the address keeps
++ * any allocation below the boundary. Passing the limit through max_pnum
++ * instead (the sixth argument) does not: it made the allocation fail outright.
+  */
+ #define PG_ADDRESS_LIMIT	0x100000000ull
+-#define PG_MAX_PAGE_BELOW_4G	0xfffffu	/* page numbers the allocation may use */
++#define PG_NO_HIGH_BITS		0xffffffff00000000ull
+ 
+ struct pg_hfi_table {
+ 	uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
+@@ -916,24 +919,34 @@
+ static bool
+ pg_gmu_region(vm_offset_t *va, uint64_t *pa)
+ {
++	static const vm_offset_t masks[2] = { PG_NO_HIGH_BITS, 0 };
++
+ 	if (*va != 0) {
+ 		return true;
+ 	}
+-	for (int attempt = 0; attempt < 4; attempt++) {
+-		if (kmem_alloc_contig(kernel_map, va, PG_GMU_REGION_SIZE, PG_GMU_REGION_SIZE - 1,
+-		    0, PG_MAX_PAGE_BELOW_4G, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+-		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	for (unsigned m = 0; m < 2; m++) {
++		for (int attempt = 0; attempt < 3; attempt++) {
++			if (kmem_alloc_contig(kernel_map, va, PG_GMU_REGION_SIZE,
++			    PG_GMU_REGION_SIZE - 1, masks[m], 0,
++			    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++				*va = 0;
++				printf("POLARIS GPU: 10 no allocation with address mask %#llx\n",
++				    (uint64_t)masks[m]);
++				break;		/* the next mask may do better */
++			}
++			*pa = kvtophys(*va);
++			if (*pa != 0 && *pa + PG_GMU_REGION_SIZE <= PG_ADDRESS_LIMIT) {
++				if (m != 0) {
++					printf("POLARIS GPU: 10 the region only came back below 4 GB "
++					    "on attempt %d without the mask\n", attempt + 1);
++				}
++				return true;
++			}
++			printf("POLARIS GPU: 10 that region came back at %#llx, above the 32-bit "
++			    "boundary the firmware can address: given back\n", *pa);
++			kmem_free(kernel_map, *va, PG_GMU_REGION_SIZE);
+ 			*va = 0;
+-			return false;
+ 		}
+-		*pa = kvtophys(*va);
+-		if (*pa != 0 && *pa + PG_GMU_REGION_SIZE <= PG_ADDRESS_LIMIT) {
+-			return true;
+-		}
+-		printf("POLARIS GPU: 10 that region came back at %#llx, above the 32-bit "
+-		    "boundary the firmware can address: given back\n", *pa);
+-		kmem_free(kernel_map, *va, PG_GMU_REGION_SIZE);
+-		*va = 0;
+ 	}
+ 	return false;
+ }
