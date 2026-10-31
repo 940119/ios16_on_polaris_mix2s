@@ -1,0 +1,61 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1052,6 +1052,8 @@
+ static uint64_t pg_queue_pa[PG_GMU_HFI_QUEUES];
+ static uint64_t pg_log_iova, pg_hfi_iova, pg_dbg_iova;	/* what the firmware is told */
+ static uint64_t pg_queue_iova[PG_GMU_HFI_QUEUES];
++#define PG_CP_SQE_IOVA		0x10000000ull	/* the CP's microcode and ring live here */
++#define PG_CP_RING_IOVA		0x10008000ull
+ #define PG_CP_WINDOW_L2	0x00000080u	/* (0x10000000 >> 21) & 0x1ff: the CP's window */
+ 
+ static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
+@@ -1260,7 +1262,18 @@
+ 		return false;
+ 	}
+ 	PG_CHECK("tables: all four pages are in place");
++	/*
++	 * Both windows hang off the SAME level 2 page, but they hang off different
++	 * LEVEL 1 entries: 0x60000000 >> 30 is 1 and 0x10000000 >> 30 is 0. Build
++	 * 0140 filled only entry 1, so the CP's window walked into a zero L1 entry
++	 * and the 3D core's first instruction fetch was a translation fault
++	 * (CB FSR 0x402) - the ring was never read. Both entries point at the one
++	 * level 2 page; that page's index 0x300 is the GMU's window and 0x80 is
++	 * the CP's.
++	 */
+ 	((uint64_t *)pg_l1_va)[(PG_GMU_IOVA_BASE >> 30) & 0x1ff] =
++	    kvtophys(pg_l2_va) | PG_PTE_TABLE;
++	((uint64_t *)pg_l1_va)[(PG_CP_SQE_IOVA >> 30) & 0x1ff] =
+ 	    kvtophys(pg_l2_va) | PG_PTE_TABLE;
+ 	((uint64_t *)pg_l2_va)[(PG_GMU_IOVA_BASE >> 21) & 0x1ff] =
+ 	    kvtophys(pg_l3_va) | PG_PTE_TABLE;
+@@ -3115,8 +3128,6 @@
+  * 0x10000000. Each page is allocated and mapped on its own: the ring only has
+  * to be contiguous in IOVA, never in physical memory.
+  */
+-#define PG_CP_SQE_IOVA		0x10000000ull
+-#define PG_CP_RING_IOVA		0x10008000ull
+ #define PG_CP_REGION		0x8000u		/* 32 KB each, MSM_GPU_RINGBUFFER_SZ */
+ #define PG_CP_PAGES		8u		/* 8 x 4 KB */
+ #define PG_CP_PAGE_WORDS	(PG_GMU_PAGE_SIZE / 4u)
+@@ -3273,9 +3284,10 @@
+ 	{
+ 		vm_offset_t cb = pg_smmu_cb(PG_GMU_CTX);
+ 
+-		printf("POLARIS GPU: 15 context bank %u: FSR %#010x FSYNR0 %#010x, "
++		printf("POLARIS GPU: 15 context bank %u: FSR %#010x FSYNR0 %#010x FAR %#010x%08x, "
+ 		    "global fault %#010x\n", PG_GMU_CTX, pg_rd(cb + PG_CB_FSR),
+-		    pg_rd(cb + 0x5c), pg_rd(pg_smmu + PG_SMMU_SGFSR));
++		    pg_rd(cb + 0x5c), pg_rd(cb + 0x64), pg_rd(cb + 0x60),
++		    pg_rd(pg_smmu + PG_SMMU_SGFSR));
+ 	}
+ 	return done;
+ }
+@@ -3297,7 +3309,7 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0140 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0141 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
