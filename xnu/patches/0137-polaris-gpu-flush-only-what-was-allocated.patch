@@ -1,0 +1,28 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1278,7 +1278,15 @@
+ 		    (kvtophys(va + (vm_offset_t)PG_GMU_PAGE_SIZE * i) & PG_PTE_ADDR) |
+ 		    PG_PTE_ATTR | PG_PTE_PAGE;
+ 	}
+-	pg_to_memory(pg_l3_va, PAGE_SIZE);
++	/*
++	 * Flush exactly what was allocated. Build 0136 flushed PAGE_SIZE (16 KB)
++	 * from a 4 KB allocation and the dc civac on the twelve kilobytes past it
++	 * - unmapped in kernel_map - was an immediate kernel data abort with
++	 * far 0x20. Every buffer in this file is PG_GMU_PAGE_SIZE for that reason.
++	 */
++	PG_CHECK("map: the descriptor is written, flushing the level 3 page");
++	pg_to_memory(pg_l3_va, PG_GMU_PAGE_SIZE);
++	PG_CHECK("map: the level 3 page is flushed");
+ 	printf("POLARIS GPU: 10 %s: %#llx -> %#llx, descriptor %#llx in slot %u\n", name, iova,
+ 	    kvtophys(va), l3[((iova >> 12) & 0x1ff)], (uint32_t)((iova >> 12) & 0x1ff));
+ 	return true;
+@@ -2729,7 +2737,7 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0136 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0137 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
