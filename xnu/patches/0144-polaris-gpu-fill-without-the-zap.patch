@@ -1,0 +1,323 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -3350,7 +3350,12 @@
+ #define PG_CP_MEM_WRITE		0x3du
+ #define PG_MEMPTRS_IOVA		0x10010000ull
+ 
++/* 8 x 4 KB of ring, which is what RB_CNTL below was set up for in step 15 */
++#define PG_RING_WORDS		(PG_CP_PAGES * 1024u)
++#define PG_RING_PAGE_WORDS	1024u
++
+ static vm_offset_t pg_memptrs_va;
++static uint32_t pg_cp_wptr = 9u;	/* carried from step 15's CP_ME_INIT to later steps */
+ 
+ static int64_t
+ pg_scm_call(uint64_t function, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t res[3])
+@@ -3486,12 +3491,22 @@
+ 	}
+ 	trust = pg_rd(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL);
+ 	printf("POLARIS GPU: 16 RBBM_SECVID_TRUST_CNTL %#010x: %s\n", trust,
+-	    trust == 0 ? "already out of secure mode" : "still secure: the zap has to run");
+-	if (trust != 0 && !pg_zap_load()) {
+-		printf("POLARIS GPU: 16 the zap did not authenticate; the core stays secure\n");
+-		return false;
+-	}
+-	if (trust != 0) {
++	    trust == 0 ? "already out of secure mode" : "still secure: the zap would be the way out");
++	/*
++	 * 0143 stopped here: TrustZone answered PAS_SUPPORTED(13) with 0, the zap
++	 * never loaded, and the ladder returned before the CP had written a single
++	 * word. But the CP had already fetched and executed CP_ME_INIT through this
++	 * SMMU, so "secure" is not obviously in the way of a memory write, and the
++	 * Mi 8 port never got past this question either (its own log says "zap
++	 * authentication remains unverified").
++	 *
++	 * So 0144 stops treating the zap as a gate: when it does not authenticate,
++	 * RBBM_SECVID_TRUST_CNTL is left exactly as it is - this phone says
++	 * qcom,gpu-quirk-secvid-set-once, one write is all it has, and the zap is
++	 * what would make that write legal - and the write test below runs anyway.
++	 * It answers the only question that matters: may the CP write memory.
++	 */
++	if (trust != 0 && pg_zap_load()) {
+ 		ring[wptr++] = pg_pkt7(PG_CP_SET_SECURE_MODE, 1);
+ 		ring[wptr++] = 0;
+ 		pg_to_memory(pg_ring_va[0], PG_GMU_PAGE_SIZE);
+@@ -3508,8 +3523,13 @@
+ 		printf("POLARIS GPU: 16 CP_SET_SECURE_MODE: RPTR %u WPTR %u, SECVID_TRUST_CNTL %#010x "
+ 		    "(%s)\n", rptr, pg_rd(pg_gpu3d + 4u * PG_CP_RB_WPTR), trust,
+ 		    trust == 0 ? "NON-SECURE MODE" : "still secure");
++	} else if (trust != 0) {
++		printf("POLARIS GPU: 16 no zap on this phone: SECVID_TRUST_CNTL is left untouched "
++		    "(set-once) and the CP's write test runs anyway\n");
+ 	}
+ 	nonsecure = pg_rd(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL) == 0;
++	printf("POLARIS GPU: 16 the core is %s; the write below is the real question\n",
++	    nonsecure ? "out of secure mode" : "still secure");
+ 	PG_CHECK("16: the secure mode question is settled");
+ 	/* The first real command: CP_MEM_WRITE of two words into the memptrs page. */
+ 	{
+@@ -3540,10 +3560,230 @@
+ 		    (memptrs[2] == 0xc0ffee21u && memptrs[3] == 0x0badf00du) ?
+ 		    "ARRIVED in memory" : "did NOT arrive");
+ 	}
+-	if (!nonsecure) {
+-		printf("POLARIS GPU: 16 the core is still secure: nothing after this is attempted\n");
+-	}
++	pg_cp_wptr = wptr;
+ 	return ok;
++}
++
++/* ---- step 17: a real fill, written by the CP through the SMMU ----------------------------------- */
++
++/*
++ * The Mi 8 port's gpu_fill_screen() never touches the 3D pipeline: it fills the
++ * framebuffer with CP_MEM_WRITE packets straight out of the ring. That is the
++ * cheapest decisive test of the thing that actually matters here - whether the
++ * command processor, running as the 3D core's stream, may write memory while
++ * the core has never left secure mode.
++ *
++ * The image is built so that one glance says what went wrong if it does: eight
++ * colour bars, a white frame along the top and the two sides, and a grey ramp
++ * along the bottom, which only reads left to right if rows and columns are the
++ * right way round.
++ *
++ * The ring is eight separately allocated pages, so it is indexed, never walked.
++ * The write pointer is masked into the ring the way Linux and the Mi 8 port keep
++ * it, because the hardware's read pointer is masked too: an equality test is the
++ * only drain test that still works after the ring has wrapped once.
++ */
++#define PG_DRAW_IOVA		0x10020000ull	/* inside the CP's 2 MB window, after the memptrs */
++#define PG_DRAW_WIDTH		1024u
++#define PG_DRAW_HEIGHT		128u
++#define PG_DRAW_WORDS		(PG_DRAW_WIDTH * PG_DRAW_HEIGHT)
++#define PG_DRAW_PAGES		(PG_DRAW_WORDS * 4u / PG_GMU_PAGE_SIZE)
++#define PG_DRAW_PAGE_WORDS	(PG_GMU_PAGE_SIZE / 4u)
++#define PG_DRAW_CHUNK		1000u		/* dwords per CP_MEM_WRITE packet */
++#define PG_DRAW_PER_BATCH	6u		/* 6 x (3 + 1000) words: inside the ring */
++#define PG_DRAW_SENTINEL	0xdeadbeefu
++
++static vm_offset_t pg_draw_va[PG_DRAW_PAGES];
++
++static void
++pg_ring_put(uint32_t at, uint32_t value)
++{
++	at &= PG_RING_WORDS - 1u;
++	((uint32_t *)pg_ring_va[at / PG_RING_PAGE_WORDS])[at % PG_RING_PAGE_WORDS] = value;
++}
++
++static void
++pg_ring_flush(void)
++{
++	for (uint32_t i = 0; i < PG_CP_PAGES; i++) {
++		pg_to_memory(pg_ring_va[i], PG_GMU_PAGE_SIZE);
++	}
++}
++
++static uint32_t *
++pg_draw_word(uint32_t index)
++{
++	return &((uint32_t *)pg_draw_va[index / PG_DRAW_PAGE_WORDS])[index % PG_DRAW_PAGE_WORDS];
++}
++
++static uint32_t
++pg_draw_pixel(uint32_t x, uint32_t y)
++{
++	static const uint32_t bars[8] = {
++		0xffffffffu, 0xffffff00u, 0xff00ffffu, 0xff00ff00u,
++		0xffff00ffu, 0xffff0000u, 0xff0000ffu, 0xff000000u
++	};
++
++	if (y >= PG_DRAW_HEIGHT - 8u) {
++		uint32_t v = x * 255u / (PG_DRAW_WIDTH - 1u);
++
++		return 0xff000000u | (v << 16) | (v << 8) | v;
++	}
++	if (y < 8u || x < 8u || x >= PG_DRAW_WIDTH - 8u) {
++		return 0xffffffffu;
++	}
++	return bars[x * 8u / PG_DRAW_WIDTH];
++}
++
++static bool
++pg_step_draw(void)
++{
++	uint32_t wptr = pg_cp_wptr, rptr = 0, sent = 0, batches = 0;
++	uint32_t wrong = 0, first_bad = 0, first_bad_want = 0, first_bad_got = 0;
++	uint32_t changes = 0, last = 0;
++	bool ok = true;
++
++	if (pg_gpu3d == 0 || !pg_smmu_tables() || pg_ring_va[0] == 0) {
++		printf("POLARIS GPU: 17 the CP is not there\n");
++		return false;
++	}
++	for (uint32_t i = 0; i < PG_DRAW_PAGES; i++) {
++		if (kmem_alloc(kernel_map, &pg_draw_va[i], PG_GMU_PAGE_SIZE,
++		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("POLARIS GPU: 17 no memory for framebuffer page %u\n", i);
++			return false;
++		}
++	}
++	PG_CHECK("17: the framebuffer is allocated");
++	for (uint32_t i = 0; i < PG_DRAW_PAGES; i++) {
++		if (!pg_map_phys(PG_DRAW_IOVA + (uint64_t)i * PG_GMU_PAGE_SIZE,
++		    kvtophys(pg_draw_va[i]), "the framebuffer")) {
++			return false;
++		}
++	}
++	pg_to_memory(pg_l3b_va, PG_GMU_PAGE_SIZE);
++	{
++		uint64_t *l3 = (uint64_t *)pg_smmu_l3(PG_DRAW_IOVA);
++		uint32_t first = (uint32_t)((PG_DRAW_IOVA >> 12) & 0x1ff);
++		uint32_t lastslot = (uint32_t)(((PG_DRAW_IOVA +
++		    (PG_DRAW_PAGES - 1) * PG_GMU_PAGE_SIZE) >> 12) & 0x1ff);
++
++		printf("POLARIS GPU: 17 %ux%u BGRA at iova %#llx, %u pages; slot %u -> %#llx, "
++		    "slot %u -> %#llx\n", PG_DRAW_WIDTH, PG_DRAW_HEIGHT, PG_DRAW_IOVA,
++		    (uint32_t)PG_DRAW_PAGES, first, l3[first] & PG_PTE_ADDR, lastslot,
++		    l3[lastslot] & PG_PTE_ADDR);
++	}
++	PG_CHECK("17: the framebuffer is in the 3D core's window");
++	/* A sentinel first, so "the CP wrote nothing" and "the CP wrote this" cannot be confused. */
++	for (uint32_t i = 0; i < PG_DRAW_WORDS; i++) {
++		*pg_draw_word(i) = PG_DRAW_SENTINEL;
++	}
++	for (uint32_t i = 0; i < PG_DRAW_PAGES; i++) {
++		pg_to_memory(pg_draw_va[i], PG_GMU_PAGE_SIZE);
++	}
++	PG_CHECK("17: the sentinel is in memory");
++	while (sent < PG_DRAW_WORDS && ok) {
++		for (uint32_t c = 0; c < PG_DRAW_PER_BATCH && sent < PG_DRAW_WORDS; c++) {
++			uint32_t n = PG_DRAW_WORDS - sent < PG_DRAW_CHUNK ?
++			    PG_DRAW_WORDS - sent : PG_DRAW_CHUNK;
++			uint64_t addr = PG_DRAW_IOVA + 4ull * sent;
++
++			pg_ring_put(wptr++, pg_pkt7(PG_CP_MEM_WRITE, n + 2u));
++			pg_ring_put(wptr++, (uint32_t)addr);
++			pg_ring_put(wptr++, (uint32_t)(addr >> 32));
++			for (uint32_t i = 0; i < n; i++) {
++				uint32_t pixel = sent + i;
++
++				pg_ring_put(wptr++, pg_draw_pixel(pixel % PG_DRAW_WIDTH,
++				    pixel / PG_DRAW_WIDTH));
++			}
++			sent += n;
++		}
++		/*
++		 * WPTR is written masked, the way Linux and the Mi 8 port do it: the
++		 * hardware's RPTR is masked too, so an equality test is the only drain
++		 * test that works once the ring has wrapped once.
++		 */
++		wptr &= PG_RING_WORDS - 1u;
++		pg_ring_flush();
++		pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		{
++			bool drained = false;
++
++			for (uint32_t i = 0; i < 20000; i++) {
++				rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
++				if (rptr == wptr) {
++					drained = true;
++					break;
++				}
++				pg_sleep_us(10);
++			}
++			if (!drained) {
++				printf("POLARIS GPU: 17 the CP stopped at %u of %u dwords: RPTR %u "
++				    "WPTR %u, RBBM_STATUS %#010x INT_0_STATUS %#010x\n", sent,
++				    (uint32_t)PG_DRAW_WORDS, rptr,
++				    pg_rd(pg_gpu3d + 4u * PG_CP_RB_WPTR),
++				    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS),
++				    pg_rd(pg_gpu3d + 4u * PG_RBBM_INT_STATUS));
++				ok = false;
++			}
++		}
++		batches++;
++	}
++	pg_cp_wptr = wptr;
++	{
++		vm_offset_t cb = pg_smmu_cb(PG_GMU_CTX);
++
++		printf("POLARIS GPU: 17 the CP %s: %u dwords in %u submissions, RBBM_STATUS %#010x "
++		    "INT_0_STATUS %#010x; context bank %u FSR %#010x FSYNR0 %#010x FAR %#010x%08x\n",
++		    ok ? "read the whole ring" : "did NOT read the whole ring", sent, batches,
++		    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS),
++		    pg_rd(pg_gpu3d + 4u * PG_RBBM_INT_STATUS), PG_GMU_CTX,
++		    pg_rd(cb + PG_CB_FSR), pg_rd(cb + 0x5c), pg_rd(cb + 0x64), pg_rd(cb + 0x60));
++	}
++	PG_CHECK("17: the CP has been given the fill");
++	/* Read it back out of memory, not out of a cache the CP never touched. */
++	for (uint32_t i = 0; i < PG_DRAW_PAGES; i++) {
++		pg_to_memory(pg_draw_va[i], PG_GMU_PAGE_SIZE);
++	}
++	for (uint32_t i = 0; i < PG_DRAW_WORDS; i++) {
++		uint32_t want = pg_draw_pixel(i % PG_DRAW_WIDTH, i / PG_DRAW_WIDTH);
++		uint32_t got = *pg_draw_word(i);
++
++		if (got != want) {
++			if (wrong == 0) {
++				first_bad = i;
++				first_bad_want = want;
++				first_bad_got = got;
++			}
++			wrong++;
++		}
++		if (i == 0 || got != last) {
++			changes++;
++			last = got;
++		}
++	}
++	printf("POLARIS GPU: 17 read back %u dwords: %u wrong", (uint32_t)PG_DRAW_WORDS, wrong);
++	if (wrong != 0) {
++		printf(", first at %u (x %u y %u) wanted %#010x got %#010x", first_bad,
++		    first_bad % PG_DRAW_WIDTH, first_bad / PG_DRAW_WIDTH, first_bad_want,
++		    first_bad_got);
++	}
++	printf("; %u colour changes along the walk\n", changes);
++	printf("POLARIS GPU: 17 corners %#010x %#010x %#010x %#010x, centre %#010x, ramp %#010x "
++	    "%#010x\n", *pg_draw_word(0), *pg_draw_word(PG_DRAW_WIDTH - 1),
++	    *pg_draw_word(PG_DRAW_WORDS - PG_DRAW_WIDTH), *pg_draw_word(PG_DRAW_WORDS - 1),
++	    *pg_draw_word((PG_DRAW_HEIGHT / 2) * PG_DRAW_WIDTH + PG_DRAW_WIDTH / 2),
++	    *pg_draw_word((PG_DRAW_HEIGHT - 4) * PG_DRAW_WIDTH),
++	    *pg_draw_word((PG_DRAW_HEIGHT - 4) * PG_DRAW_WIDTH + PG_DRAW_WIDTH - 1));
++	if (wrong == 0) {
++		printf("POLARIS GPU: 17 THE CP WROTE THE WHOLE IMAGE: this core writes memory "
++		    "without the zap\n");
++	} else if (changes == 1 && last == PG_DRAW_SENTINEL) {
++		printf("POLARIS GPU: 17 nothing arrived: the sentinel is untouched everywhere\n");
++	}
++	return ok && wrong == 0;
+ }
+ 
+ /* ---- the ladder ------------------------------------------------------------------------------------ */
+@@ -3563,7 +3803,7 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0143 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0144 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
+@@ -3700,10 +3940,19 @@
+ 	}
+ 	PG_CHECK("step 16: the zap shader and the CP's first write");
+ 	if (!pg_step_zap()) {
+-		printf("POLARIS GPU: stop after 16: the zap or the CP's first write did not land\n");
++		printf("POLARIS GPU: stop after 16: the CP's first write did not land\n");
+ 		return;
+ 	}
+-	printf("POLARIS GPU: ladder done at 16; the CP has written to memory on its own\n");
++	if (upto < 17) {
++		printf("POLARIS GPU: ladder done at 16; the CP has written to memory on its own\n");
++		return;
++	}
++	PG_CHECK("step 17: a real fill through the CP");
++	if (!pg_step_draw()) {
++		printf("POLARIS GPU: stop after 17: the fill did not land\n");
++		return;
++	}
++	printf("POLARIS GPU: ladder done at 17; the CP has filled a framebuffer through the SMMU\n");
+ }
+ 
+ void
