@@ -1,0 +1,73 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1601,28 +1601,41 @@
+ 		delay(100000);
+ 	}
+ 	/*
+-	 * 0148: reset the whole core first, the way Linux does it.
++	 * 0149: the whole-core reset is now opt-in, and off by default.
+ 	 *
+-	 * Everything up to 0147 only pulsed DCTL.CSFTRST, which resets the
+-	 * device controller but leaves the rest of the core alone - including
+-	 * the endpoint command engine's own state. dwc3_core_soft_reset()
+-	 * asserts GCTL.CORESOFTRESET (bit 11) instead, which is the reset
+-	 * that clears CMDACT and the endpoint configuration table.
++	 * 0148 asserted GCTL.CORESOFTRESET (bit 11) before DCTL.CSFTRST,
++	 * because that is what Linux's dwc3_core_soft_reset() does. The
++	 * build ran and produced a kernel that dies inside the first second
++	 * of boot - before the log ring's first one-second flush, which is
++	 * why the ring came back with nothing new in it at all and why the
++	 * phone fell straight back to fastboot with a black screen.
+ 	 *
+-	 * DCTL.CSFTRST is kept as a second step because it is what unstuck
+-	 * the command engine in the earlier builds, and its other bits are
+-	 * preserved rather than zeroed: ABL hands over DCTL 0x00f00000 and
+-	 * every previous reset threw bits 20-23 away.
++	 * A whole-core reset also resets the DWC3's AXI master while its
++	 * transactions are still outstanding. With the SMMU in bypass and
++	 * the wrapper already programmed, that can raise a bus error the
++	 * SoC answers by resetting. It is the only change in 0148 that can
++	 * do anything at all this early: every other edit is either a bit
++	 * definition or a write to a register that was already being
++	 * written in 0147, and 0147 boots.
++	 *
++	 * So it stays behind sweetusbfullreset=1 and the default path is
++	 * the 0147 one: pulse DCTL.CSFTRST, which is the reset that clears
++	 * CMDACT, and keep the other DCTL bits that ABL set instead of
++	 * zeroing them.
+ 	 */
+-	dwc_wr(GCTL, gctl | GCTL_CORESOFTRESET);
+-	int g;
+-	for (g = 0; g < 100 && (dwc_rd(GCTL) & GCTL_CORESOFTRESET); g++) {
+-		delay(1000);
++	int full = 0;
++	PE_parse_boot_argn("sweetusbfullreset", &full, sizeof(full));
++	if (full) {
++		int g;
++		dwc_wr(GCTL, gctl | GCTL_CORESOFTRESET);
++		for (g = 0; g < 100 && (dwc_rd(GCTL) & GCTL_CORESOFTRESET); g++) {
++			delay(1000);
++		}
++		dwc_wr(GCTL, gctl);
++		printf("  core reset: GCTL.CORESOFTRESET cleared after %d ms, "
++		    "GCTL 0x%08x GSTS 0x%08x%s\n", g, dwc_rd(GCTL), dwc_rd(GSTS),
++		    (dwc_rd(GSTS) & 1u) ? " CSRTIMEOUT" : "");
+ 	}
+-	dwc_wr(GCTL, gctl);
+-	printf("  core reset: GCTL.CORESOFTRESET cleared after %d ms, GCTL 0x%08x GSTS 0x%08x%s\n",
+-	    g, dwc_rd(GCTL), dwc_rd(GSTS),
+-	    (dwc_rd(GSTS) & 1u) ? " CSRTIMEOUT" : "");
+ 
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_CSFTRST);
+ 	int i;
+@@ -1636,8 +1649,8 @@
+ 	dwc_wr(GCTL, gctl);
+ 	dwc_wr(GUSB2PHYCFG, gusb2);
+ 	dwc_wr(GUSB3PIPECTL, gusb3);
+-	printf("  dev reset: DCTL.CSFTRST cleared after %d ms, DCTL 0x%08x DSTS 0x%08x\n",
+-	    i, dwc_rd(DCTL), dwc_rd(DSTS));
++	printf("  dev reset: DCTL.CSFTRST cleared after %d ms, DCTL 0x%08x DSTS 0x%08x "
++	    "(full %d)\n", i, dwc_rd(DCTL), dwc_rd(DSTS), full);
+ 	return 0;
+ }
+ 
