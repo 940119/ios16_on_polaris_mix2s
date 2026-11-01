@@ -1,0 +1,375 @@
+diff -Nur a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-02 05:14:43.204104208 +0800
++++ b/bsd/conf/files	2026-11-02 05:14:43.226746908 +0800
+@@ -105,6 +105,7 @@
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_cat.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff -Nur a/bsd/dev/sweet_cat.c b/bsd/dev/sweet_cat.c
+--- a/bsd/dev/sweet_cat.c	1970-01-01 08:00:00.000000000 +0800
++++ b/bsd/dev/sweet_cat.c	2026-11-02 05:14:43.220141808 +0800
+@@ -0,0 +1,336 @@
++/*
++ * Sweet (polaris, Mi MIX 2S) file reader: print a file, or a directory, into the
++ * console ring.
++ *
++ * The phone has no shell and no way to get a file off it. Everything that has
++ * gone wrong on this port since the kernel started booting is in userland -
++ * PosterBoard traps inside the dyld shared cache, securityd keeps failing
++ * AppleKeyStore calls - and none of it can be read without a way to look at the
++ * files the system itself wrote. The crash reports are the important ones:
++ * ReportCrash symbolises them on the device, so they say which library trapped
++ * and what the assertion said, which is exactly what the register dump in the
++ * ring cannot.
++ *
++ * Boot-args, read once each boot:
++ *
++ *	sweetcat=<path>[,<path>]..	up to three files or directories
++ *	sweetcatdelay=<ticks>		ticks to wait first (default 9, ten seconds each)
++ *	sweetcatskip=<n>		bytes to skip in each file (default 0)
++ *
++ * A directory is listed, and then up to three files in it whose names end in
++ * ".ips" are printed as well. That is the whole point: a crash report's name is
++ * a timestamp nobody can guess, and one flash cycle is a lot to spend learning
++ * it. The wait exists because the report is written about forty seconds into the
++ * boot, well after the root is mounted and a lookup would have succeeded.
++ *
++ * The read happens from the log thread's tick, not at probe time: at probe time
++ * the root is not mounted and vnode_lookup() would fail. Every tick retries
++ * until the lookup succeeds, and gives up after SWEET_CAT_TRIES so a wrong path
++ * does not retry for the rest of the boot.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/namei.h>
++#include <sys/uio.h>
++#include <sys/dirent.h>
++#include <sys/fcntl.h>
++#include <sys/kauth.h>
++#include <sys/vfs_context.h>
++#include <pexpert/pexpert.h>
++
++#define SWEET_CAT_PATH		160u
++#define SWEET_CAT_PATHS		3u	/* boot-args are capped at 607 bytes */
++#define SWEET_CAT_CHUNK		4096u
++#define SWEET_CAT_MAX		(512u * 1024u)	/* what one file may add to the ring */
++#define SWEET_CAT_TRIES		120u		/* ticks before a path is called wrong */
++#define SWEET_CAT_LINE		200u
++#define SWEET_CAT_IPS		3u		/* crash reports printed per directory */
++#define SWEET_CAT_NAME		96u
++
++static char sweet_cat_arg[SWEET_CAT_PATH * SWEET_CAT_PATHS];
++static char sweet_cat_path[SWEET_CAT_PATHS][SWEET_CAT_PATH];
++static uint32_t sweet_cat_npaths;
++static uint32_t sweet_cat_cur;
++static uint32_t sweet_cat_skip;
++static uint32_t sweet_cat_tries;
++static uint32_t sweet_cat_delay = 9u;
++static uint32_t sweet_cat_ticks;
++static bool sweet_cat_done;
++
++/*
++ * One static buffer, like the log ring: the allocator is not worth two failure
++ * paths here, and a few kilobytes of bss is nothing. The name table is small on
++ * purpose - the point is the one report that just happened, not an archive.
++ */
++static char sweet_cat_buf[SWEET_CAT_CHUNK];
++static char sweet_cat_ips_name[SWEET_CAT_IPS][SWEET_CAT_NAME];
++
++void sweet_cat_tick(void);
++
++/*
++ * Console output is line oriented and the ring is read by a person, so a file is
++ * printed a line at a time: unprintable bytes become dots and the line is
++ * flushed on a newline or when it fills. A JSON crash report survives that; a
++ * binary would not, and reading a binary is not what this is for.
++ */
++struct sweet_cat_out {
++	char line[SWEET_CAT_LINE];
++	uint32_t used;
++	uint64_t total;
++};
++
++static void
++sweet_cat_flush(struct sweet_cat_out *o)
++{
++	if (o->used == 0) {
++		return;
++	}
++	o->line[o->used] = '\0';
++	printf("SWEET CAT: %s\n", o->line);
++	o->used = 0;
++}
++
++static bool
++sweet_cat_put(struct sweet_cat_out *o, const char *buf, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		char c = buf[i];
++
++		if (c == '\n') {
++			sweet_cat_flush(o);
++			continue;
++		}
++		if (c == '\r') {
++			continue;
++		}
++		if (c < 0x20 || c == 0x7f) {
++			c = '.';
++		}
++		o->line[o->used++] = c;
++		if (o->used == SWEET_CAT_LINE - 1u) {
++			sweet_cat_flush(o);
++		}
++		if (++o->total >= SWEET_CAT_MAX) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++sweet_cat_file(struct vnode *vp, vfs_context_t ctx, const char *what)
++{
++	struct sweet_cat_out out;
++	char *buf = sweet_cat_buf;
++	off_t off = (off_t)sweet_cat_skip;
++	int error = 0;
++
++	memset(&out, 0, sizeof(out));
++	for (;;) {
++		int resid = 0;
++		uint32_t got;
++
++		error = vn_rdwr(UIO_READ, vp, buf, (int)SWEET_CAT_CHUNK, off,
++		    UIO_SYSSPACE, 0, kauth_cred_get(), &resid, NULL);
++		if (error != 0) {
++			printf("SWEET CAT: %s: read failed at offset %lld: %d\n", what,
++			    (long long)off, error);
++			break;
++		}
++		got = SWEET_CAT_CHUNK - (uint32_t)resid;
++		if (got == 0) {
++			break;
++		}
++		if (!sweet_cat_put(&out, buf, got)) {
++			printf("SWEET CAT: stopping at %u bytes; the rest is not printed\n",
++			    SWEET_CAT_MAX);
++			break;
++		}
++		off += (off_t)got;
++		if (got < SWEET_CAT_CHUNK) {
++			break;
++		}
++	}
++	sweet_cat_flush(&out);
++	printf("SWEET CAT: %s: %llu bytes printed from offset %u\n", what, out.total,
++	    sweet_cat_skip);
++}
++
++/*
++ * A directory is listed, and every name in it that ends in ".ips" is printed.
++ * The names are collected during the listing and the files are opened after the
++ * listing is finished, because opening a file while the directory's own readdir
++ * is half way through its buffer is a good way to see a stale entry.
++ */
++static void
++sweet_cat_dir(struct vnode *vp, vfs_context_t ctx, const char *dir)
++{
++	char *buf = sweet_cat_buf;
++	uint64_t off = 0;
++	uint32_t names = 0, nips = 0;
++
++	for (uint32_t round = 0; round < 64u; round++) {
++		int eofflag = 0, error, n;
++		uio_t uio = uio_create(1, off, UIO_SYSSPACE, UIO_READ);
++
++		if (uio == NULL) {
++			break;
++		}
++		uio_addiov(uio, (uint64_t)(uintptr_t)buf, SWEET_CAT_CHUNK);
++		error = VNOP_READDIR(vp, uio, 0, &eofflag, NULL, ctx);
++		n = (int)SWEET_CAT_CHUNK - (int)uio_resid(uio);
++		off = uio_offset(uio);
++		uio_free(uio);
++		if (error != 0) {
++			printf("SWEET CAT: %s: readdir failed: %d\n", dir, error);
++			break;
++		}
++		for (int at = 0; at + (int)sizeof(struct dirent) <= n; ) {
++			struct dirent *d = (struct dirent *)(void *)(buf + at);
++			uint32_t len;
++
++			if (d->d_reclen == 0 || at + d->d_reclen > n) {
++				break;
++			}
++			len = d->d_namlen;
++			if (len > 0 && len < MAXNAMLEN) {
++				printf("SWEET CAT: %s/%.*s\n", dir, (int)len, d->d_name);
++				names++;
++				if (nips < SWEET_CAT_IPS && len > 4u && len < SWEET_CAT_NAME &&
++				    d->d_name[len - 4] == '.' && d->d_name[len - 3] == 'i' &&
++				    d->d_name[len - 2] == 'p' && d->d_name[len - 1] == 's') {
++					memcpy(sweet_cat_ips_name[nips], d->d_name, len);
++					sweet_cat_ips_name[nips][len] = '\0';
++					nips++;
++				}
++			}
++			at += d->d_reclen;
++		}
++		if (eofflag) {
++			break;
++		}
++	}
++	printf("SWEET CAT: %s: %u names, %u crash reports\n", dir, names, nips);
++
++	for (uint32_t i = 0; i < nips; i++) {
++		char full[SWEET_CAT_PATH + SWEET_CAT_NAME + 2u];
++		struct vnode *fvp = NULL;
++		int error;
++
++		snprintf(full, sizeof(full), "%s/%s", dir, sweet_cat_ips_name[i]);
++		error = vnode_lookup(full, 0, &fvp, ctx);
++		if (error != 0) {
++			printf("SWEET CAT: %s: lookup failed: %d\n", full, error);
++			continue;
++		}
++		printf("SWEET CAT: --- %s ---\n", full);
++		sweet_cat_file(fvp, ctx, full);
++		vnode_put(fvp);
++	}
++}
++
++/*
++ * Split the boot-arg on commas. A path may not contain a comma, which for
++ * anything under /var is true.
++ */
++static void
++sweet_cat_parse(void)
++{
++	uint32_t len, at = 0;
++
++	(void)PE_parse_boot_argn("sweetcat", sweet_cat_arg, sizeof(sweet_cat_arg));
++	(void)PE_parse_boot_argn("sweetcatskip", &sweet_cat_skip,
++	    sizeof(sweet_cat_skip));
++	(void)PE_parse_boot_argn("sweetcatdelay", &sweet_cat_delay,
++	    sizeof(sweet_cat_delay));
++	len = (uint32_t)strlen(sweet_cat_arg);
++	for (uint32_t i = 0; i <= len; i++) {
++		char c = (i == len) ? ',' : sweet_cat_arg[i];
++
++		if (c == ',') {
++			if (at > 0 && sweet_cat_npaths < SWEET_CAT_PATHS) {
++				sweet_cat_path[sweet_cat_npaths][at] = '\0';
++				sweet_cat_npaths++;
++			}
++			at = 0;
++			continue;
++		}
++		if (at + 1u < SWEET_CAT_PATH) {
++			sweet_cat_path[sweet_cat_npaths][at++] = c;
++		}
++	}
++	if (sweet_cat_npaths == 0) {
++		sweet_cat_done = true;
++		return;
++	}
++	for (uint32_t i = 0; i < sweet_cat_npaths; i++) {
++		printf("SWEET CAT: will read %s in %u ticks\n", sweet_cat_path[i],
++		    sweet_cat_delay);
++	}
++}
++
++/*
++ * Called once a second by the log thread. Nothing happens for the first
++ * sweetcatdelay ticks, then each path in turn is looked up; a path that is not
++ * there yet is retried on the next tick and the ones behind it wait.
++ */
++void
++sweet_cat_tick(void)
++{
++	vfs_context_t ctx;
++	int error;
++
++	if (sweet_cat_done) {
++		return;
++	}
++	if (sweet_cat_npaths == 0) {
++		sweet_cat_parse();
++		return;
++	}
++	if (++sweet_cat_ticks <= sweet_cat_delay) {
++		return;
++	}
++
++	ctx = vfs_context_create(NULL);
++	if (ctx == NULL) {
++		return;
++	}
++	while (sweet_cat_cur < sweet_cat_npaths) {
++		const char *path = sweet_cat_path[sweet_cat_cur];
++		struct vnode *vp = NULL;
++
++		if (++sweet_cat_tries > SWEET_CAT_TRIES) {
++			printf("SWEET CAT: %s never appeared after %u ticks\n", path,
++			    SWEET_CAT_TRIES);
++			sweet_cat_cur++;
++			sweet_cat_tries = 0;
++			continue;
++		}
++		error = vnode_lookup(path, 0, &vp, ctx);
++		if (error != 0) {
++			if (sweet_cat_tries % 6u == 0) {
++				printf("SWEET CAT: %s not there yet (%d), try %u\n", path,
++				    error, sweet_cat_tries);
++			}
++			break;
++		}
++		printf("SWEET CAT: %s is there after %u tries\n", path, sweet_cat_tries);
++		if (vnode_isreg(vp)) {
++			sweet_cat_file(vp, ctx, path);
++		} else if (vnode_isdir(vp)) {
++			sweet_cat_dir(vp, ctx, path);
++		} else {
++			printf("SWEET CAT: %s is neither a file nor a directory\n", path);
++		}
++		vnode_put(vp);
++		sweet_cat_cur++;
++		sweet_cat_tries = 0;
++	}
++	vfs_context_rele(ctx);
++	if (sweet_cat_cur >= sweet_cat_npaths) {
++		sweet_cat_done = true;
++		printf("SWEET CAT: done after %u ticks\n", sweet_cat_ticks);
++	}
++}
+diff -Nur a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-02 05:14:43.199430408 +0800
++++ b/bsd/dev/sweet_ufs.c	2026-11-02 05:14:43.213383308 +0800
+@@ -49,6 +49,7 @@
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
++void sweet_cat_tick(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+@@ -905,6 +906,12 @@
+ 			printf("SWEET LOG: write failed, stopping\n");
+ 			return;
+ 		}
++		/*
++		 * The file reader waits for the root to be mounted, and this loop is
++		 * the only thing in the kernel that already ticks once a second after
++		 * the mount has happened. It does nothing unless sweetcat= is set.
++		 */
++		sweet_cat_tick();
+ 	}
+ }
+ 
