@@ -1082,7 +1082,7 @@ static uint64_t pg_queue_iova[PG_GMU_HFI_QUEUES];
  * five entries, and build 0140's fault was an empty level 1 entry, not an
  * empty level 2 one.
  */
-#define PG_CP_WINDOW_L2S	5u
+#define PG_CP_WINDOW_L2S	6u
 
 static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
 static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
@@ -3878,10 +3878,15 @@ pg_step_draw(void)
 #define PG_PANEL_MAX_PAGES	2400u		/* 0x100a0000..0x109fffff: the rest of the window */
 /*
  * Where a kernel buffer gets mapped when the command processor has to read it.
- * Well clear of the panel window above and of the ring and the memptrs, which
- * sit in the low part of the same address space.
+ *
+ * It has to be inside the CP's window, and the window is ten megabytes with the
+ * panel filling nine point three of them - 0x20000000, the obvious choice, is
+ * three gigabytes of address space away from anything pg_smmu_l3() knows about
+ * and the mapping would simply have been refused. One more level 2 entry makes
+ * the window twelve megabytes, and this sits in the first two of the new ones,
+ * immediately above the last panel page.
  */
-#define PG_SURF_IOVA		0x20000000ull
+#define PG_SURF_IOVA		0x10a00000ull
 
 /*
  * The panel's geometry comes from PE_current_console(), which is where
@@ -4440,39 +4445,40 @@ pg_memcpy_test(uint32_t width, uint32_t height, uint32_t stride)
 }
 
 /*
- * Step 18c: what a copy costs, and whether the CP can read what the CPU wrote.
+ * Step 18c: can the CP read memory the CPU wrote, and who copies faster.
  *
- * Two questions, and each one costs a flash cycle on its own, so they go in the
- * same boot.
+ * This is the question that decides whether present() can use any of this. The
+ * panel is I/O memory, which the command processor reads straight out of RAM, but
+ * present() copies out of an IOSurface: pages the CPU wrote through its cache,
+ * mapped into the GPU window as non-cached memory. If the CP cannot see those
+ * writes, a fast copy of the wrong bytes is worth nothing.
  *
- * The first decides whether any of this is worth wiring into present(): the same
- * half panel, 4.6 MB, from the top half to the bottom, done once by the CPU with
- * memcpy and once by the command processor with a single CP_MEMCPY. Same source,
- * same destination, same size; the only difference is who moves it. The CPU's
- * copy is the better half of its case, too - one contiguous memcpy, not two
- * thousand row-at-a-time ones.
+ * So a kernel buffer is filled, mapped into the CP's window and copied onto the
+ * panel twice - once straight after the CPU wrote it, once after flushing the
+ * cache - because whether the flush is needed decides how much the real thing
+ * would cost per frame. The two destinations are different rows, so neither
+ * result can be mistaken for the other.
  *
- * The second decides whether it can work at all. The panel is I/O memory, which
- * the command processor reads straight out of RAM, but present() copies out of
- * an IOSurface: pages the CPU wrote through its cache, mapped into the GPU window
- * as non-cached memory. If the CP cannot see those writes, the copy is worthless
- * however fast it is - so a kernel buffer is filled, flushed, mapped and copied
- * onto the panel, then read back word by word.
+ * Then the same row, copied a hundred times, by the CPU and by the command
+ * processor. The CPU's version is the best case it has: one contiguous memcpy to
+ * one row. The CP's version batches all hundred packets into one submission,
+ * which is how present() would use it.
  *
- * Both parts write to the panel, and the timing part overwrites the top half of
- * it with the bottom half. That happens after step 18 has taken its verdict, so
- * it cannot change what the ladder reports.
+ * Everything here is one row at a time on purpose. The first version of this
+ * mapped the whole panel with ml_io_map and asked for a single 1.1 million dword
+ * copy, and the boot stopped without printing again - so the sizes are small
+ * enough that a failure shows up as a wrong pixel rather than as a dead kernel.
+ *
+ * Off unless polarisgpucopybench=1.
  */
 static void
 pg_copy_bench(uint32_t width, uint32_t height, uint32_t stride)
 {
-	static uint32_t after[2048];
-	uint64_t bytes = (uint64_t)stride * (uint64_t)height;
-	uint64_t half = (uint64_t)stride * (uint64_t)(height / 2u);
-	uint32_t words = width, bench = stride * 3u, wptr = pg_cp_wptr;
-	uint32_t i, diff, pages;
-	uint64_t t0, t1, cpu_ns = 0, cp_ns = 0;
-	vm_offset_t kbuf = 0, all;
+	static uint32_t got[2048];
+	uint32_t words = width, bench = stride * 3u, wptr;
+	uint32_t i, diff, pages, row_nf, row_f, row_t, off = 0;
+	uint64_t dst_t, t0, t1, cpu_ns = 0, cp_ns = 0;
+	vm_offset_t kbuf = 0, va_t;
 	uint32_t *buf;
 
 	if (height < 8u || width > 2048u || stride < width * 4u) {
@@ -4480,8 +4486,11 @@ pg_copy_bench(uint32_t width, uint32_t height, uint32_t stride)
 		    height);
 		return;
 	}
+	row_nf = height - 3u;
+	row_f = height - 2u;
+	row_t = height - 4u;
 
-	/* ---- the second question first: can the CP read a kernel buffer? ---- */
+	/* ---- a kernel buffer the CPU writes and the CP has to read ---- */
 	if (kmem_alloc(kernel_map, &kbuf, (vm_size_t)bench,
 	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		printf("POLARIS GPU: 18c no memory for the source buffer\n");
@@ -4492,63 +4501,105 @@ pg_copy_bench(uint32_t width, uint32_t height, uint32_t stride)
 		buf[i] = 0xff000000u | (i & 0xffffu);
 	}
 	pages = bench / PG_GMU_PAGE_SIZE;
+	printf("POLARIS GPU: 18c buffer %u bytes at phys %#llx, %u pages, first %08x last "
+	    "%08x\n", bench, (uint64_t)kvtophys(kbuf), pages, buf[0], buf[words - 1u]);
 	for (i = 0; i < pages; i++) {
 		if (!pg_map_phys(PG_SURF_IOVA + (uint64_t)i * PG_GMU_PAGE_SIZE,
 		    (uint64_t)kvtophys(kbuf + (vm_offset_t)i * PG_GMU_PAGE_SIZE),
 		    "copy source")) {
-			printf("POLARIS GPU: 18c the source buffer would not map\n");
+			printf("POLARIS GPU: 18c the source buffer would not map at %#llx\n",
+			    PG_SURF_IOVA);
+			kmem_free(kernel_map, kbuf, bench);
 			return;
 		}
 	}
-	flush_dcache64((addr64_t)kbuf, bench, 0);
-	printf("POLARIS GPU: 18c %u bytes written by the CPU at phys %#llx: %u pages "
-	    "mapped at iova %#llx, cache flushed\n", bench,
-	    (uint64_t)kvtophys(kbuf), pages, PG_SURF_IOVA);
+	printf("POLARIS GPU: 18c mapped at iova %#llx; about to copy without a flush\n",
+	    PG_SURF_IOVA);
 
-	if (!pg_memcpy_span(PG_PANEL_IOVA + (uint64_t)(height - 2u) * stride,
-	    PG_SURF_IOVA, words, false, &wptr)) {
+	/* ---- 1: no flush, straight after the CPU wrote it ---- */
+	wptr = pg_cp_wptr;
+	if (!pg_memcpy_span(PG_PANEL_IOVA + (uint64_t)row_nf * stride, PG_SURF_IOVA,
+	    words, false, &wptr)) {
 		pg_cp_wptr = wptr;
-		return;
-	}
-	pg_cp_wptr = wptr;
-	diff = pg_row_diff(height - 2u, buf, after, words, stride);
-	if (diff == words) {
-		printf("POLARIS GPU: 18c THE CP READ WHAT THE CPU WROTE: %u dwords out of a "
-		    "kernel buffer land on row %u unchanged\n", words, height - 2u);
-	} else {
-		printf("POLARIS GPU: 18c the CP could not read the buffer: word %u reads "
-		    "%08x, the buffer holds %08x\n", diff, after[diff], buf[diff]);
-	}
-
-	/* ---- then the first question: the same bytes, CPU against CP ---- */
-	all = ml_io_map((vm_offset_t)pg_panel_phys, (vm_size_t)bytes);
-	if (all == 0) {
-		printf("POLARIS GPU: 18c the panel would not map whole; no timing\n");
 		kmem_free(kernel_map, kbuf, bench);
 		return;
 	}
-	t0 = mach_absolute_time();
-	memcpy((void *)all, (const void *)(all + (vm_offset_t)half), (size_t)half);
-	t1 = mach_absolute_time();
-	absolutetime_to_nanoseconds(t1 - t0, &cpu_ns);
+	pg_cp_wptr = wptr;
+	diff = pg_row_diff(row_nf, buf, got, words, stride);
+	if (diff == words) {
+		printf("POLARIS GPU: 18c WITHOUT a flush the CP still read it: %u dwords on row "
+		    "%u are the buffer's\n", words, row_nf);
+	} else {
+		printf("POLARIS GPU: 18c without a flush word %u reads %08x, the buffer holds "
+		    "%08x - the cache has to be written back\n", diff, got[diff], buf[diff]);
+	}
 
+	/* ---- 2: with the flush ---- */
+	flush_dcache64((addr64_t)kbuf, bench, 0);
 	wptr = pg_cp_wptr;
-	t0 = mach_absolute_time();
-	if (!pg_memcpy_span(PG_PANEL_IOVA, PG_PANEL_IOVA + half, (uint32_t)(half / 4u),
+	if (!pg_memcpy_span(PG_PANEL_IOVA + (uint64_t)row_f * stride, PG_SURF_IOVA, words,
 	    false, &wptr)) {
 		pg_cp_wptr = wptr;
 		kmem_free(kernel_map, kbuf, bench);
 		return;
 	}
+	pg_cp_wptr = wptr;
+	diff = pg_row_diff(row_f, buf, got, words, stride);
+	if (diff == words) {
+		printf("POLARIS GPU: 18c THE CP READ WHAT THE CPU WROTE: %u dwords out of a "
+		    "kernel buffer land on row %u unchanged after a flush\n", words, row_f);
+	} else {
+		printf("POLARIS GPU: 18c after a flush word %u reads %08x, the buffer holds "
+		    "%08x\n", diff, got[diff], buf[diff]);
+	}
+
+	/* ---- 3: a hundred rows, CPU against CP ---- */
+	va_t = pg_panel_row_va(row_t, stride, &off);
+	if (va_t == 0) {
+		printf("POLARIS GPU: 18c row %u has no mapping; no timing\n", row_t);
+		kmem_free(kernel_map, kbuf, bench);
+		return;
+	}
+	dst_t = PG_PANEL_IOVA + (uint64_t)row_t * stride;
+	t0 = mach_absolute_time();
+	for (i = 0; i < 100u; i++) {
+		memcpy((void *)(va_t + off), (const void *)buf, (size_t)words * 4u);
+	}
+	t1 = mach_absolute_time();
+	absolutetime_to_nanoseconds(t1 - t0, &cpu_ns);
+
+	wptr = pg_cp_wptr;
+	t0 = mach_absolute_time();
+	for (i = 0; i < 100u; i++) {
+		pg_ring_put(wptr++, pg_pkt7(PG_CP_MEMCPY, 5));
+		pg_ring_put(wptr++, words);
+		pg_ring_put(wptr++, (uint32_t)PG_SURF_IOVA);
+		pg_ring_put(wptr++, (uint32_t)(PG_SURF_IOVA >> 32));
+		pg_ring_put(wptr++, (uint32_t)dst_t);
+		pg_ring_put(wptr++, (uint32_t)(dst_t >> 32));
+	}
+	wptr &= PG_RING_WORDS - 1u;
+	pg_ring_flush();
+	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (i = 0; i < 100000; i++) {
+		if (pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) == wptr) {
+			break;
+		}
+		pg_sleep_us(10);
+	}
 	t1 = mach_absolute_time();
 	absolutetime_to_nanoseconds(t1 - t0, &cp_ns);
+	if (i == 100000) {
+		printf("POLARIS GPU: 18c the CP never finished the hundred copies: RPTR %u WPTR "
+		    "%u RBBM_STATUS %#010x\n", pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR), wptr,
+		    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
+	} else {
+		printf("POLARIS GPU: 18c a hundred rows of %u bytes: CPU memcpy %llu us, "
+		    "CP_MEMCPY %llu us - the CP is %s\n", words * 4u, cpu_ns / 1000,
+		    cp_ns / 1000, cp_ns < cpu_ns ? "FASTER" : "not faster");
+	}
 	pg_cp_wptr = wptr;
-
-	printf("POLARIS GPU: 18c %llu bytes: CPU memcpy %llu us (%llu MB/s), CP_MEMCPY "
-	    "%llu us (%llu MB/s) - the CP is %s\n", half, cpu_ns / 1000,
-	    cpu_ns ? (half / 1000u) * 1000u / cpu_ns : 0, cp_ns / 1000,
-	    cp_ns ? (half / 1000u) * 1000u / cp_ns : 0,
-	    cp_ns < cpu_ns ? "FASTER" : "not faster");
 	kmem_free(kernel_map, kbuf, bench);
 }
 
