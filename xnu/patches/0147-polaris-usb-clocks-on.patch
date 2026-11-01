@@ -1,0 +1,88 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -73,6 +73,70 @@
+ 	return v;
+ }
+ 
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * Switch on the USB3 controller's clock branches.
++ *
++ * 0146 answered the command-engine question: DEPCMD latches CMDACT (bit 16,
++ * confirmed - it now reads 0x00010009) and never retires it, in all four
++ * strategies and with the PHY powered up. A device controller does exactly
++ * that when it has no UTMI clock: register access still works because that
++ * rides the AHB branch, but the device state machine never advances.
++ *
++ * On polaris the mock-UTMI branch (GCC_USB30_PRIM_MOCK_UTMI_CLK_CBCR, 0x0f018)
++ * reads back 0x00000000 while every other branch in the window reads
++ * 0x00000001 - its enable bit is clear. In a GCC CBCR bit 0 is the branch
++ * enable and bit 31 is "halted", which is how the GPU ladder switches its own
++ * register bus on. So do the same here, print what moved, and let the strategy
++ * loop run afterwards.
++ *
++ * The window is dumped first because 0x0f000 is the block's BCR: if its bit 0
++ * is set the block reset is still asserted and no clock will help.
++ */
++static void
++ud_usb_clocks_on(vm_offset_t gcc)
++{
++	uint32_t off;
++
++	printf("SWEET USB: gcc usb30_prim before:");
++	for (off = 0; off < 0x40; off += 4) {
++		printf(" %02x=%08x", off, usb_rd(gcc, 0x0000f000 + off));
++	}
++	printf("\n");
++
++	/* BCR bit 0 is BLK_ARES: 1 means the block is held in reset. */
++	if (usb_rd(gcc, 0x0000f000) & 1u) {
++		printf("SWEET USB: gcc usb30_prim BCR has the block in reset; releasing it\n");
++		usb_wr(gcc, 0x0000f000, usb_rd(gcc, 0x0000f000) & ~1u);
++		delay(500);
++		printf("SWEET USB: gcc usb30_prim BCR now 0x%08x\n", usb_rd(gcc, 0x0000f000));
++	}
++
++	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++		uint32_t before = usb_rd(gcc, usb_cbcr[i].off);
++		if (before & 1u) {
++			continue;
++		}
++		usb_wr(gcc, usb_cbcr[i].off, (before & ~CBCR_CLK_OFF) | 1u);
++		delay(200);
++		printf("SWEET USB: clk %-12s 0x%08x -> 0x%08x (%s)\n", usb_cbcr[i].name,
++		    before, usb_rd(gcc, usb_cbcr[i].off),
++		    (usb_rd(gcc, usb_cbcr[i].off) & 1u) ? "enable bit took" : "STILL OFF");
++	}
++
++	printf("SWEET USB: gcc usb30_prim after:");
++	for (off = 0; off < 0x40; off += 4) {
++		printf(" %02x=%08x", off, usb_rd(gcc, 0x0000f000 + off));
++	}
++	printf("\n");
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -112,6 +176,14 @@
+ 	if (!clocks_on) {
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
++	}
++	/*
++	 * 0147: switch on whatever branch the boot loader left off, then re-read
++	 * so everything below runs against the real clock state.
++	 */
++	ud_usb_clocks_on(gcc);
++	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+ 	}
+ 	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+ 	if (dwc == 0) {
