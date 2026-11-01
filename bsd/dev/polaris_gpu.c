@@ -4005,6 +4005,7 @@ pg_step_panel(void)
 	uint64_t phys = 0;
 	uint32_t width = 0, height = 0, stride = 0;
 	uint32_t bytes, words, pages, wptr = pg_cp_wptr, rptr = 0, sent = 0, batches = 0;
+	uint32_t fresh = 0;
 	bool ok = true;
 
 	if (pg_gpu3d == 0 || !pg_smmu_tables() || pg_ring_va[0] == 0) {
@@ -4033,13 +4034,12 @@ pg_step_panel(void)
 	/*
 	 * Map it for the CPU before anything is written, and read the top row
 	 * once: whatever is there now is what the rest of the system left on the
-	 * surface, which is the baseline the readings at the end are measured
-	 * against.
+	 * surface, which is the baseline the readings below are measured against.
 	 */
 	if (!pg_panel_attach(phys, stride, height)) {
 		return false;
 	}
-	pg_panel_show("before the fill,", 0, width, height, stride);
+	pg_panel_show("before anything,", 0, width, height, stride);
 
 	/*
 	 * Map the whole panel. The panel's first page is the one the display
@@ -4065,6 +4065,39 @@ pg_step_panel(void)
 		    l3l[li] & PG_PTE_ADDR, l3f == l3l ? "the same" : "different");
 	}
 	PG_CHECK("18: the whole panel is in the 3D core's window");
+
+	/*
+	 * The decisive reading comes first, while the command processor is known
+	 * to be alive: step 17 has just drained a thousand packets through it.
+	 * Write one row and read it back at once. If those three pixels are ours,
+	 * the CP's writes reach the memory the display scans out and the CPU sees
+	 * them, and the long fill below only adds how far the ring got.
+	 *
+	 * Doing this after the fill instead would have measured nothing at all in
+	 * both 0155 and 0156, because the fill is exactly where the CP stops.
+	 */
+	{
+		bool wrote = pg_panel_write_row(0, width, height, stride);
+
+		if (!wrote) {
+			printf("POLARIS GPU: 18 the CP would not take another row, so the reading "
+			    "below says nothing about the surface\n");
+		}
+		fresh = pg_panel_show(wrote ? "a moment after rewriting" :
+		    "after a rewrite the CP did not take,", 0, width, height, stride);
+		for (uint32_t i = 0; i < 100u; i++) {
+			pg_sleep_us(10000);
+		}
+		pg_panel_show("one second later,", 0, width, height, stride);
+		ok = wrote && (fresh == 3);
+		if (ok) {
+			printf("POLARIS GPU: 18 the CP's writes are in the memory the display scans "
+			    "out, and the CPU reads them back within microseconds\n");
+		} else if (wrote) {
+			printf("POLARIS GPU: 18 a row written microseconds ago does not read back: "
+			    "the CPU's view of %#llx is not the surface the CP wrote\n", phys);
+		}
+	}
 
 	{
 		bool stalled = false;
@@ -4149,7 +4182,6 @@ pg_step_panel(void)
 	{
 		uint32_t per_row = stride / 4u;
 		uint32_t written_rows = sent / per_row;
-		uint32_t fresh;
 
 		if (written_rows > height) {
 			written_rows = height;
@@ -4159,31 +4191,17 @@ pg_step_panel(void)
 			return false;
 		}
 		/*
-		 * Row 0 was written first, so it has had the longest time to be
-		 * repainted. The last row that landed is the one that was written
-		 * a moment ago, and it is also in a different level 2 entry of the
-		 * CP's window, so it is the only evidence that the window really
-		 * is five level 3 pages and not just the first one.
+		 * These rows have had seconds to be repainted, so they are not the
+		 * proof - the rewrite above was. They say how far the fill got and
+		 * what the surface looked like once it stopped: row 0 was written
+		 * first and has had the longest exposure, and the last row that
+		 * landed is in a different level 2 entry of the CP's window, so it
+		 * is also the evidence that the window is five level 3 pages and not
+		 * just the first one.
 		 */
 		pg_panel_show("after the fill,", 0, width, height, stride);
 		if (written_rows >= 16u) {
 			pg_panel_show("after the fill,", written_rows - 1u, width, height, stride);
-		}
-		if (!pg_panel_write_row(0, width, height, stride)) {
-			return false;
-		}
-		fresh = pg_panel_show("a moment after rewriting", 0, width, height, stride);
-		for (uint32_t i = 0; i < 100u; i++) {
-			pg_sleep_us(10000);
-		}
-		pg_panel_show("one second later,", 0, width, height, stride);
-		ok = (fresh == 3);
-		if (ok) {
-			printf("POLARIS GPU: 18 the CP's writes are in the memory the display scans "
-			    "out, and the CPU reads them back within microseconds\n");
-		} else {
-			printf("POLARIS GPU: 18 a row written microseconds ago still does not read "
-			    "back: the CPU's view of %#llx is not the surface the CP wrote\n", phys);
 		}
 	}
 	return ok;
