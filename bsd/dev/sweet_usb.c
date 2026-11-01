@@ -38,6 +38,7 @@
 #include <sys/kern_event.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern void ml_io_unmap(vm_offset_t, vm_size_t);
 void sweet_usb_probe(void);
 static void sweet_usb_gadget_start(vm_offset_t dwc);
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
@@ -202,8 +203,8 @@ sweet_usb_probe(void)
 	 * first register access and flushed immediately, so either it is in the
 	 * ring or the kernel that wrote the ring was not this one.
 	 */
-	printf("SWEET USB: ======== build 0155 alive: ten minute monitor, GSTS cable/session/"
-	    "bvalid by name ========\n");
+	printf("SWEET USB: ======== build 0156 alive: PORT_POWERDOWN sweep, every monitor "
+	    "sample printed ========\n");
 	sweet_log_flush_now();
 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
 	if (gcc == 0) {
@@ -1576,15 +1577,17 @@ ud_mon_thread(void *arg, wait_result_t wr)
 	(void)wr;
 	ud_sleep_ms(3000);
 	/*
-	 * Twenty samples was the whole window in 0153 and 0154, and nobody can
-	 * pull a cable out and put it back inside twenty seconds - so the one
-	 * experiment that would settle whether the host just needs a fresh
-	 * connect edge has never actually been run. Ten minutes, and a line only
-	 * when something changes (plus one a minute as a heartbeat) so the ring
-	 * is not filled with identical lines.
+	 * Ten minutes, and this time every sample is printed.
+	 *
+	 * Build 0155 printed only on change, so a run with no change was
+	 * indistinguishable from a run where the monitor never sampled - and the
+	 * one thing that run did prove (the cable can come out and go back in
+	 * with nothing to show for it) needed the reader to trust that the loop
+	 * really ran. Six hundred lines is 78 KB against a 4 MB ring; being able
+	 * to see every sample is worth more than the space.
 	 */
-	printf("SWEET USB: monitor start: 600 samples, one a second, a line whenever the "
-	    "state changes - unplug and replug the cable at any point in that window\n");
+	printf("SWEET USB: monitor start: 600 samples, one a second, every one printed - "
+	    "unplug and replug the cable at any point in that window\n");
 	{
 		uint32_t last_d = dwc_rd(DSTS), last_g = dwc_rd(GSTS), last_ev = 0;
 		uint32_t changes = 0;
@@ -1595,7 +1598,7 @@ ud_mon_thread(void *arg, wait_result_t wr)
 			uint32_t ev = dwc_rd(GEVNTCOUNT) & 0xffff;
 			bool moved = (d != last_d || g != last_g || ev != last_ev);
 
-			if (moved || (m % 60) == 0) {
+			{
 				/*
 				 * Decoded against Linux core.h, not guessed:
 				 *   DSTS[2:0]   ConnectSpd: 0 = high speed, 1 = full speed,
@@ -2607,6 +2610,44 @@ sweet_usb_gadget_start(vm_offset_t dwc)
 		if (ud_attach_and_wait(cfg[k].name, 4000) > 0) {
 			saw_event = 1;
 			printf("SWEET USB: attempt %u %s WON\n", k + 1, cfg[k].name);
+		}
+	}
+
+	/*
+	 * Build 0155 settled one thing and it is worth writing down: unplugging
+	 * the cable changed nothing - not DSTS, not GSTS, not the event count.
+	 * So the port is electrically dead from the controller's side, and the
+	 * controller side is not what is wrong (endpoints configured, DALEPENA
+	 * set, RUN_STOP set, core not halted).
+	 *
+	 * What is left is the PHY's own termination. In device mode the core
+	 * asks the PHY for the D+ pull-up; QUSB2 decides whether it presents it,
+	 * and PORT_POWERDOWN is the register that says so. The boot loader left
+	 * 0x23 and this driver has been writing 0x22; neither connects, and
+	 * nobody has tried anything else. Sweep the plausible values and wait
+	 * for an event after each.
+	 */
+	if (!saw_event) {
+		static const uint32_t pd[] = { 0x23u, 0x22u, 0x20u, 0x02u, 0x00u };
+		vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+
+		printf("SWEET USB: step 4b/6 PORT_POWERDOWN sweep\n");
+		if (phy == 0) {
+			printf("SWEET USB:   QUSB2 map failed\n");
+		}
+		for (unsigned k = 0; phy != 0 && k < sizeof(pd) / sizeof(pd[0]) && !saw_event; k++) {
+			ud_detach("pd-sweep", 300, 0);
+			usb_wr(phy, QUSB2_PORT_POWERDOWN, pd[k]);
+			ud_sleep_ms(100);
+			printf("SWEET USB:   POWERDOWN <- %#04x, PLL_STATUS 0x%02x\n", pd[k],
+			    usb_rd(phy, QUSB2_PLL_STATUS));
+			if (ud_attach_and_wait("pd-sweep", 2000) > 0) {
+				saw_event = 1;
+				printf("SWEET USB:   POWERDOWN %#04x WON\n", pd[k]);
+			}
+		}
+		if (phy != 0) {
+			ml_io_unmap(phy, QUSB2_SIZE);
 		}
 	}
 
