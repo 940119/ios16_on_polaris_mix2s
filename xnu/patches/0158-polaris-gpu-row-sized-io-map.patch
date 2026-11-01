@@ -1,0 +1,168 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-01 20:42:54.035268594 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-01 20:42:54.073139794 +0800
+@@ -3873,20 +3873,43 @@
+ }
+ 
+ /*
+- * Read pixels back through the CPU.
++ * Read pixels back through the CPU, a row at a time.
+  *
+- * Build 0155 verified nothing when the fill did not finish, so a panel that was
+- * three quarters right looked exactly like a panel that had never been written.
+- * Build 0156 fixed that and then panicked before it printed its summary:
++ * Two separate things killed the read-back before it reported anything.
++ *
++ * Build 0156 called ml_io_unmap() after each probe:
+  *
+  *   va_map_delete(0xfffffe1086419e98, 0xfffffe460dbc000, 0xfffffe460dcbc000):
+  *       Attempting to remove permanent VM map entry
+  *       0xfffffe108641f970 [0xfffffe460db10000:0xfffffe460dcbc000)
+  *
+- * ml_io_map() hands back an entry the vm map marks permanent, so ml_io_unmap()
+- * may not delete any part of it - not the whole entry and not a tail of it. A
+- * boot probe that leaks ten megabytes of device address space is cheaper than
+- * one that panics, so the panel is mapped once here and never released.
++ * and that is because ml_io_unmap() is:
++ *
++ *   pmap_remove(kernel_pmap, addr, addr + sz);
++ *   kmem_free(kernel_map, addr, sz);
++ *
++ * while io_map() took the address out of io_submap, not kernel_map. Freeing it
++ * against kernel_map walks into the permanent entry that happens to contain the
++ * address and panics. Nothing here calls ml_io_unmap() any more.
++ *
++ * Build 0157 then mapped the whole panel in one call, 9338880 bytes, and the
++ * kernel died before it could print anything at all: its log ring stops at
++ * "at step 18" with no line after it. osfmk/arm/io_map.c explains why:
++ *
++ *   #define IO_MAP_SIZE (8ul << 20)
++ *   io_submap = kmem_suballoc(kernel_map, &io_range.min_address, IO_MAP_SIZE, ...)
++ *   kmem_alloc(unmappable ? kernel_map : io_submap, &start, alloc_size,
++ *              kmaflags (which carries KMA_NOFAIL), VM_KERN_MEMORY_IOKIT);
++ *
++ * The submap is eight megabytes for the whole kernel and the allocation cannot
++ * fail - it panics instead. Everything else this file maps already owns about
++ * 2.1 MB of it (GCC 576K, GPU3D 256K, the command doorbell 256K, GMU 192K, PDC
++ * 128K, SMMU 64K, step 17's 128 page framebuffer 512K, the ring and the GMU
++ * pages), so a nine megabyte mapping cannot fit and no amount of care helps.
++ *
++ * Hence one mapping per row that is actually read, at most three pages each,
++ * six rows, 72 KB. The mapping is kept rather than released, which is what
++ * makes ml_io_unmap() irrelevant.
+  *
+  * The mapping is not the only thing 0156 got wrong. Every pixel it managed to
+  * report read 0xff000000 - opaque black - while the values it compared against
+@@ -3896,48 +3919,65 @@
+  * window server by this point in the boot, and the fill takes seconds, which is
+  * ample time for the rows written first to be painted over.
+  *
+- * Hence three readings of the same three pixels: before the fill, microseconds
++ * Hence three readings of the same three pixels: before anything, microseconds
+  * after one row is written again, and one second after that. If the first is
+  * black and the second is ours, the panel was repainted and the write landed.
+  * If the second is black too, the CPU is not looking at the surface the CP
+  * wrote and no amount of waiting will help.
+  */
+-static vm_offset_t pg_panel_map;
+-static uint32_t pg_panel_skew;
+-static vm_size_t pg_panel_span;
++#define PG_PANEL_PROBES		6u	/* rows this file ever reads back */
+ 
+-static bool
+-pg_panel_attach(uint64_t phys, uint32_t stride, uint32_t height)
+-{
+-	uint64_t bytes = (uint64_t)stride * (uint64_t)height;
+-	uint64_t base = phys & ~(uint64_t)(PG_GMU_PAGE_SIZE - 1u);
++struct pg_panel_probe {
++	uint32_t row;
++	uint32_t off;		/* byte offset of the row inside its mapping */
++	vm_offset_t va;
++};
++
++static struct pg_panel_probe pg_panel_probe[PG_PANEL_PROBES];
++static uint32_t pg_panel_probes;
++static uint64_t pg_panel_phys;
+ 
+-	if (pg_panel_map != 0) {
+-		return true;
+-	}
+-	/*
+-	 * The console's base is page aligned on this panel, but carrying the
+-	 * skew costs nothing and a dropped skew would put every read one row
+-	 * out without any number looking obviously wrong.
+-	 */
+-	pg_panel_skew = (uint32_t)(phys - base);
+-	pg_panel_span = (vm_size_t)(((uint64_t)pg_panel_skew + bytes +
+-	    PG_GMU_PAGE_SIZE - 1u) & ~(uint64_t)(PG_GMU_PAGE_SIZE - 1u));
+-	pg_panel_map = ml_io_map((vm_offset_t)base, pg_panel_span);
+-	if (pg_panel_map == 0) {
+-		printf("POLARIS GPU: 18 the panel at %#llx will not map\n", phys);
+-		return false;
++static vm_offset_t
++pg_panel_row_va(uint32_t row, uint32_t stride, uint32_t *offp)
++{
++	uint64_t at = pg_panel_phys + (uint64_t)row * (uint64_t)stride;
++	uint64_t base = at & ~(uint64_t)(PG_GMU_PAGE_SIZE - 1u);
++	uint32_t off = (uint32_t)(at - base);
++	vm_size_t span;
++
++	for (uint32_t i = 0; i < pg_panel_probes; i++) {
++		if (pg_panel_probe[i].row == row) {
++			*offp = pg_panel_probe[i].off;
++			return pg_panel_probe[i].va;
++		}
+ 	}
+-	printf("POLARIS GPU: 18 the panel is mapped once at %#llx: %#llx + %u, %u bytes\n",
+-	    pg_panel_map, base, pg_panel_skew, (uint32_t)pg_panel_span);
+-	return true;
++	if (pg_panel_probes >= PG_PANEL_PROBES) {
++		printf("POLARIS GPU: 18 no probe slot left for row %u\n", row);
++		return 0;
++	}
++	/* The row plus its offset, rounded up: three pages for a 4320 stride. */
++	span = (vm_size_t)(((uint64_t)off + (uint64_t)stride + PG_GMU_PAGE_SIZE - 1u) &
++	    ~(uint64_t)(PG_GMU_PAGE_SIZE - 1u));
++	pg_panel_probe[pg_panel_probes].va = ml_io_map((vm_offset_t)base, span);
++	pg_panel_probe[pg_panel_probes].off = off;
++	pg_panel_probe[pg_panel_probes].row = row;
++	printf("POLARIS GPU: 18 row %u lives at %#llx + %u: %u bytes mapped at %#llx\n",
++	    row, base, off, (uint32_t)span, pg_panel_probe[pg_panel_probes].va);
++	pg_panel_probes++;
++	*offp = off;
++	return pg_panel_probe[pg_panel_probes - 1u].va;
+ }
+ 
+ static uint32_t
+ pg_panel_read(uint32_t row, uint32_t col, uint32_t stride)
+ {
+-	return ((volatile uint32_t *)(pg_panel_map + pg_panel_skew +
+-	    (uint64_t)row * (uint64_t)stride))[col];
++	uint32_t off = 0;
++	vm_offset_t va = pg_panel_row_va(row, stride, &off);
++
++	if (va == 0) {
++		return 0;
++	}
++	return ((volatile uint32_t *)(va + off + (uint64_t)col * 4u))[0];
+ }
+ 
+ /* Three pixels of one row: what they read, and what the CP was told to write. */
+@@ -4032,13 +4072,11 @@
+ 	printf("POLARIS GPU: 18 panel %#llx %ux%u stride %u: the whole thing, %u bytes, "
+ 	    "%u pages at iova %#llx\n", phys, width, height, stride, bytes, pages, PG_PANEL_IOVA);
+ 	/*
+-	 * Map it for the CPU before anything is written, and read the top row
+-	 * once: whatever is there now is what the rest of the system left on the
+-	 * surface, which is the baseline the readings below are measured against.
++	 * Read the top row before anything is written: whatever is there now is
++	 * what the rest of the system left on the surface, which is the baseline
++	 * the readings below are measured against.
+ 	 */
+-	if (!pg_panel_attach(phys, stride, height)) {
+-		return false;
+-	}
++	pg_panel_phys = phys;
+ 	pg_panel_show("before anything,", 0, width, height, stride);
+ 
+ 	/*
