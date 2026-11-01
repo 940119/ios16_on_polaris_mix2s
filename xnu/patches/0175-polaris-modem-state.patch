@@ -1,0 +1,335 @@
+diff -Nur a/bsd/dev/polaris_modem.c b/bsd/dev/polaris_modem.c
+--- a/bsd/dev/polaris_modem.c	2026-11-02 06:13:33.697350956 +0800
++++ b/bsd/dev/polaris_modem.c	2026-11-02 06:13:33.712644743 +0800
+@@ -28,11 +28,18 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/machine_routines.h>
++#include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
+ #include <mach/vm_param.h>
+ #include <libkern/libkern.h>
+ 
+ extern int sweet_ufs_raw_read(uint8_t lun, uint64_t lba, uint32_t count, void *to);
++extern void sweet_log_flush_now(void);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ #define MD_LUN			4
+ #define MD_PART_LBA		65536u		/* 0x10000000 bytes / 4096 */
+@@ -45,6 +52,7 @@
+  * a kilobyte of stack to read a directory. */
+ static uint8_t md_block[MD_BLOCK];
+ static uint8_t md_cluster[MD_MAX_CLUSTER];
++static int md_chan;		/* wait channel for the short sleeps below */
+ 
+ static struct {
+ 	uint32_t bps, spc, reserved, fats, root_ent, fatsz;
+@@ -205,15 +213,20 @@
+ 	printf("\n");
+ }
+ 
+-static bool
+-polaris_modem_requested(void)
++/*
++ * 0: nothing at all, 1: read the firmware (step 1), 2: also read the modem's
++ * own state (step 2). The level is the boot-arg's value, so one argument covers
++ * both steps and a boot can ask for either.
++ */
++static int
++polaris_modem_level(void)
+ {
+ 	int optin = 0;
+ 
+ 	if (!PE_parse_boot_argn("polarismodem", &optin, sizeof(optin))) {
+-		return false;
++		return 0;
+ 	}
+-	return optin == 1;
++	return optin;
+ }
+ 
+ void
+@@ -221,7 +234,7 @@
+ {
+ 	uint32_t total;
+ 
+-	if (!polaris_modem_requested()) {
++	if (polaris_modem_level() < 1) {
+ 		return;
+ 	}
+ 	printf("POLARIS MODEM: ======== build 0169 alive: reading the modem partition on "
+@@ -271,4 +284,246 @@
+ 	md_walk(md_image_cluster, md_image_entry, NULL);
+ 	printf("POLARIS MODEM: read only; nothing was written\n");
+ }
++
++/*
++ * Step 2: is the modem already running?
++ *
++ * Step 1 proved the firmware can be read. That only matters if it has to be
++ * loaded, and the boot loader may well have loaded it already - the ABL is the
++ * thing that normally brings the modem up, and on this phone it is untouched.
++ * The answer decides what the rest of this line costs:
++ *
++ *   the boot FSM finished (MSS_STATUS bit 0)  the modem is up and the work is
++ *                                             talking to it: QMI over SMEM,
++ *                                             which is where the Wi-Fi line's
++ *                                             GLINK already points
++ *   PBL never ran                             nothing has loaded it, and the
++ *                                             AP would have to do the whole
++ *                                             PIL job: authenticate the MBA,
++ *                                             hand it the metadata, and wait
++ *                                             on a boot FSM. That is a large
++ *                                             piece of work, and it needs the
++ *                                             TrustZone side too.
++ *
++ * Everything here is a register read, in the order Linux reads them, with one
++ * exception: the MSS AHB clock has to be running before its registers can be
++ * read at all, so the three clock branches the Q6 needs are switched on first.
++ * That is the same kind of write the USB and GPU probes already do, on a block
++ * that is always powered.
++ *
++ * The addresses and the offsets are not guesses. The device tree for sdm845
++ * puts the Q6 control block at 0x04080000 and the RMB - the register block the
++ * boot ROM and the MBA report through - at 0x04180000, and the offsets and the
++ * status values below come from drivers/remoteproc/qcom_q6v5_mss.c:
++ *
++ *	RMB_MBA_IMAGE_REG	0x00	RMB_PBL_STATUS_REG	0x04
++ *	RMB_MBA_COMMAND_REG	0x08	RMB_MBA_STATUS_REG	0x0c
++ *	RMB_PMI_META_DATA_REG	0x10	RMB_PMI_CODE_START_REG	0x14
++ *	RMB_PMI_CODE_LENGTH_REG	0x18	RMB_MBA_MSS_STATUS	0x40
++ *	RMB_MBA_ALT_RESET	0x44
++ *
++ * Boot with polarismodem=2 to run it, and with =1 to run only step 1.
++ */
++#define MD_GCC_PHYS		0x00100000ull
++#define MD_GCC_SIZE		0x00090000ull
++#define MD_Q6_PHYS		0x04080000ull
++#define MD_RMB_PHYS		0x04180000ull
++#define MD_MAP_SIZE		0x00001000ull
++
++#define MD_CBCR_OFF		(1u << 31)	/* branch halted, i.e. the clock is off */
++
++struct md_reg {
++	uint32_t off;
++	const char *name;
++};
++
++static const struct md_reg md_clocks[] = {
++	{ 0x8a000, "mss_cfg_ahb" },
++	{ 0x38004, "boot_rom_ahb" },
++	{ 0x8a004, "mss_mfab_axis" },
++	{ 0x8a150, "mss_snoc_axi" },
++	{ 0x8a154, "mss_q6_memnoc_axi" },
++};
++
++#define MD_GCC_APPS_VOTE	0x52004		/* bit 17: GPLL0 to the modem */
++#define MD_GCC_MSS_CFG_AHB	0x8a000
++#define MD_GCC_BOOT_ROM_AHB	0x38004
++
++static const struct md_reg md_rmb[] = {
++	{ 0x00, "MBA_IMAGE" },
++	{ 0x04, "PBL_STATUS" },
++	{ 0x08, "MBA_COMMAND" },
++	{ 0x0c, "MBA_STATUS" },
++	{ 0x10, "PMI_META_DATA" },
++	{ 0x14, "PMI_CODE_START" },
++	{ 0x18, "PMI_CODE_LENGTH" },
++	{ 0x40, "MBA_MSS_STATUS" },
++	{ 0x44, "MBA_ALT_RESET" },
++};
++
++static const struct md_reg md_q6[] = {
++	{ 0x014, "QDSP6SS_RESET" },
++	{ 0x020, "QDSP6SS_GFMUX_CTL" },
++	{ 0x030, "QDSP6SS_PWR_CTL" },
++	{ 0x0b0, "QDSP6SS_MEM_PWR_CTL" },
++	{ 0x110, "QDSP6SS_STRAP_ACC" },
++	{ 0x400, "QDSP6SS_BOOT_CORE_START" },
++	{ 0x404, "QDSP6SS_BOOT_CMD" },
++};
++
++static uint32_t
++md_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(void *)(base + off);
++}
++
++static void
++md_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(void *)(base + off) = v;
++}
++
++static void
++md_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&md_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Switch a clock branch on and say whether it came up. */
++static void
++md_clock_on(vm_offset_t gcc, uint32_t off, const char *name)
++{
++	uint32_t before = md_rd(gcc, off);
++
++	if (!(before & MD_CBCR_OFF) && (before & 1u)) {
++		printf("POLARIS MODEM: %-18s 0x%05x already on (0x%08x)\n", name, off, before);
++		return;
++	}
++	md_wr(gcc, off, before | 1u);
++	for (unsigned i = 0; i < 20u; i++) {
++		uint32_t v = md_rd(gcc, off);
++
++		if (!(v & MD_CBCR_OFF)) {
++			printf("POLARIS MODEM: %-18s 0x%05x 0x%08x -> 0x%08x on\n", name, off,
++			    before, v);
++			return;
++		}
++		md_sleep_ms(1);
++	}
++	printf("POLARIS MODEM: %-18s 0x%05x 0x%08x -> 0x%08x STILL HALTED\n", name, off,
++	    before, md_rd(gcc, off));
++}
++
++static void
++md_dump_clocks(vm_offset_t gcc, const char *when)
++{
++	for (unsigned i = 0; i < sizeof(md_clocks) / sizeof(md_clocks[0]); i++) {
++		uint32_t v = md_rd(gcc, md_clocks[i].off);
++
++		printf("POLARIS MODEM: %s %-18s 0x%05x = 0x%08x %s\n", when, md_clocks[i].name,
++		    md_clocks[i].off, v, (v & MD_CBCR_OFF) ? "OFF" : "on");
++	}
++	{
++		uint32_t v = md_rd(gcc, MD_GCC_APPS_VOTE);
++
++		printf("POLARIS MODEM: %s apps vote          0x%05x = 0x%08x "
++		    "(mss gpll0 div %s)\n", when, MD_GCC_APPS_VOTE, v,
++		    (v & (1u << 17)) ? "voted" : "not voted");
++	}
++}
++
++/*
++ * The four values the MBA reports as it goes, in the order it reports them.
++ * Anything outside that list is printed as a raw number rather than dressed up.
++ */
++static const char *
++md_mba_status_name(uint32_t v)
++{
++	switch (v) {
++	case 0: return "nothing yet: the MBA has not run";
++	case 1: return "XPU unlocked";
++	case 2: return "XPU unlocked, memory scribbled";
++	case 3: return "metadata authenticated";
++	case 4: return "AUTH COMPLETE";
++	default: return "not a value this reader knows";
++	}
++}
++
++void
++polaris_modem_state_probe(void)
++{
++	vm_offset_t gcc, rmb, q6;
++	uint32_t pbl, mba, mss;
++
++	if (polaris_modem_level() < 2) {
++		return;
++	}
++	printf("POLARIS MODEM: ======== build 0175 alive: the modem's own state, "
++	    "registers only, nothing is loaded ========\n");
++	sweet_log_flush_now();
++
++	gcc = ml_io_map(MD_GCC_PHYS, MD_GCC_SIZE);
++	if (gcc == 0) {
++		printf("POLARIS MODEM: GCC did not map\n");
++		return;
++	}
++	md_dump_clocks(gcc, "before");
++	md_clock_on(gcc, MD_GCC_MSS_CFG_AHB, "mss_cfg_ahb");
++	md_clock_on(gcc, MD_GCC_BOOT_ROM_AHB, "boot_rom_ahb");
++	{
++		uint32_t v = md_rd(gcc, MD_GCC_APPS_VOTE);
++
++		md_wr(gcc, MD_GCC_APPS_VOTE, v | (1u << 17));
++		printf("POLARIS MODEM: apps vote          0x%05x 0x%08x -> 0x%08x "
++		    "(mss gpll0 div voted)\n", MD_GCC_APPS_VOTE, v,
++		    md_rd(gcc, MD_GCC_APPS_VOTE));
++	}
++	md_dump_clocks(gcc, "after");
++	sweet_log_flush_now();
++
++	/*
++	 * From here the reads go into the modem's own blocks. The clock above is
++	 * what makes them readable at all; if a read still stalls, the line
++	 * before it says which one, and the ring was flushed a moment ago.
++	 */
++	rmb = ml_io_map(MD_RMB_PHYS, MD_MAP_SIZE);
++	if (rmb == 0) {
++		printf("POLARIS MODEM: the RMB at %#llx did not map\n", MD_RMB_PHYS);
++		return;
++	}
++	printf("POLARIS MODEM: RMB at %#llx, reading\n", MD_RMB_PHYS);
++	for (unsigned i = 0; i < sizeof(md_rmb) / sizeof(md_rmb[0]); i++) {
++		printf("POLARIS MODEM:   %-18s +0x%02x reading\n", md_rmb[i].name, md_rmb[i].off);
++		printf("POLARIS MODEM:   %-18s +0x%02x = 0x%08x\n", md_rmb[i].name,
++		    md_rmb[i].off, md_rd(rmb, md_rmb[i].off));
++	}
++	pbl = md_rd(rmb, 0x04);
++	mba = md_rd(rmb, 0x0c);
++	mss = md_rd(rmb, 0x40);
++
++	printf("POLARIS MODEM: the boot ROM %s (PBL_STATUS 0x%x)\n",
++	    pbl ? "ran and handed over" : "never ran", pbl);
++	printf("POLARIS MODEM: the MBA: %s (MBA_STATUS 0x%x)\n", md_mba_status_name(mba), mba);
++	printf("POLARIS MODEM: boot FSM %s (MSS_STATUS 0x%x, bit 0 %d)\n",
++	    (mss & 1u) ? "FINISHED - the modem is up" : "did not finish", mss, mss & 1u);
++	sweet_log_flush_now();
++
++	q6 = ml_io_map(MD_Q6_PHYS, MD_MAP_SIZE);
++	if (q6 == 0) {
++		printf("POLARIS MODEM: the Q6 block at %#llx did not map\n", MD_Q6_PHYS);
++		return;
++	}
++	printf("POLARIS MODEM: Q6 control at %#llx, reading (this is the block that "
++	    "can stall when it is powered down)\n", MD_Q6_PHYS);
++	for (unsigned i = 0; i < sizeof(md_q6) / sizeof(md_q6[0]); i++) {
++		printf("POLARIS MODEM:   %-24s +0x%03x reading\n", md_q6[i].name, md_q6[i].off);
++		printf("POLARIS MODEM:   %-24s +0x%03x = 0x%08x\n", md_q6[i].name,
++		    md_q6[i].off, md_rd(q6, md_q6[i].off));
++	}
++	printf("POLARIS MODEM: read only; nothing was written to the modem\n");
++}
+ #endif
+diff -Nur a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-02 06:13:33.690076750 +0800
++++ b/bsd/dev/sweet_ufs.c	2026-11-02 06:13:33.705548591 +0800
+@@ -62,6 +62,7 @@
+ extern void polaris_wifi_probe(void);
+ extern void polaris_qmp_probe(void);
+ extern void polaris_modem_probe(void);
++extern void polaris_modem_state_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -737,6 +738,12 @@
+ 	 */
+ 	polaris_modem_probe();
+ 	/*
++	 * Modem step 2: is the modem already running? Registers only, off unless
++	 * polarismodem=2. It switches the MSS AHB clock on first, because the RMB
++	 * cannot be read without it, and that is the only write it makes.
++	 */
++	polaris_modem_state_probe();
++	/*
+ 	 * Last, and off unless polarisgpuprobe=2. Build 0102 showed why: the
+ 	 * first read of the GPU clock controller parks the calling thread in the
+ 	 * interconnect for good while the rest of the system keeps running, so
