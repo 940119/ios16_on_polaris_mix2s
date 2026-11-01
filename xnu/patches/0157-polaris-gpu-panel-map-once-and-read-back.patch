@@ -1,0 +1,298 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-01 20:03:02.362776571 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-01 20:03:02.389781371 +0800
+@@ -17,7 +17,6 @@
+ #include <mach/mach_time.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ 
+ extern bool polaris_touch_i2c_board(void);
+ 
+@@ -3874,78 +3873,130 @@
+ }
+ 
+ /*
+- * Read a handful of pixels back through the CPU.
++ * Read pixels back through the CPU.
+  *
+- * Three rows near the top and three near the bottom, three columns each. The
+- * bottom rows matter as much as the top ones: they are in a different level 2
+- * entry of the CP's window, so they are the only evidence that the window
+- * really is five level 3 pages and not just the first one.
+- *
+- * ml_io_map wants a page-aligned physical address, and a row start is not one
+- * (stride 4320), so each probe is mapped from the page below it and read at an
+- * offset.
+- */
+-static bool
+-pg_panel_verify(uint64_t phys, uint32_t width, uint32_t height, uint32_t stride,
+-    uint32_t written_rows)
+-{
+-	uint32_t rows[6], cols[3];
+-	uint32_t probes = 3, wrong = 0, checked = 0;
+-
+-	rows[0] = 0;
+-	rows[1] = 1;
+-	rows[2] = 7;
+-	/*
+-	 * Build 0155 stopped the fill at 83% and then verified nothing, so a
+-	 * panel that was three quarters right looked exactly like a panel that
+-	 * was not written at all. Probe the last rows that are known to have
+-	 * been written instead of the last rows of the panel: a partial fill is
+-	 * still evidence, and it names where the command processor stopped.
+-	 */
+-	if (written_rows >= 16u) {
+-		rows[3] = written_rows - 8u;
+-		rows[4] = written_rows - 2u;
+-		rows[5] = written_rows - 1u;
+-		probes = 6;
++ * Build 0155 verified nothing when the fill did not finish, so a panel that was
++ * three quarters right looked exactly like a panel that had never been written.
++ * Build 0156 fixed that and then panicked before it printed its summary:
++ *
++ *   va_map_delete(0xfffffe1086419e98, 0xfffffe460dbc000, 0xfffffe460dcbc000):
++ *       Attempting to remove permanent VM map entry
++ *       0xfffffe108641f970 [0xfffffe460db10000:0xfffffe460dcbc000)
++ *
++ * ml_io_map() hands back an entry the vm map marks permanent, so ml_io_unmap()
++ * may not delete any part of it - not the whole entry and not a tail of it. A
++ * boot probe that leaks ten megabytes of device address space is cheaper than
++ * one that panics, so the panel is mapped once here and never released.
++ *
++ * The mapping is not the only thing 0156 got wrong. Every pixel it managed to
++ * report read 0xff000000 - opaque black - while the values it compared against
++ * (0xff0000ff, 0xff007f80, 0xff00ff00) are exactly what pg_panel_pixel() says
++ * the command processor was told to write. So the question is not whether the
++ * arithmetic is right but where the black came from: the surface belongs to the
++ * window server by this point in the boot, and the fill takes seconds, which is
++ * ample time for the rows written first to be painted over.
++ *
++ * Hence three readings of the same three pixels: before the fill, microseconds
++ * after one row is written again, and one second after that. If the first is
++ * black and the second is ours, the panel was repainted and the write landed.
++ * If the second is black too, the CPU is not looking at the surface the CP
++ * wrote and no amount of waiting will help.
++ */
++static vm_offset_t pg_panel_map;
++static uint32_t pg_panel_skew;
++static vm_size_t pg_panel_span;
++
++static bool
++pg_panel_attach(uint64_t phys, uint32_t stride, uint32_t height)
++{
++	uint64_t bytes = (uint64_t)stride * (uint64_t)height;
++	uint64_t base = phys & ~(uint64_t)(PG_GMU_PAGE_SIZE - 1u);
++
++	if (pg_panel_map != 0) {
++		return true;
+ 	}
++	/*
++	 * The console's base is page aligned on this panel, but carrying the
++	 * skew costs nothing and a dropped skew would put every read one row
++	 * out without any number looking obviously wrong.
++	 */
++	pg_panel_skew = (uint32_t)(phys - base);
++	pg_panel_span = (vm_size_t)(((uint64_t)pg_panel_skew + bytes +
++	    PG_GMU_PAGE_SIZE - 1u) & ~(uint64_t)(PG_GMU_PAGE_SIZE - 1u));
++	pg_panel_map = ml_io_map((vm_offset_t)base, pg_panel_span);
++	if (pg_panel_map == 0) {
++		printf("POLARIS GPU: 18 the panel at %#llx will not map\n", phys);
++		return false;
++	}
++	printf("POLARIS GPU: 18 the panel is mapped once at %#llx: %#llx + %u, %u bytes\n",
++	    pg_panel_map, base, pg_panel_skew, (uint32_t)pg_panel_span);
++	return true;
++}
++
++static uint32_t
++pg_panel_read(uint32_t row, uint32_t col, uint32_t stride)
++{
++	return ((volatile uint32_t *)(pg_panel_map + pg_panel_skew +
++	    (uint64_t)row * (uint64_t)stride))[col];
++}
++
++/* Three pixels of one row: what they read, and what the CP was told to write. */
++static uint32_t
++pg_panel_show(const char *when, uint32_t row, uint32_t width, uint32_t height,
++    uint32_t stride)
++{
++	uint32_t cols[3], got[3], want[3], same = 0;
++
+ 	cols[0] = 0;
+ 	cols[1] = width / 2u;
+ 	cols[2] = width - 1u;
++	for (uint32_t i = 0; i < 3; i++) {
++		got[i] = pg_panel_read(row, cols[i], stride);
++		want[i] = pg_panel_pixel(row, cols[i], width, height);
++		if (got[i] == want[i]) {
++			same++;
++		}
++	}
++	printf("POLARIS GPU: 18 %s row %u: reads %#010x %#010x %#010x, wanted "
++	    "%#010x %#010x %#010x\n", when, row, got[0], got[1], got[2],
++	    want[0], want[1], want[2]);
++	return same;
++}
+ 
+-	for (uint32_t r = 0; r < probes; r++) {
+-		uint64_t at = phys + (uint64_t)rows[r] * stride;
+-		uint64_t base = at & ~(uint64_t)(PG_GMU_PAGE_SIZE - 1u);
+-		uint32_t off = (uint32_t)(at - base);
+-		vm_size_t span = (vm_size_t)((off + stride + PG_GMU_PAGE_SIZE - 1u) &
+-		    ~(vm_size_t)(PG_GMU_PAGE_SIZE - 1u));
+-		vm_offset_t va = ml_io_map((vm_offset_t)base, span);
++/*
++ * One row, one packet, one drain. That is the shortest gap this code can put
++ * between "the CP was told to write this" and "the CPU read it", and the gap is
++ * what decides whether the reading means anything on a surface the rest of the
++ * system is drawing on.
++ */
++static bool
++pg_panel_write_row(uint32_t row, uint32_t width, uint32_t height, uint32_t stride)
++{
++	uint32_t wptr = pg_cp_wptr, rptr = 0, per_row = stride / 4u;
++	uint64_t addr = PG_PANEL_IOVA + (uint64_t)row * (uint64_t)stride;
+ 
+-		if (va == 0) {
+-			printf("POLARIS GPU: 18 could not map row %u to read it back\n", rows[r]);
+-			return false;
+-		}
+-		for (uint32_t c = 0; c < 3; c++) {
+-			uint32_t got = ((volatile uint32_t *)(va + off + cols[c] * 4u))[0];
+-			uint32_t want = pg_panel_pixel(rows[r], cols[c], width, height);
+-
+-			checked++;
+-			if (got != want) {
+-				wrong++;
+-				if (wrong <= 6) {
+-					printf("POLARIS GPU: 18 row %u col %u reads %#010x, the CP "
+-					    "was told to write %#010x\n", rows[r], cols[c], got, want);
+-				}
+-			}
++	pg_ring_put(wptr++, pg_pkt7(PG_CP_MEM_WRITE, per_row + 2u));
++	pg_ring_put(wptr++, (uint32_t)addr);
++	pg_ring_put(wptr++, (uint32_t)(addr >> 32));
++	for (uint32_t i = 0; i < per_row; i++) {
++		pg_ring_put(wptr++, pg_panel_pixel(row, i, width, height));
++	}
++	wptr &= PG_RING_WORDS - 1u;
++	pg_ring_flush();
++	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < 100000; i++) {
++		rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
++		if (rptr == wptr) {
++			pg_cp_wptr = wptr;
++			return true;
+ 		}
+-		ml_io_unmap(va, span);
++		pg_sleep_us(10);
+ 	}
+-	printf("POLARIS GPU: 18 read %u pixels back through the CPU: %u wrong "
+-	    "(rows %u %u %u%s%u %u %u; columns 0, %u and %u)\n",
+-	    checked, wrong, rows[0], rows[1], rows[2],
+-	    probes == 6 ? ", " : "",
+-	    probes == 6 ? rows[3] : 0, probes == 6 ? rows[4] : 0, probes == 6 ? rows[5] : 0,
+-	    width / 2u, width - 1u);
+-	return wrong == 0;
++	printf("POLARIS GPU: 18 rewriting row %u did not drain: RPTR %u WPTR %u, "
++	    "RBBM_STATUS %#010x\n", row, rptr, wptr,
++	    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++	return false;
+ }
+ 
+ static bool
+@@ -3979,6 +4030,16 @@
+ 	words = bytes / 4u;
+ 	printf("POLARIS GPU: 18 panel %#llx %ux%u stride %u: the whole thing, %u bytes, "
+ 	    "%u pages at iova %#llx\n", phys, width, height, stride, bytes, pages, PG_PANEL_IOVA);
++	/*
++	 * Map it for the CPU before anything is written, and read the top row
++	 * once: whatever is there now is what the rest of the system left on the
++	 * surface, which is the baseline the readings at the end are measured
++	 * against.
++	 */
++	if (!pg_panel_attach(phys, stride, height)) {
++		return false;
++	}
++	pg_panel_show("before the fill,", 0, width, height, stride);
+ 
+ 	/*
+ 	 * Map the whole panel. The panel's first page is the one the display
+@@ -4049,12 +4110,29 @@
+ 					pg_sleep_us(10);
+ 				}
+ 				if (!drained) {
++					vm_offset_t cb = pg_smmu_cb(PG_GMU_CTX);
++
+ 					printf("POLARIS GPU: 18 the CP stalled at %u of %u dwords "
+ 					    "(%u%%) after %u submissions: RPTR %u WPTR %u, "
+ 					    "RBBM_STATUS %#010x; keeping what landed\n",
+ 					    sent, words, (uint32_t)((uint64_t)sent * 100u / words),
+ 					    batches, rptr, pg_rd(pg_gpu3d + 4u * PG_CP_RB_WPTR),
+ 					    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++					/*
++					 * Build 0155 stopped at 83% and 0156 at 65%,
++					 * which is what a race looks like and also
++					 * what a fault looks like. The context bank
++					 * tells them apart: a translation fault leaves
++					 * FSR non-zero and FAR pointing at the address
++					 * the CP could not reach, and a stopped stream
++					 * leaves both at zero.
++					 */
++					printf("POLARIS GPU: 18 context bank %u FSR %#010x "
++					    "FSYNR0 %#010x FAR %#010x%08x INT_0_STATUS "
++					    "%#010x\n", PG_GMU_CTX, pg_rd(cb + PG_CB_FSR),
++					    pg_rd(cb + 0x5c), pg_rd(cb + 0x64),
++					    pg_rd(cb + 0x60),
++					    pg_rd(pg_gpu3d + 4u * PG_RBBM_INT_STATUS));
+ 					stalled = true;
+ 				}
+ 			}
+@@ -4071,15 +4149,41 @@
+ 	{
+ 		uint32_t per_row = stride / 4u;
+ 		uint32_t written_rows = sent / per_row;
++		uint32_t fresh;
+ 
+ 		if (written_rows > height) {
+ 			written_rows = height;
+ 		}
+-		if (written_rows > 0) {
+-			ok = pg_panel_verify(phys, width, height, stride, written_rows);
+-		} else {
++		if (written_rows == 0) {
+ 			printf("POLARIS GPU: 18 nothing was written, so there is nothing to read back\n");
+-			ok = false;
++			return false;
++		}
++		/*
++		 * Row 0 was written first, so it has had the longest time to be
++		 * repainted. The last row that landed is the one that was written
++		 * a moment ago, and it is also in a different level 2 entry of the
++		 * CP's window, so it is the only evidence that the window really
++		 * is five level 3 pages and not just the first one.
++		 */
++		pg_panel_show("after the fill,", 0, width, height, stride);
++		if (written_rows >= 16u) {
++			pg_panel_show("after the fill,", written_rows - 1u, width, height, stride);
++		}
++		if (!pg_panel_write_row(0, width, height, stride)) {
++			return false;
++		}
++		fresh = pg_panel_show("a moment after rewriting", 0, width, height, stride);
++		for (uint32_t i = 0; i < 100u; i++) {
++			pg_sleep_us(10000);
++		}
++		pg_panel_show("one second later,", 0, width, height, stride);
++		ok = (fresh == 3);
++		if (ok) {
++			printf("POLARIS GPU: 18 the CP's writes are in the memory the display scans "
++			    "out, and the CPU reads them back within microseconds\n");
++		} else {
++			printf("POLARIS GPU: 18 a row written microseconds ago still does not read "
++			    "back: the CPU's view of %#llx is not the surface the CP wrote\n", phys);
+ 		}
+ 	}
+ 	return ok;
