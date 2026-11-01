@@ -1,21 +1,27 @@
 diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
---- a/bsd/dev/polaris_gpu.c	2026-11-02 02:22:30.957437113 +0800
-+++ b/bsd/dev/polaris_gpu.c	2026-11-02 02:22:30.997771913 +0800
-@@ -3394,6 +3394,13 @@
+--- a/bsd/dev/polaris_gpu.c	2026-11-02 02:29:53.230941668 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-02 02:29:53.278411168 +0800
+@@ -3394,6 +3394,19 @@
  #define PG_ZAP_REGION_SIZE	0x2000u
  #define PG_CP_SET_SECURE_MODE	0x66u
  #define PG_CP_MEM_WRITE		0x3du
 +/*
-+ * CP_DMA: the command processor's own copy engine, five words after the header
-+ * (source, destination, byte count). Filling is only half of what the panel
-+ * needs - present() copies a surface onto it - and a fill cannot copy, so this
-+ * is the packet that has to work before any of that is worth wiring up.
++ * The two packets that can move bytes. Filling is only half of what the panel
++ * needs - present() copies a surface onto it, and a fill cannot copy - so one
++ * of these has to work before any of it is worth wiring up.
++ *
++ * CP_DMA is the command processor's own copy engine, five words after the
++ * header: source, destination, byte count. CP_MEM_TO_MEM is the older packet
++ * that does the same job and takes the same five words in an order the two
++ * references disagree about, which is why step 18b tries both orders rather
++ * than believing one.
 + */
 +#define PG_CP_DMA		0x41u
++#define PG_CP_MEM_TO_MEM	0x73u
  #define PG_MEMPTRS_IOVA		0x10010000ull
  
  /* 8 x 4 KB of ring, which is what RB_CNTL below was set up for in step 15 */
-@@ -4026,6 +4033,40 @@
+@@ -4026,6 +4039,40 @@
  }
  
  /*
@@ -56,37 +62,45 @@ diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
   * One row, one packet, one drain. That is the shortest gap this code can put
   * between "the CP was told to write this" and "the CPU read it", and the gap is
   * what decides whether the reading means anything on a surface the rest of the
-@@ -4232,6 +4273,115 @@
+@@ -4232,6 +4279,144 @@
  	return sent;
  }
  
 +/*
-+ * One CP_DMA copy, waited for.
++ * One command-processor copy, waited for.
 + *
-+ * `dst` and `src` are addresses in the 3D core's window, which is the only
-+ * address space the command processor walks. The byte count must be a multiple
-+ * of four and the two ends must not overlap.
++ * Two packets can move bytes on this command processor and the phone is asked
++ * both in one boot, because which one it takes is not something worth spending
++ * a build on finding out:
 + *
-+ * The encoding is the one Linux uses for the same packet on the same command
-+ * processor (amdgpu_vm_copy_pte: header, source, destination, byte count), with
-+ * the header built by this file's pg_pkt7() because that is the packet type the
-+ * CP here takes - CP_MEM_WRITE has been going through it since step 15.
++ *	CP_DMA		0x41	five words: source, destination, byte count
++ *	CP_MEM_TO_MEM	0x73	five words as well, and the references that
++ *				describe it disagree about which address comes
++ *				first, so both orders are tried
 + *
-+ * The wait is the same one the fill uses: the read pointer has to come back to
-+ * the write pointer before the data can be read. A copy that does not drain is
-+ * reported rather than waited on forever, and the caller decides what it means.
++ * `first` and `second` are written in the order the caller believes the packet
++ * wants them. Both are addresses in the 3D core's window, which is the only
++ * address space the command processor walks; the byte count must be a multiple
++ * of four.
++ *
++ * The wait is the fill's: the read pointer has to come back to the write
++ * pointer. Those are two different failures and the return value separates
++ * them - a copy that lands wrong is a wrong encoding, a command processor that
++ * stops taking words is a stopped command processor, and after the second one
++ * nothing else may be submitted.
 + */
 +static bool
-+pg_dma_copy(uint64_t dst, uint64_t src, uint32_t bytes, uint32_t *wptrp)
++pg_dma_copy(uint32_t opcode, uint64_t first, uint64_t second, uint32_t bytes,
++    uint32_t *wptrp)
 +{
 +	uint32_t wptr = *wptrp, rptr = 0;
 +	bool drained = false;
 +
-+	pg_ring_put(wptr++, pg_pkt7(PG_CP_DMA, 5));
-+	pg_ring_put(wptr++, (uint32_t)src);
-+	pg_ring_put(wptr++, (uint32_t)(src >> 32));
-+	pg_ring_put(wptr++, (uint32_t)dst);
-+	pg_ring_put(wptr++, (uint32_t)(dst >> 32));
++	pg_ring_put(wptr++, pg_pkt7(opcode, 5));
++	pg_ring_put(wptr++, (uint32_t)first);
++	pg_ring_put(wptr++, (uint32_t)(first >> 32));
++	pg_ring_put(wptr++, (uint32_t)second);
++	pg_ring_put(wptr++, (uint32_t)(second >> 32));
 +	pg_ring_put(wptr++, bytes);
 +	wptr &= PG_RING_WORDS - 1u;
 +	pg_ring_flush();
@@ -101,8 +115,8 @@ diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
 +		pg_sleep_us(10);
 +	}
 +	if (!drained) {
-+		printf("POLARIS GPU: 18b the CP did not take the copy packet: RPTR %u WPTR %u, "
-+		    "RBBM_STATUS %#010x\n", rptr, wptr,
++		printf("POLARIS GPU: 18b the CP stopped at the copy packet (opcode %#x): RPTR "
++		    "%u WPTR %u, RBBM_STATUS %#010x\n", opcode, rptr, wptr,
 +		    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
 +	}
 +	*wptrp = wptr;
@@ -117,62 +131,83 @@ diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
 + * difference between "the CP is a paintbrush" and "the CP can present a frame".
 + *
 + * Row 0 is the source because the fill above has just written a known ramp into
-+ * it, and row 100 is the destination because it is far enough away to be a
-+ * different page and close enough that nothing else has touched it. Both rows
-+ * are read by the CPU before and after, so the comparison does not depend on
-+ * what the ramp happens to be.
++ * it. Each attempt gets its own destination row, so a failed attempt cannot be
++ * mistaken for a successful one, and every row is read by the CPU before and
++ * after, so the comparison never depends on what the ramp happens to be.
++ *
++ * The attempts stop at the first one that stops the command processor: after
++ * that the ring is wedged and any further packet would be read as data.
 + *
 + * Off unless polarisgpudma=1: it writes, and the fill above it is already the
 + * step's verdict.
 + */
++struct pg_dma_try {
++	uint32_t opcode;
++	bool dst_first;
++	uint32_t row;
++	const char *what;
++};
++
 +static void
 +pg_dma_test(uint32_t width, uint32_t height, uint32_t stride)
 +{
++	static const struct pg_dma_try tries[] = {
++		{ PG_CP_DMA,        false, 100, "CP_DMA, source then destination" },
++		{ PG_CP_MEM_TO_MEM, true,  101, "CP_MEM_TO_MEM, destination then source" },
++		{ PG_CP_MEM_TO_MEM, false, 102, "CP_MEM_TO_MEM, source then destination" },
++	};
 +	static uint32_t before[2048], after[2048];
-+	uint32_t row = 0, dstrow = 100, words = width, wptr = pg_cp_wptr, i;
-+	uint64_t src, dst;
-+	bool drained;
++	uint32_t words = width, wptr = pg_cp_wptr;
++	uint64_t src = PG_PANEL_IOVA;
 +
-+	if (height <= dstrow || width > 2048u || stride < width * 4u) {
-+		printf("POLARIS GPU: 18b a %ux%u panel is not one this test fits\n", width, height);
++	if (width > 2048u || stride < width * 4u || height <= 104u) {
++		printf("POLARIS GPU: 18b a %ux%u panel is not one this test fits\n", width,
++		    height);
 +		return;
 +	}
-+	src = PG_PANEL_IOVA;
-+	dst = PG_PANEL_IOVA + (uint64_t)dstrow * stride;
-+	printf("POLARIS GPU: 18b copying row %u (%#llx) to row %u (%#llx), %u bytes, with "
-+	    "CP_DMA\n", row, src, dstrow, dst, words * 4u);
++	if (!pg_panel_peek(0, before, words, stride)) {
++		printf("POLARIS GPU: 18b row 0 did not read; there is nothing to copy\n");
++		return;
++	}
++	for (uint32_t t = 0; t < sizeof(tries) / sizeof(tries[0]); t++) {
++		const struct pg_dma_try *plan = &tries[t];
++		uint64_t dst = PG_PANEL_IOVA + (uint64_t)plan->row * stride;
++		uint32_t i;
 +
-+	if (!pg_panel_peek(row, before, words, stride)) {
-+		printf("POLARIS GPU: 18b row %u did not read\n", row);
-+		return;
-+	}
-+	drained = pg_dma_copy(dst, src, words * 4u, &wptr);
-+	pg_cp_wptr = wptr;
-+	if (!drained) {
-+		return;
-+	}
-+	if (!pg_panel_peek(dstrow, after, words, stride)) {
-+		printf("POLARIS GPU: 18b row %u did not read\n", dstrow);
-+		return;
-+	}
-+	for (i = 0; i < words; i++) {
-+		if (after[i] != before[i]) {
-+			break;
++		printf("POLARIS GPU: 18b attempt %u: %s, row 0 (%#llx) to row %u (%#llx), "
++		    "%u bytes\n", t + 1u, plan->what, src, plan->row, dst, words * 4u);
++		if (!pg_dma_copy(plan->opcode, plan->dst_first ? dst : src,
++		    plan->dst_first ? src : dst, words * 4u, &wptr)) {
++			pg_cp_wptr = wptr;
++			printf("POLARIS GPU: 18b stopping here: the ring is wedged\n");
++			return;
 +		}
++		pg_cp_wptr = wptr;
++		if (!pg_panel_peek(plan->row, after, words, stride)) {
++			printf("POLARIS GPU: 18b row %u did not read back\n", plan->row);
++			continue;
++		}
++		for (i = 0; i < words; i++) {
++			if (after[i] != before[i]) {
++				break;
++			}
++		}
++		if (i == words) {
++			printf("POLARIS GPU: 18b THE CP COPIED THE ROW: %s moved %u dwords "
++			    "from row 0 to row %u, and the CPU reads them back\n", plan->what,
++			    words, plan->row);
++			return;
++		}
++		printf("POLARIS GPU: 18b %s did not land: word %u reads %08x, row 0 has "
++		    "%08x\n", plan->what, i, after[i], before[i]);
 +	}
-+	if (i == words) {
-+		printf("POLARIS GPU: 18b THE CP COPIED THE ROW: %u dwords from row %u to row %u, "
-+		    "and the CPU reads them back\n", words, row, dstrow);
-+	} else {
-+		printf("POLARIS GPU: 18b the copy did not land: first word that differs is %u "
-+		    "(%08x, wanted %08x)\n", i, after[i], before[i]);
-+	}
++	printf("POLARIS GPU: 18b neither copy packet moved the row\n");
 +}
 +
  static bool
  pg_step_panel(void)
  {
-@@ -4380,7 +4530,7 @@
+@@ -4380,7 +4565,7 @@
  		 */
  		uint32_t sent_top, sent_bottom, end_top, end_bottom;
  		uint32_t want = band;
@@ -181,7 +216,7 @@ diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
  
  		/*
  		 * polarisgpufill=1 asks for the whole nine megabytes instead of the
-@@ -4430,6 +4580,20 @@
+@@ -4430,6 +4615,20 @@
  			printf("POLARIS GPU: 18 THE CP WROTE %s OF THE PANEL: %u dwords, and the CPU "
  			    "reads the pixels back\n", fill_all ? "ALL" : "BOTH ENDS", sent_top);
  		}
