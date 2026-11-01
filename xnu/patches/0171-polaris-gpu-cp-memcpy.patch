@@ -1,0 +1,256 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-02 03:17:53.993025480 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-02 03:17:54.145800980 +0800
+@@ -3394,6 +3394,27 @@
+ #define PG_ZAP_REGION_SIZE	0x2000u
+ #define PG_CP_SET_SECURE_MODE	0x66u
+ #define PG_CP_MEM_WRITE		0x3du
++/*
++ * The one packet on this command processor that copies a block.
++ *
++ * Five words after the header, and the order is count first, then the two
++ * addresses - not the other way round, which is what build 0170 sent:
++ *
++ *	word 0	how many dwords to copy, not bytes
++ *	word 1	source low
++ *	word 2	source high
++ *	word 3	destination low
++ *	word 4	destination high
++ *
++ * 0170 asked for the copy with 0x41 and 0x73 instead. 0x41 is CP_EXEC_CS_INDIRECT,
++ * an indirect compute dispatch, and 0x73 is CP_MEM_TO_MEM, which is not a copy at
++ * all: it is the scatter-accumulate packet the occlusion queries use, and it
++ * writes dst = src_a + src_b + src_c. Both were accepted and neither moved a
++ * byte, which is exactly what those two packets do when handed arguments meant
++ * for a memcpy - so "the CP took the packet" only ever says the header was well
++ * formed, and nothing more.
++ */
++#define PG_CP_MEMCPY		0x75u
+ #define PG_MEMPTRS_IOVA		0x10010000ull
+ 
+ /* 8 x 4 KB of ring, which is what RB_CNTL below was set up for in step 15 */
+@@ -4026,6 +4047,40 @@
+ }
+ 
+ /*
++ * A whole row in one go.
++ *
++ * pg_panel_read() goes back to the mapping table for every pixel it touches,
++ * which is right for the three samples above and wrong for a copy test that has
++ * to compare a thousand words twice. The mapping is taken once here and walked.
++ *
++ * The row is contiguous inside its mapping because pg_panel_row_va() maps the
++ * page holding the row start plus enough pages to hold a whole stride, so a run
++ * of `words` dwords that fits in one stride never leaves the mapping. That is
++ * checked rather than assumed: a caller asking for more than a stride would
++ * read the next row and compare it against something it was never copied from.
++ */
++static bool
++pg_panel_peek(uint32_t row, uint32_t *to, uint32_t words, uint32_t stride)
++{
++	uint32_t off = 0;
++	vm_offset_t va;
++
++	if (words == 0 || words > stride / 4u) {
++		printf("POLARIS GPU: 18b %u words do not fit in a %u byte stride\n", words,
++		    stride);
++		return false;
++	}
++	va = pg_panel_row_va(row, stride, &off);
++	if (va == 0) {
++		return false;
++	}
++	for (uint32_t i = 0; i < words; i++) {
++		to[i] = ((volatile uint32_t *)(va + off + (uint64_t)i * 4u))[0];
++	}
++	return true;
++}
++
++/*
+  * One row, one packet, one drain. That is the shortest gap this code can put
+  * between "the CP was told to write this" and "the CPU read it", and the gap is
+  * what decides whether the reading means anything on a surface the rest of the
+@@ -4232,6 +4287,152 @@
+ 	return sent;
+ }
+ 
++/*
++ * One CP_MEMCPY, waited for.
++ *
++ * `dst_first` exists only because the packet has two addresses in a row and a
++ * wrong order is the kind of mistake that costs a boot: the first attempt sends
++ * the order the register database documents, the second sends the other one, and
++ * the log says which landed.
++ *
++ * The wait is the fill's: the read pointer has to come back to the write
++ * pointer. That separates two different failures - a command processor that
++ * stops taking words is a stopped command processor and nothing else may be
++ * submitted after it, while a copy that drains but does not land is a wrong
++ * packet.
++ */
++static bool
++pg_memcpy_span(uint64_t dst, uint64_t src, uint32_t dwords, bool dst_first,
++    uint32_t *wptrp)
++{
++	uint32_t wptr = *wptrp, rptr = 0;
++	uint64_t first = dst_first ? dst : src;
++	uint64_t second = dst_first ? src : dst;
++	bool drained = false;
++
++	pg_ring_put(wptr++, pg_pkt7(PG_CP_MEMCPY, 5));
++	pg_ring_put(wptr++, dwords);
++	pg_ring_put(wptr++, (uint32_t)first);
++	pg_ring_put(wptr++, (uint32_t)(first >> 32));
++	pg_ring_put(wptr++, (uint32_t)second);
++	pg_ring_put(wptr++, (uint32_t)(second >> 32));
++	wptr &= PG_RING_WORDS - 1u;
++	pg_ring_flush();
++	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < 100000; i++) {
++		rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
++		if (rptr == wptr) {
++			drained = true;
++			break;
++		}
++		pg_sleep_us(10);
++	}
++	if (!drained) {
++		printf("POLARIS GPU: 18b the CP stopped at CP_MEMCPY: RPTR %u WPTR %u, "
++		    "RBBM_STATUS %#010x\n", rptr, wptr,
++		    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++	}
++	*wptrp = wptr;
++	return drained;
++}
++
++/*
++ * Index of the first word of `row` that differs from `want`, or `words` if the
++ * row matches. An unreadable row counts as a difference at the start.
++ */
++static uint32_t
++pg_row_diff(uint32_t row, const uint32_t *want, uint32_t *got, uint32_t words,
++    uint32_t stride)
++{
++	if (!pg_panel_peek(row, got, words, stride)) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < words; i++) {
++		if (got[i] != want[i]) {
++			return i;
++		}
++	}
++	return words;
++}
++
++/*
++ * Step 18b: copy a row of the panel with the command processor and read it back.
++ *
++ * A fill proves the CP can put words into the memory the display scans out. A
++ * copy proves it can take them from there as well, and that is the whole
++ * difference between "the CP is a paintbrush" and "the CP can present a frame".
++ *
++ * Row 0 is the source because the fill above has just written a known ramp into
++ * it. Each attempt gets its own destination row, so a failed attempt cannot be
++ * mistaken for a successful one.
++ *
++ * The read pointer moving past the packet does not mean the copy has finished,
++ * so each attempt polls the destination row for a fifth of a second before
++ * calling it a failure. 0170 read once, immediately, which would have called a
++ * slow copy a missing one.
++ *
++ * Off unless polarisgpucopy=1: it writes, and the fill above it is already the
++ * step's verdict.
++ */
++struct pg_copy_try {
++	bool dst_first;
++	uint32_t row;
++	const char *what;
++};
++
++static void
++pg_memcpy_test(uint32_t width, uint32_t height, uint32_t stride)
++{
++	static const struct pg_copy_try tries[] = {
++		{ false, 100, "count, source, destination" },
++		{ true,  101, "count, destination, source" },
++	};
++	static uint32_t before[2048], after[2048];
++	uint32_t words = width, wptr = pg_cp_wptr;
++	uint64_t src = PG_PANEL_IOVA;
++
++	if (width > 2048u || stride < width * 4u || height <= 104u) {
++		printf("POLARIS GPU: 18b a %ux%u panel is not one this test fits\n", width,
++		    height);
++		return;
++	}
++	if (!pg_panel_peek(0, before, words, stride)) {
++		printf("POLARIS GPU: 18b row 0 did not read; there is nothing to copy\n");
++		return;
++	}
++	printf("POLARIS GPU: 18b row 0 starts %08x %08x and ends %08x\n", before[0],
++	    before[1], before[words - 1u]);
++	for (uint32_t t = 0; t < sizeof(tries) / sizeof(tries[0]); t++) {
++		const struct pg_copy_try *plan = &tries[t];
++		uint64_t dst = PG_PANEL_IOVA + (uint64_t)plan->row * stride;
++		uint32_t diff, waited;
++
++		printf("POLARIS GPU: 18b attempt %u: CP_MEMCPY %s, row 0 (%#llx) to row %u "
++		    "(%#llx), %u dwords\n", t + 1u, plan->what, src, plan->row, dst, words);
++		if (!pg_memcpy_span(dst, src, words, plan->dst_first, &wptr)) {
++			pg_cp_wptr = wptr;
++			printf("POLARIS GPU: 18b stopping here: the ring is wedged\n");
++			return;
++		}
++		pg_cp_wptr = wptr;
++		diff = pg_row_diff(plan->row, before, after, words, stride);
++		for (waited = 0; diff != words && waited < 20u; waited++) {
++			pg_sleep_us(10000);
++			diff = pg_row_diff(plan->row, before, after, words, stride);
++		}
++		if (diff == words) {
++			printf("POLARIS GPU: 18b THE CP COPIED THE ROW: CP_MEMCPY with %s moved "
++			    "%u dwords from row 0 to row %u in under %u ms, and the CPU reads "
++			    "them back\n", plan->what, words, plan->row, (waited + 1u) * 10u);
++			return;
++		}
++		printf("POLARIS GPU: 18b %s did not land: word %u reads %08x, row 0 has "
++		    "%08x\n", plan->what, diff, after[diff], before[diff]);
++	}
++	printf("POLARIS GPU: 18b CP_MEMCPY moved nothing in either address order\n");
++}
++
+ static bool
+ pg_step_panel(void)
+ {
+@@ -4380,7 +4581,7 @@
+ 		 */
+ 		uint32_t sent_top, sent_bottom, end_top, end_bottom;
+ 		uint32_t want = band;
+-		int fill_all = 0;
++		int fill_all = 0, copy_wanted = 0;
+ 
+ 		/*
+ 		 * polarisgpufill=1 asks for the whole nine megabytes instead of the
+@@ -4430,6 +4631,21 @@
+ 			printf("POLARIS GPU: 18 THE CP WROTE %s OF THE PANEL: %u dwords, and the CPU "
+ 			    "reads the pixels back\n", fill_all ? "ALL" : "BOTH ENDS", sent_top);
+ 		}
++
++		/*
++		 * Step 18b: the same command processor, told to copy instead of to
++		 * fill. This is the step that matters for the real job, because
++		 * present() moves a surface onto the panel and a fill cannot move
++		 * anything. Off unless polarisgpucopy=1: it writes to a row the band
++		 * fill never touches, and the fill above is already this step's
++		 * verdict, so a failure here must not take the ladder down.
++		 */
++		(void)PE_parse_boot_argn("polarisgpucopy", &copy_wanted,
++		    sizeof(copy_wanted));
++		if (copy_wanted) {
++			pg_memcpy_test(width, height, stride);
++		}
++
+ 		if (fill_all) {
+ 			/*
+ 			 * Twenty seconds with nothing printed, so the ramp is what the
