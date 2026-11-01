@@ -3395,18 +3395,26 @@ pg_step_cp(void)
 #define PG_CP_SET_SECURE_MODE	0x66u
 #define PG_CP_MEM_WRITE		0x3du
 /*
- * The two packets that can move bytes. Filling is only half of what the panel
- * needs - present() copies a surface onto it, and a fill cannot copy - so one
- * of these has to work before any of it is worth wiring up.
+ * The one packet on this command processor that copies a block.
  *
- * CP_DMA is the command processor's own copy engine, five words after the
- * header: source, destination, byte count. CP_MEM_TO_MEM is the older packet
- * that does the same job and takes the same five words in an order the two
- * references disagree about, which is why step 18b tries both orders rather
- * than believing one.
+ * Five words after the header, and the order is count first, then the two
+ * addresses - not the other way round, which is what build 0170 sent:
+ *
+ *	word 0	how many dwords to copy, not bytes
+ *	word 1	source low
+ *	word 2	source high
+ *	word 3	destination low
+ *	word 4	destination high
+ *
+ * 0170 asked for the copy with 0x41 and 0x73 instead. 0x41 is CP_EXEC_CS_INDIRECT,
+ * an indirect compute dispatch, and 0x73 is CP_MEM_TO_MEM, which is not a copy at
+ * all: it is the scatter-accumulate packet the occlusion queries use, and it
+ * writes dst = src_a + src_b + src_c. Both were accepted and neither moved a
+ * byte, which is exactly what those two packets do when handed arguments meant
+ * for a memcpy - so "the CP took the packet" only ever says the header was well
+ * formed, and nothing more.
  */
-#define PG_CP_DMA		0x41u
-#define PG_CP_MEM_TO_MEM	0x73u
+#define PG_CP_MEMCPY		0x75u
 #define PG_MEMPTRS_IOVA		0x10010000ull
 
 /* 8 x 4 KB of ring, which is what RB_CNTL below was set up for in step 15 */
@@ -4280,41 +4288,34 @@ pg_panel_fill(uint32_t first, uint32_t count, uint32_t width, uint32_t height,
 }
 
 /*
- * One command-processor copy, waited for.
+ * One CP_MEMCPY, waited for.
  *
- * Two packets can move bytes on this command processor and the phone is asked
- * both in one boot, because which one it takes is not something worth spending
- * a build on finding out:
- *
- *	CP_DMA		0x41	five words: source, destination, byte count
- *	CP_MEM_TO_MEM	0x73	five words as well, and the references that
- *				describe it disagree about which address comes
- *				first, so both orders are tried
- *
- * `first` and `second` are written in the order the caller believes the packet
- * wants them. Both are addresses in the 3D core's window, which is the only
- * address space the command processor walks; the byte count must be a multiple
- * of four.
+ * `dst_first` exists only because the packet has two addresses in a row and a
+ * wrong order is the kind of mistake that costs a boot: the first attempt sends
+ * the order the register database documents, the second sends the other one, and
+ * the log says which landed.
  *
  * The wait is the fill's: the read pointer has to come back to the write
- * pointer. Those are two different failures and the return value separates
- * them - a copy that lands wrong is a wrong encoding, a command processor that
- * stops taking words is a stopped command processor, and after the second one
- * nothing else may be submitted.
+ * pointer. That separates two different failures - a command processor that
+ * stops taking words is a stopped command processor and nothing else may be
+ * submitted after it, while a copy that drains but does not land is a wrong
+ * packet.
  */
 static bool
-pg_dma_copy(uint32_t opcode, uint64_t first, uint64_t second, uint32_t bytes,
+pg_memcpy_span(uint64_t dst, uint64_t src, uint32_t dwords, bool dst_first,
     uint32_t *wptrp)
 {
 	uint32_t wptr = *wptrp, rptr = 0;
+	uint64_t first = dst_first ? dst : src;
+	uint64_t second = dst_first ? src : dst;
 	bool drained = false;
 
-	pg_ring_put(wptr++, pg_pkt7(opcode, 5));
+	pg_ring_put(wptr++, pg_pkt7(PG_CP_MEMCPY, 5));
+	pg_ring_put(wptr++, dwords);
 	pg_ring_put(wptr++, (uint32_t)first);
 	pg_ring_put(wptr++, (uint32_t)(first >> 32));
 	pg_ring_put(wptr++, (uint32_t)second);
 	pg_ring_put(wptr++, (uint32_t)(second >> 32));
-	pg_ring_put(wptr++, bytes);
 	wptr &= PG_RING_WORDS - 1u;
 	pg_ring_flush();
 	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
@@ -4328,12 +4329,31 @@ pg_dma_copy(uint32_t opcode, uint64_t first, uint64_t second, uint32_t bytes,
 		pg_sleep_us(10);
 	}
 	if (!drained) {
-		printf("POLARIS GPU: 18b the CP stopped at the copy packet (opcode %#x): RPTR "
-		    "%u WPTR %u, RBBM_STATUS %#010x\n", opcode, rptr, wptr,
+		printf("POLARIS GPU: 18b the CP stopped at CP_MEMCPY: RPTR %u WPTR %u, "
+		    "RBBM_STATUS %#010x\n", rptr, wptr,
 		    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
 	}
 	*wptrp = wptr;
 	return drained;
+}
+
+/*
+ * Index of the first word of `row` that differs from `want`, or `words` if the
+ * row matches. An unreadable row counts as a difference at the start.
+ */
+static uint32_t
+pg_row_diff(uint32_t row, const uint32_t *want, uint32_t *got, uint32_t words,
+    uint32_t stride)
+{
+	if (!pg_panel_peek(row, got, words, stride)) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < words; i++) {
+		if (got[i] != want[i]) {
+			return i;
+		}
+	}
+	return words;
 }
 
 /*
@@ -4345,29 +4365,28 @@ pg_dma_copy(uint32_t opcode, uint64_t first, uint64_t second, uint32_t bytes,
  *
  * Row 0 is the source because the fill above has just written a known ramp into
  * it. Each attempt gets its own destination row, so a failed attempt cannot be
- * mistaken for a successful one, and every row is read by the CPU before and
- * after, so the comparison never depends on what the ramp happens to be.
+ * mistaken for a successful one.
  *
- * The attempts stop at the first one that stops the command processor: after
- * that the ring is wedged and any further packet would be read as data.
+ * The read pointer moving past the packet does not mean the copy has finished,
+ * so each attempt polls the destination row for a fifth of a second before
+ * calling it a failure. 0170 read once, immediately, which would have called a
+ * slow copy a missing one.
  *
- * Off unless polarisgpudma=1: it writes, and the fill above it is already the
+ * Off unless polarisgpucopy=1: it writes, and the fill above it is already the
  * step's verdict.
  */
-struct pg_dma_try {
-	uint32_t opcode;
+struct pg_copy_try {
 	bool dst_first;
 	uint32_t row;
 	const char *what;
 };
 
 static void
-pg_dma_test(uint32_t width, uint32_t height, uint32_t stride)
+pg_memcpy_test(uint32_t width, uint32_t height, uint32_t stride)
 {
-	static const struct pg_dma_try tries[] = {
-		{ PG_CP_DMA,        false, 100, "CP_DMA, source then destination" },
-		{ PG_CP_MEM_TO_MEM, true,  101, "CP_MEM_TO_MEM, destination then source" },
-		{ PG_CP_MEM_TO_MEM, false, 102, "CP_MEM_TO_MEM, source then destination" },
+	static const struct pg_copy_try tries[] = {
+		{ false, 100, "count, source, destination" },
+		{ true,  101, "count, destination, source" },
 	};
 	static uint32_t before[2048], after[2048];
 	uint32_t words = width, wptr = pg_cp_wptr;
@@ -4382,39 +4401,36 @@ pg_dma_test(uint32_t width, uint32_t height, uint32_t stride)
 		printf("POLARIS GPU: 18b row 0 did not read; there is nothing to copy\n");
 		return;
 	}
+	printf("POLARIS GPU: 18b row 0 starts %08x %08x and ends %08x\n", before[0],
+	    before[1], before[words - 1u]);
 	for (uint32_t t = 0; t < sizeof(tries) / sizeof(tries[0]); t++) {
-		const struct pg_dma_try *plan = &tries[t];
+		const struct pg_copy_try *plan = &tries[t];
 		uint64_t dst = PG_PANEL_IOVA + (uint64_t)plan->row * stride;
-		uint32_t i;
+		uint32_t diff, waited;
 
-		printf("POLARIS GPU: 18b attempt %u: %s, row 0 (%#llx) to row %u (%#llx), "
-		    "%u bytes\n", t + 1u, plan->what, src, plan->row, dst, words * 4u);
-		if (!pg_dma_copy(plan->opcode, plan->dst_first ? dst : src,
-		    plan->dst_first ? src : dst, words * 4u, &wptr)) {
+		printf("POLARIS GPU: 18b attempt %u: CP_MEMCPY %s, row 0 (%#llx) to row %u "
+		    "(%#llx), %u dwords\n", t + 1u, plan->what, src, plan->row, dst, words);
+		if (!pg_memcpy_span(dst, src, words, plan->dst_first, &wptr)) {
 			pg_cp_wptr = wptr;
 			printf("POLARIS GPU: 18b stopping here: the ring is wedged\n");
 			return;
 		}
 		pg_cp_wptr = wptr;
-		if (!pg_panel_peek(plan->row, after, words, stride)) {
-			printf("POLARIS GPU: 18b row %u did not read back\n", plan->row);
-			continue;
+		diff = pg_row_diff(plan->row, before, after, words, stride);
+		for (waited = 0; diff != words && waited < 20u; waited++) {
+			pg_sleep_us(10000);
+			diff = pg_row_diff(plan->row, before, after, words, stride);
 		}
-		for (i = 0; i < words; i++) {
-			if (after[i] != before[i]) {
-				break;
-			}
-		}
-		if (i == words) {
-			printf("POLARIS GPU: 18b THE CP COPIED THE ROW: %s moved %u dwords "
-			    "from row 0 to row %u, and the CPU reads them back\n", plan->what,
-			    words, plan->row);
+		if (diff == words) {
+			printf("POLARIS GPU: 18b THE CP COPIED THE ROW: CP_MEMCPY with %s moved "
+			    "%u dwords from row 0 to row %u in under %u ms, and the CPU reads "
+			    "them back\n", plan->what, words, plan->row, (waited + 1u) * 10u);
 			return;
 		}
 		printf("POLARIS GPU: 18b %s did not land: word %u reads %08x, row 0 has "
-		    "%08x\n", plan->what, i, after[i], before[i]);
+		    "%08x\n", plan->what, diff, after[diff], before[diff]);
 	}
-	printf("POLARIS GPU: 18b neither copy packet moved the row\n");
+	printf("POLARIS GPU: 18b CP_MEMCPY moved nothing in either address order\n");
 }
 
 static bool
@@ -4565,7 +4581,7 @@ pg_step_panel(void)
 		 */
 		uint32_t sent_top, sent_bottom, end_top, end_bottom;
 		uint32_t want = band;
-		int fill_all = 0, dma_wanted = 0;
+		int fill_all = 0, copy_wanted = 0;
 
 		/*
 		 * polarisgpufill=1 asks for the whole nine megabytes instead of the
@@ -4620,13 +4636,14 @@ pg_step_panel(void)
 		 * Step 18b: the same command processor, told to copy instead of to
 		 * fill. This is the step that matters for the real job, because
 		 * present() moves a surface onto the panel and a fill cannot move
-		 * anything. Off unless polarisgpudma=1: it writes to a row the band
+		 * anything. Off unless polarisgpucopy=1: it writes to a row the band
 		 * fill never touches, and the fill above is already this step's
 		 * verdict, so a failure here must not take the ladder down.
 		 */
-		(void)PE_parse_boot_argn("polarisgpudma", &dma_wanted, sizeof(dma_wanted));
-		if (dma_wanted) {
-			pg_dma_test(width, height, stride);
+		(void)PE_parse_boot_argn("polarisgpucopy", &copy_wanted,
+		    sizeof(copy_wanted));
+		if (copy_wanted) {
+			pg_memcpy_test(width, height, stride);
 		}
 
 		if (fill_all) {
