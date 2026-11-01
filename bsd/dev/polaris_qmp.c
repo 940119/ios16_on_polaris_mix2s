@@ -40,6 +40,7 @@
 #include <sys/systm.h>
 #include <pexpert/pexpert.h>
 #include <mach/vm_param.h>
+#include <kern/clock.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -70,11 +71,46 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 #define PQ_APCS_AOP		(1u << 0)	/* "the AOP has something for us" */
 
 static vm_offset_t pq_base;
+static vm_offset_t pq_apcs;
 
 static uint32_t
 pq_rd(uint32_t offset)
 {
 	return *(const volatile uint32_t *)(pq_base + offset);
+}
+
+/* A register write, and not the next one until it has left the core. The AOP
+ * watches these words, and a reordered second write would show it a state the
+ * first one never produced. */
+static void
+pq_wr(uint32_t offset, uint32_t value)
+{
+	*(volatile uint32_t *)(pq_base + offset) = value;
+	__asm__ __volatile__("dsb sy" ::: "memory");
+}
+
+/*
+ * The doorbell. QMP has no interrupt of its own: the AOP is told to look at the
+ * mailbox by a bit in the APCS IPC register, and the same register is where the
+ * AOP raises its own bits. Bit 0 is this mailbox's.
+ */
+static void
+pq_ring(void)
+{
+	__asm__ __volatile__("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(pq_apcs + PQ_APCS_IPC) = PQ_APCS_AOP;
+}
+
+static bool
+pq_wait(uint32_t offset, uint32_t want, uint32_t ms)
+{
+	for (uint32_t i = 0; i < ms * 10; i++) {
+		if (pq_rd(offset) == want) {
+			return true;
+		}
+		delay(100);			/* microseconds */
+	}
+	return pq_rd(offset) == want;
 }
 
 /* A link or channel register reads as one of the two words the driver writes,
@@ -91,15 +127,22 @@ pq_state(uint32_t value)
 	return "neither up nor down";
 }
 
-static bool
-polaris_qmp_requested(void)
+/*
+ * 0: off. 1: read. 2: read, then open the mailbox.
+ *
+ * Same shape as the SMEM probe's level, and for the same reason: reading a
+ * register and writing a handshake have different failure modes, and a build
+ * should be able to ask for the second without the first being re-argued.
+ */
+static int
+polaris_qmp_level(void)
 {
 	int optin = 0;
 
 	if (!PE_parse_boot_argn("polarisqmp", &optin, sizeof(optin))) {
-		return false;
+		return 0;
 	}
-	return optin == 1;
+	return optin;
 }
 
 /*
@@ -119,14 +162,80 @@ pq_dump(void)
 	}
 }
 
+/*
+ * Linux's qmp_open(): link, channel, acknowledgements, one ring per step.
+ *
+ * What is already open is found open - the boot loader leaves the mailbox up for
+ * whoever comes next - and every step that is not acknowledged within a second
+ * takes the link down again rather than leaving a half-open mailbox behind.
+ */
+static bool
+pq_open(uint32_t box, uint32_t size)
+{
+	if (size < PQ_MESSAGE + 4 || box < 0x3c || box + size > PQ_SIZE || (box & 3)) {
+		printf("POLARIS QMP: our mailbox is not where a message fits: not opening\n");
+		return false;
+	}
+	if (pq_rd(PQ_OUR_LINK) == PQ_UP && pq_rd(PQ_OUR_LINK_ACK) == PQ_UP &&
+	    pq_rd(PQ_OUR_CHANNEL) == PQ_UP && pq_rd(PQ_THEIR_CHANNEL) == PQ_UP &&
+	    pq_rd(PQ_OUR_CHANNEL_ACK) == PQ_UP) {
+		printf("POLARIS QMP: the mailbox is open already\n");
+		return true;
+	}
+	printf("POLARIS QMP: ---- opening the mailbox, four steps ----\n");
+
+	pq_wr(PQ_THEIR_LINK_ACK, pq_rd(PQ_THEIR_LINK));
+	pq_wr(PQ_OUR_LINK, PQ_UP);
+	pq_ring();
+	if (!pq_wait(PQ_OUR_LINK_ACK, PQ_UP, 1000)) {
+		printf("POLARIS QMP: step 1: THE AOP DOES NOT ACKNOWLEDGE OUR LINK within a second; "
+		    "taken down again\n");
+		pq_wr(PQ_OUR_LINK, PQ_DOWN);
+		pq_ring();
+		return false;
+	}
+	printf("POLARIS QMP: step 1: the AOP acknowledged our link\n");
+
+	pq_wr(PQ_OUR_CHANNEL, PQ_UP);
+	pq_ring();
+	if (!pq_wait(PQ_THEIR_CHANNEL, PQ_UP, 1000)) {
+		printf("POLARIS QMP: step 2: THE AOP DOES NOT OPEN ITS CHANNEL within a second; "
+		    "ours is taken down again\n");
+		pq_wr(PQ_OUR_CHANNEL, PQ_DOWN);
+		pq_wr(PQ_OUR_LINK, PQ_DOWN);
+		pq_ring();
+		return false;
+	}
+	printf("POLARIS QMP: step 2: the AOP opened its channel\n");
+
+	pq_wr(PQ_THEIR_CHANNEL_ACK, PQ_UP);
+	pq_ring();
+	if (!pq_wait(PQ_OUR_CHANNEL_ACK, PQ_UP, 1000)) {
+		printf("POLARIS QMP: step 3: THE AOP DOES NOT ACKNOWLEDGE OUR CHANNEL within a "
+		    "second; taken down again\n");
+		pq_wr(PQ_OUR_CHANNEL, PQ_DOWN);
+		pq_wr(PQ_OUR_LINK, PQ_DOWN);
+		pq_ring();
+		return false;
+	}
+	printf("POLARIS QMP: step 3: the AOP acknowledged our channel\n");
+
+	printf("POLARIS QMP: THE MAILBOX TO THE AOP IS OPEN\n");
+	printf("POLARIS QMP: after the handshake: our link %#x, its ack %#x, our channel %#x, "
+	    "its ack %#x, their channel %#x\n", pq_rd(PQ_OUR_LINK), pq_rd(PQ_OUR_LINK_ACK),
+	    pq_rd(PQ_OUR_CHANNEL), pq_rd(PQ_OUR_CHANNEL_ACK), pq_rd(PQ_THEIR_CHANNEL));
+	return true;
+}
+
 void
 polaris_qmp_probe(void)
 {
 	uint32_t magic, version, box, size, ipc;
 	vm_offset_t apcs;
 	bool open;
+	int level = polaris_qmp_level();
 
-	if (!polaris_qmp_requested()) {
+	if (level < 1) {
 		return;
 	}
 	pq_base = ml_io_map((vm_offset_t)PQ_PHYS, PQ_SIZE);
@@ -134,8 +243,9 @@ polaris_qmp_probe(void)
 		printf("POLARIS QMP: the mailbox at %#llx did not map\n", PQ_PHYS);
 		return;
 	}
-	printf("POLARIS QMP: ======== build 0166 alive: reading the QMP mailbox at %#llx, "
-	    "nothing else ========\n", PQ_PHYS);
+	printf("POLARIS QMP: ======== build 0168 alive: reading the QMP mailbox at %#llx, "
+	    "and %s ========\n", PQ_PHYS,
+	    level >= 2 ? "opening it" : "nothing else");
 
 	magic = pq_rd(PQ_MAGIC);
 	version = pq_rd(PQ_VERSION);
@@ -191,6 +301,12 @@ polaris_qmp_probe(void)
 	ipc = *(const volatile uint32_t *)(apcs + PQ_APCS_IPC);
 	printf("POLARIS QMP: APCS IPC at %#llx reads %#x: the AOP's line is %s\n",
 	    PQ_APCS_PHYS + PQ_APCS_IPC, ipc, (ipc & PQ_APCS_AOP) ? "raised" : "quiet");
-	printf("POLARIS QMP: read only; nothing was written\n");
+	pq_apcs = apcs;
+
+	if (level < 2) {
+		printf("POLARIS QMP: read only; nothing was written\n");
+		return;
+	}
+	pq_open(box, size);
 }
 #endif
