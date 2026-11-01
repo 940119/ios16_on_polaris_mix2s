@@ -202,8 +202,8 @@ sweet_usb_probe(void)
 	 * first register access and flushed immediately, so either it is in the
 	 * ring or the kernel that wrote the ring was not this one.
 	 */
-	printf("SWEET USB: ======== build 0154 alive: full select_utmi_clk sequence, "
-	    "ENBLSLPM cleared before run ========\n");
+	printf("SWEET USB: ======== build 0155 alive: ten minute monitor, GSTS cable/session/"
+	    "bvalid by name ========\n");
 	sweet_log_flush_now();
 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
 	if (gcc == 0) {
@@ -399,6 +399,17 @@ sweet_usb_probe(void)
 #define DSTS_SPEED(v)   ((v) & 7u)
 #define DSTS_SOFFN(v)   (((v) >> 3) & 0x3fffu)
 #define DSTS_LNKST(v)   (((v) >> 18) & 0xfu)
+
+/*
+ * GSTS tells whether the controller thinks a cable is on the port at all, and
+ * it is the one register the four attach attempts never looked at. Bits 12, 13
+ * and 14 are BSessVld, BCable and BValid in Linux's core.h; build 0154 read
+ * GSTS 0x7e800000, i.e. all three clear, which is why no bus reset ever came.
+ * Print them by name so the next round does not have to decode the hex.
+ */
+#define GSTS_BSESSVLD   (1u << 12)
+#define GSTS_BCABLE     (1u << 13)
+#define GSTS_BVALID     (1u << 14)
 
 #define DEPCMD_SETEPCONFIG      1
 #define DEPCMD_SETTRANSFRESOURCE 2
@@ -1564,36 +1575,56 @@ ud_mon_thread(void *arg, wait_result_t wr)
 	(void)arg;
 	(void)wr;
 	ud_sleep_ms(3000);
-	printf("SWEET USB: monitor start, unplug and replug the cable now\n");
-	for (m = 0; m < 20; m++) {
-		uint32_t d = dwc_rd(DSTS);
-		/*
-		 * Decoded against Linux core.h, not guessed:
-		 *   DSTS[2:0]   ConnectSpd: 0 = high speed, 1 = full speed,
-		 *               4 = super speed (DWC3_DSTS_HIGHSPEED is (0 << 0))
-		 *   DSTS[21:18] USBLNKST
-		 *   DSTS[22]    DevCtrlHlt
-		 * The previous line printed `cs=%d` from bit 0 alone and `spd` from
-		 * bits[3:1], which is part of SOFFN - so "cs=1 spd=0" meant
-		 * "full speed, and three frame-number bits", not what it looked
-		 * like.
-		 *
-		 * Bit 22 is DevCtrlHlt and it is trustworthy; 0152 was wrong to
-		 * distrust it. It reads 1 exactly when RUN_STOP has been cleared,
-		 * i.e. when the core is stopped - which is what "halted" means.
-		 * The two are printed side by side so the pairing is visible:
-		 * a monitor line with runstop 0 and hlt 1 is a stopped core, and
-		 * a stopped core raises no events.
-		 */
-		printf("SWEET USB: mon %2d spd=%u DSTS 0x%08x (b20 %d hlt %d idle %d) "
-		    "DCTL 0x%08x run %d GSTS 0x%08x ev 0x%08x\n",
-		    m, d & 7u, d,
-		    !!(d & DSTS_BIT20), !!(d & DSTS_DEVCTRLHLT), !!(d & DSTS_BIT23),
-		    dwc_rd(DCTL), !!(dwc_rd(DCTL) & DCTL_RUN_STOP),
-		    dwc_rd(GSTS), dwc_rd(GEVNTCOUNT) & 0xffff);
-		ud_sleep_ms(1000);
+	/*
+	 * Twenty samples was the whole window in 0153 and 0154, and nobody can
+	 * pull a cable out and put it back inside twenty seconds - so the one
+	 * experiment that would settle whether the host just needs a fresh
+	 * connect edge has never actually been run. Ten minutes, and a line only
+	 * when something changes (plus one a minute as a heartbeat) so the ring
+	 * is not filled with identical lines.
+	 */
+	printf("SWEET USB: monitor start: 600 samples, one a second, a line whenever the "
+	    "state changes - unplug and replug the cable at any point in that window\n");
+	{
+		uint32_t last_d = dwc_rd(DSTS), last_g = dwc_rd(GSTS), last_ev = 0;
+		uint32_t changes = 0;
+
+		for (m = 0; m < 600; m++) {
+			uint32_t d = dwc_rd(DSTS);
+			uint32_t g = dwc_rd(GSTS);
+			uint32_t ev = dwc_rd(GEVNTCOUNT) & 0xffff;
+			bool moved = (d != last_d || g != last_g || ev != last_ev);
+
+			if (moved || (m % 60) == 0) {
+				/*
+				 * Decoded against Linux core.h, not guessed:
+				 *   DSTS[2:0]   ConnectSpd: 0 = high speed, 1 = full speed,
+				 *               4 = super speed (DWC3_DSTS_HIGHSPEED is (0 << 0))
+				 *   DSTS[21:18] USBLNKST
+				 *   DSTS[22]    DevCtrlHlt
+				 * Bit 22 reads 1 exactly when RUN_STOP has been cleared, i.e.
+				 * when the core is stopped, which is what "halted" means. The
+				 * two are printed side by side so the pairing is visible.
+				 */
+				printf("SWEET USB: mon %3d spd=%u DSTS 0x%08x (b20 %d hlt %d idle %d) "
+				    "DCTL 0x%08x run %d GSTS 0x%08x (cable %d sess %d bvalid %d) "
+				    "ev 0x%08x%s\n",
+				    m, d & 7u, d,
+				    !!(d & DSTS_BIT20), !!(d & DSTS_DEVCTRLHLT), !!(d & DSTS_BIT23),
+				    dwc_rd(DCTL), !!(dwc_rd(DCTL) & DCTL_RUN_STOP),
+				    g, !!(g & GSTS_BCABLE), !!(g & GSTS_BSESSVLD), !!(g & GSTS_BVALID),
+				    ev, moved ? "  <- changed" : "");
+				if (moved) {
+					changes++;
+				}
+				last_d = d;
+				last_g = g;
+				last_ev = ev;
+			}
+			ud_sleep_ms(1000);
+		}
+		printf("SWEET USB: monitor done: %u state changes in 600 s\n", changes);
 	}
-	printf("SWEET USB: monitor done\n");
 	/* A kernel thread may not return; park it out of the way. */
 	for (;;) {
 		ud_sleep_ms(60000);
