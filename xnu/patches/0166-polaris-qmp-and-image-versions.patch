@@ -1,0 +1,362 @@
+diff -Nur a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-02 00:18:55.117934351 +0800
++++ b/bsd/conf/files	2026-11-02 00:18:55.156885351 +0800
+@@ -116,6 +116,7 @@
+ bsd/dev/polaris_gpu_diag.c		standard
+ bsd/dev/polaris_gpu.c			standard
+ bsd/dev/polaris_wifi.c			standard
++bsd/dev/polaris_qmp.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff -Nur a/bsd/dev/polaris_qmp.c b/bsd/dev/polaris_qmp.c
+--- a/bsd/dev/polaris_qmp.c	1970-01-01 08:00:00.000000000 +0800
++++ b/bsd/dev/polaris_qmp.c	2026-11-02 00:18:55.150805751 +0800
+@@ -0,0 +1,196 @@
++/*
++ * Polaris (Mi MIX 2S, SDM845), Wi-Fi step 2: look at the QMP mailbox and say
++ * what state it is in.
++ *
++ * Nothing here writes. The Mi 8 port reaches the wireless subsystem through
++ * QMP: a small mailbox in the always-on block that the AP and the AOP share,
++ * four link/channel registers each way plus a 64-byte message box. wlfw uses
++ * it to ask the AOP to load firmware into the WCN3990, so the WLAN port cannot
++ * get past its first step without it, and the first thing worth knowing is
++ * whether this phone's mailbox is where the Mi 8's is and whether somebody has
++ * already opened it.
++ *
++ * The device tree agrees on the address:
++ *
++ *   /soc/qcom,qmp-aop@c300000
++ *     compatible    qcom,qmp-mbox
++ *     reg           0xc300000 0x100000   (msgram)
++ *                   0x1799000c 0x4      (irq-reg-base: APCS IPC)
++ *
++ * which is exactly the Mi 8's pair, 0x0c300000 for the mailbox and 0x1799000c
++ * for the interrupt register. That is the reason this build reads rather than
++ * guesses: agreement in the device tree is a good sign, not proof that the
++ * registers hold what the driver expects.
++ *
++ * Register offsets are Linux's (drivers/mailbox/qcom-qmp.c, sdm845 data), and
++ * the Mi 8 port uses the same ones. Two parties write the same words from
++ * opposite ends: what the AP calls "our" is "their" from the AOP's side, so the
++ * pair of registers at 0x24 and 0x0c are the same handshake seen twice.
++ *
++ * A mailbox is open when all six of our/their link and channel bits read 0xffff
++ * - the driver writes 0x0000ffff to mean up and 0xffff0000 to mean down, and
++ * the boot loader leaves an opened mailbox open for whoever comes next. If it
++ * is open already, wlfw can use it as it stands; if it is closed, opening it is
++ * a write and belongs in a later build with its own failure mode.
++ *
++ * Boot with polarisqmp=1 to run it. Default: nothing at all.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <mach/vm_param.h>
++#include <vm/vm_kern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define PQ_PHYS			0x0c300000ull	/* dt: qcom,qmp-aop@c300000 */
++#define PQ_SIZE			0x1000u
++
++#define PQ_MAGIC		0x00
++#define PQ_VERSION		0x04
++#define PQ_THEIR_LINK		0x0c
++#define PQ_THEIR_LINK_ACK	0x10
++#define PQ_THEIR_CHANNEL	0x14
++#define PQ_THEIR_CHANNEL_ACK	0x18
++#define PQ_OUR_LINK		0x24
++#define PQ_OUR_LINK_ACK		0x28
++#define PQ_OUR_CHANNEL		0x2c
++#define PQ_OUR_CHANNEL_ACK	0x30
++#define PQ_OUR_BOX_SIZE		0x34
++#define PQ_OUR_BOX		0x38
++#define PQ_MESSAGE		64u
++
++#define PQ_MAGIC_VALUE		0x4d41494c	/* "MAIL" */
++#define PQ_UP			0x0000ffffu
++#define PQ_DOWN			0xffff0000u
++
++#define PQ_APCS_PHYS		0x17990000ull	/* dt: irq-reg-base */
++#define PQ_APCS_IPC		0x0c
++#define PQ_APCS_AOP		(1u << 0)	/* "the AOP has something for us" */
++
++static vm_offset_t pq_base;
++
++static uint32_t
++pq_rd(uint32_t offset)
++{
++	return *(const volatile uint32_t *)(pq_base + offset);
++}
++
++/* A link or channel register reads as one of the two words the driver writes,
++ * or as something else, which is worth printing rather than rounding off. */
++static const char *
++pq_state(uint32_t value)
++{
++	if (value == PQ_UP) {
++		return "up";
++	}
++	if (value == PQ_DOWN) {
++		return "down";
++	}
++	return "neither up nor down";
++}
++
++static bool
++polaris_qmp_requested(void)
++{
++	int optin = 0;
++
++	if (!PE_parse_boot_argn("polarisqmp", &optin, sizeof(optin))) {
++		return false;
++	}
++	return optin == 1;
++}
++
++/*
++ * The mailbox, as a block of words, when the magic is not where it belongs.
++ *
++ * The Mi 8's layout is the only one this port knows, and a wrong offset would
++ * otherwise show up as a column of "neither up nor down" with nothing to say
++ * about what the real layout is. Sixteen words is enough to see a magic, a
++ * version and a handshake hiding somewhere else in the block.
++ */
++static void
++pq_dump(void)
++{
++	for (uint32_t at = 0; at < 0x40; at += 0x10) {
++		printf("POLARIS QMP:  %#04x: %08x %08x %08x %08x\n", at, pq_rd(at),
++		    pq_rd(at + 4), pq_rd(at + 8), pq_rd(at + 0xc));
++	}
++}
++
++void
++polaris_qmp_probe(void)
++{
++	uint32_t magic, version, box, size, ipc;
++	vm_offset_t apcs;
++	bool open;
++
++	if (!polaris_qmp_requested()) {
++		return;
++	}
++	pq_base = ml_io_map((vm_offset_t)PQ_PHYS, PQ_SIZE);
++	if (pq_base == 0) {
++		printf("POLARIS QMP: the mailbox at %#llx did not map\n", PQ_PHYS);
++		return;
++	}
++	printf("POLARIS QMP: ======== build 0166 alive: reading the QMP mailbox at %#llx, "
++	    "nothing else ========\n", PQ_PHYS);
++
++	magic = pq_rd(PQ_MAGIC);
++	version = pq_rd(PQ_VERSION);
++	printf("POLARIS QMP: magic %#x (%s), version %u\n", magic,
++	    magic == PQ_MAGIC_VALUE ? "\"MAIL\"" : "not \"MAIL\"", version);
++	if (magic != PQ_MAGIC_VALUE) {
++		printf("POLARIS QMP: this is not the mailbox the Mi 8 port knows; the block "
++		    "as it reads:\n");
++		pq_dump();
++		return;
++	}
++
++	printf("POLARIS QMP: their link %#x (%s), its ack %#x (%s)\n",
++	    pq_rd(PQ_THEIR_LINK), pq_state(pq_rd(PQ_THEIR_LINK)),
++	    pq_rd(PQ_THEIR_LINK_ACK), pq_state(pq_rd(PQ_THEIR_LINK_ACK)));
++	printf("POLARIS QMP: our link %#x (%s), its ack %#x (%s)\n",
++	    pq_rd(PQ_OUR_LINK), pq_state(pq_rd(PQ_OUR_LINK)),
++	    pq_rd(PQ_OUR_LINK_ACK), pq_state(pq_rd(PQ_OUR_LINK_ACK)));
++	printf("POLARIS QMP: their channel %#x (%s), its ack %#x (%s)\n",
++	    pq_rd(PQ_THEIR_CHANNEL), pq_state(pq_rd(PQ_THEIR_CHANNEL)),
++	    pq_rd(PQ_THEIR_CHANNEL_ACK), pq_state(pq_rd(PQ_THEIR_CHANNEL_ACK)));
++	printf("POLARIS QMP: our channel %#x (%s), its ack %#x (%s)\n",
++	    pq_rd(PQ_OUR_CHANNEL), pq_state(pq_rd(PQ_OUR_CHANNEL)),
++	    pq_rd(PQ_OUR_CHANNEL_ACK), pq_state(pq_rd(PQ_OUR_CHANNEL_ACK)));
++
++	box = pq_rd(PQ_OUR_BOX);
++	size = pq_rd(PQ_OUR_BOX_SIZE);
++	printf("POLARIS QMP: our message box at +%#x, %u bytes", box, size);
++	if (size < PQ_MESSAGE || box < 0x3c || box + size > PQ_SIZE || (box & 3)) {
++		printf(": not a box this can use\n");
++	} else {
++		printf(": %u words of room, the first four read %08x %08x %08x %08x\n",
++		    size / 4, pq_rd(box), pq_rd(box + 4), pq_rd(box + 8), pq_rd(box + 0xc));
++	}
++
++	open = pq_rd(PQ_OUR_LINK) == PQ_UP && pq_rd(PQ_OUR_LINK_ACK) == PQ_UP &&
++	    pq_rd(PQ_OUR_CHANNEL) == PQ_UP && pq_rd(PQ_THEIR_CHANNEL) == PQ_UP &&
++	    pq_rd(PQ_OUR_CHANNEL_ACK) == PQ_UP;
++	printf("POLARIS QMP: %s\n", open ?
++	    "the mailbox is already open: wlfw can use it as it stands" :
++	    "the mailbox is not open: opening it is a write, and that is a later build");
++
++	/*
++	 * The interrupt register, one word in the APCS block. Bit 0 is the AOP's
++	 * line; the Mi 8 port rings it after every handshake step, so its
++	 * current value says whether anything is pending right now.
++	 */
++	apcs = ml_io_map((vm_offset_t)PQ_APCS_PHYS, 0x1000);
++	if (apcs == 0) {
++		printf("POLARIS QMP: the APCS block at %#llx did not map\n", PQ_APCS_PHYS);
++		return;
++	}
++	ipc = *(const volatile uint32_t *)(apcs + PQ_APCS_IPC);
++	printf("POLARIS QMP: APCS IPC at %#llx reads %#x: the AOP's line is %s\n",
++	    PQ_APCS_PHYS + PQ_APCS_IPC, ipc, (ipc & PQ_APCS_AOP) ? "raised" : "quiet");
++	printf("POLARIS QMP: read only; nothing was written\n");
++}
++#endif
+diff -Nur a/bsd/dev/polaris_wifi.c b/bsd/dev/polaris_wifi.c
+--- a/bsd/dev/polaris_wifi.c	2026-11-02 00:18:55.111627951 +0800
++++ b/bsd/dev/polaris_wifi.c	2026-11-02 00:18:55.145196851 +0800
+@@ -41,6 +41,25 @@
+  * way a short read shows up as a failed check rather than as garbage.
+  *
+  * Boot with polariswifi=1 to run it. Default: nothing at all.
++ *
++ * Build 0165 finished the walk and answered the question it was built for, and
++ * the answer was not the expected one: every partition the AP is a party to is
++ * empty. Partition 5 (ap <-> host 8, 16 KB) exists with a valid $PRT and has
++ * nothing in it; partition 10 (ap <-> modem, 496 KB) is the same; the only
++ * partition with items in it is the global one. That is not a fault - SMEM items
++ * are allocated by whichever side brings a transport up, and this kernel has
++ * never brought one up. The Mi 8 port allocates its own (qcom_smem_alloc, the
++ * descriptor 478 and the first FIFO 479) and so will this one.
++ *
++ * Two things follow. First, the WLAN item numbers cannot be confirmed by
++ * finding them; they have to be created. Second, partition 5 is 16384 bytes in
++ * total and 32 of those are the header, so the Mi 8 port's 16 KB FIFO cannot
++ * fit in it - the FIFO sizes for this edge have to be chosen against that
++ * budget, not copied.
++ *
++ * So this build also reads what the global partition does carry: the image
++ * version tables (469 and 602) are a record per firmware image, in host order,
++ * and their names are the cheapest way to say which subsystem host 8 is.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -123,6 +142,8 @@
+ 
+ static const volatile uint8_t *pw_smem;
+ 
++static void pw_strings(uint32_t at, uint32_t size, unsigned want);
++
+ static bool
+ pw_peek(uint32_t offset, void *to, uint32_t size)
+ {
+@@ -255,6 +276,11 @@
+ 		printf("POLARIS WIFI:     item %u at %#x, %u bytes\n", item.item,
+ 		    offset + at + (uint32_t)sizeof(item) + item.padding_header,
+ 		    item.size - item.padding_data);
++		if (item.size >= 64) {
++			pw_strings(offset + at + (uint32_t)sizeof(item) + item.padding_header,
++			    item.size - item.padding_data,
++			    (item.item == 469 || item.item == 602) ? 20u : 4u);
++		}
+ 		at += (uint32_t)sizeof(item) + item.padding_header + item.size;
+ 	}
+ 	if (cacheline != 0 && (cacheline & (cacheline - 1)) == 0) {
+@@ -270,6 +296,10 @@
+ 			printf("POLARIS WIFI:     item %u at %#x, %u bytes (from the top)\n",
+ 			    item.item, offset + at - item.size,
+ 			    item.size - item.padding_data);
++			if (item.size >= 64) {
++				pw_strings(offset + at - item.size, item.size - item.padding_data,
++				    (item.item == 469 || item.item == 602) ? 20u : 4u);
++			}
+ 			at -= step_back + item.size;
+ 		}
+ 	}
+@@ -277,6 +307,53 @@
+ }
+ 
+ /*
++ * A bounded strings extraction from one item.
++ *
++ * The global partition's items are the only ones with anything in them, and two
++ * of them are the image version tables (469, 4096 bytes; 602, 10240 bytes): the
++ * boot loader writes a record per firmware image it loaded, each with the
++ * image's name and build id. Those names are the cheapest way to find out which
++ * subsystems this phone actually has, and - because the records are in host
++ * order - which host id each one is. That matters here because the table lists
++ * hosts 7 and 8, which the Mi 8 port never names.
++ *
++ * The record layout is not assumed. Printable runs of three characters or more
++ * are printed as they come, which reads a name table correctly whatever the
++ * field sizes turn out to be, and prints nothing misleading if the item is not
++ * a name table at all.
++ */
++static void
++pw_strings(uint32_t at, uint32_t size, unsigned want)
++{
++	char buf[48];
++	unsigned run = 0, shown = 0;
++	uint32_t limit = size < 8192 ? size : 8192;
++
++	for (uint32_t i = 0; i <= limit; i++) {
++		uint8_t c = 0;
++		bool printable = i < limit && pw_peek(at + i, &c, 1) && c >= 0x20 && c < 0x7f;
++
++		if (printable) {
++			if (run < sizeof(buf) - 1) {
++				buf[run] = (char)c;
++			}
++			run++;
++			continue;
++		}
++		if (run >= 3) {
++			unsigned n = run < sizeof(buf) - 1 ? run : (unsigned)sizeof(buf) - 1;
++
++			buf[n] = 0;
++			printf("POLARIS WIFI:       \"%s\"\n", buf);
++			if (++shown >= want) {
++				return;
++			}
++		}
++		run = 0;
++	}
++}
++
++/*
+  * Whether the application processor may touch a partition at all.
+  *
+  * Build 0164 walked every entry in the table and stopped dead on partition 4,
+@@ -320,7 +397,7 @@
+ 		return;
+ 	}
+ 	memset(&census, 0, sizeof(census));
+-	printf("POLARIS WIFI: ======== build 0165 alive: reading SMEM at %#llx (%u bytes) "
++	printf("POLARIS WIFI: ======== build 0166 alive: reading SMEM at %#llx (%u bytes) "
+ 	    "and nothing else ========\n", PW_PHYS, PW_SIZE);
+ 
+ 	printf("POLARIS WIFI: the boot loader's version word at %#x is %#x (12 in [31:16] means "
+diff -Nur a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-02 00:18:55.104696351 +0800
++++ b/bsd/dev/sweet_ufs.c	2026-11-02 00:18:55.139167751 +0800
+@@ -59,6 +59,7 @@
+ extern void polaris_gpu_init(void);
+ extern void sweet_usb_probe(void);
+ extern void polaris_wifi_probe(void);
++extern void polaris_qmp_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -679,6 +680,15 @@
+ 	 */
+ 	sweet_usb_probe();
+ 	/*
++	 * Wi-Fi step 2: the QMP mailbox, read only, off unless polarisqmp=1.
++	 * It goes before the SMEM walk on purpose. Both blocks are always-on, so
++	 * either order is safe, but the SMEM walk is the one with a known way to
++	 * hang - build 0164 stalled a core on a partition the AP does not own -
++	 * and this probe must not be behind it: a stall in the walk would take
++	 * the mailbox reading with it and cost a whole cycle to find out.
++	 */
++	polaris_qmp_probe();
++	/*
+ 	 * Wi-Fi step 1: read SMEM and say what is in it. Off unless
+ 	 * polariswifi=1. It only reads, and SMEM is always-on, so it is safe
+ 	 * here - after the USB arm, which is where a wedge is most likely.
