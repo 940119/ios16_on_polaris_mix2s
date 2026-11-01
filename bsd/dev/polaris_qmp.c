@@ -286,7 +286,8 @@ polaris_qmp_probe(void)
 	    pq_rd(PQ_OUR_CHANNEL_ACK) == PQ_UP;
 	printf("POLARIS QMP: %s\n", open ?
 	    "the mailbox is already open: wlfw can use it as it stands" :
-	    "the mailbox is not open: opening it is a write, and that is a later build");
+	    (level >= 2 ? "the mailbox is not open: this build opens it below" :
+	    "the mailbox is not open: opening it is a write, and that is a later build"));
 
 	/*
 	 * The interrupt register, one word in the APCS block. Bit 0 is the AOP's
