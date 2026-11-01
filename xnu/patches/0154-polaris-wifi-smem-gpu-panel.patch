@@ -1,0 +1,650 @@
+diff -Nur a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 17:34:51.520689637 +0800
++++ b/bsd/conf/files	2026-11-01 17:34:51.557791078 +0800
+@@ -115,6 +115,7 @@
+ bsd/dev/polaris_touch_i2c.c		standard
+ bsd/dev/polaris_gpu_diag.c		standard
+ bsd/dev/polaris_gpu.c			standard
++bsd/dev/polaris_wifi.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-01 17:34:51.517409522 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-01 17:34:51.543823234 +0800
+@@ -3786,6 +3786,159 @@
+ 	return ok && wrong == 0;
+ }
+ 
++/* ---- step 18: the CP writes the memory the display is scanning out --------- */
++
++/*
++ * Steps 1..17 prove the 3D core can write memory it owns. This step asks the
++ * only question that matters for a display: can it write the *panel*?
++ *
++ * The panel is 1080x2160 at a 4320-byte stride, about 9.3 MB. The CP's address
++ * window is a single 2 MB slice at 0x10000000, and step 17's scratch buffer
++ * already occupies 0x10020000-0x1009ffff, so only 0x100a0000-0x100fffff (384 KB,
++ * 96 pages) is free. A whole-panel fill therefore cannot be mapped; a band can.
++ * Sixty-four rows is 276480 bytes, 68 pages, and it leaves room to spare.
++ *
++ * There is no read-back: the panel memory has no kernel mapping in this file,
++ * and adding one just to verify would defeat the point. The check is the screen
++ * - sixty-four rows of a colour ramp at the top of the display, drawn by the
++ * command processor. backboardd's first swap overwrites it, so it is a boot-time
++ * flash, not a persistent image.
++ */
++#define PG_PANEL_IOVA		0x100a0000ull	/* the free tail of the CP's window */
++#define PG_PANEL_MAX_PAGES	96u		/* 0x100a0000..0x100fffff */
++#define PG_PANEL_ROWS		64u
++
++/*
++ * The panel's geometry comes from PE_current_console(), which is where
++ * SweetFramebuffer::start() gets it too (video.v_baseAddr and friends). Reading
++ * it here rather than exporting it from the framebuffer keeps this file free of
++ * any dependency on the display kext, and it is the same number either way.
++ */
++static bool
++pg_panel_geometry(uint64_t *phys, uint32_t *width, uint32_t *height, uint32_t *stride)
++{
++	PE_Video video;
++
++	PE_current_console(&video);
++	if (video.v_baseAddr == 0 || video.v_width == 0 || video.v_height == 0 ||
++	    video.v_rowBytes == 0) {
++		return false;
++	}
++	*phys = video.v_baseAddr;
++	*width = (uint32_t)video.v_width;
++	*height = (uint32_t)video.v_height;
++	*stride = (uint32_t)video.v_rowBytes;
++	return true;
++}
++
++static bool
++pg_step_panel(void)
++{
++	uint64_t phys = 0, iova;
++	uint32_t width = 0, height = 0, stride = 0;
++	uint32_t bytes, words, pages, rows, wptr = pg_cp_wptr, rptr = 0, sent = 0, batches = 0;
++	bool ok = true;
++
++	if (pg_gpu3d == 0 || !pg_smmu_tables() || pg_ring_va[0] == 0) {
++		printf("POLARIS GPU: 18 the CP is not there\n");
++		return false;
++	}
++	if (!pg_panel_geometry(&phys, &width, &height, &stride)) {
++		printf("POLARIS GPU: 18 the console has no framebuffer; nothing to write\n");
++		return false;
++	}
++	if (phys == 0 || stride < width * 4 || height < PG_PANEL_ROWS) {
++		printf("POLARIS GPU: 18 the panel geometry is unusable (%#llx, %ux%u stride %u)\n",
++		    phys, width, height, stride);
++		return false;
++	}
++	rows = PG_PANEL_ROWS;
++	bytes = stride * rows;
++	pages = (bytes + PG_GMU_PAGE_SIZE - 1u) / PG_GMU_PAGE_SIZE;
++	if (pages > PG_PANEL_MAX_PAGES) {
++		rows = (PG_PANEL_MAX_PAGES * PG_GMU_PAGE_SIZE) / stride;
++		bytes = stride * rows;
++		pages = (bytes + PG_GMU_PAGE_SIZE - 1u) / PG_GMU_PAGE_SIZE;
++	}
++	words = bytes / 4u;
++	printf("POLARIS GPU: 18 panel %#llx %ux%u stride %u: %u rows, %u bytes, %u pages at iova %#llx\n",
++	    phys, width, height, stride, rows, bytes, pages, PG_PANEL_IOVA);
++
++	/*
++	 * Map the band. The panel's first page is the one the display starts
++	 * scanning at, so this is the top of the visible image.
++	 */
++	for (uint32_t i = 0; i < pages; i++) {
++		if (!pg_map_phys(PG_PANEL_IOVA + (uint64_t)i * PG_GMU_PAGE_SIZE,
++		    phys + (uint64_t)i * PG_GMU_PAGE_SIZE, "the panel")) {
++			return false;
++		}
++	}
++	pg_to_memory(pg_l3b_va, PG_GMU_PAGE_SIZE);
++	{
++		uint64_t *l3 = (uint64_t *)pg_smmu_l3(PG_PANEL_IOVA);
++		uint32_t first = (uint32_t)((PG_PANEL_IOVA >> 12) & 0x1ff);
++
++		printf("POLARIS GPU: 18 slot %u -> %#llx (the panel's first page)\n",
++		    first, l3[first] & PG_PTE_ADDR);
++	}
++	PG_CHECK("18: the panel band is in the 3D core's window");
++
++	while (sent < words && ok) {
++		for (uint32_t c = 0; c < PG_DRAW_PER_BATCH && sent < words; c++) {
++			uint32_t n = words - sent < PG_DRAW_CHUNK ? words - sent : PG_DRAW_CHUNK;
++			uint64_t addr = PG_PANEL_IOVA + 4ull * sent;
++
++			pg_ring_put(wptr++, pg_pkt7(PG_CP_MEM_WRITE, n + 2u));
++			pg_ring_put(wptr++, (uint32_t)addr);
++			pg_ring_put(wptr++, (uint32_t)(addr >> 32));
++			for (uint32_t i = 0; i < n; i++) {
++				uint32_t at = sent + i;
++				uint32_t row = at / (stride / 4u);
++				uint32_t col = at % (stride / 4u);
++				uint32_t v = col * 255u / (width - 1u);
++				uint32_t g = row * 255u / (rows - 1u);
++
++				pg_ring_put(wptr++, 0xff000000u | (g << 16) | (v << 8) | (255u - v));
++			}
++			sent += n;
++		}
++		wptr &= PG_RING_WORDS - 1u;
++		pg_ring_flush();
++		pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		{
++			bool drained = false;
++
++			for (uint32_t i = 0; i < 20000; i++) {
++				rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
++				if (rptr == wptr) {
++					drained = true;
++					break;
++				}
++				pg_sleep_us(10);
++			}
++			if (!drained) {
++				printf("POLARIS GPU: 18 the CP stopped at %u of %u dwords: RPTR %u "
++				    "WPTR %u, RBBM_STATUS %#010x\n", sent, words, rptr,
++				    pg_rd(pg_gpu3d + 4u * PG_CP_RB_WPTR),
++				    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++				ok = false;
++			}
++		}
++		batches++;
++	}
++	pg_cp_wptr = wptr;
++	iova = PG_PANEL_IOVA;
++	printf("POLARIS GPU: 18 the CP %s: %u dwords in %u submissions at %#llx\n",
++	    ok ? "wrote the band" : "did NOT write the band", sent, batches, iova);
++	if (ok) {
++		printf("POLARIS GPU: 18 the top %u rows of the panel now hold the CP's ramp; "
++		    "backboardd's next swap replaces them\n", rows);
++	}
++	return ok;
++}
++
+ /* ---- the ladder ------------------------------------------------------------------------------------ */
+ 
+ void
+@@ -3952,7 +4105,16 @@
+ 		printf("POLARIS GPU: stop after 17: the fill did not land\n");
+ 		return;
+ 	}
+-	printf("POLARIS GPU: ladder done at 17; the CP has filled a framebuffer through the SMMU\n");
++	if (upto < 18) {
++		printf("POLARIS GPU: ladder done at 17; the CP has filled a framebuffer through the SMMU\n");
++		return;
++	}
++	PG_CHECK("step 18: the CP writes the panel");
++	if (!pg_step_panel()) {
++		printf("POLARIS GPU: stop after 18: the panel band did not land\n");
++		return;
++	}
++	printf("POLARIS GPU: ladder done at 18; the CP has written the panel\n");
+ }
+ 
+ void
+diff -Nur a/bsd/dev/polaris_wifi.c b/bsd/dev/polaris_wifi.c
+--- a/bsd/dev/polaris_wifi.c	1970-01-01 08:00:00.000000000 +0800
++++ b/bsd/dev/polaris_wifi.c	2026-11-01 17:34:51.549124415 +0800
+@@ -0,0 +1,314 @@
++/*
++ * Polaris (Mi MIX 2S, SDM845) Wi-Fi, step 1: read the shared memory and say
++ * what is in it.
++ *
++ * Nothing here writes. The point is to answer one question before any of the
++ * WCN3990 machinery is ported: is this phone's SMEM laid out the way the Mi 8's
++ * is? The Mi 8 port (bsd/dev/mi8_rproc.c) has a working WLAN stack, and it is
++ * only reusable if the tables line up. If the item numbers differ, the port
++ * needs a mapping table and that is cheaper to discover here than three builds
++ * later.
++ *
++ * The layout is Linux's (drivers/soc/qcom/smem.c):
++ *
++ *   the region        2 MB at 0x86000000 (dt: qcom,smem@86000000)
++ *   the table of      the last 4 KB of the region: magic "$TOC", version 1,
++ *   contents          then `count` 48-byte entries of {offset, size, flags,
++ *                     host0, host1, cacheline}
++ *   a partition       at entry.offset: magic "$PRT", its two hosts, size, and
++ *                     the two free-space pointers
++ *   an item           a 16-byte header {canary 0xa5a5, item, size, paddings}
++ *                     followed by the item's bytes
++ *
++ * Host ids are Linux's: 0 is the application processor, 1 the modem, 2 the
++ * audio DSP, 3 the sensors DSP, 5 the compute DSP, 0xfffe "global".
++ *
++ * Why a copy loop instead of a struct pointer: the region is mapped write-
++ * combined and is not normal memory, so every read goes through smem_peek()
++ * one byte at a time. That is also how the Mi 8 port does it, and it is the
++ * only way a short read shows up as a failed check rather than as garbage.
++ *
++ * Boot with polariswifi=1 to run it. Default: nothing at all.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <mach/vm_param.h>
++#include <vm/vm_kern.h>
++#include <vm/memory_types.h>
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
++
++#define PW_PHYS			0x86000000ull
++#define PW_SIZE			0x00200000u
++
++#define PW_HOST_AP		0
++#define PW_HOST_MODEM		1
++#define PW_HOST_ADSP		2
++#define PW_HOST_SDSP		3
++#define PW_HOST_CDSP		5
++#define PW_HOST_GLOBAL		0xfffe
++
++#define PW_CANARY		0xa5a5
++
++/* Linux's struct smem_table_entry, 48 bytes. */
++struct pw_toc_entry {
++	uint32_t offset;
++	uint32_t size;
++	uint32_t flags;
++	uint16_t host0;
++	uint16_t host1;
++	uint32_t cacheline;
++	uint32_t reserved[7];
++};
++
++/* Linux's struct smem_table, 32 bytes, at PW_SIZE - 0x1000. */
++struct pw_toc {
++	uint8_t  magic[4];
++	uint32_t version;
++	uint32_t count;
++	uint32_t reserved[5];
++};
++
++/* Linux's struct smem_partition, 32 bytes, at the partition's offset. */
++struct pw_partition {
++	uint8_t  magic[4];
++	uint16_t host0;
++	uint16_t host1;
++	uint32_t size;
++	uint32_t free_uncached;
++	uint32_t free_cached;
++	uint32_t reserved[3];
++};
++
++/* Linux's struct smem_entry, 16 bytes, before each item's bytes. */
++struct pw_item_header {
++	uint16_t canary;
++	uint16_t item;
++	uint32_t size;
++	uint16_t padding_data;
++	uint16_t padding_header;
++	uint32_t reserved;
++};
++
++/*
++ * The items the WLAN path needs, named the way the Mi 8 port names them. These
++ * are Linux's sdm845 numbers; the whole point of this build is to find out
++ * whether this phone agrees.
++ */
++#define PW_ITEM_SMP2P_AP	429	/* our half of the pair, every remote */
++#define PW_ITEM_SMP2P_REMOTE	443	/* the remote's half */
++#define PW_ITEM_SMP2P_MSS_AP	428
++#define PW_ITEM_SMP2P_MSS	435
++#define PW_ITEM_GLINK_DESC	478
++#define PW_ITEM_GLINK_FIFO	479
++#define PW_ITEM_CRASH_REASON	421	/* 421 + remote pid */
++
++static const volatile uint8_t *pw_smem;
++
++static bool
++pw_peek(uint32_t offset, void *to, uint32_t size)
++{
++	if (pw_smem == NULL) {
++		pw_smem = (const volatile uint8_t *)ml_io_map_unmappable(PW_PHYS, PW_SIZE,
++		    VM_WIMG_WCOMB);
++	}
++	if (pw_smem == NULL || offset + size > PW_SIZE) {
++		return false;
++	}
++	for (uint32_t i = 0; i < size; i++) {
++		((uint8_t *)to)[i] = pw_smem[offset + i];
++	}
++	return true;
++}
++
++static uint32_t
++pw_word(uint32_t offset)
++{
++	uint32_t v = 0;
++
++	pw_peek(offset, &v, sizeof(v));
++	return v;
++}
++
++static bool
++pw_toc(struct pw_toc *toc)
++{
++	return pw_peek(PW_SIZE - 0x1000, toc, sizeof(*toc)) &&
++	    memcmp(toc->magic, "$TOC", 4) == 0 && toc->version == 1 && toc->count <= 64;
++}
++
++static const char *
++pw_host_name(uint16_t host)
++{
++	switch (host) {
++	case PW_HOST_AP:      return "ap";
++	case PW_HOST_MODEM:   return "modem";
++	case PW_HOST_ADSP:    return "adsp";
++	case PW_HOST_SDSP:    return "sdsp";
++	case PW_HOST_CDSP:    return "cdsp";
++	case PW_HOST_GLOBAL:  return "global";
++	default:              return "?";
++	}
++}
++
++/*
++ * Walk one partition and report what is in it.
++ *
++ * Items are laid out from the start of the partition upwards, and (when the
++ * partition has a cache line) from the end of it downwards as well; the two
++ * meet at free_uncached / free_cached. Both directions are walked, because an
++ * item allocated by the boot loader can sit in either half and the WLAN items
++ * are usually the ones the boot loader put at the top.
++ */
++static void
++pw_survey(uint16_t one, uint16_t other)
++{
++	struct pw_toc toc;
++	struct pw_toc_entry entry;
++	struct pw_partition header;
++	struct pw_item_header item;
++	uint32_t found = 0, offset = 0, size = 0, cacheline = 0;
++	unsigned low = 0, high = 0, shown = 0;
++	uint32_t at, step_back;
++	bool saw_smp2p_ap = false, saw_smp2p_remote = false;
++	bool saw_mss_ap = false, saw_mss = false, saw_desc = false, saw_fifo = false;
++
++	if (!pw_toc(&toc)) {
++		printf("POLARIS WIFI: no $TOC, the region is not SMEM as Linux knows it\n");
++		return;
++	}
++	for (uint32_t i = 0; i < toc.count; i++) {
++		if (!pw_peek(PW_SIZE - 0x1000 + (uint32_t)sizeof(toc) +
++		    i * (uint32_t)sizeof(entry), &entry, sizeof(entry))) {
++			break;
++		}
++		if (entry.offset == 0 || entry.size == 0) {
++			continue;
++		}
++		if ((entry.host0 == one && entry.host1 == other) ||
++		    (entry.host0 == other && entry.host1 == one)) {
++			found = entry.offset;
++			size = entry.size;
++			cacheline = entry.cacheline;
++			break;
++		}
++	}
++	if (found == 0) {
++		printf("POLARIS WIFI: %s<->%s: no partition in the table\n",
++		    pw_host_name(one), pw_host_name(other));
++		return;
++	}
++	if (!pw_peek(found, &header, sizeof(header)) || memcmp(header.magic, "$PRT", 4) != 0 ||
++	    header.size != size) {
++		printf("POLARIS WIFI: %s<->%s: offset %#x size %#x but no $PRT there\n",
++		    pw_host_name(one), pw_host_name(other), found, size);
++		return;
++	}
++	printf("POLARIS WIFI: %s<->%s: at %#x (%u bytes, cache line %u, free %u/%u)\n",
++	    pw_host_name(one), pw_host_name(other), found, size, cacheline,
++	    header.free_uncached, header.free_cached);
++
++	if (header.free_uncached > header.size || header.free_cached > header.size) {
++		printf("POLARIS WIFI:   the free pointers are outside the partition: not walking it\n");
++		return;
++	}
++	for (at = (uint32_t)sizeof(header); at + sizeof(item) <= header.free_uncached;) {
++		if (!pw_peek(found + at, &item, sizeof(item)) || item.canary != PW_CANARY ||
++		    item.size > header.size) {
++			break;
++		}
++		low++;
++		if (shown < 10) {
++			printf("POLARIS WIFI:   item %u at %#x, %u bytes\n", item.item,
++			    found + at + (uint32_t)sizeof(item) + item.padding_header,
++			    item.size - item.padding_data);
++			shown++;
++		}
++		if (item.item == PW_ITEM_SMP2P_AP)     saw_smp2p_ap = true;
++		if (item.item == PW_ITEM_SMP2P_REMOTE) saw_smp2p_remote = true;
++		if (item.item == PW_ITEM_SMP2P_MSS_AP) saw_mss_ap = true;
++		if (item.item == PW_ITEM_SMP2P_MSS)    saw_mss = true;
++		if (item.item == PW_ITEM_GLINK_DESC)   saw_desc = true;
++		if (item.item == PW_ITEM_GLINK_FIFO)   saw_fifo = true;
++		at += (uint32_t)sizeof(item) + item.padding_header + item.size;
++	}
++	if (cacheline != 0 && (cacheline & (cacheline - 1)) == 0) {
++		step_back = ((uint32_t)sizeof(item) + cacheline - 1) & ~(cacheline - 1);
++		for (at = header.size - step_back; at > header.free_cached && at < header.size;) {
++			if (!pw_peek(found + at, &item, sizeof(item)) ||
++			    item.canary != PW_CANARY || item.size > at) {
++				break;
++			}
++			high++;
++			if (shown < 10) {
++				printf("POLARIS WIFI:   item %u at %#x, %u bytes (from the top)\n",
++				    item.item, found + at - item.size,
++				    item.size - item.padding_data);
++				shown++;
++			}
++			if (item.item == PW_ITEM_SMP2P_AP)     saw_smp2p_ap = true;
++			if (item.item == PW_ITEM_SMP2P_REMOTE) saw_smp2p_remote = true;
++			if (item.item == PW_ITEM_SMP2P_MSS_AP) saw_mss_ap = true;
++			if (item.item == PW_ITEM_SMP2P_MSS)    saw_mss = true;
++			if (item.item == PW_ITEM_GLINK_DESC)   saw_desc = true;
++			if (item.item == PW_ITEM_GLINK_FIFO)   saw_fifo = true;
++			at -= step_back + item.size;
++		}
++	}
++	printf("POLARIS WIFI:   %u items from the bottom, %u from the top; smp2p ap %d remote %d, "
++	    "mss ap %d mss %d, glink desc %d fifo %d\n", low, high,
++	    saw_smp2p_ap, saw_smp2p_remote, saw_mss_ap, saw_mss, saw_desc, saw_fifo);
++}
++
++static bool
++polaris_wifi_requested(void)
++{
++	int optin = 0;
++
++	if (!PE_parse_boot_argn("polariswifi", &optin, sizeof(optin))) {
++		return false;
++	}
++	return optin == 1;
++}
++
++void
++polaris_wifi_probe(void)
++{
++	struct pw_toc toc;
++
++	if (!polaris_wifi_requested()) {
++		return;
++	}
++	printf("POLARIS WIFI: ======== build 0154 alive: reading SMEM at %#llx (%u bytes) "
++	    "and nothing else ========\n", PW_PHYS, PW_SIZE);
++
++	printf("POLARIS WIFI: the boot loader's version word at %#x is %#x (12 in [31:16] means "
++	    "the partition table is in use)\n", 0x40 + 4 * 7, pw_word(0x40 + 4 * 7));
++
++	if (!pw_toc(&toc)) {
++		printf("POLARIS WIFI: no $TOC at %#x: this is not SMEM v1\n", PW_SIZE - 0x1000);
++		return;
++	}
++	printf("POLARIS WIFI: $TOC version %u, %u entries\n", toc.version, toc.count);
++	for (uint32_t i = 0; i < toc.count; i++) {
++		struct pw_toc_entry entry;
++
++		if (!pw_peek(PW_SIZE - 0x1000 + (uint32_t)sizeof(toc) +
++		    i * (uint32_t)sizeof(entry), &entry, sizeof(entry))) {
++			break;
++		}
++		printf("POLARIS WIFI: toc %2u: %s <-> %s at %#x, %u bytes, cache line %u, flags %#x\n",
++		    i, pw_host_name(entry.host0), pw_host_name(entry.host1), entry.offset,
++		    entry.size, entry.cacheline, entry.flags);
++	}
++
++	pw_survey(PW_HOST_GLOBAL, PW_HOST_GLOBAL);
++	pw_survey(PW_HOST_AP, PW_HOST_MODEM);
++	pw_survey(PW_HOST_AP, PW_HOST_ADSP);
++	pw_survey(PW_HOST_AP, PW_HOST_CDSP);
++	pw_survey(PW_HOST_AP, PW_HOST_SDSP);
++	printf("POLARIS WIFI: read only; nothing was written\n");
++}
++#endif
+diff -Nur a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-11-01 17:34:51.513263823 +0800
++++ b/bsd/dev/sweet_ufs.c	2026-11-01 17:34:51.535623488 +0800
+@@ -58,6 +58,7 @@
+ extern void polaris_gpu_state_probe(void);
+ extern void polaris_gpu_init(void);
+ extern void sweet_usb_probe(void);
++extern void polaris_wifi_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -678,6 +679,12 @@
+ 	 */
+ 	sweet_usb_probe();
+ 	/*
++	 * Wi-Fi step 1: read SMEM and say what is in it. Off unless
++	 * polariswifi=1. It only reads, and SMEM is always-on, so it is safe
++	 * here - after the USB arm, which is where a wedge is most likely.
++	 */
++	polaris_wifi_probe();
++	/*
+ 	 * Last, and off unless polarisgpuprobe=2. Build 0102 showed why: the
+ 	 * first read of the GPU clock controller parks the calling thread in the
+ 	 * interconnect for good while the rest of the system keeps running, so
+diff -Nur a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c	2026-11-01 17:34:51.471124451 +0800
++++ b/bsd/dev/sweet_usb.c	2026-11-01 17:34:51.527457759 +0800
+@@ -202,8 +202,8 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0153 alive: DCTL.RUN_STOP polarity fixed "
+-	    "(set = run), so attach actually runs the core ========\n");
++	printf("SWEET USB: ======== build 0154 alive: full select_utmi_clk sequence, "
++	    "ENBLSLPM cleared before run ========\n");
+ 	sweet_log_flush_now();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -381,6 +381,8 @@
+  */
+ #define DCTL_RUN_STOP   (1u << 31)   /* 1 = run, 0 = stop */
+ #define DCTL_CSFTRST    (1u << 30)
++/* dwc3 core.h: DWC3_GUSB2PHYCFG_ENBLSLPM BIT(8), DWC3_GUSB2PHYCFG_SUSPHY BIT(6). */
++#define GUSB2PHYCFG_ENBLSLPM (1u << 8)
+ /*
+  * DSTS, from Linux dwc3 core.h:
+  *   [2:0]   ConnectSpeed (0=HS, 1=FS, 2=LS, 4=SS)
+@@ -1430,10 +1432,22 @@
+ }
+ 
+ /*
+- * Hand the wrapper the high-speed PHY's UTMI clock. The controller is wired
+- * for both PHYs and GENERAL_CFG selects which one feeds the core; the DT
+- * says maximum-speed = high-speed. Written with the bit numbers mainline
+- * dwc3-qcom uses for this SoC - which is not what this function did before.
++ * Hand the wrapper the high-speed PHY's UTMI clock.
++ *
++ * Mainline's dwc3_qcom_select_utmi_clk() is three steps, not one:
++ *
++ *   1 set PIPE_UTMI_CLK_DIS (BIT 8)          - stop the PIPE clock first
++ *   2 sleep
++ *   3 set PIPE_UTMI_CLK_SEL (BIT 0) | PIPE3_PHYSTATUS_SW (BIT 3)
++ *   4 sleep
++ *   5 clear PIPE_UTMI_CLK_DIS (BIT 8)
++ *
++ * Until 0154 this did only step 3, so PIPE3_PHYSTATUS_SW was never set and the
++ * clock was never stopped and restarted. That matters here because the device
++ * tree for ssusb@a600000 has no qcom,select-utmi-as-pipe-clk at all, while
++ * ssphy@88e8000 exists - mainline would not take this path at all, so this is
++ * the one place where the port deliberately overrides the hardware's own
++ * description and has to do it exactly the way the vendor path does.
+  */
+ static void
+ ud_pipe_select(void)
+@@ -1444,19 +1458,31 @@
+ 		return;
+ 	}
+ 	uint32_t g = usb_rd(qs, QSCRATCH_GENERAL_CFG);
+-	*(volatile uint32_t *)(qs + QSCRATCH_GENERAL_CFG) =
+-	    (g & ~PIPE_UTMI_CLK_DIS) | PIPE_UTMI_CLK_SEL;
+-	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t v;
++
++	/* 1: stop the PIPE clock. */
++	usb_wr(qs, QSCRATCH_GENERAL_CFG, g | PIPE_UTMI_CLK_DIS);
+ 	delay(1000);
+-	printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (UTMI clk sel)\n",
+-	    g, usb_rd(qs, QSCRATCH_GENERAL_CFG));
++	/* 2: select UTMI as the pipe clock and take the PHY status from software. */
++	v = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	usb_wr(qs, QSCRATCH_GENERAL_CFG, v | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
++	delay(1000);
++	/* 3: let the PIPE clock run again. */
++	v = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	usb_wr(qs, QSCRATCH_GENERAL_CFG, v & ~PIPE_UTMI_CLK_DIS);
++	delay(1000);
++	printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (sel %d phystatus_sw %d clk_dis %d)\n",
++	    g, usb_rd(qs, QSCRATCH_GENERAL_CFG),
++	    !!(usb_rd(qs, QSCRATCH_GENERAL_CFG) & PIPE_UTMI_CLK_SEL),
++	    !!(usb_rd(qs, QSCRATCH_GENERAL_CFG) & PIPE3_PHYSTATUS_SW),
++	    !!(usb_rd(qs, QSCRATCH_GENERAL_CFG) & PIPE_UTMI_CLK_DIS));
+ }
+ 
+ /*
+  * Force a real detach.
+  *
+- * Clearing DCTL.RUN_STOP stops the core, and a stopped core drops the D+
+- * pull-up. That matters because a host only
++ * Clearing DCTL.RUN_STOP stops the core, and a stopped core drops the D+ pull-up.
++ * That matters because a host only
+  * issues a bus reset when it observes a *new* connect: ABL left this port
+  * enumerated for fastboot and never dropped the pull-up on hand-off, so by
+  * the time this driver runs the host has a device it already gave up on and
+@@ -1580,7 +1606,25 @@
+ 	int seen = 0;
+ 	int w;
+ 
+-	/* Set RUN_STOP: run the core, which is what raises the D+ pull-up. */
++	/*
++	 * Set RUN_STOP: run the core, which is what raises the D+ pull-up.
++	 *
++	 * GUSB2PHYCFG.ENBLSLPM is cleared first, the way Linux's
++	 * dwc3_gadget_run_stop() does it. That comment in gadget.c says the
++	 * workaround was found by experiment and is not in the programming
++	 * guide: with LPM enabled across a start/stop the controller can time
++	 * out. This port reads 0x00002500 there, i.e. ENBLSLPM set, and this
++	 * driver starts and stops the core four times in a row.
++	 */
++	{
++		uint32_t cfg = dwc_rd(GUSB2PHYCFG);
++
++		if (cfg & GUSB2PHYCFG_ENBLSLPM) {
++			dwc_wr(GUSB2PHYCFG, cfg & ~GUSB2PHYCFG_ENBLSLPM);
++			printf("SWEET USB: GUSB2PHYCFG 0x%08x -> 0x%08x (ENBLSLPM cleared)\n",
++			    cfg, dwc_rd(GUSB2PHYCFG));
++		}
++	}
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (w = 0; w < (int)(ms / 5); w++) {
+ 		uint32_t cnt;
