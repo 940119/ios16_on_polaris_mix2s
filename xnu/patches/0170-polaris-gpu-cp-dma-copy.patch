@@ -1,0 +1,204 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-02 02:22:30.957437113 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-02 02:22:30.997771913 +0800
+@@ -3394,6 +3394,13 @@
+ #define PG_ZAP_REGION_SIZE	0x2000u
+ #define PG_CP_SET_SECURE_MODE	0x66u
+ #define PG_CP_MEM_WRITE		0x3du
++/*
++ * CP_DMA: the command processor's own copy engine, five words after the header
++ * (source, destination, byte count). Filling is only half of what the panel
++ * needs - present() copies a surface onto it - and a fill cannot copy, so this
++ * is the packet that has to work before any of that is worth wiring up.
++ */
++#define PG_CP_DMA		0x41u
+ #define PG_MEMPTRS_IOVA		0x10010000ull
+ 
+ /* 8 x 4 KB of ring, which is what RB_CNTL below was set up for in step 15 */
+@@ -4026,6 +4033,40 @@
+ }
+ 
+ /*
++ * A whole row in one go.
++ *
++ * pg_panel_read() goes back to the mapping table for every pixel it touches,
++ * which is right for the three samples above and wrong for a copy test that has
++ * to compare a thousand words twice. The mapping is taken once here and walked.
++ *
++ * The row is contiguous inside its mapping because pg_panel_row_va() maps the
++ * page holding the row start plus enough pages to hold a whole stride, so a run
++ * of `words` dwords that fits in one stride never leaves the mapping. That is
++ * checked rather than assumed: a caller asking for more than a stride would
++ * read the next row and compare it against something it was never copied from.
++ */
++static bool
++pg_panel_peek(uint32_t row, uint32_t *to, uint32_t words, uint32_t stride)
++{
++	uint32_t off = 0;
++	vm_offset_t va;
++
++	if (words == 0 || words > stride / 4u) {
++		printf("POLARIS GPU: 18b %u words do not fit in a %u byte stride\n", words,
++		    stride);
++		return false;
++	}
++	va = pg_panel_row_va(row, stride, &off);
++	if (va == 0) {
++		return false;
++	}
++	for (uint32_t i = 0; i < words; i++) {
++		to[i] = ((volatile uint32_t *)(va + off + (uint64_t)i * 4u))[0];
++	}
++	return true;
++}
++
++/*
+  * One row, one packet, one drain. That is the shortest gap this code can put
+  * between "the CP was told to write this" and "the CPU read it", and the gap is
+  * what decides whether the reading means anything on a surface the rest of the
+@@ -4232,6 +4273,115 @@
+ 	return sent;
+ }
+ 
++/*
++ * One CP_DMA copy, waited for.
++ *
++ * `dst` and `src` are addresses in the 3D core's window, which is the only
++ * address space the command processor walks. The byte count must be a multiple
++ * of four and the two ends must not overlap.
++ *
++ * The encoding is the one Linux uses for the same packet on the same command
++ * processor (amdgpu_vm_copy_pte: header, source, destination, byte count), with
++ * the header built by this file's pg_pkt7() because that is the packet type the
++ * CP here takes - CP_MEM_WRITE has been going through it since step 15.
++ *
++ * The wait is the same one the fill uses: the read pointer has to come back to
++ * the write pointer before the data can be read. A copy that does not drain is
++ * reported rather than waited on forever, and the caller decides what it means.
++ */
++static bool
++pg_dma_copy(uint64_t dst, uint64_t src, uint32_t bytes, uint32_t *wptrp)
++{
++	uint32_t wptr = *wptrp, rptr = 0;
++	bool drained = false;
++
++	pg_ring_put(wptr++, pg_pkt7(PG_CP_DMA, 5));
++	pg_ring_put(wptr++, (uint32_t)src);
++	pg_ring_put(wptr++, (uint32_t)(src >> 32));
++	pg_ring_put(wptr++, (uint32_t)dst);
++	pg_ring_put(wptr++, (uint32_t)(dst >> 32));
++	pg_ring_put(wptr++, bytes);
++	wptr &= PG_RING_WORDS - 1u;
++	pg_ring_flush();
++	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < 100000; i++) {
++		rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
++		if (rptr == wptr) {
++			drained = true;
++			break;
++		}
++		pg_sleep_us(10);
++	}
++	if (!drained) {
++		printf("POLARIS GPU: 18b the CP did not take the copy packet: RPTR %u WPTR %u, "
++		    "RBBM_STATUS %#010x\n", rptr, wptr,
++		    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++	}
++	*wptrp = wptr;
++	return drained;
++}
++
++/*
++ * Step 18b: copy a row of the panel with the command processor and read it back.
++ *
++ * A fill proves the CP can put words into the memory the display scans out. A
++ * copy proves it can take them from there as well, and that is the whole
++ * difference between "the CP is a paintbrush" and "the CP can present a frame".
++ *
++ * Row 0 is the source because the fill above has just written a known ramp into
++ * it, and row 100 is the destination because it is far enough away to be a
++ * different page and close enough that nothing else has touched it. Both rows
++ * are read by the CPU before and after, so the comparison does not depend on
++ * what the ramp happens to be.
++ *
++ * Off unless polarisgpudma=1: it writes, and the fill above it is already the
++ * step's verdict.
++ */
++static void
++pg_dma_test(uint32_t width, uint32_t height, uint32_t stride)
++{
++	static uint32_t before[2048], after[2048];
++	uint32_t row = 0, dstrow = 100, words = width, wptr = pg_cp_wptr, i;
++	uint64_t src, dst;
++	bool drained;
++
++	if (height <= dstrow || width > 2048u || stride < width * 4u) {
++		printf("POLARIS GPU: 18b a %ux%u panel is not one this test fits\n", width, height);
++		return;
++	}
++	src = PG_PANEL_IOVA;
++	dst = PG_PANEL_IOVA + (uint64_t)dstrow * stride;
++	printf("POLARIS GPU: 18b copying row %u (%#llx) to row %u (%#llx), %u bytes, with "
++	    "CP_DMA\n", row, src, dstrow, dst, words * 4u);
++
++	if (!pg_panel_peek(row, before, words, stride)) {
++		printf("POLARIS GPU: 18b row %u did not read\n", row);
++		return;
++	}
++	drained = pg_dma_copy(dst, src, words * 4u, &wptr);
++	pg_cp_wptr = wptr;
++	if (!drained) {
++		return;
++	}
++	if (!pg_panel_peek(dstrow, after, words, stride)) {
++		printf("POLARIS GPU: 18b row %u did not read\n", dstrow);
++		return;
++	}
++	for (i = 0; i < words; i++) {
++		if (after[i] != before[i]) {
++			break;
++		}
++	}
++	if (i == words) {
++		printf("POLARIS GPU: 18b THE CP COPIED THE ROW: %u dwords from row %u to row %u, "
++		    "and the CPU reads them back\n", words, row, dstrow);
++	} else {
++		printf("POLARIS GPU: 18b the copy did not land: first word that differs is %u "
++		    "(%08x, wanted %08x)\n", i, after[i], before[i]);
++	}
++}
++
+ static bool
+ pg_step_panel(void)
+ {
+@@ -4380,7 +4530,7 @@
+ 		 */
+ 		uint32_t sent_top, sent_bottom, end_top, end_bottom;
+ 		uint32_t want = band;
+-		int fill_all = 0;
++		int fill_all = 0, dma_wanted = 0;
+ 
+ 		/*
+ 		 * polarisgpufill=1 asks for the whole nine megabytes instead of the
+@@ -4430,6 +4580,20 @@
+ 			printf("POLARIS GPU: 18 THE CP WROTE %s OF THE PANEL: %u dwords, and the CPU "
+ 			    "reads the pixels back\n", fill_all ? "ALL" : "BOTH ENDS", sent_top);
+ 		}
++
++		/*
++		 * Step 18b: the same command processor, told to copy instead of to
++		 * fill. This is the step that matters for the real job, because
++		 * present() moves a surface onto the panel and a fill cannot move
++		 * anything. Off unless polarisgpudma=1: it writes to a row the band
++		 * fill never touches, and the fill above is already this step's
++		 * verdict, so a failure here must not take the ladder down.
++		 */
++		(void)PE_parse_boot_argn("polarisgpudma", &dma_wanted, sizeof(dma_wanted));
++		if (dma_wanted) {
++			pg_dma_test(width, height, stride);
++		}
++
+ 		if (fill_all) {
+ 			/*
+ 			 * Twenty seconds with nothing printed, so the ramp is what the
