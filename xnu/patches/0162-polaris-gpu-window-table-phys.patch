@@ -1,0 +1,61 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-01 22:36:30.982216590 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-01 22:36:31.012347590 +0800
+@@ -1311,8 +1311,30 @@
+ 	 * page is used before step 18; the rest exist so the panel fits.
+ 	 */
+ 	for (uint32_t i = 0; i < PG_CP_WINDOW_L2S; i++) {
++		/*
++		 * kvtophys() per page, not once plus i pages. kmem_alloc() gives
++		 * virtually contiguous pages and says nothing about where they
++		 * land physically, so "the first page's address plus four" is a
++		 * guess - and build 0160 proved it was the wrong guess: the top
++		 * 32 rows (the first table) wrote fine and the first write into
++		 * the fifth table was a translation fault, FSR 0x402, FAR
++		 * 0x10964600, which is exactly the start of the bottom band.
++		 * The CPU read the descriptors back as correct the whole time
++		 * because it writes them through the virtual address.
++		 */
+ 		((uint64_t *)pg_l2_va)[PG_CP_WINDOW_L2 + i] =
+-		    (kvtophys(pg_l3b_va) + (uint64_t)i * PG_GMU_PAGE_SIZE) | PG_PTE_TABLE;
++		    (kvtophys(pg_l3b_va + (vm_offset_t)i * PG_GMU_PAGE_SIZE) &
++		    PG_PTE_ADDR) | PG_PTE_TABLE;
++	}
++	/*
++	 * The five table addresses, side by side. If they are not consecutive
++	 * the descriptor arithmetic above was reading someone else's memory, and
++	 * that is worth seeing in the ring rather than deducing from a fault.
++	 */
++	for (uint32_t i = 0; i < PG_CP_WINDOW_L2S; i++) {
++		printf("POLARIS GPU: 10 window table %u: %#llx%s", i,
++		    kvtophys(pg_l3b_va + (vm_offset_t)i * PG_GMU_PAGE_SIZE),
++		    i + 1u == PG_CP_WINDOW_L2S ? "\n" : "  ");
+ 	}
+ 	PG_CHECK("tables: the descriptors are written, flushing");
+ 	pg_to_memory(pg_l1_va, PG_GMU_PAGE_SIZE);
+@@ -4177,6 +4199,25 @@
+ 				    pg_rd(cb + PG_CB_FSR), pg_rd(cb + 0x5c), pg_rd(cb + 0x64),
+ 				    pg_rd(cb + 0x60),
+ 				    pg_rd(pg_gpu3d + 4u * PG_RBBM_INT_STATUS));
++				{
++					uint64_t far = (uint64_t)pg_rd(cb + 0x60) |
++					    ((uint64_t)pg_rd(cb + 0x64) << 32);
++					uint64_t *l3f = (uint64_t *)pg_smmu_l3(far);
++
++					/*
++					 * The same question 0160 could not answer
++					 * from the fault alone: is the descriptor
++					 * missing, or is the table the walker used
++					 * not the one this code filled in? The
++					 * second line is the one that says it.
++					 */
++					printf("POLARIS GPU: 18 FAR %#llx: table %u slot %u, "
++					    "the CPU's descriptor there is %#llx\n", far,
++					    l3f == NULL ? 0u : (uint32_t)(((far >> 21) & 0x1ff) -
++					    PG_CP_WINDOW_L2), l3f == NULL ? 0u :
++					    (uint32_t)((far >> 12) & 0x1ff),
++					    l3f == NULL ? 0ull : l3f[(far >> 12) & 0x1ff]);
++				}
+ 				pg_cp_watch("the batch did not drain in one second", wptr);
+ 				pg_cp_probe("after the fill stopped");
+ 				stalled = true;
