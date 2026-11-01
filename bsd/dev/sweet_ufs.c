@@ -62,6 +62,7 @@ extern void sweet_usb_probe(void);
 extern void polaris_wifi_probe(void);
 extern void polaris_qmp_probe(void);
 extern void polaris_modem_probe(void);
+extern void polaris_modem_state_probe(void);
 
 #define REG_CAP         0x00
 #define REG_IS          0x20
@@ -736,6 +737,12 @@ sweet_ufs_init(void)
 	 * the root filesystem is mounted and before anything else uses the disk.
 	 */
 	polaris_modem_probe();
+	/*
+	 * Modem step 2: is the modem already running? Registers only, off unless
+	 * polarismodem=2. It switches the MSS AHB clock on first, because the RMB
+	 * cannot be read without it, and that is the only write it makes.
+	 */
+	polaris_modem_state_probe();
 	/*
 	 * Last, and off unless polarisgpuprobe=2. Build 0102 showed why: the
 	 * first read of the GPU clock controller parks the calling thread in the
