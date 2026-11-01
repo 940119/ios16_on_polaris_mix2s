@@ -1,0 +1,514 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-01 18:48:25.637055429 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-01 18:48:25.674709388 +0800
+@@ -17,6 +17,7 @@
+ #include <mach/mach_time.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ 
+ extern bool polaris_touch_i2c_board(void);
+ 
+@@ -1069,9 +1070,23 @@
+ #define PG_CP_SQE_IOVA		0x10000000ull	/* the CP's microcode and ring live here */
+ #define PG_CP_RING_IOVA		0x10008000ull
+ #define PG_CP_WINDOW_L2	0x00000080u	/* (0x10000000 >> 21) & 0x1ff: the CP's window */
++/*
++ * How many 2 MB level 2 entries the CP's window spans.
++ *
++ * Build 0154 could only fill a 64-row band of the panel, because one level 3
++ * page is 2 MB and step 17's scratch already owned most of it. Five entries
++ * make the window 0x10000000-0x109fffff (10 MB), which is enough for the whole
++ * 1080x2160 panel (9331200 bytes) with room to spare - and the panel starts at
++ * 0x100a0000, above step 17's scratch, so nothing already mapped moves.
++ *
++ * The level 1 entry is unchanged: 0x10000000 >> 30 is 0 for every one of these
++ * five entries, and build 0140's fault was an empty level 1 entry, not an
++ * empty level 2 one.
++ */
++#define PG_CP_WINDOW_L2S	5u
+ 
+ static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
+-static vm_offset_t pg_l3b_va;			/* the second window, for the CP */
++static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
+ static bool pg_keep_running;		/* the ladder continues past step 13 */
+ static bool pg_smmu_mode;			/* polarisgpumap=1: translate instead of bypass */
+ static int pg_mmu_way;				/* polarisgpummu: 0 auto, 1 entry, 2 unmatched, 3 off */
+@@ -1270,7 +1285,7 @@
+ 		return false;
+ 	}
+ 	PG_CHECK("tables: the second level 3 page, for the CP's window");
+-	if (kmem_alloc(kernel_map, &pg_l3b_va, PG_GMU_PAGE_SIZE,
++	if (kmem_alloc(kernel_map, &pg_l3b_va, PG_CP_WINDOW_L2S * PG_GMU_PAGE_SIZE,
+ 	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("POLARIS GPU: 10 no memory for the SMMU's second level 3 table\n");
+ 		return false;
+@@ -1291,21 +1306,31 @@
+ 	    kvtophys(pg_l2_va) | PG_PTE_TABLE;
+ 	((uint64_t *)pg_l2_va)[(PG_GMU_IOVA_BASE >> 21) & 0x1ff] =
+ 	    kvtophys(pg_l3_va) | PG_PTE_TABLE;
+-	((uint64_t *)pg_l2_va)[PG_CP_WINDOW_L2] = kvtophys(pg_l3b_va) | PG_PTE_TABLE;
++	/*
++	 * The CP's window is PG_CP_WINDOW_L2S level 3 pages back to back, so the
++	 * 3D core sees 10 MB of contiguous IOVA instead of 2 MB. Only the first
++	 * page is used before step 18; the rest exist so the panel fits.
++	 */
++	for (uint32_t i = 0; i < PG_CP_WINDOW_L2S; i++) {
++		((uint64_t *)pg_l2_va)[PG_CP_WINDOW_L2 + i] =
++		    (kvtophys(pg_l3b_va) + (uint64_t)i * PG_GMU_PAGE_SIZE) | PG_PTE_TABLE;
++	}
+ 	PG_CHECK("tables: the descriptors are written, flushing");
+ 	pg_to_memory(pg_l1_va, PG_GMU_PAGE_SIZE);
+ 	pg_to_memory(pg_l2_va, PG_GMU_PAGE_SIZE);
+ 	printf("POLARIS GPU: 10 SMMU tables: level 1 %#llx, level 2 %#llx, level 3 %#llx and "
+-	    "%#llx (the CP's window)\n", kvtophys(pg_l1_va), kvtophys(pg_l2_va),
+-	    kvtophys(pg_l3_va), kvtophys(pg_l3b_va));
++	    "%#llx (%u pages, the CP's window: %#llx-%#llx)\n", kvtophys(pg_l1_va), kvtophys(pg_l2_va),
++	    kvtophys(pg_l3_va), kvtophys(pg_l3b_va), PG_CP_WINDOW_L2S, PG_CP_SQE_IOVA,
++	    PG_CP_SQE_IOVA + (uint64_t)PG_CP_WINDOW_L2S * 0x200000ull - 1ull);
+ 	return true;
+ }
+ 
+ /*
+- * Which level 3 table owns an address. Two 2 MB windows are wired up: the one
+- * the GMU's queues live in (0x60000000) and the one the CP's microcode and ring
+- * live in (0x10000000). Anything else has no table and must not be mapped -
+- * a wrong slot here would silently rewrite another window's descriptors.
++ * Which level 3 table owns an address. The GMU's queues live in one 2 MB window
++ * at 0x60000000; the CP's microcode, ring and everything it is asked to write
++ * live in PG_CP_WINDOW_L2S consecutive 2 MB windows starting at 0x10000000.
++ * Anything else has no table and must not be mapped - a wrong slot here would
++ * silently rewrite another window's descriptors.
+  */
+ static vm_offset_t
+ pg_smmu_l3(uint64_t iova)
+@@ -1315,8 +1340,8 @@
+ 	if (l2 == (uint32_t)((PG_GMU_IOVA_BASE >> 21) & 0x1ff)) {
+ 		return pg_l3_va;
+ 	}
+-	if (l2 == PG_CP_WINDOW_L2) {
+-		return pg_l3b_va;
++	if (l2 >= PG_CP_WINDOW_L2 && l2 < PG_CP_WINDOW_L2 + PG_CP_WINDOW_L2S) {
++		return pg_l3b_va + (vm_offset_t)(l2 - PG_CP_WINDOW_L2) * PG_GMU_PAGE_SIZE;
+ 	}
+ 	return 0;
+ }
+@@ -3241,7 +3266,7 @@
+ 			return false;
+ 		}
+ 	}
+-	pg_to_memory(pg_l3b_va, PG_GMU_PAGE_SIZE);
++	pg_to_memory(pg_l3b_va, PG_CP_WINDOW_L2S * PG_GMU_PAGE_SIZE);
+ 	{
+ 		uint64_t *l3 = (uint64_t *)pg_smmu_l3(PG_CP_SQE_IOVA);
+ 
+@@ -3487,7 +3512,7 @@
+ 		if (!pg_map_phys(PG_MEMPTRS_IOVA, kvtophys(pg_memptrs_va), "the memptrs page")) {
+ 			return false;
+ 		}
+-		pg_to_memory(pg_l3b_va, PG_GMU_PAGE_SIZE);
++		pg_to_memory(pg_l3b_va, PG_CP_WINDOW_L2S * PG_GMU_PAGE_SIZE);
+ 	}
+ 	trust = pg_rd(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL);
+ 	printf("POLARIS GPU: 16 RBBM_SECVID_TRUST_CNTL %#010x: %s\n", trust,
+@@ -3661,7 +3686,7 @@
+ 			return false;
+ 		}
+ 	}
+-	pg_to_memory(pg_l3b_va, PG_GMU_PAGE_SIZE);
++	pg_to_memory(pg_l3b_va, PG_CP_WINDOW_L2S * PG_GMU_PAGE_SIZE);
+ 	{
+ 		uint64_t *l3 = (uint64_t *)pg_smmu_l3(PG_DRAW_IOVA);
+ 		uint32_t first = (uint32_t)((PG_DRAW_IOVA >> 12) & 0x1ff);
+@@ -3792,21 +3817,23 @@
+  * Steps 1..17 prove the 3D core can write memory it owns. This step asks the
+  * only question that matters for a display: can it write the *panel*?
+  *
+- * The panel is 1080x2160 at a 4320-byte stride, about 9.3 MB. The CP's address
+- * window is a single 2 MB slice at 0x10000000, and step 17's scratch buffer
+- * already occupies 0x10020000-0x1009ffff, so only 0x100a0000-0x100fffff (384 KB,
+- * 96 pages) is free. A whole-panel fill therefore cannot be mapped; a band can.
+- * Sixty-four rows is 276480 bytes, 68 pages, and it leaves room to spare.
+- *
+- * There is no read-back: the panel memory has no kernel mapping in this file,
+- * and adding one just to verify would defeat the point. The check is the screen
+- * - sixty-four rows of a colour ramp at the top of the display, drawn by the
+- * command processor. backboardd's first swap overwrites it, so it is a boot-time
+- * flash, not a persistent image.
+- */
+-#define PG_PANEL_IOVA		0x100a0000ull	/* the free tail of the CP's window */
+-#define PG_PANEL_MAX_PAGES	96u		/* 0x100a0000..0x100fffff */
+-#define PG_PANEL_ROWS		64u
++ * The panel is 1080x2160 at a 4320-byte stride, 9331200 bytes. Build 0154 could
++ * only reach a 64-row band of it, because the CP's window was a single 2 MB
++ * level 3 page and step 17's scratch buffer already owned most of it. The window
++ * is now PG_CP_WINDOW_L2S (five) level 3 pages, 10 MB, so the whole panel fits -
++ * starting at 0x100a0000, above everything already mapped, so no existing
++ * descriptor moves.
++ *
++ * Build 0154 also had no read-back: the only check was the screen, and
++ * backboardd's first swap erases the evidence before anyone can look at it, so
++ * that build ended with "the CP consumed the ring" and nothing more. This one
++ * reads pixels back through the CPU afterwards. ml_io_map gives an uncached
++ * window onto the same physical pages the CP just wrote, which is the cheapest
++ * possible proof that the command processor's writes reached the memory the
++ * display is scanning out.
++ */
++#define PG_PANEL_IOVA		0x100a0000ull	/* the first page above step 17's scratch */
++#define PG_PANEL_MAX_PAGES	2400u		/* 0x100a0000..0x109fffff: the rest of the window */
+ 
+ /*
+  * The panel's geometry comes from PE_current_console(), which is where
+@@ -3831,12 +3858,88 @@
+ 	return true;
+ }
+ 
++/*
++ * The one definition of what the CP is told to write, so the read-back below
++ * compares against the same arithmetic instead of a copy of it. Red ramps left
++ * to right, green top to bottom, so a swapped stride or a wrong row offset is
++ * visible in the numbers and not just in the picture.
++ */
++static uint32_t
++pg_panel_pixel(uint32_t row, uint32_t col, uint32_t width, uint32_t height)
++{
++	uint32_t v = col * 255u / (width - 1u);
++	uint32_t g = row * 255u / (height - 1u);
++
++	return 0xff000000u | (g << 16) | (v << 8) | (255u - v);
++}
++
++/*
++ * Read a handful of pixels back through the CPU.
++ *
++ * Three rows near the top and three near the bottom, three columns each. The
++ * bottom rows matter as much as the top ones: they are in a different level 2
++ * entry of the CP's window, so they are the only evidence that the window
++ * really is five level 3 pages and not just the first one.
++ *
++ * ml_io_map wants a page-aligned physical address, and a row start is not one
++ * (stride 4320), so each probe is mapped from the page below it and read at an
++ * offset.
++ */
++static bool
++pg_panel_verify(uint64_t phys, uint32_t width, uint32_t height, uint32_t stride)
++{
++	uint32_t rows[6], cols[3];
++	uint32_t wrong = 0, checked = 0;
++
++	rows[0] = 0;
++	rows[1] = 1;
++	rows[2] = 7;
++	rows[3] = height - 8u;
++	rows[4] = height - 2u;
++	rows[5] = height - 1u;
++	cols[0] = 0;
++	cols[1] = width / 2u;
++	cols[2] = width - 1u;
++
++	for (uint32_t r = 0; r < 6; r++) {
++		uint64_t at = phys + (uint64_t)rows[r] * stride;
++		uint64_t base = at & ~(uint64_t)(PG_GMU_PAGE_SIZE - 1u);
++		uint32_t off = (uint32_t)(at - base);
++		vm_size_t span = (vm_size_t)((off + stride + PG_GMU_PAGE_SIZE - 1u) &
++		    ~(vm_size_t)(PG_GMU_PAGE_SIZE - 1u));
++		vm_offset_t va = ml_io_map((vm_offset_t)base, span);
++
++		if (va == 0) {
++			printf("POLARIS GPU: 18 could not map row %u to read it back\n", rows[r]);
++			return false;
++		}
++		for (uint32_t c = 0; c < 3; c++) {
++			uint32_t got = ((volatile uint32_t *)(va + off + cols[c] * 4u))[0];
++			uint32_t want = pg_panel_pixel(rows[r], cols[c], width, height);
++
++			checked++;
++			if (got != want) {
++				wrong++;
++				if (wrong <= 6) {
++					printf("POLARIS GPU: 18 row %u col %u reads %#010x, the CP "
++					    "was told to write %#010x\n", rows[r], cols[c], got, want);
++				}
++			}
++		}
++		ml_io_unmap(va, span);
++	}
++	printf("POLARIS GPU: 18 read %u pixels back through the CPU: %u wrong "
++	    "(rows 0, 1, 7 and the last 8; columns 0, %u and %u)\n",
++	    checked, wrong, width / 2u, width - 1u);
++	return wrong == 0;
++}
++
+ static bool
+ pg_step_panel(void)
+ {
+-	uint64_t phys = 0, iova;
++	uint64_t phys = 0;
+ 	uint32_t width = 0, height = 0, stride = 0;
+-	uint32_t bytes, words, pages, rows, wptr = pg_cp_wptr, rptr = 0, sent = 0, batches = 0;
++	uint32_t bytes, words, pages, wptr = pg_cp_wptr, rptr = 0, sent = 0, batches = 0;
+ 	bool ok = true;
+ 
+ 	if (pg_gpu3d == 0 || !pg_smmu_tables() || pg_ring_va[0] == 0) {
+@@ -3847,26 +3950,26 @@
+ 		printf("POLARIS GPU: 18 the console has no framebuffer; nothing to write\n");
+ 		return false;
+ 	}
+-	if (phys == 0 || stride < width * 4 || height < PG_PANEL_ROWS) {
++	if (phys == 0 || stride < width * 4 || height < 8) {
+ 		printf("POLARIS GPU: 18 the panel geometry is unusable (%#llx, %ux%u stride %u)\n",
+ 		    phys, width, height, stride);
+ 		return false;
+ 	}
+-	rows = PG_PANEL_ROWS;
+-	bytes = stride * rows;
++	bytes = stride * height;
+ 	pages = (bytes + PG_GMU_PAGE_SIZE - 1u) / PG_GMU_PAGE_SIZE;
+ 	if (pages > PG_PANEL_MAX_PAGES) {
+-		rows = (PG_PANEL_MAX_PAGES * PG_GMU_PAGE_SIZE) / stride;
+-		bytes = stride * rows;
+-		pages = (bytes + PG_GMU_PAGE_SIZE - 1u) / PG_GMU_PAGE_SIZE;
++		printf("POLARIS GPU: 18 the panel is %u pages and the window holds %u: not "
++		    "writing a partial image\n", pages, PG_PANEL_MAX_PAGES);
++		return false;
+ 	}
+ 	words = bytes / 4u;
+-	printf("POLARIS GPU: 18 panel %#llx %ux%u stride %u: %u rows, %u bytes, %u pages at iova %#llx\n",
+-	    phys, width, height, stride, rows, bytes, pages, PG_PANEL_IOVA);
++	printf("POLARIS GPU: 18 panel %#llx %ux%u stride %u: the whole thing, %u bytes, "
++	    "%u pages at iova %#llx\n", phys, width, height, stride, bytes, pages, PG_PANEL_IOVA);
+ 
+ 	/*
+-	 * Map the band. The panel's first page is the one the display starts
+-	 * scanning at, so this is the top of the visible image.
++	 * Map the whole panel. The panel's first page is the one the display
++	 * starts scanning at, so this is the top of the visible image, and the
++	 * last page is nine megabytes further into the window.
+ 	 */
+ 	for (uint32_t i = 0; i < pages; i++) {
+ 		if (!pg_map_phys(PG_PANEL_IOVA + (uint64_t)i * PG_GMU_PAGE_SIZE,
+@@ -3874,32 +3977,34 @@
+ 			return false;
+ 		}
+ 	}
+-	pg_to_memory(pg_l3b_va, PG_GMU_PAGE_SIZE);
++	pg_to_memory(pg_l3b_va, PG_CP_WINDOW_L2S * PG_GMU_PAGE_SIZE);
+ 	{
+-		uint64_t *l3 = (uint64_t *)pg_smmu_l3(PG_PANEL_IOVA);
+-		uint32_t first = (uint32_t)((PG_PANEL_IOVA >> 12) & 0x1ff);
+-
+-		printf("POLARIS GPU: 18 slot %u -> %#llx (the panel's first page)\n",
+-		    first, l3[first] & PG_PTE_ADDR);
++		uint64_t last = PG_PANEL_IOVA + (uint64_t)(pages - 1u) * PG_GMU_PAGE_SIZE;
++		uint32_t fi = (uint32_t)((PG_PANEL_IOVA >> 12) & 0x1ff);
++		uint32_t li = (uint32_t)((last >> 12) & 0x1ff);
++		uint64_t *l3f = (uint64_t *)pg_smmu_l3(PG_PANEL_IOVA);
++		uint64_t *l3l = (uint64_t *)pg_smmu_l3(last);
++
++		printf("POLARIS GPU: 18 first page slot %u -> %#llx, last (%#llx) slot %u -> "
++		    "%#llx, tables %s\n", fi, l3f[fi] & PG_PTE_ADDR, last, li,
++		    l3l[li] & PG_PTE_ADDR, l3f == l3l ? "the same" : "different");
+ 	}
+-	PG_CHECK("18: the panel band is in the 3D core's window");
++	PG_CHECK("18: the whole panel is in the 3D core's window");
+ 
+ 	while (sent < words && ok) {
+ 		for (uint32_t c = 0; c < PG_DRAW_PER_BATCH && sent < words; c++) {
+ 			uint32_t n = words - sent < PG_DRAW_CHUNK ? words - sent : PG_DRAW_CHUNK;
+ 			uint64_t addr = PG_PANEL_IOVA + 4ull * sent;
++			uint32_t per_row = stride / 4u;
+ 
+ 			pg_ring_put(wptr++, pg_pkt7(PG_CP_MEM_WRITE, n + 2u));
+ 			pg_ring_put(wptr++, (uint32_t)addr);
+ 			pg_ring_put(wptr++, (uint32_t)(addr >> 32));
+ 			for (uint32_t i = 0; i < n; i++) {
+ 				uint32_t at = sent + i;
+-				uint32_t row = at / (stride / 4u);
+-				uint32_t col = at % (stride / 4u);
+-				uint32_t v = col * 255u / (width - 1u);
+-				uint32_t g = row * 255u / (rows - 1u);
+ 
+-				pg_ring_put(wptr++, 0xff000000u | (g << 16) | (v << 8) | (255u - v));
++				pg_ring_put(wptr++, pg_panel_pixel(at / per_row, at % per_row,
++				    width, height));
+ 			}
+ 			sent += n;
+ 		}
+@@ -3929,12 +4034,11 @@
+ 		batches++;
+ 	}
+ 	pg_cp_wptr = wptr;
+-	iova = PG_PANEL_IOVA;
+ 	printf("POLARIS GPU: 18 the CP %s: %u dwords in %u submissions at %#llx\n",
+-	    ok ? "wrote the band" : "did NOT write the band", sent, batches, iova);
++	    ok ? "wrote the whole panel" : "did NOT write the panel", sent, batches,
++	    PG_PANEL_IOVA);
+ 	if (ok) {
+-		printf("POLARIS GPU: 18 the top %u rows of the panel now hold the CP's ramp; "
+-		    "backboardd's next swap replaces them\n", rows);
++		ok = pg_panel_verify(phys, width, height, stride);
+ 	}
+ 	return ok;
+ }
+@@ -4111,10 +4215,11 @@
+ 	}
+ 	PG_CHECK("step 18: the CP writes the panel");
+ 	if (!pg_step_panel()) {
+-		printf("POLARIS GPU: stop after 18: the panel band did not land\n");
++		printf("POLARIS GPU: stop after 18: the panel fill did not land\n");
+ 		return;
+ 	}
+-	printf("POLARIS GPU: ladder done at 18; the CP has written the panel\n");
++	printf("POLARIS GPU: ladder done at 18; the CP has written the whole panel and the "
++	    "CPU read it back\n");
+ }
+ 
+ void
+diff -Nur a/bsd/dev/polaris_wifi.c b/bsd/dev/polaris_wifi.c
+--- a/bsd/dev/polaris_wifi.c	2026-11-01 18:48:25.641280429 +0800
++++ b/bsd/dev/polaris_wifi.c	2026-11-01 18:48:25.680280429 +0800
+@@ -220,7 +220,7 @@
+ 			break;
+ 		}
+ 		low++;
+-		if (shown < 10) {
++		if (shown < 16) {
+ 			printf("POLARIS WIFI:   item %u at %#x, %u bytes\n", item.item,
+ 			    found + at + (uint32_t)sizeof(item) + item.padding_header,
+ 			    item.size - item.padding_data);
+@@ -242,7 +242,7 @@
+ 				break;
+ 			}
+ 			high++;
+-			if (shown < 10) {
++			if (shown < 16) {
+ 				printf("POLARIS WIFI:   item %u at %#x, %u bytes (from the top)\n",
+ 				    item.item, found + at - item.size,
+ 				    item.size - item.padding_data);
+@@ -281,7 +281,7 @@
+ 	if (!polaris_wifi_requested()) {
+ 		return;
+ 	}
+-	printf("POLARIS WIFI: ======== build 0154 alive: reading SMEM at %#llx (%u bytes) "
++	printf("POLARIS WIFI: ======== build 0155 alive: reading SMEM at %#llx (%u bytes) "
+ 	    "and nothing else ========\n", PW_PHYS, PW_SIZE);
+ 
+ 	printf("POLARIS WIFI: the boot loader's version word at %#x is %#x (12 in [31:16] means "
+diff -Nur a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c	2026-11-01 18:48:25.646346746 +0800
++++ b/bsd/dev/sweet_usb.c	2026-11-01 18:48:25.658613763 +0800
+@@ -202,8 +202,8 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0154 alive: full select_utmi_clk sequence, "
+-	    "ENBLSLPM cleared before run ========\n");
++	printf("SWEET USB: ======== build 0155 alive: ten minute monitor, GSTS cable/session/"
++	    "bvalid by name ========\n");
+ 	sweet_log_flush_now();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -400,6 +400,17 @@
+ #define DSTS_SOFFN(v)   (((v) >> 3) & 0x3fffu)
+ #define DSTS_LNKST(v)   (((v) >> 18) & 0xfu)
+ 
++/*
++ * GSTS tells whether the controller thinks a cable is on the port at all, and
++ * it is the one register the four attach attempts never looked at. Bits 12, 13
++ * and 14 are BSessVld, BCable and BValid in Linux's core.h; build 0154 read
++ * GSTS 0x7e800000, i.e. all three clear, which is why no bus reset ever came.
++ * Print them by name so the next round does not have to decode the hex.
++ */
++#define GSTS_BSESSVLD   (1u << 12)
++#define GSTS_BCABLE     (1u << 13)
++#define GSTS_BVALID     (1u << 14)
++
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
+@@ -1564,36 +1575,56 @@
+ 	(void)arg;
+ 	(void)wr;
+ 	ud_sleep_ms(3000);
+-	printf("SWEET USB: monitor start, unplug and replug the cable now\n");
+-	for (m = 0; m < 20; m++) {
+-		uint32_t d = dwc_rd(DSTS);
+-		/*
+-		 * Decoded against Linux core.h, not guessed:
+-		 *   DSTS[2:0]   ConnectSpd: 0 = high speed, 1 = full speed,
+-		 *               4 = super speed (DWC3_DSTS_HIGHSPEED is (0 << 0))
+-		 *   DSTS[21:18] USBLNKST
+-		 *   DSTS[22]    DevCtrlHlt
+-		 * The previous line printed `cs=%d` from bit 0 alone and `spd` from
+-		 * bits[3:1], which is part of SOFFN - so "cs=1 spd=0" meant
+-		 * "full speed, and three frame-number bits", not what it looked
+-		 * like.
+-		 *
+-		 * Bit 22 is DevCtrlHlt and it is trustworthy; 0152 was wrong to
+-		 * distrust it. It reads 1 exactly when RUN_STOP has been cleared,
+-		 * i.e. when the core is stopped - which is what "halted" means.
+-		 * The two are printed side by side so the pairing is visible:
+-		 * a monitor line with runstop 0 and hlt 1 is a stopped core, and
+-		 * a stopped core raises no events.
+-		 */
+-		printf("SWEET USB: mon %2d spd=%u DSTS 0x%08x (b20 %d hlt %d idle %d) "
+-		    "DCTL 0x%08x run %d GSTS 0x%08x ev 0x%08x\n",
+-		    m, d & 7u, d,
+-		    !!(d & DSTS_BIT20), !!(d & DSTS_DEVCTRLHLT), !!(d & DSTS_BIT23),
+-		    dwc_rd(DCTL), !!(dwc_rd(DCTL) & DCTL_RUN_STOP),
+-		    dwc_rd(GSTS), dwc_rd(GEVNTCOUNT) & 0xffff);
+-		ud_sleep_ms(1000);
++	/*
++	 * Twenty samples was the whole window in 0153 and 0154, and nobody can
++	 * pull a cable out and put it back inside twenty seconds - so the one
++	 * experiment that would settle whether the host just needs a fresh
++	 * connect edge has never actually been run. Ten minutes, and a line only
++	 * when something changes (plus one a minute as a heartbeat) so the ring
++	 * is not filled with identical lines.
++	 */
++	printf("SWEET USB: monitor start: 600 samples, one a second, a line whenever the "
++	    "state changes - unplug and replug the cable at any point in that window\n");
++	{
++		uint32_t last_d = dwc_rd(DSTS), last_g = dwc_rd(GSTS), last_ev = 0;
++		uint32_t changes = 0;
++
++		for (m = 0; m < 600; m++) {
++			uint32_t d = dwc_rd(DSTS);
++			uint32_t g = dwc_rd(GSTS);
++			uint32_t ev = dwc_rd(GEVNTCOUNT) & 0xffff;
++			bool moved = (d != last_d || g != last_g || ev != last_ev);
++
++			if (moved || (m % 60) == 0) {
++				/*
++				 * Decoded against Linux core.h, not guessed:
++				 *   DSTS[2:0]   ConnectSpd: 0 = high speed, 1 = full speed,
++				 *               4 = super speed (DWC3_DSTS_HIGHSPEED is (0 << 0))
++				 *   DSTS[21:18] USBLNKST
++				 *   DSTS[22]    DevCtrlHlt
++				 * Bit 22 reads 1 exactly when RUN_STOP has been cleared, i.e.
++				 * when the core is stopped, which is what "halted" means. The
++				 * two are printed side by side so the pairing is visible.
++				 */
++				printf("SWEET USB: mon %3d spd=%u DSTS 0x%08x (b20 %d hlt %d idle %d) "
++				    "DCTL 0x%08x run %d GSTS 0x%08x (cable %d sess %d bvalid %d) "
++				    "ev 0x%08x%s\n",
++				    m, d & 7u, d,
++				    !!(d & DSTS_BIT20), !!(d & DSTS_DEVCTRLHLT), !!(d & DSTS_BIT23),
++				    dwc_rd(DCTL), !!(dwc_rd(DCTL) & DCTL_RUN_STOP),
++				    g, !!(g & GSTS_BCABLE), !!(g & GSTS_BSESSVLD), !!(g & GSTS_BVALID),
++				    ev, moved ? "  <- changed" : "");
++				if (moved) {
++					changes++;
++				}
++				last_d = d;
++				last_g = g;
++				last_ev = ev;
++			}
++			ud_sleep_ms(1000);
++		}
++		printf("SWEET USB: monitor done: %u state changes in 600 s\n", changes);
+ 	}
+-	printf("SWEET USB: monitor done\n");
+ 	/* A kernel thread may not return; park it out of the way. */
+ 	for (;;) {
+ 		ud_sleep_ms(60000);
