@@ -1,0 +1,197 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -47,17 +47,27 @@
+ #define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
++/*
++ * The names carry the offset because three of these were read for five builds
++ * under a name that did not match what the register is. 0x0f010/0x0f014/0x0f018
++ * are the USB30_PRIM CBCR block in order (master, mock-UTMI, sleep) and
++ * 0x0f01c is the mock-UTMI CMD_RCGR, which legitimately reads 0x00100105 - an
++ * RCG is not a CBCR and its bit 0 is CLK_ENABLE, not CLK_OFF. Reading 0x0f018
++ * as "the UTMI clock" produced the "clk utmi ... STILL OFF" line that sent two
++ * builds after a clock fault that did not exist. The last four offsets came
++ * from another SoC and are printed only because they have always been printed.
++ */
+ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "master@f010", 0x0f010 },
++	{ "mockutmi@f014", 0x0f014 },
++	{ "sleep@f018", 0x0f018 },
++	{ "cfgnocaxi@502c", 0x0502c },
++	{ "aggreaxi@8201c", 0x8201c },
++	{ "ahb2phy@6a004", 0x6a004 },
++	{ "clkref@8c010", 0x8c010 },
+ };
+ 
+ #define DWC3_PA                 0x0a600000
+@@ -192,9 +202,8 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0152 alive: PHY init table taken from "
+-	    "qusb@88e2000 (BIAS_CTRL2 0x17, TUNE2 0x2b), PLL ready bit read both "
+-	    "ways, QSCRATCH bits corrected ========\n");
++	printf("SWEET USB: ======== build 0153 alive: DCTL.RUN_STOP polarity fixed "
++	    "(set = run), so attach actually runs the core ========\n");
+ 	sweet_log_flush_now();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -347,28 +356,43 @@
+ #define   PIPE3_PHYSTATUS_SW    (1u << 3)
+ #define   PIPE_UTMI_CLK_DIS     (1u << 8)
+ 
+-#define DCTL_RUN_STOP   (1u << 31)   /* 1 = stopped, 0 = running (DWC3 puts it at bit 31) */
++/*
++ * DCTL.RUN_STOP: SET means run, CLEAR means stop.
++ *
++ * This file had it backwards until 0153 and every attach in 0148-0152 was
++ * therefore a detach. Linux settles it: dwc3_gadget_run_stop(dwc, is_on) does
++ * `reg |= DWC3_DCTL_RUN_STOP` when is_on is true and `reg &= ~...` when it is
++ * false, so setting the bit starts the controller. core.h calls it
++ * DWC3_DCTL_RUN_STOP	BIT(31).
++ *
++ * The register readings agree, once DevCtrlHlt is read the way core.h defines
++ * it (BIT(22), a real halt flag):
++ *
++ *   DCTL 0x80f00000 (bit31 = 1, RUN)   DSTS 0x00920001 (bit22 = 0, running)
++ *   DCTL 0x00f00000 (bit31 = 0, STOP)  DSTS 0x00d20001 (bit22 = 1, halted)
++ *
++ * 0152 read those two rows the other way round and concluded that bit 22 was
++ * not a halt flag. It is one; the polarity of RUN_STOP was the thing that was
++ * wrong. So ud_detach() was starting the core and ud_attach_and_wait() was
++ * halting it, which is exactly why no build since 0148 ever saw a bus reset:
++ * during the whole four-second window the controller was halted and DevCtrlHlt
++ * said so, twenty samples in a row, with GEVNTCOUNT at zero because a halted
++ * controller raises no events.
++ */
++#define DCTL_RUN_STOP   (1u << 31)   /* 1 = run, 0 = stop */
+ #define DCTL_CSFTRST    (1u << 30)
+ /*
+  * DSTS, from Linux dwc3 core.h:
+  *   [2:0]   ConnectSpeed (0=HS, 1=FS, 2=LS, 4=SS)
+- *   [17:3]  SOFFN        [21:18] USBLNKST      [22] DevCtrlHlt
++ *   [17:3]  SOFFN   [17] RxFifoEmpty   [21:18] USBLNKST
++ *   [22] DevCtrlHlt   [23] CoreIdle
+  *
+  * 0146 "fixed" this to bit 9, which is SOFFN[6]. At handover DSTS reads
+  * 0x00520004, so bit 9 is set and the detach loop believed the core was
+  * permanently halted - it was reading a frame counter.
+- *
+- * 0152: bit 22 is labelled DevCtrlHlt here because that is what dwc3 core.h
+- * calls it, but this core does not behave that way and the log says so. With
+- * DCTL.RUN_STOP set (stopped) DSTS reads 0x00920001, bit 22 clear; with
+- * RUN_STOP clear (running) it reads 0x00d20001, bit 22 set. A halted-state
+- * flag that reads 0 exactly while the core is stopped is not a halted-state
+- * flag. So "hlt=1" must not be used as evidence that the core is halted, and
+- * every build that did is suspect on that one point. The raw register is
+- * printed alongside it; the bits are shown, not interpreted.
+  */
+ #define DSTS_BIT20      (1u << 20)
+-#define DSTS_DEVCTRLHLT (1u << 22)  /* name from core.h; see above, unreliable */
++#define DSTS_DEVCTRLHLT (1u << 22)
+ #define DSTS_BIT23      (1u << 23)
+ #define DSTS_SPEED(v)   ((v) & 7u)
+ #define DSTS_SOFFN(v)   (((v) >> 3) & 0x3fffu)
+@@ -1431,8 +1455,8 @@
+ /*
+  * Force a real detach.
+  *
+- * Clearing DCTL.RUN_STOP halts the core, and a halted core drives the UTMI
+- * pull-down instead of the D+ pull-up. That matters because a host only
++ * Clearing DCTL.RUN_STOP stops the core, and a stopped core drops the D+
++ * pull-up. That matters because a host only
+  * issues a bus reset when it observes a *new* connect: ABL left this port
+  * enumerated for fastboot and never dropped the pull-up on hand-off, so by
+  * the time this driver runs the host has a device it already gave up on and
+@@ -1451,13 +1475,16 @@
+ 	int i;
+ 
+ 	/*
+-	 * Halt the core: RUN_STOP = 1 drops the D+ pull-up. This used to
+-	 * *clear* the bit, i.e. it started the core and raised the pull-up,
+-	 * while ud_attach_and_wait() then set it and took the pull-up away.
+-	 * So the whole attach bisect ran with the wire disconnected during
+-	 * every listening window - the host had nothing to see.
++	 * Stop the core: clearing RUN_STOP drops the D+ pull-up.
++	 *
++	 * 0148 through 0152 set the bit here instead, on the reading that
++	 * "RUN_STOP = 1 means stopped". It does not: Linux sets the bit to
++	 * run. So every detach in those five builds started the controller and
++	 * every attach stopped it, and the four-second listening window in the
++	 * bisect was spent with the wire disconnected and DevCtrlHlt reading 1
++	 * in all twenty monitor samples that followed.
+ 	 */
+-	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
+ 	for (i = 0; i < 200; i++) {
+ 		d = dwc_rd(DSTS);
+ 		if (d & DSTS_DEVCTRLHLT) {
+@@ -1525,15 +1552,15 @@
+ 		 * "full speed, and three frame-number bits", not what it looked
+ 		 * like.
+ 		 *
+-		 * Bit 22 is printed raw and unlabelled on purpose. It was called
+-		 * DevCtrlHlt and 0150/0151 read it as "the core halted between the
+-		 * attach window and the monitor", which spawned a whole theory
+-		 * about a PHY read parking the core. It cannot be that: bit 22
+-		 * reads 0 exactly when DCTL.RUN_STOP is 1. RUN_STOP is printed
+-		 * next to it so the two can be compared at a glance.
++		 * Bit 22 is DevCtrlHlt and it is trustworthy; 0152 was wrong to
++		 * distrust it. It reads 1 exactly when RUN_STOP has been cleared,
++		 * i.e. when the core is stopped - which is what "halted" means.
++		 * The two are printed side by side so the pairing is visible:
++		 * a monitor line with runstop 0 and hlt 1 is a stopped core, and
++		 * a stopped core raises no events.
+ 		 */
+-		printf("SWEET USB: mon %2d spd=%u DSTS 0x%08x (b20 %d b22 %d b23 %d) "
+-		    "DCTL 0x%08x runstop %d GSTS 0x%08x ev 0x%08x\n",
++		printf("SWEET USB: mon %2d spd=%u DSTS 0x%08x (b20 %d hlt %d idle %d) "
++		    "DCTL 0x%08x run %d GSTS 0x%08x ev 0x%08x\n",
+ 		    m, d & 7u, d,
+ 		    !!(d & DSTS_BIT20), !!(d & DSTS_DEVCTRLHLT), !!(d & DSTS_BIT23),
+ 		    dwc_rd(DCTL), !!(dwc_rd(DCTL) & DCTL_RUN_STOP),
+@@ -1553,8 +1580,8 @@
+ 	int seen = 0;
+ 	int w;
+ 
+-	/* Clear RUN_STOP: run the core, which is what raises the D+ pull-up. */
+-	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	/* Set RUN_STOP: run the core, which is what raises the D+ pull-up. */
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (w = 0; w < (int)(ms / 5); w++) {
+ 		uint32_t cnt;
+ 		int drained = 0;
+@@ -2519,15 +2546,15 @@
+ 	/*
+ 	 * Leave the core running (pull-up up) and watch the wire for 90 s.
+ 	 *
+-	 * This also used to set RUN_STOP, i.e. leave the device disconnected,
+-	 * so the monitor thread below was watching a wire the core had already
+-	 * let go of. The one thing that separates "the PHY is not driving D+"
+-	 * from "the PHY is not connected to the port" is whether the core's own
+-	 * line-state sensing follows the cable. One unplug during the window
+-	 * answers it.
++	 * This line is what made every monitor window since 0150 useless. It
++	 * cleared RUN_STOP, which stops the controller, and it runs immediately
++	 * before the monitor thread starts - so all twenty samples in 0150,
++	 * 0151 and 0152 were taken on a stopped core (DevCtrlHlt 1, GEVNTCOUNT
++	 * 0) and read as "the PHY never drove D+". Setting the bit is what
++	 * keeps the pull-up up.
+ 	 */
+ 	printf("SWEET USB: leaving the pull-up up, monitor thread starts below\n");
+-	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 
+ 	printf("SWEET USB: step 6/6 threads, DMA at 0x%llx\n", ud.dma_pa);
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
