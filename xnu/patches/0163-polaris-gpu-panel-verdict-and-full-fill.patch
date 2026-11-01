@@ -1,0 +1,135 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-01 23:02:13.809952294 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-01 23:02:13.845709994 +0800
+@@ -4329,13 +4329,25 @@
+ 			pg_sleep_us(10000);
+ 		}
+ 		pg_panel_show("one second later,", 0, width, height, stride);
+-		ok = wrote && (fresh == 3);
+-		if (ok) {
++		/*
++		 * Two of three, every time, and it is the third pixel that explains
++		 * it: the last dword of the row is the one the command processor is
++		 * still putting down when the read happens. Builds 0160 and 0162
++		 * both read 0xff0000ff 0xff007f80 0xff000000 here and both read the
++		 * whole row back correctly afterwards, so this is a measurement of
++		 * how fast the CPU is, not of whether the write landed. It is printed
++		 * and it does not decide the step; the fill below does.
++		 *
++		 * "one second later" is not a verdict either: in 0162 the boot got
++		 * far enough that the window server had repainted the row to black
++		 * by then, which is what a surface in use looks like.
++		 */
++		if (fresh == 3) {
+ 			printf("POLARIS GPU: 18 the CP's writes are in the memory the display scans "
+ 			    "out, and the CPU reads them back within microseconds\n");
+ 		} else if (wrote) {
+-			printf("POLARIS GPU: 18 a row written microseconds ago does not read back: "
+-			    "the CPU's view of %#llx is not the surface the CP wrote\n", phys);
++			printf("POLARIS GPU: 18 %u of 3 pixels were already there microseconds after "
++			    "the rewrite; the row is read again below, after the fill\n", fresh);
+ 		}
+ 	}
+ 
+@@ -4358,28 +4370,83 @@
+ 
+ 		/*
+ 		 * Thirty two rows at the top and thirty two at the bottom, not the
+-		 * whole panel. The whole panel is 2332800 dwords and this CP moves
+-		 * them at tens of thousands a second, so a full fill costs a
+-		 * minute of boot time to prove something the two ends prove in two
+-		 * submissions: the first page of the window and the last page are
+-		 * in different level 3 tables - the line above says so - and a
+-		 * write that lands at both ends can reach anywhere between them.
++		 * whole panel. The first page of the window and the last page sit
++		 * in different level 3 tables - the line above says which - so a
++		 * write that lands at both ends has crossed every table in between,
++		 * and 0162 showed it costs six submissions per end: 34560 dwords
++		 * each, drained, no fault. Filling all 2332800 would say nothing
++		 * more about reach and would take sixty eight times as long on a
++		 * surface the window server is already drawing on.
++		 */
++		uint32_t sent_top, sent_bottom, end_top, end_bottom;
++		uint32_t want = band;
++		int fill_all = 0;
++
++		/*
++		 * polarisgpufill=1 asks for the whole nine megabytes instead of the
++		 * two ends, and that is the only version of this that can be judged
++		 * with eyes rather than with a read back. Everything this file has
++		 * proved so far is a number; a screen full of red and green ramp is
++		 * not.
++		 *
++		 * The image is built with sweetusb=0 alongside it because every
++		 * printf after the fill draws over it, and the USB monitor prints
++		 * once a second for ninety seconds.
+ 		 */
+-		pg_panel_fill(0, band, width, height, stride, &wptr);
+-		if (height > 64u) {
+-			pg_panel_fill((height - 32u) * per_row, band, width, height, stride,
+-			    &wptr);
++		(void)PE_parse_boot_argn("polarisgpufill", &fill_all, sizeof(fill_all));
++		if (fill_all) {
++			want = bytes / 4u;
++			printf("POLARIS GPU: 18 filling the whole panel: %u dwords; the screen is "
++			    "the measurement\n", want);
++			sent_top = pg_panel_fill(0, want, width, height, stride, &wptr);
++			sent_bottom = sent_top;
++		} else {
++			sent_top = pg_panel_fill(0, band, width, height, stride, &wptr);
++			sent_bottom = height > 64u ?
++			    pg_panel_fill((height - 32u) * per_row, band, width, height, stride,
++			    &wptr) : 0;
+ 		}
+ 		pg_cp_wptr = wptr;
+-	}
++		end_top = pg_panel_show("after the fill,", 0, width, height, stride);
++		end_bottom = pg_panel_show("after the fill,", height - 1u, width, height,
++		    stride);
+ 
+-	/*
+-	 * These rows have had seconds to be repainted, so they are not the proof -
+-	 * the rewrite above was. They say what the far end of the window looks
+-	 * like, which is the part of the mapping the first page cannot speak for.
+-	 */
+-	pg_panel_show("after the fill,", 0, width, height, stride);
+-	pg_panel_show("after the fill,", height - 1u, width, height, stride);
++		/*
++		 * What decides the step: the command processor took every dword it
++		 * was given at both ends of a nine megabyte window, and the pixels
++		 * at both ends are the ones it was told to write. The first page
++		 * and the last page sit in different level 3 tables - the line
++		 * above says which - so the ends are not a sample of the mapping,
++		 * they are its two extremes.
++		 *
++		 * Build 0160 got the top band and faulted on the bottom one; 0162
++		 * got both, and still stopped the ladder, because this function
++		 * returned a verdict taken before the fill from a reading that can
++		 * only ever be two of three. The verdict belongs here.
++		 */
++		ok = sent_top == want && (fill_all || height <= 64u || sent_bottom == want) &&
++		    end_top == 3 && end_bottom == 3;
++		if (ok) {
++			printf("POLARIS GPU: 18 THE CP WROTE %s OF THE PANEL: %u dwords, and the CPU "
++			    "reads the pixels back\n", fill_all ? "ALL" : "BOTH ENDS", sent_top);
++		}
++		if (fill_all) {
++			/*
++			 * Twenty seconds with nothing printed, so the ramp is what the
++			 * screen holds. If it is gone before this returns, something
++			 * else owns the framebuffer and no amount of writing from the
++			 * command processor will be visible - which is also worth
++			 * knowing, and is the difference between "the CP cannot write
++			 * the panel" and "the panel is not the CP's to write".
++			 */
++			for (uint32_t i = 0; i < 2000u; i++) {
++				pg_sleep_us(10000);
++			}
++			pg_panel_show("twenty seconds after the fill,", 0, width, height, stride);
++			printf("POLARIS GPU: 18 the pause is over; if the screen held the ramp, the "
++			    "panel is the command processor's\n");
++		}
++	}
+ 	return ok;
+ }
+ 
