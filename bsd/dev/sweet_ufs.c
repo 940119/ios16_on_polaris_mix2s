@@ -49,6 +49,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern void thread_deallocate(thread_t);
 extern int hz;
 static void sweet_log_start(void);
+void sweet_cat_tick(void);
 extern void sweet_sample_start(void);
 extern void sweet_keys_init(void);
 extern void sweet_touch_init(void);
@@ -905,6 +906,12 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
 			printf("SWEET LOG: write failed, stopping\n");
 			return;
 		}
+		/*
+		 * The file reader waits for the root to be mounted, and this loop is
+		 * the only thing in the kernel that already ticks once a second after
+		 * the mount has happened. It does nothing unless sweetcat= is set.
+		 */
+		sweet_cat_tick();
 	}
 }
 
