@@ -1,0 +1,233 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-02 04:34:51.134018783 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-02 04:34:51.194726083 +0800
+@@ -1082,7 +1082,7 @@
+  * five entries, and build 0140's fault was an empty level 1 entry, not an
+  * empty level 2 one.
+  */
+-#define PG_CP_WINDOW_L2S	5u
++#define PG_CP_WINDOW_L2S	6u
+ 
+ static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
+ static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
+@@ -3876,6 +3876,17 @@
+  */
+ #define PG_PANEL_IOVA		0x100a0000ull	/* the first page above step 17's scratch */
+ #define PG_PANEL_MAX_PAGES	2400u		/* 0x100a0000..0x109fffff: the rest of the window */
++/*
++ * Where a kernel buffer gets mapped when the command processor has to read it.
++ *
++ * It has to be inside the CP's window, and the window is ten megabytes with the
++ * panel filling nine point three of them - 0x20000000, the obvious choice, is
++ * three gigabytes of address space away from anything pg_smmu_l3() knows about
++ * and the mapping would simply have been refused. One more level 2 entry makes
++ * the window twelve megabytes, and this sits in the first two of the new ones,
++ * immediately above the last panel page.
++ */
++#define PG_SURF_IOVA		0x10a00000ull
+ 
+ /*
+  * The panel's geometry comes from PE_current_console(), which is where
+@@ -3968,7 +3979,7 @@
+  * If the second is black too, the CPU is not looking at the surface the CP
+  * wrote and no amount of waiting will help.
+  */
+-#define PG_PANEL_PROBES		6u	/* rows this file ever reads back */
++#define PG_PANEL_PROBES		12u	/* rows this file ever reads back */
+ 
+ struct pg_panel_probe {
+ 	uint32_t row;
+@@ -4433,6 +4444,165 @@
+ 	printf("POLARIS GPU: 18b CP_MEMCPY moved nothing in either address order\n");
+ }
+ 
++/*
++ * Step 18c: can the CP read memory the CPU wrote, and who copies faster.
++ *
++ * This is the question that decides whether present() can use any of this. The
++ * panel is I/O memory, which the command processor reads straight out of RAM, but
++ * present() copies out of an IOSurface: pages the CPU wrote through its cache,
++ * mapped into the GPU window as non-cached memory. If the CP cannot see those
++ * writes, a fast copy of the wrong bytes is worth nothing.
++ *
++ * So a kernel buffer is filled, mapped into the CP's window and copied onto the
++ * panel twice - once straight after the CPU wrote it, once after flushing the
++ * cache - because whether the flush is needed decides how much the real thing
++ * would cost per frame. The two destinations are different rows, so neither
++ * result can be mistaken for the other.
++ *
++ * Then the same row, copied a hundred times, by the CPU and by the command
++ * processor. The CPU's version is the best case it has: one contiguous memcpy to
++ * one row. The CP's version batches all hundred packets into one submission,
++ * which is how present() would use it.
++ *
++ * Everything here is one row at a time on purpose. The first version of this
++ * mapped the whole panel with ml_io_map and asked for a single 1.1 million dword
++ * copy, and the boot stopped without printing again - so the sizes are small
++ * enough that a failure shows up as a wrong pixel rather than as a dead kernel.
++ *
++ * Off unless polarisgpucopybench=1.
++ */
++static void
++pg_copy_bench(uint32_t width, uint32_t height, uint32_t stride)
++{
++	static uint32_t got[2048];
++	uint32_t words = width, bench = stride * 3u, wptr;
++	uint32_t i, diff, pages, row_nf, row_f, row_t, off = 0;
++	uint64_t dst_t, t0, t1, cpu_ns = 0, cp_ns = 0;
++	vm_offset_t kbuf = 0, va_t;
++	uint32_t *buf;
++
++	if (height < 8u || width > 2048u || stride < width * 4u) {
++		printf("POLARIS GPU: 18c a %ux%u panel is not one this bench fits\n", width,
++		    height);
++		return;
++	}
++	row_nf = height - 3u;
++	row_f = height - 2u;
++	row_t = height - 4u;
++
++	/* ---- a kernel buffer the CPU writes and the CP has to read ---- */
++	if (kmem_alloc(kernel_map, &kbuf, (vm_size_t)bench,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("POLARIS GPU: 18c no memory for the source buffer\n");
++		return;
++	}
++	buf = (uint32_t *)kbuf;
++	for (i = 0; i < bench / 4u; i++) {
++		buf[i] = 0xff000000u | (i & 0xffffu);
++	}
++	pages = bench / PG_GMU_PAGE_SIZE;
++	printf("POLARIS GPU: 18c buffer %u bytes at phys %#llx, %u pages, first %08x last "
++	    "%08x\n", bench, (uint64_t)kvtophys(kbuf), pages, buf[0], buf[words - 1u]);
++	for (i = 0; i < pages; i++) {
++		if (!pg_map_phys(PG_SURF_IOVA + (uint64_t)i * PG_GMU_PAGE_SIZE,
++		    (uint64_t)kvtophys(kbuf + (vm_offset_t)i * PG_GMU_PAGE_SIZE),
++		    "copy source")) {
++			printf("POLARIS GPU: 18c the source buffer would not map at %#llx\n",
++			    PG_SURF_IOVA);
++			kmem_free(kernel_map, kbuf, bench);
++			return;
++		}
++	}
++	printf("POLARIS GPU: 18c mapped at iova %#llx; about to copy without a flush\n",
++	    PG_SURF_IOVA);
++
++	/* ---- 1: no flush, straight after the CPU wrote it ---- */
++	wptr = pg_cp_wptr;
++	if (!pg_memcpy_span(PG_PANEL_IOVA + (uint64_t)row_nf * stride, PG_SURF_IOVA,
++	    words, false, &wptr)) {
++		pg_cp_wptr = wptr;
++		kmem_free(kernel_map, kbuf, bench);
++		return;
++	}
++	pg_cp_wptr = wptr;
++	diff = pg_row_diff(row_nf, buf, got, words, stride);
++	if (diff == words) {
++		printf("POLARIS GPU: 18c WITHOUT a flush the CP still read it: %u dwords on row "
++		    "%u are the buffer's\n", words, row_nf);
++	} else {
++		printf("POLARIS GPU: 18c without a flush word %u reads %08x, the buffer holds "
++		    "%08x - the cache has to be written back\n", diff, got[diff], buf[diff]);
++	}
++
++	/* ---- 2: with the flush ---- */
++	flush_dcache64((addr64_t)kbuf, bench, 0);
++	wptr = pg_cp_wptr;
++	if (!pg_memcpy_span(PG_PANEL_IOVA + (uint64_t)row_f * stride, PG_SURF_IOVA, words,
++	    false, &wptr)) {
++		pg_cp_wptr = wptr;
++		kmem_free(kernel_map, kbuf, bench);
++		return;
++	}
++	pg_cp_wptr = wptr;
++	diff = pg_row_diff(row_f, buf, got, words, stride);
++	if (diff == words) {
++		printf("POLARIS GPU: 18c THE CP READ WHAT THE CPU WROTE: %u dwords out of a "
++		    "kernel buffer land on row %u unchanged after a flush\n", words, row_f);
++	} else {
++		printf("POLARIS GPU: 18c after a flush word %u reads %08x, the buffer holds "
++		    "%08x\n", diff, got[diff], buf[diff]);
++	}
++
++	/* ---- 3: a hundred rows, CPU against CP ---- */
++	va_t = pg_panel_row_va(row_t, stride, &off);
++	if (va_t == 0) {
++		printf("POLARIS GPU: 18c row %u has no mapping; no timing\n", row_t);
++		kmem_free(kernel_map, kbuf, bench);
++		return;
++	}
++	dst_t = PG_PANEL_IOVA + (uint64_t)row_t * stride;
++	t0 = mach_absolute_time();
++	for (i = 0; i < 100u; i++) {
++		memcpy((void *)(va_t + off), (const void *)buf, (size_t)words * 4u);
++	}
++	t1 = mach_absolute_time();
++	absolutetime_to_nanoseconds(t1 - t0, &cpu_ns);
++
++	wptr = pg_cp_wptr;
++	t0 = mach_absolute_time();
++	for (i = 0; i < 100u; i++) {
++		pg_ring_put(wptr++, pg_pkt7(PG_CP_MEMCPY, 5));
++		pg_ring_put(wptr++, words);
++		pg_ring_put(wptr++, (uint32_t)PG_SURF_IOVA);
++		pg_ring_put(wptr++, (uint32_t)(PG_SURF_IOVA >> 32));
++		pg_ring_put(wptr++, (uint32_t)dst_t);
++		pg_ring_put(wptr++, (uint32_t)(dst_t >> 32));
++	}
++	wptr &= PG_RING_WORDS - 1u;
++	pg_ring_flush();
++	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (i = 0; i < 100000; i++) {
++		if (pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) == wptr) {
++			break;
++		}
++		pg_sleep_us(10);
++	}
++	t1 = mach_absolute_time();
++	absolutetime_to_nanoseconds(t1 - t0, &cp_ns);
++	if (i == 100000) {
++		printf("POLARIS GPU: 18c the CP never finished the hundred copies: RPTR %u WPTR "
++		    "%u RBBM_STATUS %#010x\n", pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR), wptr,
++		    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++	} else {
++		printf("POLARIS GPU: 18c a hundred rows of %u bytes: CPU memcpy %llu us, "
++		    "CP_MEMCPY %llu us - the CP is %s\n", words * 4u, cpu_ns / 1000,
++		    cp_ns / 1000, cp_ns < cpu_ns ? "FASTER" : "not faster");
++	}
++	pg_cp_wptr = wptr;
++	kmem_free(kernel_map, kbuf, bench);
++}
++
+ static bool
+ pg_step_panel(void)
+ {
+@@ -4581,7 +4751,7 @@
+ 		 */
+ 		uint32_t sent_top, sent_bottom, end_top, end_bottom;
+ 		uint32_t want = band;
+-		int fill_all = 0, copy_wanted = 0;
++		int fill_all = 0, copy_wanted = 0, bench_wanted = 0;
+ 
+ 		/*
+ 		 * polarisgpufill=1 asks for the whole nine megabytes instead of the
+@@ -4646,6 +4816,18 @@
+ 			pg_memcpy_test(width, height, stride);
+ 		}
+ 
++		/*
++		 * Step 18c: what a copy costs and whether the CP can read memory
++		 * the CPU wrote. Off unless polarisgpucopybench=1, because it
++		 * overwrites half the panel and takes tens of milliseconds doing
++		 * it - neither of which belongs in a normal boot.
++		 */
++		(void)PE_parse_boot_argn("polarisgpucopybench", &bench_wanted,
++		    sizeof(bench_wanted));
++		if (bench_wanted) {
++			pg_copy_bench(width, height, stride);
++		}
++
+ 		if (fill_all) {
+ 			/*
+ 			 * Twenty seconds with nothing printed, so the ramp is what the
