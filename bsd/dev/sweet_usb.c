@@ -81,20 +81,43 @@ usb_wr(vm_offset_t base, uint32_t off, uint32_t val)
 }
 
 /*
+ * Put the console on the disk before the next thing that might stop the machine.
+ *
+ * 0149 was built with every correction 0148 had - CMDACT back on bit 10, the
+ * QUSB2 table from the qusb node the dwc3 actually points at, DSTS.DevCtrlHlt
+ * back on bit 22 - and the ring still came back holding 0147's text: the
+ * 0147-only line "clk utmi ... STILL OFF", the 0147 strategy order
+ * (resume+utmi first, noreset third), and launchd's own boot-args line saying
+ * sweetfb_noconsole=1 while both 0148c and 0149 set it to 0. So the machine
+ * that wrote that ring was not running this code.
+ *
+ * The ring is flushed by a thread once a second. The USB probe runs inside that
+ * first second, so "the ring has no 0149 lines" cannot be told apart from "0149
+ * never ran", and four consecutive builds have now been read that way. A flush
+ * is one polled UFS write, which the probe can afford before every step that
+ * touches the core; the GPU ladder has done exactly this since 0134 and its
+ * checkpoints survive steps that hang the SoC.
+ */
+extern void sweet_log_flush_now(void);
+
+#define US_CHECK(what)	do { \
+	printf("SWEET USB: -- at %s\n", (what)); \
+	sweet_log_flush_now(); \
+} while (0)
+
+/*
  * Switch on the USB3 controller's clock branches.
  *
- * 0146 answered the command-engine question: DEPCMD latches CMDACT (bit 16,
- * confirmed - it now reads 0x00010009) and never retires it, in all four
- * strategies and with the PHY powered up. A device controller does exactly
- * that when it has no UTMI clock: register access still works because that
- * rides the AHB branch, but the device state machine never advances.
+ * The comment here used to say that 0146 had confirmed CMDACT on bit 16. It had
+ * not: bit 16 is CommandParam[0], so 0146 and 0147 wrote every endpoint command
+ * as "parameter 1, CMDACT clear", the core executed nothing, and the 500 ms poll
+ * reported a timeout for all four strategies. 0148 moved CMDACT to bit 10, which
+ * is what Linux's core.h says, and that is what this build keeps.
  *
- * On polaris the mock-UTMI branch (GCC_USB30_PRIM_MOCK_UTMI_CLK_CBCR, 0x0f018)
- * reads back 0x00000000 while every other branch in the window reads
- * 0x00000001 - its enable bit is clear. In a GCC CBCR bit 0 is the branch
- * enable and bit 31 is "halted", which is how the GPU ladder switches its own
- * register bus on. So do the same here, print what moved, and let the strategy
- * loop run afterwards.
+ * The mock-UTMI branch is GCC_USB30_PRIM_MOCK_UTMI_CLK_CBCR at 0x0f014. An
+ * earlier build polled 0x0f018 and called it "STILL OFF"; 0x0f018 is the RCG's
+ * CMD_RCGR, which is legitimately zero under clk_rcg2_shared_ops. The real CBCR
+ * reads back with bit 0 set, so the UTMI clock was never the fault.
  *
  * The window is dumped first because 0x0f000 is the block's BCR: if its bit 0
  * is set the block reset is still asserted and no clock will help.
@@ -159,6 +182,19 @@ sweet_usb_probe(void)
 	if (!enabled) {
 		return;
 	}
+	/*
+	 * Say which build this is before anything that could stop the machine,
+	 * and put it on the disk.
+	 *
+	 * Every ring read since 0148 has come back holding the previous build's
+	 * text, and there was no single line anywhere that could answer "did
+	 * the new kernel run at all". This one can: it is printed before the
+	 * first register access and flushed immediately, so either it is in the
+	 * ring or the kernel that wrote the ring was not this one.
+	 */
+	printf("SWEET USB: ======== build 0150 alive: CMDACT bit 10, QUSB2 88e2000, "
+	    "whole-core reset off by default, probe flushes synchronously ========\n");
+	sweet_log_flush_now();
 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
 	if (gcc == 0) {
 		printf("SWEET USB: GCC map failed\n");
@@ -416,6 +452,7 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
 	dwc_wr(DEPCMDPAR1(ep), p1);
 	dwc_wr(DEPCMDPAR2(ep), p2);
 	printf("SWEET USB: epcmd ep%u PAR written, firing DEPCMD\n", ep);
+	sweet_log_flush_now();
 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
 	printf("SWEET USB: epcmd ep%u DEPCMD 0x%08x, polling\n", ep, dwc_rd(DEPCMD(ep)));
 	/*
@@ -460,6 +497,11 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
 		    ep, cmd & 0xf, v, status, active, i, i / 10,
 		    dwc_rd(DEPCMDPAR0(ep)), dwc_rd(DEPCMDPAR1(ep)), dwc_rd(DEPCMDPAR2(ep)),
 		    stuck ? " STUCK" : (status ? " REJECTED" : ""));
+		/*
+		 * The whole point of the build: get this line on the disk even
+		 * if the next command is the one that stops the machine.
+		 */
+		sweet_log_flush_now();
 		if (!stuck && status == 0) {
 			return 0;
 		}
@@ -1893,6 +1935,7 @@ static int
 ud_try(const char *tag, unsigned flags)
 {
 	printf("SWEET USB: try %s (flags 0x%x)\n", tag, flags);
+	sweet_log_flush_now();
 	if (flags & UD_F_NORESET) {
 		/*
 		 * ABL hands over a controller that was working seconds ago,
@@ -1907,6 +1950,7 @@ ud_try(const char *tag, unsigned flags)
 		printf("  %s: FAILED at reset\n", tag);
 		return -1;
 	}
+	US_CHECK("core reset returned");
 	if (flags & UD_F_VBUS) {
 		ud_vbus_override();
 	}
@@ -1919,9 +1963,11 @@ ud_try(const char *tag, unsigned flags)
 			printf("  %s: PHY stayed in power-down\n", tag);
 		}
 	}
+	US_CHECK("PHY sequence returned");
 	if (flags & UD_F_UTMI) {
 		ud_hsphy_connect();
 	}
+	US_CHECK("UTMI connect returned");
 	if (flags & UD_F_PIPE) {
 		ud_pipe_select();
 	}
@@ -1929,6 +1975,7 @@ ud_try(const char *tag, unsigned flags)
 		dwc_wr(GCTL, dwc_rd(GCTL) | GCTL_DSBLCLKGTNG);
 		printf("  %s: GCTL 0x%08x (DSBLCLKGTNG set)\n", tag, dwc_rd(GCTL));
 	}
+	US_CHECK("about to arm the event ring");
 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
@@ -1957,6 +2004,7 @@ ud_try(const char *tag, unsigned flags)
 	 * the state a working Linux gadget has and this driver never
 	 * established, and matching them costs two register writes.
 	 */
+	US_CHECK("event ring armed, about to write DCFG");
 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
 	dwc_wr(DCFG, dcfg | DCFG_IGNSTRMPP);
 	dwc_wr(GRXTHRCFG, dwc_rd(GRXTHRCFG) & ~GRXTHRCFG_PKTCNTSEL);
@@ -1979,6 +2027,7 @@ ud_try(const char *tag, unsigned flags)
 	dwc_wr(DEVTEN, 0x7);
 	printf("  %s: pre-ep0 GUSB2PHYCFG 0x%08x GSTS 0x%08x DSTS 0x%08x\n",
 	    tag, dwc_rd(GUSB2PHYCFG), dwc_rd(GSTS), dwc_rd(DSTS));
+	sweet_log_flush_now();
 
 	if (flags & UD_F_RUNSTOP) {
 		/*
@@ -1995,10 +2044,12 @@ ud_try(const char *tag, unsigned flags)
 	if (flags & UD_F_DALEPENA) {
 		dwc_wr(DALEPENA, 0x3);
 	}
+	US_CHECK("about to DEPSTARTCFG");
 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0)) {
 		printf("  %s: FAILED at DEPSTARTCFG\n", tag);
 		return -1;
 	}
+	US_CHECK("DEPSTARTCFG returned");
 	/*
 	 * Endpoint 0 is a control endpoint, so its max packet size may only be
 	 * 8, 16, 32 or 64. This diagnostic path used 512, which is not a legal
@@ -2006,6 +2057,7 @@ ud_try(const char *tag, unsigned flags)
 	 * command that never cleared CMDACT. Linux builds ep0 from
 	 * usb_endpoint_maxp() of the ep0 descriptor, i.e. 64.
 	 */
+	US_CHECK("about to ep0 OUT DEPCFG");
 	if (ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3),
 	    (1u << 8) | (1u << 10) | (0u << 25), 0)) {
 		printf("  %s: FAILED at ep0 OUT DEPCFG\n", tag);
@@ -2014,6 +2066,7 @@ ud_try(const char *tag, unsigned flags)
 		    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0));
 		return -1;
 	}
+	US_CHECK("ep0 OUT configured, about to the rest");
 	if (ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
 	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3),
 	    (1u << 8) | (1u << 10) | (1u << 25), 0) ||
@@ -2024,6 +2077,7 @@ ud_try(const char *tag, unsigned flags)
 	dwc_wr(DALEPENA, 0x3);
 	ud_fifo_dump();
 	printf("  %s: endpoint 0 configured OK\n", tag);
+	sweet_log_flush_now();
 	return 0;
 }
 
