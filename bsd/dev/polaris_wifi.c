@@ -276,6 +276,28 @@ pw_survey(uint32_t offset, uint32_t size, uint32_t cacheline, struct pw_census *
 	printf("POLARIS WIFI:   %u items from the bottom, %u from the top\n", low, high);
 }
 
+/*
+ * Whether the application processor may touch a partition at all.
+ *
+ * Build 0164 walked every entry in the table and stopped dead on partition 4,
+ * the adsp <-> sdsp one: the label printed, then nothing - no "$PRT", no
+ * "unreadable", and the other cores kept printing USB samples for another
+ * eighty seconds. A read that never returns while the rest of the machine runs
+ * is one core stalled on the bus, and the difference between partition 4 and
+ * the three before it is that the AP is a party to those three and not to it.
+ * Qualcomm's XPU guards SMEM partitions against hosts that do not own them, so
+ * touching one from the wrong side is a bus hang, not a data abort.
+ *
+ * Only partitions with the AP on one side (or the global one, which is
+ * everybody's) are read.
+ */
+static bool
+pw_ours(uint16_t host0, uint16_t host1)
+{
+	return host0 == PW_HOST_AP || host1 == PW_HOST_AP ||
+	    host0 == PW_HOST_GLOBAL || host1 == PW_HOST_GLOBAL;
+}
+
 static bool
 polaris_wifi_requested(void)
 {
@@ -292,13 +314,13 @@ polaris_wifi_probe(void)
 {
 	struct pw_census census;
 	struct pw_toc toc;
-	uint32_t walked = 0;
+	uint32_t walked = 0, skipped = 0;
 
 	if (!polaris_wifi_requested()) {
 		return;
 	}
 	memset(&census, 0, sizeof(census));
-	printf("POLARIS WIFI: ======== build 0164 alive: reading SMEM at %#llx (%u bytes) "
+	printf("POLARIS WIFI: ======== build 0165 alive: reading SMEM at %#llx (%u bytes) "
 	    "and nothing else ========\n", PW_PHYS, PW_SIZE);
 
 	printf("POLARIS WIFI: the boot loader's version word at %#x is %#x (12 in [31:16] means "
@@ -331,13 +353,19 @@ polaris_wifi_probe(void)
 		if (entry.offset == 0 || entry.size == 0) {
 			continue;
 		}
+		if (!pw_ours(entry.host0, entry.host1)) {
+			printf("POLARIS WIFI: partition %u (hosts %u/%u): not the AP's, "
+			    "not read\n", i, entry.host0, entry.host1);
+			skipped++;
+			continue;
+		}
 		printf("POLARIS WIFI: partition %u (%s <-> %s):\n", i,
 		    pw_host_name(entry.host0), pw_host_name(entry.host1));
 		pw_survey(entry.offset, entry.size, entry.cacheline, &census);
 		walked++;
 	}
-	printf("POLARIS WIFI: %u partitions walked, %u items seen, %u distinct ids:",
-	    walked, census.items, census.count);
+	printf("POLARIS WIFI: %u partitions walked, %u left alone, %u items seen, %u distinct "
+	    "ids:", walked, skipped, census.items, census.count);
 	for (uint32_t i = 0; i < census.count; i++) {
 		printf(" %u", census.ids[i]);
 	}
