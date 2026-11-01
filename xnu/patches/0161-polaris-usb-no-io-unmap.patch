@@ -1,0 +1,32 @@
+diff -Nur a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c	2026-11-01 22:30:00.830844880 +0800
++++ b/bsd/dev/sweet_usb.c	2026-11-01 22:30:00.859150971 +0800
+@@ -2646,9 +2646,25 @@
+ 				printf("SWEET USB:   POWERDOWN %#04x WON\n", pd[k]);
+ 			}
+ 		}
+-		if (phy != 0) {
+-			ml_io_unmap(phy, QUSB2_SIZE);
+-		}
++		/*
++		 * The map is deliberately not released. ml_io_unmap() cannot be
++		 * used on anything io_map() returned, for two separate reasons,
++		 * and the sweep above is what finally proved it:
++		 *
++		 *   panic(cpu 0 caller 0xffffffe00079724ac): vm_map_delete(
++		 *       0xfffffe10014a30,0xfffffe300f172000,0xfffffe300f176000):
++		 *       start is not aligned to 0x4000 @vm_map.c:7901
++		 *
++		 * One, io_map() returns start + (phys_addr - trunc_page(phys_addr)),
++		 * so the address handed back is not page aligned at all whenever the
++		 * device register block is not - and QUSB2_PA is 0x088e2000, which
++		 * leaves 0x2000 inside a 16 KB page. Two, kmem_free() rounds the
++		 * size but passes the address through untruncated to vm_map_delete(),
++		 * which asserts. ml_io_unmap() also frees against kernel_map while
++		 * io_map() allocated from io_submap, so even a page aligned address
++		 * would land in the wrong map. Sixteen kilobytes once is the whole
++		 * cost of leaving it mapped.
++		 */
+ 	}
+ 
+ 	ud_qscratch_dump("post");
