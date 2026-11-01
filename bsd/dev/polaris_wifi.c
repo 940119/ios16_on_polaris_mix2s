@@ -41,6 +41,25 @@
  * way a short read shows up as a failed check rather than as garbage.
  *
  * Boot with polariswifi=1 to run it. Default: nothing at all.
+ *
+ * Build 0165 finished the walk and answered the question it was built for, and
+ * the answer was not the expected one: every partition the AP is a party to is
+ * empty. Partition 5 (ap <-> host 8, 16 KB) exists with a valid $PRT and has
+ * nothing in it; partition 10 (ap <-> modem, 496 KB) is the same; the only
+ * partition with items in it is the global one. That is not a fault - SMEM items
+ * are allocated by whichever side brings a transport up, and this kernel has
+ * never brought one up. The Mi 8 port allocates its own (qcom_smem_alloc, the
+ * descriptor 478 and the first FIFO 479) and so will this one.
+ *
+ * Two things follow. First, the WLAN item numbers cannot be confirmed by
+ * finding them; they have to be created. Second, partition 5 is 16384 bytes in
+ * total and 32 of those are the header, so the Mi 8 port's 16 KB FIFO cannot
+ * fit in it - the FIFO sizes for this edge have to be chosen against that
+ * budget, not copied.
+ *
+ * So this build also reads what the global partition does carry: the image
+ * version tables (469 and 602) are a record per firmware image, in host order,
+ * and their names are the cheapest way to say which subsystem host 8 is.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -122,6 +141,8 @@ struct pw_item_header {
 #define PW_ITEMS_MAX		64u
 
 static const volatile uint8_t *pw_smem;
+
+static void pw_strings(uint32_t at, uint32_t size, unsigned want);
 
 static bool
 pw_peek(uint32_t offset, void *to, uint32_t size)
@@ -255,6 +276,11 @@ pw_survey(uint32_t offset, uint32_t size, uint32_t cacheline, struct pw_census *
 		printf("POLARIS WIFI:     item %u at %#x, %u bytes\n", item.item,
 		    offset + at + (uint32_t)sizeof(item) + item.padding_header,
 		    item.size - item.padding_data);
+		if (item.size >= 64) {
+			pw_strings(offset + at + (uint32_t)sizeof(item) + item.padding_header,
+			    item.size - item.padding_data,
+			    (item.item == 469 || item.item == 602) ? 20u : 4u);
+		}
 		at += (uint32_t)sizeof(item) + item.padding_header + item.size;
 	}
 	if (cacheline != 0 && (cacheline & (cacheline - 1)) == 0) {
@@ -270,10 +296,61 @@ pw_survey(uint32_t offset, uint32_t size, uint32_t cacheline, struct pw_census *
 			printf("POLARIS WIFI:     item %u at %#x, %u bytes (from the top)\n",
 			    item.item, offset + at - item.size,
 			    item.size - item.padding_data);
+			if (item.size >= 64) {
+				pw_strings(offset + at - item.size, item.size - item.padding_data,
+				    (item.item == 469 || item.item == 602) ? 20u : 4u);
+			}
 			at -= step_back + item.size;
 		}
 	}
 	printf("POLARIS WIFI:   %u items from the bottom, %u from the top\n", low, high);
+}
+
+/*
+ * A bounded strings extraction from one item.
+ *
+ * The global partition's items are the only ones with anything in them, and two
+ * of them are the image version tables (469, 4096 bytes; 602, 10240 bytes): the
+ * boot loader writes a record per firmware image it loaded, each with the
+ * image's name and build id. Those names are the cheapest way to find out which
+ * subsystems this phone actually has, and - because the records are in host
+ * order - which host id each one is. That matters here because the table lists
+ * hosts 7 and 8, which the Mi 8 port never names.
+ *
+ * The record layout is not assumed. Printable runs of three characters or more
+ * are printed as they come, which reads a name table correctly whatever the
+ * field sizes turn out to be, and prints nothing misleading if the item is not
+ * a name table at all.
+ */
+static void
+pw_strings(uint32_t at, uint32_t size, unsigned want)
+{
+	char buf[48];
+	unsigned run = 0, shown = 0;
+	uint32_t limit = size < 8192 ? size : 8192;
+
+	for (uint32_t i = 0; i <= limit; i++) {
+		uint8_t c = 0;
+		bool printable = i < limit && pw_peek(at + i, &c, 1) && c >= 0x20 && c < 0x7f;
+
+		if (printable) {
+			if (run < sizeof(buf) - 1) {
+				buf[run] = (char)c;
+			}
+			run++;
+			continue;
+		}
+		if (run >= 3) {
+			unsigned n = run < sizeof(buf) - 1 ? run : (unsigned)sizeof(buf) - 1;
+
+			buf[n] = 0;
+			printf("POLARIS WIFI:       \"%s\"\n", buf);
+			if (++shown >= want) {
+				return;
+			}
+		}
+		run = 0;
+	}
 }
 
 /*
@@ -320,7 +397,7 @@ polaris_wifi_probe(void)
 		return;
 	}
 	memset(&census, 0, sizeof(census));
-	printf("POLARIS WIFI: ======== build 0165 alive: reading SMEM at %#llx (%u bytes) "
+	printf("POLARIS WIFI: ======== build 0166 alive: reading SMEM at %#llx (%u bytes) "
 	    "and nothing else ========\n", PW_PHYS, PW_SIZE);
 
 	printf("POLARIS WIFI: the boot loader's version word at %#x is %#x (12 in [31:16] means "
