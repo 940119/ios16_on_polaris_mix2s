@@ -192,8 +192,8 @@ sweet_usb_probe(void)
 	 * first register access and flushed immediately, so either it is in the
 	 * ring or the kernel that wrote the ring was not this one.
 	 */
-	printf("SWEET USB: ======== build 0150 alive: CMDACT bit 10, QUSB2 88e2000, "
-	    "whole-core reset off by default, probe flushes synchronously ========\n");
+	printf("SWEET USB: ======== build 0151 alive: ep0 configured by table+utmi, "
+	    "QSCRATCH dumped and bit-probed, probe flushes synchronously ========\n");
 	sweet_log_flush_now();
 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
 	if (gcc == 0) {
@@ -1431,9 +1431,23 @@ ud_mon_thread(void *arg, wait_result_t wr)
 	printf("SWEET USB: monitor start, unplug and replug the cable now\n");
 	for (m = 0; m < 20; m++) {
 		uint32_t d = dwc_rd(DSTS);
-		printf("SWEET USB: mon %2d cs=%d spd=%u susp=%d hlt=%d DSTS 0x%08x GSTS 0x%08x ev 0x%08x\n",
-		    m, !!(d & 1), (d >> 1) & 7u, !!(d & (1u << 8)), !!(d & DSTS_DEVCTRLHLT),
-		    d, dwc_rd(GSTS), dwc_rd(GEVNTCOUNT) & 0xffff);
+		/*
+		 * Decoded against Linux core.h, not guessed:
+		 *   DSTS[2:0]   ConnectSpd: 0 = high speed, 1 = full speed,
+		 *               4 = super speed (DWC3_DSTS_HIGHSPEED is (0 << 0))
+		 *   DSTS[21:18] USBLNKST
+		 *   DSTS[22]    DevCtrlHlt
+		 * The previous line printed `cs=%d` from bit 0 alone and `spd` from
+		 * bits[3:1], which is part of SOFFN - so "cs=1 spd=0" meant
+		 * "full speed, and three frame-number bits", not what it looked
+		 * like. DCTL is printed too, because between the attach window
+		 * (DevCtrlHlt 0) and this monitor (DevCtrlHlt 1) nothing in this
+		 * driver writes DCTL, and only the final PHY read happens.
+		 */
+		printf("SWEET USB: mon %2d spd=%u lnkst=%u hlt=%d DSTS 0x%08x DCTL 0x%08x "
+		    "GSTS 0x%08x ev 0x%08x\n",
+		    m, d & 7u, (d >> 18) & 0xfu, !!(d & DSTS_DEVCTRLHLT),
+		    d, dwc_rd(DCTL), dwc_rd(GSTS), dwc_rd(GEVNTCOUNT) & 0xffff);
 		ud_sleep_ms(1000);
 	}
 	printf("SWEET USB: monitor done\n");
@@ -1752,6 +1766,67 @@ ud_hsphy_state(const char *tag, uint32_t hs)
 	    !!(hs & VBUSVLDEXTSEL0), !!(hs & VBUSVLDEXT0), !!(hs & UTMI_OTG_VBUS_VALID),
 	    !!(hs & USB2_UTMI_CLK_EN), !!(hs & USB2_SUSPEND_N),
 	    !!(hs & USB2_SUSPEND_N_SEL), !!(hs & SW_SESSVLD_SEL));
+}
+
+/*
+ * The wrapper's state, read out instead of guessed at.
+ *
+ * HS_PHY_CTRL sits at QSCRATCH + 0x10 and the bits this file writes there were
+ * inferred from phy-msm-usb, not taken from a header - and 0150 showed the
+ * inference is wrong: after writing bits 13, 14, 20, 21, 22, 23 and 28, only 20
+ * and 28 read back set. dp_pullup (13), utmi_clk_en (21) and suspend_n (22)
+ * never took, and those three are exactly the ones that would explain a device
+ * that runs but never drives D+.
+ *
+ * So stop guessing in two ways at once: dump the whole 256-byte window around
+ * the register, and then ask the register itself which of its bits are
+ * writable. A bit that will not hold is read-only status, and the control it
+ * was supposed to be is somewhere else in the window.
+ */
+static void
+ud_qscratch_dump(const char *tag)
+{
+	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+
+	if (qs == 0) {
+		printf("SWEET USB: QSCRATCH map failed (%s)\n", tag);
+		return;
+	}
+	for (unsigned off = 0; off < 0x100; off += 0x10) {
+		printf("SWEET USB: qscratch %s %02x: %08x %08x %08x %08x\n", tag, off,
+		    usb_rd(qs, off), usb_rd(qs, off + 4),
+		    usb_rd(qs, off + 8), usb_rd(qs, off + 12));
+	}
+}
+
+/*
+ * One bit at a time: set it, read it back, put the original value back. The
+ * register is a configuration word, so a single-bit excursion and an immediate
+ * restore is the smallest question that can be asked of it.
+ */
+static void
+ud_hsphy_probe(void)
+{
+	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+	uint32_t orig, sticky = 0;
+
+	if (qs == 0) {
+		return;
+	}
+	orig = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
+	for (unsigned b = 0; b < 32; b++) {
+		uint32_t v;
+		*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = orig | (1u << b);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		v = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
+		*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = orig;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		if (v & (1u << b)) {
+			sticky |= 1u << b;
+		}
+	}
+	printf("SWEET USB: hsphy probe orig 0x%08x writable mask 0x%08x, restored 0x%08x\n",
+	    orig, sticky, usb_rd(qs, QSCRATCH_HS_PHY_CTRL));
 }
 
 static void
@@ -2284,6 +2359,23 @@ sweet_usb_gadget_start(vm_offset_t dwc)
 	printf("SWEET USB: step 3/6 GEVNTCOUNT 0x%08x GEVNTSIZ 0x%08x DEVTEN 0x%08x\n",
 	    dwc_rd(GEVNTCOUNT) & 0xffff, dwc_rd(GEVNTSIZ), dwc_rd(DEVTEN));
 
+	/*
+	 * Measure the wrapper before anything is attached, and do the one PHY
+	 * read here rather than at the very end.
+	 *
+	 * In 0150 the core was running (DSTS.DevCtrlHlt 0) throughout the attach
+	 * window and halted (1) in every one of the nineteen monitor samples
+	 * that followed. Nothing in this driver writes DCTL between the two, and
+	 * the only thing that happens in between is ud_phy_state("final") - so
+	 * that read is the prime suspect for parking the core, and leaving it
+	 * where it was makes the monitor window useless. It still has to run
+	 * once, because the PHY is the block this kernel has stalled on before;
+	 * it now runs before the bisect, where its cost is bounded.
+	 */
+	ud_qscratch_dump("pre");
+	ud_hsphy_probe();
+	ud_phy_state("before bisect");
+
 	printf("SWEET USB: step 4/6 attach bisect\n");
 	static const struct {
 		const char *name;
@@ -2307,6 +2399,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
 		}
 	}
 
+	ud_qscratch_dump("post");
 	printf("SWEET USB: step 5/6 %s (DSTS 0x%08x GSTS 0x%08x)\n",
 	    saw_event ? "bus reset seen, arming ep0 SETUP" : "host never reset the bus",
 	    dwc_rd(DSTS), dwc_rd(GSTS));
@@ -2343,10 +2436,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
 	}
 
 	/*
-	 * The one PHY read in this build, and it is deliberately last: every
-	 * attach has been tried and both threads are up, so if this read parks
-	 * the core it costs nothing that has not already been printed.
+	 * The PHY read that used to be here now runs before the bisect, where
+	 * it cannot park the core in the middle of the observation window.
 	 */
-	ud_phy_state("final");
 }
 #endif /* ARM64_BOARD_CONFIG_SWEET */
