@@ -1,0 +1,114 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-01 21:08:08.693991420 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-01 21:08:08.721843920 +0800
+@@ -4039,6 +4039,73 @@
+ 	return false;
+ }
+ 
++/*
++ * "The CP stopped" and "the CP is crawling" look the same to a one second drain
++ * timeout, and 0158 cannot tell them apart: it reported a stall at 0% of the
++ * fill while the read pointer had in fact moved 2337 words, which is about 2300
++ * dwords a second - alive, and two thousand times slower than this block should
++ * be. Watch the read pointer instead of testing it once: five samples over two
++ * seconds say whether it is moving, standing still, or slowing down.
++ */
++static void
++pg_cp_watch(const char *when, uint32_t wptr)
++{
++	uint32_t last = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
++
++	printf("POLARIS GPU: 18 %s: RPTR %u of WPTR %u, RBBM_STATUS %#010x; watching\n",
++	    when, last, wptr, pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++	for (uint32_t i = 0; i < 5u; i++) {
++		uint32_t now;
++
++		for (uint32_t k = 0; k < 40u; k++) {
++			pg_sleep_us(10000);
++		}
++		now = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
++		printf("POLARIS GPU: 18   %u ms later RPTR %u (%+d), RBBM_STATUS %#010x\n",
++		    (i + 1u) * 400u, now, (int32_t)(now - last),
++		    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++		last = now;
++	}
++}
++
++/*
++ * Is the CP alive at all, or is the panel's memory the thing it cannot get
++ * through? A 64 dword write to step 17's kernel buffer answers it: same packet,
++ * same ring, same context bank, different destination. If this one drains while
++ * the panel's did not, the CP is fine and the destination is the problem; if
++ * neither drains, the CP itself is gone.
++ */
++static void
++pg_cp_probe(const char *when)
++{
++	uint32_t wptr = pg_cp_wptr, rptr = 0;
++
++	pg_ring_put(wptr++, pg_pkt7(PG_CP_MEM_WRITE, 64u + 2u));
++	pg_ring_put(wptr++, (uint32_t)PG_DRAW_IOVA);
++	pg_ring_put(wptr++, (uint32_t)(PG_DRAW_IOVA >> 32));
++	for (uint32_t i = 0; i < 64u; i++) {
++		pg_ring_put(wptr++, 0xa5a50000u | i);
++	}
++	wptr &= PG_RING_WORDS - 1u;
++	pg_ring_flush();
++	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < 100000; i++) {
++		rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
++		if (rptr == wptr) {
++			pg_cp_wptr = wptr;
++			printf("POLARIS GPU: 18 %s: the CP took a 64 dword write to kernel "
++			    "memory, so the CP is alive and the panel is what it cannot write\n",
++			    when);
++			return;
++		}
++		pg_sleep_us(10);
++	}
++	printf("POLARIS GPU: 18 %s: the CP takes nothing at all, kernel memory included: "
++	    "RPTR %u WPTR %u, RBBM_STATUS %#010x\n", when, rptr, wptr,
++	    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++}
++
+ static bool
+ pg_step_panel(void)
+ {
+@@ -4072,6 +4139,16 @@
+ 	printf("POLARIS GPU: 18 panel %#llx %ux%u stride %u: the whole thing, %u bytes, "
+ 	    "%u pages at iova %#llx\n", phys, width, height, stride, bytes, pages, PG_PANEL_IOVA);
+ 	/*
++	 * Step 17 ended with RBBM_STATUS 0x00c00015 and step 18's stall reported
++	 * 0x00800005, so the block changed state somewhere in between and the
++	 * difference matters: 0x00400000 and 0x00000010 are the bits that go.
++	 * Stamp the status at the three points that bracket the work so the next
++	 * ring says where it changed instead of leaving it to be guessed.
++	 */
++	printf("POLARIS GPU: 18 on entry: RBBM_STATUS %#010x RPTR %u WPTR %u\n",
++	    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS),
++	    pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR), wptr);
++	/*
+ 	 * Read the top row before anything is written: whatever is there now is
+ 	 * what the rest of the system left on the surface, which is the baseline
+ 	 * the readings below are measured against.
+@@ -4137,6 +4214,10 @@
+ 		}
+ 	}
+ 
++	printf("POLARIS GPU: 18 before the fill: RBBM_STATUS %#010x RPTR %u WPTR %u\n",
++	    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS),
++	    pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR), wptr);
++
+ 	{
+ 		bool stalled = false;
+ 
+@@ -4204,6 +4285,8 @@
+ 					    pg_rd(cb + 0x5c), pg_rd(cb + 0x64),
+ 					    pg_rd(cb + 0x60),
+ 					    pg_rd(pg_gpu3d + 4u * PG_RBBM_INT_STATUS));
++					pg_cp_watch("the batch did not drain in one second", wptr);
++					pg_cp_probe("after the fill stopped");
+ 					stalled = true;
+ 				}
+ 			}
