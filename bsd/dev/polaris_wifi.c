@@ -60,6 +60,24 @@
  * So this build also reads what the global partition does carry: the image
  * version tables (469 and 602) are a record per firmware image, in host order,
  * and their names are the cheapest way to say which subsystem host 8 is.
+ *
+ * Build 0166 read them and they were nearly empty - two records, the boot
+ * loader's and the trusted zone's - because the table only lists images that
+ * were loaded, and no remote processor's firmware has been. So the names say
+ * nothing about host 8.
+ *
+ * What does say something is the shape of the table. Five of the fifteen
+ * partitions involve hosts 7 or 8, and they are exactly the edges a wireless
+ * subsystem has: ap <-> 8, modem <-> 8, 7 <-> 8, and 7 <-> modem. The wireless
+ * power domain on this platform is served by the modem, and the always-on
+ * power manager is what has an edge to both - so 7 is the AOP and 8 is the
+ * wireless subsystem. The device tree backs the second half of that up by
+ * omission: it describes smp2p edges for hosts 1, 2, 3 and 5 and for no other
+ * number, which is what a subsystem that talks GLINK and not SMP2P looks like.
+ *
+ * This build is the write. polariswifi=2 allocates the GLINK descriptor and the
+ * two FIFOs in the ap <-> 8 partition, sized to fit the sixteen kilobytes it
+ * has, and reads the partition back afterwards so the printout is the evidence.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -82,6 +100,15 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
 #define PW_HOST_CDSP		5
 #define PW_HOST_SPSS		6
 #define PW_HOST_GLOBAL		0xfffe
+
+/*
+ * The host the WLAN partition belongs to, until the image version table says
+ * otherwise. Host 8 is the only number in the table with an edge to the AP that
+ * is not already accounted for (modem, adsp, dsps, cdsp all are), it has an edge
+ * to the modem as well - and the WLAN power domain on this platform is the
+ * modem's - and its partition is 16 KB, which is the size of a GLINK edge.
+ */
+#define PW_HOST_WLAN_GUESS	8
 
 #define PW_CANARY		0xa5a5
 
@@ -140,7 +167,7 @@ struct pw_item_header {
 
 #define PW_ITEMS_MAX		64u
 
-static const volatile uint8_t *pw_smem;
+static volatile uint8_t *pw_smem;
 
 static void pw_strings(uint32_t at, uint32_t size, unsigned want);
 
@@ -148,7 +175,7 @@ static bool
 pw_peek(uint32_t offset, void *to, uint32_t size)
 {
 	if (pw_smem == NULL) {
-		pw_smem = (const volatile uint8_t *)ml_io_map_unmappable(PW_PHYS, PW_SIZE,
+		pw_smem = (volatile uint8_t *)ml_io_map_unmappable(PW_PHYS, PW_SIZE,
 		    VM_WIMG_WCOMB);
 	}
 	if (pw_smem == NULL || offset + size > PW_SIZE) {
@@ -158,6 +185,26 @@ pw_peek(uint32_t offset, void *to, uint32_t size)
 		((uint8_t *)to)[i] = pw_smem[offset + i];
 	}
 	return true;
+}
+
+/*
+ * One word, written, and not the next one until it has landed.
+ *
+ * SMEM is shared with the other side through the interconnect, not through a
+ * cache, but "written" and "visible" are still two different things on this
+ * core: the allocation below publishes an item in two steps (the entry, then
+ * the partition's free mark) and a reordered second store would advertise a
+ * half-written entry. The barrier after every store is the cheap way to not
+ * have to reason about that at all.
+ */
+static void
+pw_poke(uint32_t offset, uint32_t value)
+{
+	if (pw_smem == NULL || offset + sizeof(value) > PW_SIZE) {
+		return;
+	}
+	*(volatile uint32_t *)(pw_smem + offset) = value;
+	__asm__ __volatile__("dsb sy" ::: "memory");
 }
 
 static uint32_t
@@ -375,15 +422,184 @@ pw_ours(uint16_t host0, uint16_t host1)
 	    host0 == PW_HOST_GLOBAL || host1 == PW_HOST_GLOBAL;
 }
 
+/*
+ * ---- allocating items, the way qcom_smem_alloc() does ----
+ *
+ * Build 0165 proved the partitions the AP is a party to are empty, so the WLAN
+ * items cannot be found: they have to be created. Linux creates them in
+ * qcom_smem_alloc_private(), and the Mi 8 port reimplements that as
+ * item_make_locked(); this is the same four steps.
+ *
+ * An item is a 16-byte header followed by its bytes, packed upwards from the
+ * end of the partition header, and `free_uncached` is the mark that says where
+ * the next one goes. So allocating is: walk to the mark, check it is really the
+ * end of the last item (a mark that disagrees with the entries means somebody
+ * else is mid-allocation), check there is room below `free_cached`, write the
+ * header whole, and only then move the mark. The order matters: the mark is
+ * what the other side watches, so it must never point at a header that is not
+ * completely there yet.
+ *
+ * The partition is small - 16 KB for the WLAN edge - and the sizes are chosen
+ * against that budget rather than copied from the Mi 8's modem edge, where a
+ * single 16 KB FIFO fits because the partition is 496 KB.
+ */
+struct pw_part {
+	uint32_t offset;
+	uint32_t size;
+	uint32_t cacheline;
+};
+
+/* The partition whose two hosts are `a` and `b`, in either order. */
 static bool
-polaris_wifi_requested(void)
+pw_partition_of(uint16_t a, uint16_t b, struct pw_part *out)
+{
+	struct pw_toc toc;
+
+	if (!pw_toc(&toc)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < toc.count; i++) {
+		struct pw_toc_entry entry;
+
+		if (!pw_peek(PW_SIZE - 0x1000 + (uint32_t)sizeof(toc) +
+		    i * (uint32_t)sizeof(entry), &entry, sizeof(entry))) {
+			return false;
+		}
+		if (entry.offset == 0 || entry.size == 0) {
+			continue;
+		}
+		if ((entry.host0 == a && entry.host1 == b) ||
+		    (entry.host0 == b && entry.host1 == a)) {
+			out->offset = entry.offset;
+			out->size = entry.size;
+			out->cacheline = entry.cacheline;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Make one item, zeroed, or find the one that is already there. `data_at` is set
+ * to the item's bytes either way. False: nothing was written.
+ */
+static bool
+pw_make_item(const struct pw_part *p, uint32_t item, uint32_t size, uint32_t *data_at)
+{
+	struct pw_partition header;
+	struct pw_item_header entry;
+	uint32_t at, need = (uint32_t)sizeof(entry) + size;
+
+	if ((size & 7u) != 0) {
+		printf("POLARIS WIFI: item %u: %u bytes is not a multiple of 8\n", item, size);
+		return false;
+	}
+	if (!pw_peek(p->offset, &header, sizeof(header))) {
+		return false;
+	}
+	if (header.free_uncached > header.free_cached || header.free_cached > header.size ||
+	    header.size > p->size) {
+		printf("POLARIS WIFI: item %u: the partition's marks make no sense "
+		    "(free %u/%u, size %u, table says %u): nothing written\n", item,
+		    header.free_uncached, header.free_cached, header.size, p->size);
+		return false;
+	}
+	for (at = (uint32_t)sizeof(header); at < header.free_uncached;) {
+		if (!pw_peek(p->offset + at, &entry, sizeof(entry)) ||
+		    entry.canary != PW_CANARY || entry.size > header.size) {
+			break;
+		}
+		if (entry.item == item) {
+			*data_at = p->offset + at + (uint32_t)sizeof(entry) +
+			    entry.padding_header;
+			printf("POLARIS WIFI: item %u is already there at %#x, %u bytes: "
+			    "left alone\n", item, *data_at, entry.size - entry.padding_data);
+			return true;
+		}
+		at += (uint32_t)sizeof(entry) + entry.padding_header + entry.size;
+	}
+	if (at != header.free_uncached) {
+		printf("POLARIS WIFI: item %u: the entries end at +%#x but the mark says +%#x: "
+		    "nothing written\n", item, at, header.free_uncached);
+		return false;
+	}
+	if (at + need > header.free_cached) {
+		printf("POLARIS WIFI: item %u: %u bytes wanted, %u free: nothing written\n",
+		    item, need, header.free_cached - at);
+		return false;
+	}
+	pw_poke(p->offset + at, PW_CANARY | (item << 16));
+	pw_poke(p->offset + at + 4, size);
+	pw_poke(p->offset + at + 8, 0);			/* no padding either side */
+	pw_poke(p->offset + at + 12, 0);
+	pw_poke(p->offset + __offsetof(struct pw_partition, free_uncached), at + need);
+	*data_at = p->offset + at + (uint32_t)sizeof(entry);
+	for (uint32_t off = 0; off < size; off += 4) {
+		pw_poke(*data_at + off, 0);
+	}
+	printf("POLARIS WIFI: item %u made at %#x, %u bytes, zeroed; the mark is now +%u\n",
+	    item, *data_at, size, at + need);
+	return true;
+}
+
+/*
+ * The GLINK set for one edge, sized to fit the partition it goes in.
+ *
+ * The descriptor is 32 bytes and holds the FIFO sizes, so the peer learns them
+ * from it; the FIFOs themselves are what has to fit. For the WLAN edge the whole
+ * partition is 16 KB, so 4 KB each way with room to spare beats the Mi 8's 16 KB
+ * one that would not fit at all.
+ */
+#define PW_GLINK_DESC_SIZE	32u
+#define PW_GLINK_FIFO_SIZE	4096u
+
+static void
+pw_allocate(uint16_t remote)
+{
+	struct pw_part p;
+	uint32_t at = 0, tx = 0, rx = 0;
+	bool ok;
+
+	if (!pw_partition_of(PW_HOST_AP, remote, &p)) {
+		printf("POLARIS WIFI: no partition with ap and host %u: nothing to allocate in\n",
+		    remote);
+		return;
+	}
+	printf("POLARIS WIFI: ---- allocating in the ap <-> host %u partition at %#x, "
+	    "%u bytes ----\n", remote, p.offset, p.size);
+
+	ok = pw_make_item(&p, PW_ITEM_GLINK_DESC, PW_GLINK_DESC_SIZE, &at);
+	ok = pw_make_item(&p, PW_ITEM_GLINK_FIFO, PW_GLINK_FIFO_SIZE, &tx) && ok;
+	ok = pw_make_item(&p, PW_ITEM_GLINK_FIFO + 1, PW_GLINK_FIFO_SIZE, &rx) && ok;
+	printf("POLARIS WIFI: the GLINK set: descriptor %#x, tx fifo %#x, rx fifo %#x: %s\n",
+	    at, tx, rx, ok ? "all three in place" : "NOT all in place");
+
+	/* read it back through the same window, so what is printed is what is there */
+	{
+		struct pw_census again;
+
+		memset(&again, 0, sizeof(again));
+		pw_survey(p.offset, p.size, p.cacheline, &again);
+	}
+}
+
+/*
+ * 0: off. 1: read. 2: read, then allocate the GLINK set in the WLAN edge.
+ *
+ * A level rather than a flag because the two halves have very different failure
+ * modes - a read can stall a core on the bus, a write can leave a mark pointing
+ * at a header that is not there - and a build should be able to ask for the
+ * second without the first having to be re-argued.
+ */
+static int
+polaris_wifi_level(void)
 {
 	int optin = 0;
 
 	if (!PE_parse_boot_argn("polariswifi", &optin, sizeof(optin))) {
-		return false;
+		return 0;
 	}
-	return optin == 1;
+	return optin;
 }
 
 void
@@ -392,13 +608,15 @@ polaris_wifi_probe(void)
 	struct pw_census census;
 	struct pw_toc toc;
 	uint32_t walked = 0, skipped = 0;
+	int level = polaris_wifi_level();
 
-	if (!polaris_wifi_requested()) {
+	if (level < 1) {
 		return;
 	}
 	memset(&census, 0, sizeof(census));
-	printf("POLARIS WIFI: ======== build 0166 alive: reading SMEM at %#llx (%u bytes) "
-	    "and nothing else ========\n", PW_PHYS, PW_SIZE);
+	printf("POLARIS WIFI: ======== build 0167 alive: reading SMEM at %#llx (%u bytes), "
+	    "and %s ========\n", PW_PHYS, PW_SIZE,
+	    level >= 2 ? "writing the GLINK set into the WLAN partition" : "nothing else");
 
 	printf("POLARIS WIFI: the boot loader's version word at %#x is %#x (12 in [31:16] means "
 	    "the partition table is in use)\n", 0x40 + 4 * 7, pw_word(0x40 + 4 * 7));
@@ -456,6 +674,14 @@ polaris_wifi_probe(void)
 	    pw_census_has(&census, PW_ITEM_GLINK_DESC),
 	    pw_census_has(&census, PW_ITEM_GLINK_FIFO),
 	    pw_census_has(&census, PW_ITEM_CRASH_REASON));
-	printf("POLARIS WIFI: read only; nothing was written\n");
+
+	if (level >= 2) {
+		int remote = PW_HOST_WLAN_GUESS;
+
+		(void)PE_parse_boot_argn("polariswifihost", &remote, sizeof(remote));
+		pw_allocate((uint16_t)remote);
+	} else {
+		printf("POLARIS WIFI: read only; nothing was written\n");
+	}
 }
 #endif
