@@ -1,0 +1,284 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -238,6 +238,9 @@
+  * Synopsys DWC3 databook as used by Linux drivers/usb/dwc3 (gadget.c,
+  * ep0.c).
+  */
++#define GRXTHRCFG       0xc108
++#define   GRXTHRCFG_PKTCNTSEL (1u << 29)
++#define   DCFG_IGNSTRMPP      (1u << 23)
+ #define GCTL            0xc110
+ #define GEVNTADRLO      0xc400
+ #define GEVNTADRHI      0xc404
+@@ -284,11 +287,18 @@
+ #define DCTL_RUN_STOP   (1u << 31)   /* 1 = stopped, 0 = running (DWC3 puts it at bit 31) */
+ #define DCTL_CSFTRST    (1u << 30)
+ /*
+- * DSTS bit 9 is DevCtrlHlt. Bit 22 was used here, which sits inside the
+- * SOFFN frame counter - so "halted" was really "some frame-number bit is
+- * set" and the detach wait loop could never terminate on it.
+- */
+-#define DSTS_DEVCTRLHLT (1u << 9)
++ * DSTS, from Linux dwc3 core.h:
++ *   [2:0]   ConnectSpeed (0=HS, 1=FS, 2=LS, 4=SS)
++ *   [17:3]  SOFFN        [21:18] USBLNKST      [22] DevCtrlHlt
++ *
++ * 0146 "fixed" this to bit 9, which is SOFFN[6]. At handover DSTS reads
++ * 0x00520004, so bit 9 is set and the detach loop believed the core was
++ * permanently halted - it was reading a frame counter.
++ */
++#define DSTS_DEVCTRLHLT (1u << 22)
++#define DSTS_SPEED(v)   ((v) & 7u)
++#define DSTS_SOFFN(v)   (((v) >> 3) & 0x3fffu)
++#define DSTS_LNKST(v)   (((v) >> 18) & 0xfu)
+ 
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+@@ -296,15 +306,23 @@
+ #define DEPCMD_STARTTRANSFER    6
+ #define DEPCMD_DEPSTARTCFG      9
+ /*
+- * DEPCMD bit 16 is Command Active; bit 10 is HIPRI_FORCERM, which is a
+- * request hint, not a completion flag. Every build up to 0115 wrote and
+- * polled bit 10, so no endpoint command was ever issued with CMDACT set -
+- * and "DEPCFG never clears CMDACT" was a misreading of a bit that was
+- * never CMDACT to begin with. That is why SETEPCONFIG looked like a
+- * hardware failure for thirteen builds while DEPSTARTCFG (whose bit 10
+- * happened to read back clear) looked fine.
++ * DEPCMD, verbatim from Linux drivers/usb/dwc3/core.h:
++ *
++ *   #define DWC3_DEPCMD_PARAM_SHIFT   16
++ *   #define DWC3_DEPCMD_CMDACT        BIT(10)
++ *   #define DWC3_DEPCMD_HIPRI_FORCERM BIT(11)
++ *   #define DWC3_DEPCMD_STATUS(x)     (((x) >> 12) & 0x0F)
++ *
++ * Builds 0146 and 0147 declared CMDACT as bit 16. Bit 16 is
++ * CommandParam[0], so every endpoint command was written as
++ * "type | (1 << 16)" - a command with parameter 1 and CMDACT clear. The
++ * core never executed a single one, and the poll then reported a 500 ms
++ * timeout on all four strategies, which looked like a hardware failure.
++ * That is also why 0146/0147 made every strategy fail in exactly the same
++ * way, when 0145 had one that actually configured endpoint 0.
+  */
+-#define DEPCMD_CMDACT           (1u << 16)
++#define DEPCMD_CMDACT           (1u << 10)
++#define DEPCMD_HIPRI_FORCERM    (1u << 11)
+ #define DEPCMD_STATUS_SHIFT     12
+ #define DEPCMD_STATUS_MASK      0xfu
+ 
+@@ -401,50 +419,53 @@
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+ 	printf("SWEET USB: epcmd ep%u DEPCMD 0x%08x, polling\n", ep, dwc_rd(DEPCMD(ep)));
+ 	/*
+-	 * Wait for CMDACT to clear, but first make sure it was ever set.
++	 * Two phases: CMDACT latches almost immediately after the write and
++	 * drops when the core has executed the command.
+ 	 *
+-	 * A core that never latches CMDACT never ran the command, and a poll
+-	 * that only looks for "cleared" reports that as instant success. That
+-	 * is exactly how the wrong bit hid for thirteen builds. So: spin
+-	 * briefly for active, then wait for it to drop.
++	 * "active" is reported on every path, not only the failure one. A
++	 * single command coming back with active 0 can just mean the core
++	 * was faster than this read; every command coming back that way
++	 * means CMDACT is being written to the wrong bit - which is exactly
++	 * what 0146/0147 did (bit 16 is CommandParam[0]) and why all four
++	 * strategies then failed identically.
++	 *
++	 * CmdStatus is printed even when CMDACT cleared, because a command
++	 * the core rejects outright clears CMDACT at once and leaves a
++	 * non-zero status. The old code called that "ok polls 0".
+ 	 *
+ 	 * delay() is microseconds here (the soft-reset loop uses delay(1000)
+ 	 * per millisecond), so 5000 iterations is the 500 ms Linux allows.
+ 	 */
+ 	int i;
+ 	int active = 0;
++	uint32_t v = dwc_rd(DEPCMD(ep));
+ 	for (i = 0; i < 5000; i++) {
+-		uint32_t v = dwc_rd(DEPCMD(ep));
++		v = dwc_rd(DEPCMD(ep));
+ 		if (v & DEPCMD_CMDACT) {
+ 			active = 1;
+-		} else if (active || i > 20) {
++		} else if (active) {
++			break;
++		} else if (i > 100) {
++			/* 10 ms and CMDACT was never seen: do not burn 500. */
+ 			break;
+ 		}
+ 		delay(100);
+ 	}
+ 	{
+-		uint32_t v = dwc_rd(DEPCMD(ep));
+ 		uint32_t status = (v >> DEPCMD_STATUS_SHIFT) & DEPCMD_STATUS_MASK;
+-		if (v & DEPCMD_CMDACT) {
+-			printf("SWEET USB: ep%u cmd 0x%x timeout after %d polls (%d ms): DEPCMD 0x%08x "
+-			    "status %u PAR0 0x%08x PAR1 0x%08x PAR2 0x%08x\n",
+-			    ep, cmd & 0xf, i, i / 10, v, status,
+-			    dwc_rd(DEPCMDPAR0(ep)), dwc_rd(DEPCMDPAR1(ep)), dwc_rd(DEPCMDPAR2(ep)));
+-		} else if (status) {
+-			printf("SWEET USB: ep%u cmd 0x%x status %u polls %d DEPCMD 0x%08x\n",
+-			    ep, cmd & 0xf, status, i, v);
+-			return -1;
+-		} else {
+-			/*
+-			 * "active 0" is not proof of failure: a command can set and
+-			 * clear CMDACT between two reads. It is reported because if
+-			 * every command comes back this way and nothing downstream
+-			 * works, the bit is still wrong.
+-			 */
+-			printf("SWEET USB: ep%u cmd 0x%x ok polls %d DEPCMD 0x%08x (active %d)\n",
+-			    ep, cmd & 0xf, i, v, active);
++		int stuck = (v & DEPCMD_CMDACT) != 0;
++
++		printf("SWEET USB: ep%u cmd 0x%x -> DEPCMD 0x%08x status %u active %d "
++		    "polls %d (%d ms) PAR0 0x%08x PAR1 0x%08x PAR2 0x%08x%s\n",
++		    ep, cmd & 0xf, v, status, active, i, i / 10,
++		    dwc_rd(DEPCMDPAR0(ep)), dwc_rd(DEPCMDPAR1(ep)), dwc_rd(DEPCMDPAR2(ep)),
++		    stuck ? " STUCK" : (status ? " REJECTED" : ""));
++		if (!stuck && status == 0) {
+ 			return 0;
+ 		}
++		if (!stuck) {
++			return -1;
++		}
+ 	}
+ 	flush_dcache64((addr64_t)(ud.dma_pa + UD_EVT), 64, TRUE);
+ 	{
+@@ -1156,6 +1177,15 @@
+  * been run: the PHY was configured but held powered down, which is why it
+  * never produced a UTMI clock and why the controller's endpoint command
+  * engine - the part that runs off that clock - never cleared CMDACT.
++ *
++ * 0148: the table used to say 0x220=0x00 and 0x240=0x20. Those are the
++ * values from /soc/qusb@88e3000, the *second* QUSB2 PHY, whose controller
++ * ssusb@a800000 is status="disabled". Our controller is ssusb@a600000 and
++ * its usb-phy phandles are <181 844>, i.e. qusb@88e2000 + ssphy@88e8000;
++ * 88e2000's own table says 0x220=0x08 and 0x240=0x07. Every other entry is
++ * identical between the two nodes, which is exactly how the copy went
++ * unnoticed: the table looked right, apart from the two registers that
++ * differ. 0x240 is PORT_TUNE1, the HS transceiver trim.
+  */
+ static const struct {
+ 	uint16_t off;
+@@ -1163,7 +1193,7 @@
+ } qusb2_init_seq[] = {
+ 	{ 0x210, 0x23 }, { 0x004, 0x03 }, { 0x18c, 0x7c }, { 0x02c, 0x80 },
+ 	{ 0x184, 0x0a }, { 0x0b4, 0x19 }, { 0x194, 0x40 }, { 0x198, 0x20 },
+-	{ 0x214, 0x21 }, { 0x220, 0x00 }, { 0x224, 0x58 }, { 0x240, 0x20 },
++	{ 0x214, 0x21 }, { 0x220, 0x08 }, { 0x224, 0x58 }, { 0x240, 0x07 },
+ 	{ 0x244, 0x29 }, { 0x248, 0xca }, { 0x24c, 0x04 }, { 0x250, 0x03 },
+ 	{ 0x23c, 0x00 }, { 0x210, 0x22 },
+ };
+@@ -1570,7 +1600,31 @@
+ 		dwc_wr(GCTL, gctl & ~GCTL_CORESOFTRESET);
+ 		delay(100000);
+ 	}
+-	dwc_wr(DCTL, DCTL_CSFTRST);
++	/*
++	 * 0148: reset the whole core first, the way Linux does it.
++	 *
++	 * Everything up to 0147 only pulsed DCTL.CSFTRST, which resets the
++	 * device controller but leaves the rest of the core alone - including
++	 * the endpoint command engine's own state. dwc3_core_soft_reset()
++	 * asserts GCTL.CORESOFTRESET (bit 11) instead, which is the reset
++	 * that clears CMDACT and the endpoint configuration table.
++	 *
++	 * DCTL.CSFTRST is kept as a second step because it is what unstuck
++	 * the command engine in the earlier builds, and its other bits are
++	 * preserved rather than zeroed: ABL hands over DCTL 0x00f00000 and
++	 * every previous reset threw bits 20-23 away.
++	 */
++	dwc_wr(GCTL, gctl | GCTL_CORESOFTRESET);
++	int g;
++	for (g = 0; g < 100 && (dwc_rd(GCTL) & GCTL_CORESOFTRESET); g++) {
++		delay(1000);
++	}
++	dwc_wr(GCTL, gctl);
++	printf("  core reset: GCTL.CORESOFTRESET cleared after %d ms, GCTL 0x%08x GSTS 0x%08x%s\n",
++	    g, dwc_rd(GCTL), dwc_rd(GSTS),
++	    (dwc_rd(GSTS) & 1u) ? " CSRTIMEOUT" : "");
++
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_CSFTRST);
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+ 		delay(1000);
+@@ -1582,6 +1636,8 @@
+ 	dwc_wr(GCTL, gctl);
+ 	dwc_wr(GUSB2PHYCFG, gusb2);
+ 	dwc_wr(GUSB3PIPECTL, gusb3);
++	printf("  dev reset: DCTL.CSFTRST cleared after %d ms, DCTL 0x%08x DSTS 0x%08x\n",
++	    i, dwc_rd(DCTL), dwc_rd(DSTS));
+ 	return 0;
+ }
+ 
+@@ -1874,9 +1930,27 @@
+ 	    dwc_rd(GEVNTADRHI), dwc_rd(GEVNTADRLO), dwc_rd(GEVNTSIZ));
+ 	ud.evt_pos = 0;
+ 
+-	/* High speed, address 0 */
++	/*
++	 * High speed, address 0, plus the two bits Linux sets in
++	 * __dwc3_gadget_start() before it touches an endpoint:
++	 *
++	 *   DCFG.IGNSTRMPP       (bit 23) ignore the packet-pending bit when
++	 *                                 selecting a stream
++	 *   GRXTHRCFG.PKTCNTSEL  (bit 29) cleared, so DCFG.NUMP is used as the
++	 *                                 ACK TP NumP instead of the core
++	 *                                 working it out itself
++	 *
++	 * Neither is a databook precondition for DEPCFG, but they are part of
++	 * the state a working Linux gadget has and this driver never
++	 * established, and matching them costs two register writes.
++	 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+-	dwc_wr(DCFG, dcfg | 0);
++	dwc_wr(DCFG, dcfg | DCFG_IGNSTRMPP);
++	dwc_wr(GRXTHRCFG, dwc_rd(GRXTHRCFG) & ~GRXTHRCFG_PKTCNTSEL);
++	printf("  %s: DCFG 0x%08x (DevSpd %u, addr %u) GRXTHRCFG 0x%08x "
++	    "GUSB3PIPECTL 0x%08x DALEPENA 0x%08x\n",
++	    tag, dwc_rd(DCFG), dwc_rd(DCFG) & 7u, (dwc_rd(DCFG) >> 3) & 0x7fu,
++	    dwc_rd(GRXTHRCFG), dwc_rd(GUSB3PIPECTL), dwc_rd(DALEPENA));
+ 	/*
+ 	 * Device events on, but delivered only to the event ring.
+ 	 *
+@@ -2056,21 +2130,28 @@
+ 	 * endpoints on the first poll. The rest stay as regression fallbacks.
+ 	 */
+ 	/*
+-	 * 0146: resume first. It keeps ABL's efuse-trimmed TUNE1 (0x72) and
+-	 * only lifts POWER_DOWN, which is the least invasive thing that can
+-	 * work - and now that it no longer writes 0x23 it actually does lift
+-	 * it. table+utmi is second because it is the only strategy that ever
+-	 * got ep0 configured, so if resume still stalls the command engine
+-	 * there is a known-good fallback in the same boot.
++	 * 0148: noreset first, and for a different reason than before.
++	 *
++	 * With CMDACT finally on the right bit, this build can see for the
++	 * first time what the command engine actually answers. ABL hands over
++	 * a controller that was enumerating seconds ago, so the untouched
++	 * state is the best starting point and, if DEPSTARTCFG comes back
++	 * with a non-zero CmdStatus instead of hanging, the log will say so.
++	 *
++	 * table+utmi is second: it is the only strategy that ever configured
++	 * endpoint 0 (build 0145), and now runs the init sequence from the
++	 * PHY this controller is actually wired to. resume+utmi follows, and
++	 * runstop+table+utmi last, in case the core wants to be halted while
++	 * its endpoints are programmed.
+ 	 */
+ 	static const char *names[] = {
+-		"resume+utmi", "table+utmi", "noreset", "resume+utmi+pipe+vbus"
++		"noreset", "table+utmi", "resume+utmi", "runstop+table+utmi"
+ 	};
+ 	static const unsigned order[] = {
+-		UD_F_RESUME | UD_F_UTMI | UD_F_CLKGT,
+-		UD_F_PHYINIT | UD_F_UTMI | UD_F_CLKGT,
+ 		UD_F_NORESET,
+-		UD_F_RESUME | UD_F_UTMI | UD_F_CLKGT | UD_F_PIPE | UD_F_VBUS,
++		UD_F_PHYINIT | UD_F_UTMI | UD_F_CLKGT,
++		UD_F_RESUME | UD_F_UTMI | UD_F_CLKGT,
++		UD_F_PHYINIT | UD_F_UTMI | UD_F_CLKGT | UD_F_RUNSTOP,
+ 	};
+ 	int won = -1;
+ 	for (unsigned s = 0; s < sizeof(order) / sizeof(order[0]); s++) {
