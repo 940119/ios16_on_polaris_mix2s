@@ -60,6 +60,7 @@ extern void polaris_gpu_init(void);
 extern void sweet_usb_probe(void);
 extern void polaris_wifi_probe(void);
 extern void polaris_qmp_probe(void);
+extern void polaris_modem_probe(void);
 
 #define REG_CAP         0x00
 #define REG_IS          0x20
@@ -297,6 +298,40 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
 		0, (uint8_t)(count >> 8), (uint8_t)count, 0
 	};
 	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
+}
+
+/*
+ * Read device blocks from any LUN, for a probe that needs a partition the BSD
+ * layer does not own.
+ *
+ * The driver is bound to one LUN - LUN 0, where userdata is - because that is
+ * all the root filesystem needs. The modem's firmware is on LUN 4, and a second
+ * driver for a second LUN is a lot of code for a read, so this borrows the
+ * driver instead: the LUN goes in the command's UPIU, so it can be changed per
+ * command and put back afterwards.
+ *
+ * Nothing else is doing I/O when the probes run, and the lock is held across the
+ * switch anyway, so a stray strategy() call cannot land in the middle of it.
+ */
+int
+sweet_ufs_raw_read(uint8_t lun, uint64_t lba, uint32_t count, void *to)
+{
+	uint8_t saved;
+	int error;
+
+	if (count == 0 || count > BOUNCE_SIZE / UFS_BLOCK || to == NULL) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&sweet_ufs_lock);
+	saved = su.lun;
+	su.lun = lun;
+	error = ufs_read_blocks(lba, count);
+	if (error == 0) {
+		memcpy(to, (const void *)(su.dma + DMA_BOUNCE), (size_t)count * UFS_BLOCK);
+	}
+	su.lun = saved;
+	lck_mtx_unlock(&sweet_ufs_lock);
+	return error;
 }
 
 static int
@@ -694,6 +729,12 @@ sweet_ufs_init(void)
 	 * here - after the USB arm, which is where a wedge is most likely.
 	 */
 	polaris_wifi_probe();
+	/*
+	 * Modem step 1: read the firmware out of the modem partition, off unless
+	 * polarismodem=1. It borrows the UFS driver for LUN 4, so it goes after
+	 * the root filesystem is mounted and before anything else uses the disk.
+	 */
+	polaris_modem_probe();
 	/*
 	 * Last, and off unless polarisgpuprobe=2. Build 0102 showed why: the
 	 * first read of the GPU clock controller parks the calling thread in the
