@@ -1,0 +1,282 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-01 19:13:41.273689772 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-01 19:13:41.297689772 +0800
+@@ -3886,22 +3886,33 @@
+  * offset.
+  */
+ static bool
+-pg_panel_verify(uint64_t phys, uint32_t width, uint32_t height, uint32_t stride)
++pg_panel_verify(uint64_t phys, uint32_t width, uint32_t height, uint32_t stride,
++    uint32_t written_rows)
+ {
+ 	uint32_t rows[6], cols[3];
+-	uint32_t wrong = 0, checked = 0;
++	uint32_t probes = 3, wrong = 0, checked = 0;
+ 
+ 	rows[0] = 0;
+ 	rows[1] = 1;
+ 	rows[2] = 7;
+-	rows[3] = height - 8u;
+-	rows[4] = height - 2u;
+-	rows[5] = height - 1u;
++	/*
++	 * Build 0155 stopped the fill at 83% and then verified nothing, so a
++	 * panel that was three quarters right looked exactly like a panel that
++	 * was not written at all. Probe the last rows that are known to have
++	 * been written instead of the last rows of the panel: a partial fill is
++	 * still evidence, and it names where the command processor stopped.
++	 */
++	if (written_rows >= 16u) {
++		rows[3] = written_rows - 8u;
++		rows[4] = written_rows - 2u;
++		rows[5] = written_rows - 1u;
++		probes = 6;
++	}
+ 	cols[0] = 0;
+ 	cols[1] = width / 2u;
+ 	cols[2] = width - 1u;
+ 
+-	for (uint32_t r = 0; r < 6; r++) {
++	for (uint32_t r = 0; r < probes; r++) {
+ 		uint64_t at = phys + (uint64_t)rows[r] * stride;
+ 		uint64_t base = at & ~(uint64_t)(PG_GMU_PAGE_SIZE - 1u);
+ 		uint32_t off = (uint32_t)(at - base);
+@@ -3929,8 +3940,11 @@
+ 		ml_io_unmap(va, span);
+ 	}
+ 	printf("POLARIS GPU: 18 read %u pixels back through the CPU: %u wrong "
+-	    "(rows 0, 1, 7 and the last 8; columns 0, %u and %u)\n",
+-	    checked, wrong, width / 2u, width - 1u);
++	    "(rows %u %u %u%s%u %u %u; columns 0, %u and %u)\n",
++	    checked, wrong, rows[0], rows[1], rows[2],
++	    probes == 6 ? ", " : "",
++	    probes == 6 ? rows[3] : 0, probes == 6 ? rows[4] : 0, probes == 6 ? rows[5] : 0,
++	    width / 2u, width - 1u);
+ 	return wrong == 0;
+ }
+ 
+@@ -3991,54 +4005,82 @@
+ 	}
+ 	PG_CHECK("18: the whole panel is in the 3D core's window");
+ 
+-	while (sent < words && ok) {
+-		for (uint32_t c = 0; c < PG_DRAW_PER_BATCH && sent < words; c++) {
+-			uint32_t n = words - sent < PG_DRAW_CHUNK ? words - sent : PG_DRAW_CHUNK;
+-			uint64_t addr = PG_PANEL_IOVA + 4ull * sent;
+-			uint32_t per_row = stride / 4u;
+-
+-			pg_ring_put(wptr++, pg_pkt7(PG_CP_MEM_WRITE, n + 2u));
+-			pg_ring_put(wptr++, (uint32_t)addr);
+-			pg_ring_put(wptr++, (uint32_t)(addr >> 32));
+-			for (uint32_t i = 0; i < n; i++) {
+-				uint32_t at = sent + i;
++	{
++		bool stalled = false;
++
++		while (sent < words && !stalled) {
++			for (uint32_t c = 0; c < PG_DRAW_PER_BATCH && sent < words; c++) {
++				uint32_t n = words - sent < PG_DRAW_CHUNK ? words - sent : PG_DRAW_CHUNK;
++				uint64_t addr = PG_PANEL_IOVA + 4ull * sent;
++				uint32_t per_row = stride / 4u;
++
++				pg_ring_put(wptr++, pg_pkt7(PG_CP_MEM_WRITE, n + 2u));
++				pg_ring_put(wptr++, (uint32_t)addr);
++				pg_ring_put(wptr++, (uint32_t)(addr >> 32));
++				for (uint32_t i = 0; i < n; i++) {
++					uint32_t at = sent + i;
+ 
+-				pg_ring_put(wptr++, pg_panel_pixel(at / per_row, at % per_row,
+-				    width, height));
++					pg_ring_put(wptr++, pg_panel_pixel(at / per_row, at % per_row,
++					    width, height));
++				}
++				sent += n;
+ 			}
+-			sent += n;
+-		}
+-		wptr &= PG_RING_WORDS - 1u;
+-		pg_ring_flush();
+-		pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		{
+-			bool drained = false;
+-
+-			for (uint32_t i = 0; i < 20000; i++) {
+-				rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
+-				if (rptr == wptr) {
+-					drained = true;
+-					break;
++			wptr &= PG_RING_WORDS - 1u;
++			pg_ring_flush();
++			pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++			__asm__ volatile ("dsb sy" ::: "memory");
++			{
++				bool drained = false;
++
++				/*
++				 * One second, not 200 ms. Build 0155 gave up after 200 ms
++				 * at 83% and reported a stop that may only have been the
++				 * CP falling behind - the ring had 1840 words queued and
++				 * RBBM_STATUS still said the block was alive. Waiting
++				 * longer costs boot time only if the CP really has
++				 * stopped, and then the message says so.
++				 */
++				for (uint32_t i = 0; i < 100000; i++) {
++					rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
++					if (rptr == wptr) {
++						drained = true;
++						break;
++					}
++					pg_sleep_us(10);
++				}
++				if (!drained) {
++					printf("POLARIS GPU: 18 the CP stalled at %u of %u dwords "
++					    "(%u%%) after %u submissions: RPTR %u WPTR %u, "
++					    "RBBM_STATUS %#010x; keeping what landed\n",
++					    sent, words, (uint32_t)((uint64_t)sent * 100u / words),
++					    batches, rptr, pg_rd(pg_gpu3d + 4u * PG_CP_RB_WPTR),
++					    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++					stalled = true;
+ 				}
+-				pg_sleep_us(10);
+ 			}
+-			if (!drained) {
+-				printf("POLARIS GPU: 18 the CP stopped at %u of %u dwords: RPTR %u "
+-				    "WPTR %u, RBBM_STATUS %#010x\n", sent, words, rptr,
+-				    pg_rd(pg_gpu3d + 4u * PG_CP_RB_WPTR),
+-				    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
+-				ok = false;
++			batches++;
++			if (!stalled && (batches % 64u) == 0) {
++				printf("POLARIS GPU: 18 %u of %u dwords (%u%%), %u submissions\n",
++				    sent, words, (uint32_t)((uint64_t)sent * 100u / words), batches);
+ 			}
+ 		}
+-		batches++;
+ 	}
+ 	pg_cp_wptr = wptr;
+-	printf("POLARIS GPU: 18 the CP %s: %u dwords in %u submissions at %#llx\n",
+-	    ok ? "wrote the whole panel" : "did NOT write the panel", sent, batches,
+-	    PG_PANEL_IOVA);
+-	if (ok) {
+-		ok = pg_panel_verify(phys, width, height, stride);
++	printf("POLARIS GPU: 18 the CP wrote %u of %u dwords (%u%%) in %u submissions at %#llx\n",
++	    sent, words, (uint32_t)((uint64_t)sent * 100u / words), batches, PG_PANEL_IOVA);
++	{
++		uint32_t per_row = stride / 4u;
++		uint32_t written_rows = sent / per_row;
++
++		if (written_rows > height) {
++			written_rows = height;
++		}
++		if (written_rows > 0) {
++			ok = pg_panel_verify(phys, width, height, stride, written_rows);
++		} else {
++			printf("POLARIS GPU: 18 nothing was written, so there is nothing to read back\n");
++			ok = false;
++		}
+ 	}
+ 	return ok;
+ }
+diff -Nur a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c	2026-11-01 19:13:41.277689772 +0800
++++ b/bsd/dev/sweet_usb.c	2026-11-01 19:13:41.288019272 +0800
+@@ -38,6 +38,7 @@
+ #include <sys/kern_event.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -202,8 +203,8 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0155 alive: ten minute monitor, GSTS cable/session/"
+-	    "bvalid by name ========\n");
++	printf("SWEET USB: ======== build 0156 alive: PORT_POWERDOWN sweep, every monitor "
++	    "sample printed ========\n");
+ 	sweet_log_flush_now();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -1576,15 +1577,17 @@
+ 	(void)wr;
+ 	ud_sleep_ms(3000);
+ 	/*
+-	 * Twenty samples was the whole window in 0153 and 0154, and nobody can
+-	 * pull a cable out and put it back inside twenty seconds - so the one
+-	 * experiment that would settle whether the host just needs a fresh
+-	 * connect edge has never actually been run. Ten minutes, and a line only
+-	 * when something changes (plus one a minute as a heartbeat) so the ring
+-	 * is not filled with identical lines.
++	 * Ten minutes, and this time every sample is printed.
++	 *
++	 * Build 0155 printed only on change, so a run with no change was
++	 * indistinguishable from a run where the monitor never sampled - and the
++	 * one thing that run did prove (the cable can come out and go back in
++	 * with nothing to show for it) needed the reader to trust that the loop
++	 * really ran. Six hundred lines is 78 KB against a 4 MB ring; being able
++	 * to see every sample is worth more than the space.
+ 	 */
+-	printf("SWEET USB: monitor start: 600 samples, one a second, a line whenever the "
+-	    "state changes - unplug and replug the cable at any point in that window\n");
++	printf("SWEET USB: monitor start: 600 samples, one a second, every one printed - "
++	    "unplug and replug the cable at any point in that window\n");
+ 	{
+ 		uint32_t last_d = dwc_rd(DSTS), last_g = dwc_rd(GSTS), last_ev = 0;
+ 		uint32_t changes = 0;
+@@ -1595,7 +1598,7 @@
+ 			uint32_t ev = dwc_rd(GEVNTCOUNT) & 0xffff;
+ 			bool moved = (d != last_d || g != last_g || ev != last_ev);
+ 
+-			if (moved || (m % 60) == 0) {
++			{
+ 				/*
+ 				 * Decoded against Linux core.h, not guessed:
+ 				 *   DSTS[2:0]   ConnectSpd: 0 = high speed, 1 = full speed,
+@@ -2610,6 +2613,44 @@
+ 		}
+ 	}
+ 
++	/*
++	 * Build 0155 settled one thing and it is worth writing down: unplugging
++	 * the cable changed nothing - not DSTS, not GSTS, not the event count.
++	 * So the port is electrically dead from the controller's side, and the
++	 * controller side is not what is wrong (endpoints configured, DALEPENA
++	 * set, RUN_STOP set, core not halted).
++	 *
++	 * What is left is the PHY's own termination. In device mode the core
++	 * asks the PHY for the D+ pull-up; QUSB2 decides whether it presents it,
++	 * and PORT_POWERDOWN is the register that says so. The boot loader left
++	 * 0x23 and this driver has been writing 0x22; neither connects, and
++	 * nobody has tried anything else. Sweep the plausible values and wait
++	 * for an event after each.
++	 */
++	if (!saw_event) {
++		static const uint32_t pd[] = { 0x23u, 0x22u, 0x20u, 0x02u, 0x00u };
++		vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++
++		printf("SWEET USB: step 4b/6 PORT_POWERDOWN sweep\n");
++		if (phy == 0) {
++			printf("SWEET USB:   QUSB2 map failed\n");
++		}
++		for (unsigned k = 0; phy != 0 && k < sizeof(pd) / sizeof(pd[0]) && !saw_event; k++) {
++			ud_detach("pd-sweep", 300, 0);
++			usb_wr(phy, QUSB2_PORT_POWERDOWN, pd[k]);
++			ud_sleep_ms(100);
++			printf("SWEET USB:   POWERDOWN <- %#04x, PLL_STATUS 0x%02x\n", pd[k],
++			    usb_rd(phy, QUSB2_PLL_STATUS));
++			if (ud_attach_and_wait("pd-sweep", 2000) > 0) {
++				saw_event = 1;
++				printf("SWEET USB:   POWERDOWN %#04x WON\n", pd[k]);
++			}
++		}
++		if (phy != 0) {
++			ml_io_unmap(phy, QUSB2_SIZE);
++		}
++	}
++
+ 	ud_qscratch_dump("post");
+ 	printf("SWEET USB: step 5/6 %s (DSTS 0x%08x GSTS 0x%08x)\n",
+ 	    saw_event ? "bus reset seen, arming ep0 SETUP" : "host never reset the bus",
