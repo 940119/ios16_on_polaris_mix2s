@@ -3876,6 +3876,12 @@ pg_step_draw(void)
  */
 #define PG_PANEL_IOVA		0x100a0000ull	/* the first page above step 17's scratch */
 #define PG_PANEL_MAX_PAGES	2400u		/* 0x100a0000..0x109fffff: the rest of the window */
+/*
+ * Where a kernel buffer gets mapped when the command processor has to read it.
+ * Well clear of the panel window above and of the ring and the memptrs, which
+ * sit in the low part of the same address space.
+ */
+#define PG_SURF_IOVA		0x20000000ull
 
 /*
  * The panel's geometry comes from PE_current_console(), which is where
@@ -3968,7 +3974,7 @@ pg_panel_pixel(uint32_t row, uint32_t col, uint32_t width, uint32_t height)
  * If the second is black too, the CPU is not looking at the surface the CP
  * wrote and no amount of waiting will help.
  */
-#define PG_PANEL_PROBES		6u	/* rows this file ever reads back */
+#define PG_PANEL_PROBES		12u	/* rows this file ever reads back */
 
 struct pg_panel_probe {
 	uint32_t row;
@@ -4433,6 +4439,119 @@ pg_memcpy_test(uint32_t width, uint32_t height, uint32_t stride)
 	printf("POLARIS GPU: 18b CP_MEMCPY moved nothing in either address order\n");
 }
 
+/*
+ * Step 18c: what a copy costs, and whether the CP can read what the CPU wrote.
+ *
+ * Two questions, and each one costs a flash cycle on its own, so they go in the
+ * same boot.
+ *
+ * The first decides whether any of this is worth wiring into present(): the same
+ * half panel, 4.6 MB, from the top half to the bottom, done once by the CPU with
+ * memcpy and once by the command processor with a single CP_MEMCPY. Same source,
+ * same destination, same size; the only difference is who moves it. The CPU's
+ * copy is the better half of its case, too - one contiguous memcpy, not two
+ * thousand row-at-a-time ones.
+ *
+ * The second decides whether it can work at all. The panel is I/O memory, which
+ * the command processor reads straight out of RAM, but present() copies out of
+ * an IOSurface: pages the CPU wrote through its cache, mapped into the GPU window
+ * as non-cached memory. If the CP cannot see those writes, the copy is worthless
+ * however fast it is - so a kernel buffer is filled, flushed, mapped and copied
+ * onto the panel, then read back word by word.
+ *
+ * Both parts write to the panel, and the timing part overwrites the top half of
+ * it with the bottom half. That happens after step 18 has taken its verdict, so
+ * it cannot change what the ladder reports.
+ */
+static void
+pg_copy_bench(uint32_t width, uint32_t height, uint32_t stride)
+{
+	static uint32_t after[2048];
+	uint64_t bytes = (uint64_t)stride * (uint64_t)height;
+	uint64_t half = (uint64_t)stride * (uint64_t)(height / 2u);
+	uint32_t words = width, bench = stride * 3u, wptr = pg_cp_wptr;
+	uint32_t i, diff, pages;
+	uint64_t t0, t1, cpu_ns = 0, cp_ns = 0;
+	vm_offset_t kbuf = 0, all;
+	uint32_t *buf;
+
+	if (height < 8u || width > 2048u || stride < width * 4u) {
+		printf("POLARIS GPU: 18c a %ux%u panel is not one this bench fits\n", width,
+		    height);
+		return;
+	}
+
+	/* ---- the second question first: can the CP read a kernel buffer? ---- */
+	if (kmem_alloc(kernel_map, &kbuf, (vm_size_t)bench,
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("POLARIS GPU: 18c no memory for the source buffer\n");
+		return;
+	}
+	buf = (uint32_t *)kbuf;
+	for (i = 0; i < bench / 4u; i++) {
+		buf[i] = 0xff000000u | (i & 0xffffu);
+	}
+	pages = bench / PG_GMU_PAGE_SIZE;
+	for (i = 0; i < pages; i++) {
+		if (!pg_map_phys(PG_SURF_IOVA + (uint64_t)i * PG_GMU_PAGE_SIZE,
+		    (uint64_t)kvtophys(kbuf + (vm_offset_t)i * PG_GMU_PAGE_SIZE),
+		    "copy source")) {
+			printf("POLARIS GPU: 18c the source buffer would not map\n");
+			return;
+		}
+	}
+	flush_dcache64((addr64_t)kbuf, bench, 0);
+	printf("POLARIS GPU: 18c %u bytes written by the CPU at phys %#llx: %u pages "
+	    "mapped at iova %#llx, cache flushed\n", bench,
+	    (uint64_t)kvtophys(kbuf), pages, PG_SURF_IOVA);
+
+	if (!pg_memcpy_span(PG_PANEL_IOVA + (uint64_t)(height - 2u) * stride,
+	    PG_SURF_IOVA, words, false, &wptr)) {
+		pg_cp_wptr = wptr;
+		return;
+	}
+	pg_cp_wptr = wptr;
+	diff = pg_row_diff(height - 2u, buf, after, words, stride);
+	if (diff == words) {
+		printf("POLARIS GPU: 18c THE CP READ WHAT THE CPU WROTE: %u dwords out of a "
+		    "kernel buffer land on row %u unchanged\n", words, height - 2u);
+	} else {
+		printf("POLARIS GPU: 18c the CP could not read the buffer: word %u reads "
+		    "%08x, the buffer holds %08x\n", diff, after[diff], buf[diff]);
+	}
+
+	/* ---- then the first question: the same bytes, CPU against CP ---- */
+	all = ml_io_map((vm_offset_t)pg_panel_phys, (vm_size_t)bytes);
+	if (all == 0) {
+		printf("POLARIS GPU: 18c the panel would not map whole; no timing\n");
+		kmem_free(kernel_map, kbuf, bench);
+		return;
+	}
+	t0 = mach_absolute_time();
+	memcpy((void *)all, (const void *)(all + (vm_offset_t)half), (size_t)half);
+	t1 = mach_absolute_time();
+	absolutetime_to_nanoseconds(t1 - t0, &cpu_ns);
+
+	wptr = pg_cp_wptr;
+	t0 = mach_absolute_time();
+	if (!pg_memcpy_span(PG_PANEL_IOVA, PG_PANEL_IOVA + half, (uint32_t)(half / 4u),
+	    false, &wptr)) {
+		pg_cp_wptr = wptr;
+		kmem_free(kernel_map, kbuf, bench);
+		return;
+	}
+	t1 = mach_absolute_time();
+	absolutetime_to_nanoseconds(t1 - t0, &cp_ns);
+	pg_cp_wptr = wptr;
+
+	printf("POLARIS GPU: 18c %llu bytes: CPU memcpy %llu us (%llu MB/s), CP_MEMCPY "
+	    "%llu us (%llu MB/s) - the CP is %s\n", half, cpu_ns / 1000,
+	    cpu_ns ? (half / 1000u) * 1000u / cpu_ns : 0, cp_ns / 1000,
+	    cp_ns ? (half / 1000u) * 1000u / cp_ns : 0,
+	    cp_ns < cpu_ns ? "FASTER" : "not faster");
+	kmem_free(kernel_map, kbuf, bench);
+}
+
 static bool
 pg_step_panel(void)
 {
@@ -4581,7 +4700,7 @@ pg_step_panel(void)
 		 */
 		uint32_t sent_top, sent_bottom, end_top, end_bottom;
 		uint32_t want = band;
-		int fill_all = 0, copy_wanted = 0;
+		int fill_all = 0, copy_wanted = 0, bench_wanted = 0;
 
 		/*
 		 * polarisgpufill=1 asks for the whole nine megabytes instead of the
@@ -4644,6 +4763,18 @@ pg_step_panel(void)
 		    sizeof(copy_wanted));
 		if (copy_wanted) {
 			pg_memcpy_test(width, height, stride);
+		}
+
+		/*
+		 * Step 18c: what a copy costs and whether the CP can read memory
+		 * the CPU wrote. Off unless polarisgpucopybench=1, because it
+		 * overwrites half the panel and takes tens of milliseconds doing
+		 * it - neither of which belongs in a normal boot.
+		 */
+		(void)PE_parse_boot_argn("polarisgpucopybench", &bench_wanted,
+		    sizeof(bench_wanted));
+		if (bench_wanted) {
+			pg_copy_bench(width, height, stride);
 		}
 
 		if (fill_all) {
