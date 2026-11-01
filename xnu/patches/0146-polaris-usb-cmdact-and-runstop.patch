@@ -1,0 +1,227 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -209,16 +209,32 @@
+ #define   PIPE3_PHYSTATUS_SW    (1u << 3)
+ #define   PIPE_UTMI_CLK_DIS     (1u << 8)
+ 
+-#define DCTL_RUN_STOP   (1u << 31)
++#define DCTL_RUN_STOP   (1u << 31)   /* 1 = stopped, 0 = running (DWC3 puts it at bit 31) */
+ #define DCTL_CSFTRST    (1u << 30)
+-#define DSTS_DEVCTRLHLT (1u << 22)
++/*
++ * DSTS bit 9 is DevCtrlHlt. Bit 22 was used here, which sits inside the
++ * SOFFN frame counter - so "halted" was really "some frame-number bit is
++ * set" and the detach wait loop could never terminate on it.
++ */
++#define DSTS_DEVCTRLHLT (1u << 9)
+ 
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
+ #define DEPCMD_STARTTRANSFER    6
+ #define DEPCMD_DEPSTARTCFG      9
+-#define DEPCMD_CMDACT           (1u << 10)
++/*
++ * DEPCMD bit 16 is Command Active; bit 10 is HIPRI_FORCERM, which is a
++ * request hint, not a completion flag. Every build up to 0115 wrote and
++ * polled bit 10, so no endpoint command was ever issued with CMDACT set -
++ * and "DEPCFG never clears CMDACT" was a misreading of a bit that was
++ * never CMDACT to begin with. That is why SETEPCONFIG looked like a
++ * hardware failure for thirteen builds while DEPSTARTCFG (whose bit 10
++ * happened to read back clear) looked fine.
++ */
++#define DEPCMD_CMDACT           (1u << 16)
++#define DEPCMD_STATUS_SHIFT     12
++#define DEPCMD_STATUS_MASK      0xfu
+ 
+ #define TRB_HWO         (1u << 0)
+ #define TRB_LST         (1u << 1)
+@@ -313,31 +329,51 @@
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+ 	printf("SWEET USB: epcmd ep%u DEPCMD 0x%08x, polling\n", ep, dwc_rd(DEPCMD(ep)));
+ 	/*
+-	 * delay() is in microseconds here (see the soft-reset loop below, which
+-	 * uses delay(1000) per millisecond). 1000 iterations of delay(1) were
+-	 * therefore a 1 ms timeout, while Linux's dwc3_wait_gadget_ep_cmd allows
+-	 * 500 ms: DEPCMD_SETEPCONFIG never cleared CMDACT inside that window even
+-	 * though the command engine was alive (DEPCMD_DEPSTARTCFG kept
+-	 * completing right after), so it only looked like a hardware failure.
++	 * Wait for CMDACT to clear, but first make sure it was ever set.
++	 *
++	 * A core that never latches CMDACT never ran the command, and a poll
++	 * that only looks for "cleared" reports that as instant success. That
++	 * is exactly how the wrong bit hid for thirteen builds. So: spin
++	 * briefly for active, then wait for it to drop.
++	 *
++	 * delay() is microseconds here (the soft-reset loop uses delay(1000)
++	 * per millisecond), so 5000 iterations is the 500 ms Linux allows.
+ 	 */
+ 	int i;
++	int active = 0;
+ 	for (i = 0; i < 5000; i++) {
+ 		uint32_t v = dwc_rd(DEPCMD(ep));
+-		if (!(v & DEPCMD_CMDACT)) {
+-			uint32_t status = (v >> 12) & 0xf;
+-			if (status) {
+-				printf("SWEET USB: ep%u cmd 0x%x status %u polls %d DEPCMD 0x%08x\n",
+-				    ep, cmd & 0xf, status, i, v);
+-				return -1;
+-			}
+-			printf("SWEET USB: ep%u cmd 0x%x ok polls %d\n", ep, cmd & 0xf, i);
++		if (v & DEPCMD_CMDACT) {
++			active = 1;
++		} else if (active || i > 20) {
++			break;
++		}
++		delay(100);
++	}
++	{
++		uint32_t v = dwc_rd(DEPCMD(ep));
++		uint32_t status = (v >> DEPCMD_STATUS_SHIFT) & DEPCMD_STATUS_MASK;
++		if (v & DEPCMD_CMDACT) {
++			printf("SWEET USB: ep%u cmd 0x%x timeout after %d polls (%d ms): DEPCMD 0x%08x "
++			    "status %u PAR0 0x%08x PAR1 0x%08x PAR2 0x%08x\n",
++			    ep, cmd & 0xf, i, i / 10, v, status,
++			    dwc_rd(DEPCMDPAR0(ep)), dwc_rd(DEPCMDPAR1(ep)), dwc_rd(DEPCMDPAR2(ep)));
++		} else if (status) {
++			printf("SWEET USB: ep%u cmd 0x%x status %u polls %d DEPCMD 0x%08x\n",
++			    ep, cmd & 0xf, status, i, v);
++			return -1;
++		} else {
++			/*
++			 * "active 0" is not proof of failure: a command can set and
++			 * clear CMDACT between two reads. It is reported because if
++			 * every command comes back this way and nothing downstream
++			 * works, the bit is still wrong.
++			 */
++			printf("SWEET USB: ep%u cmd 0x%x ok polls %d DEPCMD 0x%08x (active %d)\n",
++			    ep, cmd & 0xf, i, v, active);
+ 			return 0;
+ 		}
+-		delay(100);
+-	}
+-	printf("SWEET USB: ep%u cmd 0x%x timeout after %d polls (%d ms): DEPCMD 0x%08x status %u PAR0 0x%08x PAR1 0x%08x PAR2 0x%08x\n",
+-	    ep, cmd & 0xf, i, i / 10, dwc_rd(DEPCMD(ep)), (dwc_rd(DEPCMD(ep)) >> 12) & 0xf,
+-	    dwc_rd(DEPCMDPAR0(ep)), dwc_rd(DEPCMDPAR1(ep)), dwc_rd(DEPCMDPAR2(ep)));
++	}
+ 	flush_dcache64((addr64_t)(ud.dma_pa + UD_EVT), 64, TRUE);
+ 	{
+ 		uint32_t *ev = (uint32_t *)(ud.dma + UD_EVT);
+@@ -1115,10 +1151,17 @@
+ 	 * Write before reading. 0112 proved this the hard way: the first PHY
+ 	 * access of that build was a read and the core stopped there, because
+ 	 * a read to a block that is not answering waits instead of failing.
+-	 * 0x23 is the byte ABL runs this port with and the byte that keeps
+-	 * PLL_STATUS at 0x64; the old code cleared bit 0 and got 0x17.
++	 *
++	 * 0x22, not 0x23. Bit 0 of this register is POWER_DOWN: writing 0x23
++	 * asserted it and left the PHY powered down, which is the exact
++	 * opposite of a resume and of what the comment above asks for. Every
++	 * build from 0106 to 0115 did that, and it is why the endpoint command
++	 * engine stalled in three of the four strategies while the one that
++	 * runs the vendor init table (which ends on 0x22) configured ep0
++	 * straight away. 0x22 is also the last entry of the DT init sequence
++	 * and the value the working stock kernel leaves behind.
+ 	 */
+-	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, 0x23);
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, 0x22);
+ 
+ 	uint32_t pll0 = qusb2_rd(phy, QUSB2_PLL_STATUS);
+ 	uint32_t pd0  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
+@@ -1180,7 +1223,14 @@
+ 	uint32_t d;
+ 	int i;
+ 
+-	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	/*
++	 * Halt the core: RUN_STOP = 1 drops the D+ pull-up. This used to
++	 * *clear* the bit, i.e. it started the core and raised the pull-up,
++	 * while ud_attach_and_wait() then set it and took the pull-up away.
++	 * So the whole attach bisect ran with the wire disconnected during
++	 * every listening window - the host had nothing to see.
++	 */
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 200; i++) {
+ 		d = dwc_rd(DSTS);
+ 		if (d & DSTS_DEVCTRLHLT) {
+@@ -1255,7 +1305,8 @@
+ 	int seen = 0;
+ 	int w;
+ 
+-	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	/* Clear RUN_STOP: run the core, which is what raises the D+ pull-up. */
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
+ 	for (w = 0; w < (int)(ms / 5); w++) {
+ 		uint32_t cnt;
+ 		int drained = 0;
+@@ -1932,14 +1983,22 @@
+ 	 * entry below is the no-reset path that then configured all four
+ 	 * endpoints on the first poll. The rest stay as regression fallbacks.
+ 	 */
++	/*
++	 * 0146: resume first. It keeps ABL's efuse-trimmed TUNE1 (0x72) and
++	 * only lifts POWER_DOWN, which is the least invasive thing that can
++	 * work - and now that it no longer writes 0x23 it actually does lift
++	 * it. table+utmi is second because it is the only strategy that ever
++	 * got ep0 configured, so if resume still stalls the command engine
++	 * there is a known-good fallback in the same boot.
++	 */
+ 	static const char *names[] = {
+-		"noreset", "resume+utmi", "resume+utmi+pipe+vbus", "table+utmi"
++		"resume+utmi", "table+utmi", "noreset", "resume+utmi+pipe+vbus"
+ 	};
+ 	static const unsigned order[] = {
++		UD_F_RESUME | UD_F_UTMI | UD_F_CLKGT,
++		UD_F_PHYINIT | UD_F_UTMI | UD_F_CLKGT,
+ 		UD_F_NORESET,
+-		UD_F_RESUME | UD_F_UTMI | UD_F_CLKGT,
+ 		UD_F_RESUME | UD_F_UTMI | UD_F_CLKGT | UD_F_PIPE | UD_F_VBUS,
+-		UD_F_PHYINIT | UD_F_UTMI | UD_F_CLKGT,
+ 	};
+ 	int won = -1;
+ 	for (unsigned s = 0; s < sizeof(order) / sizeof(order[0]); s++) {
+@@ -1967,8 +2026,18 @@
+ 	 * build printed "endpoint 0 configured OK" and then nothing, with two
+ 	 * statements in between and no way to tell which of them it died in.
+ 	 */
+-	printf("SWEET USB: step 1/6 DALEPENA\n");
++	/*
++	 * DALEPENA only latches for endpoints the core actually configured, so
++	 * reading it back is an independent verdict on whether the endpoint
++	 * commands did anything - the one thing the old CMDACT poll could not
++	 * tell us. If ep0 configured, bits 0 and 1 must be set.
++	 */
++	printf("SWEET USB: step 1/6 DALEPENA (was 0x%08x)\n", dwc_rd(DALEPENA));
+ 	dwc_wr(DALEPENA, 0x3);
++	delay(1000);
++	printf("SWEET USB: step 1/6 DALEPENA now 0x%08x (%s)\n", dwc_rd(DALEPENA),
++	    (dwc_rd(DALEPENA) & 0x3) == 0x3 ? "ep0 enabled: the commands took effect"
++	    : "ep0 NOT enabled: the endpoint commands did nothing");
+ 
+ 	/*
+ 	 * Park the core halted, then run the attach bisect.
+@@ -2026,16 +2095,17 @@
+ 	}
+ 
+ 	/*
+-	 * Drop the pull-up and leave it up; then watch the wire for 90 s.
++	 * Leave the core running (pull-up up) and watch the wire for 90 s.
+ 	 *
+-	 * The PC side already proved it never sees a connect: during a whole
+-	 * boot the phone does not reappear in the USB tree at all. The one
+-	 * thing that still separates "the PHY is not driving D+" from "the PHY
+-	 * is not connected to the port" is whether the core's own line-state
+-	 * sensing follows the cable. One unplug during the window answers it.
++	 * This also used to set RUN_STOP, i.e. leave the device disconnected,
++	 * so the monitor thread below was watching a wire the core had already
++	 * let go of. The one thing that separates "the PHY is not driving D+"
++	 * from "the PHY is not connected to the port" is whether the core's own
++	 * line-state sensing follows the cable. One unplug during the window
++	 * answers it.
+ 	 */
+ 	printf("SWEET USB: leaving the pull-up up, monitor thread starts below\n");
+-	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
+ 
+ 	printf("SWEET USB: step 6/6 threads, DMA at 0x%llx\n", ud.dma_pa);
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
