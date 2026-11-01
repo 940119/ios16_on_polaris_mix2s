@@ -47,17 +47,27 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 #define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
 #define CBCR_CLK_OFF            (1u << 31)
 
+/*
+ * The names carry the offset because three of these were read for five builds
+ * under a name that did not match what the register is. 0x0f010/0x0f014/0x0f018
+ * are the USB30_PRIM CBCR block in order (master, mock-UTMI, sleep) and
+ * 0x0f01c is the mock-UTMI CMD_RCGR, which legitimately reads 0x00100105 - an
+ * RCG is not a CBCR and its bit 0 is CLK_ENABLE, not CLK_OFF. Reading 0x0f018
+ * as "the UTMI clock" produced the "clk utmi ... STILL OFF" line that sent two
+ * builds after a clock fault that did not exist. The last four offsets came
+ * from another SoC and are printed only because they have always been printed.
+ */
 static const struct {
 	const char *name;
 	uint32_t    off;
 } usb_cbcr[] = {
-	{ "master", 0x0f010 },
-	{ "sleep", 0x0f014 },
-	{ "utmi", 0x0f018 },
-	{ "cfg-noc-axi", 0x0502c },
-	{ "aggre-axi", 0x8201c },
-	{ "ahb2phy", 0x6a004 },
-	{ "clkref", 0x8c010 },
+	{ "master@f010", 0x0f010 },
+	{ "mockutmi@f014", 0x0f014 },
+	{ "sleep@f018", 0x0f018 },
+	{ "cfgnocaxi@502c", 0x0502c },
+	{ "aggreaxi@8201c", 0x8201c },
+	{ "ahb2phy@6a004", 0x6a004 },
+	{ "clkref@8c010", 0x8c010 },
 };
 
 #define DWC3_PA                 0x0a600000
@@ -192,8 +202,8 @@ sweet_usb_probe(void)
 	 * first register access and flushed immediately, so either it is in the
 	 * ring or the kernel that wrote the ring was not this one.
 	 */
-	printf("SWEET USB: ======== build 0151 alive: ep0 configured by table+utmi, "
-	    "QSCRATCH dumped and bit-probed, probe flushes synchronously ========\n");
+	printf("SWEET USB: ======== build 0154 alive: full select_utmi_clk sequence, "
+	    "ENBLSLPM cleared before run ========\n");
 	sweet_log_flush_now();
 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
 	if (gcc == 0) {
@@ -258,8 +268,19 @@ sweet_usb_probe(void)
 	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
 	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
 	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+	/*
+	 * These are byte registers behind an AHB slave that repeats the byte on
+	 * every lane, so the 32-bit read has to be masked: 0151 printed
+	 * "PLL_STATUS 0x17171717" for what is really 0x17, and 0x17171717 was
+	 * briefly read as four different values.
+	 *
+	 * 0x1a0 is PLL_COMMON_STATUS_ONE on this PHY generation, not the
+	 * msm8996-era PLL_STATUS, which is why the ready bit is bit 0 here.
+	 */
+	printf("SWEET USB: QUSB2 PLL_COMMON_STATUS_ONE 0x%02x PWR_CTRL1 0x%02x "
+	    "PORT_TUNE1 0x%02x TEST1 0x%02x\n",
+	    usb_rd(phy, 0x1a0) & 0xff, usb_rd(phy, 0x210) & 0xff,
+	    usb_rd(phy, 0x240) & 0xff, usb_rd(phy, 0x254) & 0xff);
 }
 
 /*
@@ -300,13 +321,28 @@ sweet_usb_probe(void)
  */
 #define QSCRATCH_PA             0x0a6f8800
 #define QSCRATCH_HS_PHY_CTRL    0x10
-#define   VBUSVLDEXT0           (1u << 13)  /* D+ pull-up */
-#define   VBUSVLDEXTSEL0        (1u << 14)
+/*
+ * SDM845's HS_PHY_CTRL has exactly two bits, both from mainline
+ * drivers/usb/dwc3/dwc3-qcom.c:
+ *     UTMI_OTG_VBUS_VALID = BIT(20)
+ *     SW_SESSVLD_SEL      = BIT(28)
+ *
+ * The five names after them are NOT part of this register. They come from
+ * the older phy-msm-usb layout for an earlier SoC generation, where the
+ * wrapper did own the D+ pull-up and the UTMI clock. On SDM845 both live
+ * inside the QUSB2 PHY, and writing them here does nothing - which is what
+ * 0150 measured: after writing bits 13, 14, 20, 21, 22, 23 and 28, only 20
+ * and 28 read back, and the writable-mask probe answered 0x10100000, i.e.
+ * exactly the two real bits and nothing else. They are kept only so the
+ * probe re-measures that every build.
+ */
 #define   UTMI_OTG_VBUS_VALID   (1u << 20)
-#define   USB2_UTMI_CLK_EN      (1u << 21)
-#define   USB2_SUSPEND_N        (1u << 22)
-#define   USB2_SUSPEND_N_SEL    (1u << 23)
 #define   SW_SESSVLD_SEL        (1u << 28)
+#define   VBUSVLDEXT0           (1u << 13)  /* not this register: see above */
+#define   VBUSVLDEXTSEL0        (1u << 14)  /* not this register */
+#define   USB2_UTMI_CLK_EN      (1u << 21)  /* not this register */
+#define   USB2_SUSPEND_N        (1u << 22)  /* not this register */
+#define   USB2_SUSPEND_N_SEL    (1u << 23)  /* not this register */
 #define QSCRATCH_SS_PHY_CTRL    0x30
 #define   LANE0_PWR_PRESENT     (1u << 24)
 /*
@@ -320,18 +356,46 @@ sweet_usb_probe(void)
 #define   PIPE3_PHYSTATUS_SW    (1u << 3)
 #define   PIPE_UTMI_CLK_DIS     (1u << 8)
 
-#define DCTL_RUN_STOP   (1u << 31)   /* 1 = stopped, 0 = running (DWC3 puts it at bit 31) */
+/*
+ * DCTL.RUN_STOP: SET means run, CLEAR means stop.
+ *
+ * This file had it backwards until 0153 and every attach in 0148-0152 was
+ * therefore a detach. Linux settles it: dwc3_gadget_run_stop(dwc, is_on) does
+ * `reg |= DWC3_DCTL_RUN_STOP` when is_on is true and `reg &= ~...` when it is
+ * false, so setting the bit starts the controller. core.h calls it
+ * DWC3_DCTL_RUN_STOP	BIT(31).
+ *
+ * The register readings agree, once DevCtrlHlt is read the way core.h defines
+ * it (BIT(22), a real halt flag):
+ *
+ *   DCTL 0x80f00000 (bit31 = 1, RUN)   DSTS 0x00920001 (bit22 = 0, running)
+ *   DCTL 0x00f00000 (bit31 = 0, STOP)  DSTS 0x00d20001 (bit22 = 1, halted)
+ *
+ * 0152 read those two rows the other way round and concluded that bit 22 was
+ * not a halt flag. It is one; the polarity of RUN_STOP was the thing that was
+ * wrong. So ud_detach() was starting the core and ud_attach_and_wait() was
+ * halting it, which is exactly why no build since 0148 ever saw a bus reset:
+ * during the whole four-second window the controller was halted and DevCtrlHlt
+ * said so, twenty samples in a row, with GEVNTCOUNT at zero because a halted
+ * controller raises no events.
+ */
+#define DCTL_RUN_STOP   (1u << 31)   /* 1 = run, 0 = stop */
 #define DCTL_CSFTRST    (1u << 30)
+/* dwc3 core.h: DWC3_GUSB2PHYCFG_ENBLSLPM BIT(8), DWC3_GUSB2PHYCFG_SUSPHY BIT(6). */
+#define GUSB2PHYCFG_ENBLSLPM (1u << 8)
 /*
  * DSTS, from Linux dwc3 core.h:
  *   [2:0]   ConnectSpeed (0=HS, 1=FS, 2=LS, 4=SS)
- *   [17:3]  SOFFN        [21:18] USBLNKST      [22] DevCtrlHlt
+ *   [17:3]  SOFFN   [17] RxFifoEmpty   [21:18] USBLNKST
+ *   [22] DevCtrlHlt   [23] CoreIdle
  *
  * 0146 "fixed" this to bit 9, which is SOFFN[6]. At handover DSTS reads
  * 0x00520004, so bit 9 is set and the detach loop believed the core was
  * permanently halted - it was reading a frame counter.
  */
+#define DSTS_BIT20      (1u << 20)
 #define DSTS_DEVCTRLHLT (1u << 22)
+#define DSTS_BIT23      (1u << 23)
 #define DSTS_SPEED(v)   ((v) & 7u)
 #define DSTS_SOFFN(v)   (((v) >> 3) & 0x3fffu)
 #define DSTS_LNKST(v)   (((v) >> 18) & 0xfu)
@@ -1223,28 +1287,73 @@ qusb2_wr(vm_offset_t phy, uint32_t off, uint32_t val)
  * 0148: the table used to say 0x220=0x00 and 0x240=0x20. Those are the
  * values from /soc/qusb@88e3000, the *second* QUSB2 PHY, whose controller
  * ssusb@a800000 is status="disabled". Our controller is ssusb@a600000 and
- * its usb-phy phandles are <181 844>, i.e. qusb@88e2000 + ssphy@88e8000;
- * 88e2000's own table says 0x220=0x08 and 0x240=0x07. Every other entry is
- * identical between the two nodes, which is exactly how the copy went
- * unnoticed: the table looked right, apart from the two registers that
- * differ. 0x240 is PORT_TUNE1, the HS transceiver trim.
+ * its usb-phy phandles are <181 844>, i.e. qusb@88e2000 + ssphy@88e8000.
+ *
+ * 0152: "every other entry is identical" was wrong, and 0148 stopped after
+ * two registers instead of diffing the two tables properly. Both
+ * qcom,qusb-phy-init-seq properties were read back from the live
+ * /proc/device-tree in TWRP and compared entry by entry. They differ in
+ * FOUR places, not two:
+ *
+ *     offset             88e2000   88e3000   0151 was running
+ *     0x220  IMP_CTRL1     0x08      0x00          0x08      fixed in 0148
+ *     0x240  TUNE1         0x07      0x20          0x07      fixed in 0148
+ *     0x198  BIAS_CTRL2    0x17      0x20          0x20      fixed here
+ *     0x244  TUNE2         0x2b      0x29          0x29      fixed here
+ *
+ * So every build up to 0151 ran the disabled sibling PHY's PLL bias and HS
+ * transceiver trim. Those are the two registers that decide how the PHY
+ * biases its PLL and how hard it drives the HS transceiver, i.e. D+ - the
+ * one thing 0151 never explained, a PHY that reported itself ready while
+ * the host saw no device at all.
+ *
+ * The vendor driver also folds a 3-bit efuse field (qcom,efuse-bit-pos = 25,
+ * qcom,efuse-num-bits = 3) into TUNE2. That is deliberately NOT done here:
+ * this build tests the DT value alone, so a change in behaviour has one
+ * cause and not two.
  */
 static const struct {
 	uint16_t off;
 	uint8_t  val;
 } qusb2_init_seq[] = {
 	{ 0x210, 0x23 }, { 0x004, 0x03 }, { 0x18c, 0x7c }, { 0x02c, 0x80 },
-	{ 0x184, 0x0a }, { 0x0b4, 0x19 }, { 0x194, 0x40 }, { 0x198, 0x20 },
+	{ 0x184, 0x0a }, { 0x0b4, 0x19 }, { 0x194, 0x40 }, { 0x198, 0x17 },
 	{ 0x214, 0x21 }, { 0x220, 0x08 }, { 0x224, 0x58 }, { 0x240, 0x07 },
-	{ 0x244, 0x29 }, { 0x248, 0xca }, { 0x24c, 0x04 }, { 0x250, 0x03 },
+	{ 0x244, 0x2b }, { 0x248, 0xca }, { 0x24c, 0x04 }, { 0x250, 0x03 },
 	{ 0x23c, 0x00 }, { 0x210, 0x22 },
 };
 
 #define QUSB2_PLL_STATUS    0x1a0
 #define QUSB2_PORT_POWERDOWN 0x210
 #define QUSB2_PORT_TUNE1    0x240
-#define QUSB2_PLL_LOCKED    (1u << 5)
+#define QUSB2_PORT_TUNE2    0x244
 #define QUSB2_POWER_DOWN    (1u << 0)
+/*
+ * Two different ready bits, and every build up to 0151 read the wrong one.
+ *
+ * PLL_LOCKED = BIT(5) is the msm8996-era mask, i.e. mask_core_ready for the
+ * older entries in phy-qcom-qusb2.c. This PHY declares
+ * compatible = "qcom,qusb2phy-v2", and that generation uses
+ * CORE_READY_STATUS = BIT(0) instead. So 0151's "PLL_STATUS 0x17 (NOT
+ * locked)" said the opposite of what the v2 mask says: 0x17 has bit 0 set.
+ *
+ * The two readings also disagree in the one place physics can referee them.
+ * POWERDOWN 0x23 (bit 0 set, PHY held down) reads 0x64, bit 0 clear.
+ * Clearing POWER_DOWN to 0x22 reads 0x17, bit 0 set. A PHY that reports
+ * "ready" only after it is switched on is the sane direction, so bit 0 is
+ * the one that behaves. Both are printed from now on and neither is
+ * asserted, because this file has been wrong about a bit before.
+ */
+#define QUSB2_PLL_LOCKED    (1u << 5)   /* msm8996-era mask, not this PHY */
+#define QUSB2_CORE_READY    (1u << 0)   /* qusb2_v2 mask, this PHY */
+
+static void
+qusb2_pll_line(const char *tag, uint32_t pll)
+{
+	printf("SWEET USB: %sPLL_STATUS 0x%02x (bit0 core-ready %d, bit5 pll-locked %d)\n",
+	    tag, pll, !!(pll & QUSB2_CORE_READY), !!(pll & QUSB2_PLL_LOCKED));
+}
+
 
 static int
 ud_qusb2_init(void)
@@ -1268,10 +1377,10 @@ ud_qusb2_init(void)
 
 	uint32_t pd  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
 	uint32_t pll = qusb2_rd(phy, QUSB2_PLL_STATUS);
-	printf("SWEET USB: QUSB2 out: PLL_STATUS 0x%02x (%s) POWERDOWN 0x%02x (%s) TUNE1 0x%02x\n",
-	    pll, (pll & QUSB2_PLL_LOCKED) ? "locked" : "NOT locked",
+	printf("SWEET USB: QUSB2 out: POWERDOWN 0x%02x (%s) TUNE1 0x%02x TUNE2 0x%02x\n",
 	    pd, (pd & QUSB2_POWER_DOWN) ? "still powered down" : "enabled",
-	    qusb2_rd(phy, QUSB2_PORT_TUNE1));
+	    qusb2_rd(phy, QUSB2_PORT_TUNE1), qusb2_rd(phy, QUSB2_PORT_TUNE2));
+	qusb2_pll_line("QUSB2 out: ", pll);
 	return (pd & QUSB2_POWER_DOWN) ? -1 : 0;
 }
 
@@ -1316,17 +1425,29 @@ ud_qusb2_resume(void)
 
 	uint32_t pd  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
 	uint32_t pll = qusb2_rd(phy, QUSB2_PLL_STATUS);
-	printf("SWEET USB: QUSB2 resume out: PLL_STATUS 0x%02x (%s) POWERDOWN 0x%02x TUNE1 0x%02x\n",
-	    pll, (pll & QUSB2_PLL_LOCKED) ? "locked" : "not locked",
+	printf("SWEET USB: QUSB2 resume out: POWERDOWN 0x%02x TUNE1 0x%02x\n",
 	    pd, qusb2_rd(phy, QUSB2_PORT_TUNE1));
+	qusb2_pll_line("QUSB2 resume out: ", pll);
 	return 0;
 }
 
 /*
- * Hand the wrapper the high-speed PHY's UTMI clock. The controller is wired
- * for both PHYs and GENERAL_CFG selects which one feeds the core; the DT
- * says maximum-speed = high-speed. Written with the bit numbers mainline
- * dwc3-qcom uses for this SoC - which is not what this function did before.
+ * Hand the wrapper the high-speed PHY's UTMI clock.
+ *
+ * Mainline's dwc3_qcom_select_utmi_clk() is three steps, not one:
+ *
+ *   1 set PIPE_UTMI_CLK_DIS (BIT 8)          - stop the PIPE clock first
+ *   2 sleep
+ *   3 set PIPE_UTMI_CLK_SEL (BIT 0) | PIPE3_PHYSTATUS_SW (BIT 3)
+ *   4 sleep
+ *   5 clear PIPE_UTMI_CLK_DIS (BIT 8)
+ *
+ * Until 0154 this did only step 3, so PIPE3_PHYSTATUS_SW was never set and the
+ * clock was never stopped and restarted. That matters here because the device
+ * tree for ssusb@a600000 has no qcom,select-utmi-as-pipe-clk at all, while
+ * ssphy@88e8000 exists - mainline would not take this path at all, so this is
+ * the one place where the port deliberately overrides the hardware's own
+ * description and has to do it exactly the way the vendor path does.
  */
 static void
 ud_pipe_select(void)
@@ -1337,19 +1458,31 @@ ud_pipe_select(void)
 		return;
 	}
 	uint32_t g = usb_rd(qs, QSCRATCH_GENERAL_CFG);
-	*(volatile uint32_t *)(qs + QSCRATCH_GENERAL_CFG) =
-	    (g & ~PIPE_UTMI_CLK_DIS) | PIPE_UTMI_CLK_SEL;
-	__asm__ volatile ("dsb sy" ::: "memory");
+	uint32_t v;
+
+	/* 1: stop the PIPE clock. */
+	usb_wr(qs, QSCRATCH_GENERAL_CFG, g | PIPE_UTMI_CLK_DIS);
 	delay(1000);
-	printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (UTMI clk sel)\n",
-	    g, usb_rd(qs, QSCRATCH_GENERAL_CFG));
+	/* 2: select UTMI as the pipe clock and take the PHY status from software. */
+	v = usb_rd(qs, QSCRATCH_GENERAL_CFG);
+	usb_wr(qs, QSCRATCH_GENERAL_CFG, v | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
+	delay(1000);
+	/* 3: let the PIPE clock run again. */
+	v = usb_rd(qs, QSCRATCH_GENERAL_CFG);
+	usb_wr(qs, QSCRATCH_GENERAL_CFG, v & ~PIPE_UTMI_CLK_DIS);
+	delay(1000);
+	printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (sel %d phystatus_sw %d clk_dis %d)\n",
+	    g, usb_rd(qs, QSCRATCH_GENERAL_CFG),
+	    !!(usb_rd(qs, QSCRATCH_GENERAL_CFG) & PIPE_UTMI_CLK_SEL),
+	    !!(usb_rd(qs, QSCRATCH_GENERAL_CFG) & PIPE3_PHYSTATUS_SW),
+	    !!(usb_rd(qs, QSCRATCH_GENERAL_CFG) & PIPE_UTMI_CLK_DIS));
 }
 
 /*
  * Force a real detach.
  *
- * Clearing DCTL.RUN_STOP halts the core, and a halted core drives the UTMI
- * pull-down instead of the D+ pull-up. That matters because a host only
+ * Clearing DCTL.RUN_STOP stops the core, and a stopped core drops the D+ pull-up.
+ * That matters because a host only
  * issues a bus reset when it observes a *new* connect: ABL left this port
  * enumerated for fastboot and never dropped the pull-up on hand-off, so by
  * the time this driver runs the host has a device it already gave up on and
@@ -1368,13 +1501,16 @@ ud_detach(const char *tag, unsigned hold_ms, int power_cycle)
 	int i;
 
 	/*
-	 * Halt the core: RUN_STOP = 1 drops the D+ pull-up. This used to
-	 * *clear* the bit, i.e. it started the core and raised the pull-up,
-	 * while ud_attach_and_wait() then set it and took the pull-up away.
-	 * So the whole attach bisect ran with the wire disconnected during
-	 * every listening window - the host had nothing to see.
+	 * Stop the core: clearing RUN_STOP drops the D+ pull-up.
+	 *
+	 * 0148 through 0152 set the bit here instead, on the reading that
+	 * "RUN_STOP = 1 means stopped". It does not: Linux sets the bit to
+	 * run. So every detach in those five builds started the controller and
+	 * every attach stopped it, and the four-second listening window in the
+	 * bisect was spent with the wire disconnected and DevCtrlHlt reading 1
+	 * in all twenty monitor samples that followed.
 	 */
-	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
 	for (i = 0; i < 200; i++) {
 		d = dwc_rd(DSTS);
 		if (d & DSTS_DEVCTRLHLT) {
@@ -1383,7 +1519,7 @@ ud_detach(const char *tag, unsigned hold_ms, int power_cycle)
 		delay(1000);
 	}
 	d = dwc_rd(DSTS);
-	printf("SWEET USB: detach %s: DCTL 0x%08x DSTS 0x%08x (halt %d cs %d after %d ms)\n",
+	printf("SWEET USB: detach %s: DCTL 0x%08x DSTS 0x%08x (b22 %d cs %d after %d ms)\n",
 	    tag, dwc_rd(DCTL), d, !!(d & DSTS_DEVCTRLHLT), !!(d & 1), i);
 	ud_sleep_ms(hold_ms);
 	if (!power_cycle) {
@@ -1440,14 +1576,21 @@ ud_mon_thread(void *arg, wait_result_t wr)
 		 * The previous line printed `cs=%d` from bit 0 alone and `spd` from
 		 * bits[3:1], which is part of SOFFN - so "cs=1 spd=0" meant
 		 * "full speed, and three frame-number bits", not what it looked
-		 * like. DCTL is printed too, because between the attach window
-		 * (DevCtrlHlt 0) and this monitor (DevCtrlHlt 1) nothing in this
-		 * driver writes DCTL, and only the final PHY read happens.
+		 * like.
+		 *
+		 * Bit 22 is DevCtrlHlt and it is trustworthy; 0152 was wrong to
+		 * distrust it. It reads 1 exactly when RUN_STOP has been cleared,
+		 * i.e. when the core is stopped - which is what "halted" means.
+		 * The two are printed side by side so the pairing is visible:
+		 * a monitor line with runstop 0 and hlt 1 is a stopped core, and
+		 * a stopped core raises no events.
 		 */
-		printf("SWEET USB: mon %2d spd=%u lnkst=%u hlt=%d DSTS 0x%08x DCTL 0x%08x "
-		    "GSTS 0x%08x ev 0x%08x\n",
-		    m, d & 7u, (d >> 18) & 0xfu, !!(d & DSTS_DEVCTRLHLT),
-		    d, dwc_rd(DCTL), dwc_rd(GSTS), dwc_rd(GEVNTCOUNT) & 0xffff);
+		printf("SWEET USB: mon %2d spd=%u DSTS 0x%08x (b20 %d hlt %d idle %d) "
+		    "DCTL 0x%08x run %d GSTS 0x%08x ev 0x%08x\n",
+		    m, d & 7u, d,
+		    !!(d & DSTS_BIT20), !!(d & DSTS_DEVCTRLHLT), !!(d & DSTS_BIT23),
+		    dwc_rd(DCTL), !!(dwc_rd(DCTL) & DCTL_RUN_STOP),
+		    dwc_rd(GSTS), dwc_rd(GEVNTCOUNT) & 0xffff);
 		ud_sleep_ms(1000);
 	}
 	printf("SWEET USB: monitor done\n");
@@ -1463,8 +1606,26 @@ ud_attach_and_wait(const char *tag, unsigned ms)
 	int seen = 0;
 	int w;
 
-	/* Clear RUN_STOP: run the core, which is what raises the D+ pull-up. */
-	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
+	/*
+	 * Set RUN_STOP: run the core, which is what raises the D+ pull-up.
+	 *
+	 * GUSB2PHYCFG.ENBLSLPM is cleared first, the way Linux's
+	 * dwc3_gadget_run_stop() does it. That comment in gadget.c says the
+	 * workaround was found by experiment and is not in the programming
+	 * guide: with LPM enabled across a start/stop the controller can time
+	 * out. This port reads 0x00002500 there, i.e. ENBLSLPM set, and this
+	 * driver starts and stops the core four times in a row.
+	 */
+	{
+		uint32_t cfg = dwc_rd(GUSB2PHYCFG);
+
+		if (cfg & GUSB2PHYCFG_ENBLSLPM) {
+			dwc_wr(GUSB2PHYCFG, cfg & ~GUSB2PHYCFG_ENBLSLPM);
+			printf("SWEET USB: GUSB2PHYCFG 0x%08x -> 0x%08x (ENBLSLPM cleared)\n",
+			    cfg, dwc_rd(GUSB2PHYCFG));
+		}
+	}
+	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
 	for (w = 0; w < (int)(ms / 5); w++) {
 		uint32_t cnt;
 		int drained = 0;
@@ -1536,9 +1697,11 @@ ud_phy_state(const char *tag)
 	pll = qusb2_rd(phy, QUSB2_PLL_STATUS);
 	pd  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
 	t1  = qusb2_rd(phy, QUSB2_PORT_TUNE1);
-	t2  = qusb2_rd(phy, 0x244);
-	printf("SWEET USB:   %-12s PLL 0x%02x %-10s POWERDOWN 0x%02x TUNE1 0x%02x TUNE2 0x%02x\n",
-	    tag, pll, (pll & QUSB2_PLL_LOCKED) ? "locked" : "NOT-locked", pd, t1, t2);
+	t2  = qusb2_rd(phy, QUSB2_PORT_TUNE2);
+	printf("SWEET USB:   %-12s POWERDOWN 0x%02x TUNE1 0x%02x TUNE2 0x%02x\n",
+	    tag, pd, t1, t2);
+	printf("SWEET USB:   %-12s PLL_STATUS 0x%02x (bit0 core-ready %d, bit5 pll-locked %d)\n",
+	    tag, pll, !!(pll & QUSB2_CORE_READY), !!(pll & QUSB2_PLL_LOCKED));
 }
 
 /*
@@ -1561,6 +1724,24 @@ ud_cfg_keep23(void)
 	}
 	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, 0x23);
 	printf("SWEET USB:   POWERDOWN <- 0x23 (write only)\n");
+}
+
+/*
+ * Attempt B: the corrected table and nothing else.
+ *
+ * 0151's bisect had no such case. A wrote POWER_DOWN back to 0x23, i.e. held
+ * the PHY down, and B and C both overwrote TUNE1 with 0x57 - so the table's
+ * own TUNE1 (0x07) was never actually tested, and neither was the corrected
+ * TUNE2. This re-runs the table from qusb@88e2000 and attaches without
+ * touching anything afterwards, which makes it the clean read on whether the
+ * two wrong bytes were the whole problem.
+ */
+static void
+ud_cfg_tableonly(void)
+{
+	if (ud_qusb2_init() != 0) {
+		printf("SWEET USB:   table left the PHY powered down\n");
+	}
 }
 
 /*
@@ -1604,14 +1785,14 @@ ud_cfg_table57off(void)
 	ud_phy_table(0x22);
 }
 
-/* One line that says everything the core currently believes about the wire. *//* One line that says everything the core currently believes about the wire. */
+/* One line that says everything the core currently believes about the wire. */
 static void
 ud_live_state(const char *tag)
 {
 	uint32_t d = dwc_rd(DSTS);
 	uint32_t g = dwc_rd(GSTS);
 
-	printf("SWEET USB:   %-8s cs=%d spd=%u susp=%d hlt=%d bsessvld=%d DSTS 0x%08x GSTS 0x%08x ev 0x%08x\n",
+	printf("SWEET USB:   %-8s cs=%d spd=%u susp=%d b22=%d bsessvld=%d DSTS 0x%08x GSTS 0x%08x ev 0x%08x\n",
 	    tag, !!(d & 1), (d >> 1) & 7u, !!(d & (1u << 8)), !!(d & DSTS_DEVCTRLHLT),
 	    !!(g & (1u << 30)), d, g, dwc_rd(GEVNTCOUNT) & 0xffff);
 }
@@ -1741,31 +1922,29 @@ ud_vbus_override(void)
 /*
  * The wrapper state a working high-speed gadget sits in.
  *
- * HS_PHY_CTRL read 0x10000000 at handover: SW_SESSVLD_SEL and nothing else.
- * USB2_UTMI_CLK_EN (bit 21) is clear, so the wrapper is not enabling the
- * PHY's UTMI clock, and USB2_SUSPEND_N (bit 22) is clear, so the interface
- * is in suspend as well. A controller with no UTMI clock still retires
- * DEPSTARTCFG, which runs off the bus clock, but can never finish DEPCFG,
- * which is exactly the split the last nine builds logged.
+ * This used to claim that HS_PHY_CTRL 0x10000000 had "UTMI_CLK_EN clear" and
+ * "SUSPEND_N clear", and that those were why the controller had no UTMI
+ * clock. 0150 disproved it: those bits are not in this register on SDM845.
+ * The only two bits that exist are VBUS_VALID and SW_SESSVLD_SEL, both of
+ * which are already set, so the wrapper is configured correctly and has
+ * nothing more to give. Whatever is keeping D+ from being driven is on the
+ * PHY side, not here.
  *
- * The bits below are the connect sequence from phy-msm-usb's
- * msm_hsphy_notify_connect (VBUSVLDEXTSEL0, then VBUSVLDEXT0 to raise the
- * D+ pull-up, then UTMI_OTG_VBUS_VALID, then SW_SESSVLD_SEL) plus the two
- * clock bits. It reports each group separately so a later build can tell
- * which one actually mattered.
+ * The decode therefore reports only the two real bits. The extra names are
+ * still written by ud_hsphy_probe() on purpose, as the measurement that
+ * keeps proving they are read-only.
  */
-#define HS_CONNECT_BITS  (VBUSVLDEXT0 | VBUSVLDEXTSEL0 | UTMI_OTG_VBUS_VALID | \
-			  SW_SESSVLD_SEL)
-#define HS_CLOCK_BITS    (USB2_UTMI_CLK_EN | USB2_SUSPEND_N | USB2_SUSPEND_N_SEL)
+#define HS_CONNECT_BITS  (UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL)
+#define HS_CLOCK_BITS    0u     /* not this register on SDM845 */
 
 static void
 ud_hsphy_state(const char *tag, uint32_t hs)
 {
-	printf("SWEET USB: %s HS_PHY_CTRL 0x%08x (vbusseld %d dp_pullup %d vbus_valid %d "
-	    "utmi_clk_en %d suspend_n %d suspend_sel %d sessvld %d)\n", tag, hs,
-	    !!(hs & VBUSVLDEXTSEL0), !!(hs & VBUSVLDEXT0), !!(hs & UTMI_OTG_VBUS_VALID),
-	    !!(hs & USB2_UTMI_CLK_EN), !!(hs & USB2_SUSPEND_N),
-	    !!(hs & USB2_SUSPEND_N_SEL), !!(hs & SW_SESSVLD_SEL));
+	printf("SWEET USB: %s HS_PHY_CTRL 0x%08x (vbus_valid %d sessvld %d; "
+	    "bits 13/14/21/22/23 are not this register on SDM845: %d%d%d%d%d)\n",
+	    tag, hs, !!(hs & UTMI_OTG_VBUS_VALID), !!(hs & SW_SESSVLD_SEL),
+	    !!(hs & VBUSVLDEXT0), !!(hs & VBUSVLDEXTSEL0), !!(hs & USB2_UTMI_CLK_EN),
+	    !!(hs & USB2_SUSPEND_N), !!(hs & USB2_SUSPEND_N_SEL));
 }
 
 /*
@@ -2382,8 +2561,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
 		void (*apply)(void);
 	} cfg[] = {
 		{ "A-keep-0x23",    ud_cfg_keep23 },
-		{ "B-table-57-23",  ud_cfg_table57 },
-		{ "C-table-57-22",  ud_cfg_table57off },
+		{ "B-table-only",   ud_cfg_tableonly },
+		{ "C-table-57-23",  ud_cfg_table57 },
+		{ "D-table-57-22",  ud_cfg_table57off },
 	};
 	int saw_event = 0;
 	for (unsigned k = 0; k < sizeof(cfg) / sizeof(cfg[0]) && !saw_event; k++) {
@@ -2410,15 +2590,15 @@ sweet_usb_gadget_start(vm_offset_t dwc)
 	/*
 	 * Leave the core running (pull-up up) and watch the wire for 90 s.
 	 *
-	 * This also used to set RUN_STOP, i.e. leave the device disconnected,
-	 * so the monitor thread below was watching a wire the core had already
-	 * let go of. The one thing that separates "the PHY is not driving D+"
-	 * from "the PHY is not connected to the port" is whether the core's own
-	 * line-state sensing follows the cable. One unplug during the window
-	 * answers it.
+	 * This line is what made every monitor window since 0150 useless. It
+	 * cleared RUN_STOP, which stops the controller, and it runs immediately
+	 * before the monitor thread starts - so all twenty samples in 0150,
+	 * 0151 and 0152 were taken on a stopped core (DevCtrlHlt 1, GEVNTCOUNT
+	 * 0) and read as "the PHY never drove D+". Setting the bit is what
+	 * keeps the pull-up up.
 	 */
 	printf("SWEET USB: leaving the pull-up up, monitor thread starts below\n");
-	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
+	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
 
 	printf("SWEET USB: step 6/6 threads, DMA at 0x%llx\n", ud.dma_pa);
 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
