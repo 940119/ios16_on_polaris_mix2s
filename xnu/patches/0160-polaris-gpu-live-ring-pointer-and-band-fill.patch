@@ -1,0 +1,258 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c	2026-11-01 21:46:43.437957586 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-01 21:46:43.474784986 +0800
+@@ -4106,12 +4106,97 @@
+ 	    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
+ }
+ 
++/*
++ * Write a run of dwords into the panel's window: one packet per PG_DRAW_CHUNK,
++ * PG_DRAW_PER_BATCH packets per submission, drain between submissions.
++ *
++ * `first` is the dword offset into the panel, not into the run, so the pixel a
++ * dword gets is still derived from where it lands. Build 0158 and 0159 filled
++ * from offset 0 with a ring pointer captured before the rewrite test had moved
++ * it, which put the command processor's read pointer in the middle of a packet:
++ * it decoded the data as a header, stopped, and never took another word - the
++ * "the CP takes nothing at all" of 0159. The caller now passes the live ring
++ * pointer in, and this function hands the advanced one back.
++ */
++static uint32_t
++pg_panel_fill(uint32_t first, uint32_t count, uint32_t width, uint32_t height,
++    uint32_t stride, uint32_t *wptrp)
++{
++	uint32_t wptr = *wptrp, rptr = 0, sent = 0, batches = 0;
++	uint32_t per_row = stride / 4u;
++	bool stalled = false;
++
++	while (sent < count && !stalled) {
++		for (uint32_t c = 0; c < PG_DRAW_PER_BATCH && sent < count; c++) {
++			uint32_t n = count - sent < PG_DRAW_CHUNK ? count - sent : PG_DRAW_CHUNK;
++			uint64_t addr = PG_PANEL_IOVA + 4ull * (uint64_t)(first + sent);
++
++			pg_ring_put(wptr++, pg_pkt7(PG_CP_MEM_WRITE, n + 2u));
++			pg_ring_put(wptr++, (uint32_t)addr);
++			pg_ring_put(wptr++, (uint32_t)(addr >> 32));
++			for (uint32_t i = 0; i < n; i++) {
++				uint32_t at = first + sent + i;
++
++				pg_ring_put(wptr++, pg_panel_pixel(at / per_row, at % per_row,
++				    width, height));
++			}
++			sent += n;
++		}
++		wptr &= PG_RING_WORDS - 1u;
++		pg_ring_flush();
++		pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		{
++			bool drained = false;
++
++			/*
++			 * One second. Build 0155 gave up after 200 ms at 83% and
++			 * reported a stop that may only have been the CP falling
++			 * behind; waiting longer costs boot time only if the CP
++			 * really has stopped, and then the message says so.
++			 */
++			for (uint32_t i = 0; i < 100000; i++) {
++				rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
++				if (rptr == wptr) {
++					drained = true;
++					break;
++				}
++				pg_sleep_us(10);
++			}
++			if (!drained) {
++				vm_offset_t cb = pg_smmu_cb(PG_GMU_CTX);
++
++				printf("POLARIS GPU: 18 the CP stopped at %u of %u dwords of this "
++				    "run (%u%%), %u submissions in: RPTR %u WPTR %u, "
++				    "RBBM_STATUS %#010x\n", sent, count,
++				    (uint32_t)((uint64_t)sent * 100u / count), batches, rptr,
++				    pg_rd(pg_gpu3d + 4u * PG_CP_RB_WPTR),
++				    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++				printf("POLARIS GPU: 18 context bank %u FSR %#010x FSYNR0 %#010x "
++				    "FAR %#010x%08x INT_0_STATUS %#010x\n", PG_GMU_CTX,
++				    pg_rd(cb + PG_CB_FSR), pg_rd(cb + 0x5c), pg_rd(cb + 0x64),
++				    pg_rd(cb + 0x60),
++				    pg_rd(pg_gpu3d + 4u * PG_RBBM_INT_STATUS));
++				pg_cp_watch("the batch did not drain in one second", wptr);
++				pg_cp_probe("after the fill stopped");
++				stalled = true;
++			}
++		}
++		batches++;
++	}
++	*wptrp = wptr;
++	printf("POLARIS GPU: 18 dwords %u..%u (rows %u..%u): the CP took %u of %u in %u "
++	    "submissions\n", first, first + count - 1u, first / per_row,
++	    (first + count - 1u) / per_row, sent, count, batches);
++	return sent;
++}
++
+ static bool
+ pg_step_panel(void)
+ {
+ 	uint64_t phys = 0;
+ 	uint32_t width = 0, height = 0, stride = 0;
+-	uint32_t bytes, words, pages, wptr = pg_cp_wptr, rptr = 0, sent = 0, batches = 0;
++	uint32_t bytes, pages, wptr = pg_cp_wptr;
+ 	uint32_t fresh = 0;
+ 	bool ok = true;
+ 
+@@ -4135,7 +4220,6 @@
+ 		    "writing a partial image\n", pages, PG_PANEL_MAX_PAGES);
+ 		return false;
+ 	}
+-	words = bytes / 4u;
+ 	printf("POLARIS GPU: 18 panel %#llx %ux%u stride %u: the whole thing, %u bytes, "
+ 	    "%u pages at iova %#llx\n", phys, width, height, stride, bytes, pages, PG_PANEL_IOVA);
+ 	/*
+@@ -4214,117 +4298,47 @@
+ 		}
+ 	}
+ 
++	/*
++	 * The ring pointer the fill must start from is the one the rewrite test
++	 * left behind, not the one this function captured on entry. Builds 0158
++	 * and 0159 filled from the stale one, which put the command processor's
++	 * read pointer in the middle of a packet: it decoded the data as a
++	 * header, stopped, and never took another word - including the kernel
++	 * memory probe that was supposed to prove it was alive.
++	 */
++	wptr = pg_cp_wptr;
+ 	printf("POLARIS GPU: 18 before the fill: RBBM_STATUS %#010x RPTR %u WPTR %u\n",
+ 	    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS),
+ 	    pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR), wptr);
+ 
+ 	{
+-		bool stalled = false;
+-
+-		while (sent < words && !stalled) {
+-			for (uint32_t c = 0; c < PG_DRAW_PER_BATCH && sent < words; c++) {
+-				uint32_t n = words - sent < PG_DRAW_CHUNK ? words - sent : PG_DRAW_CHUNK;
+-				uint64_t addr = PG_PANEL_IOVA + 4ull * sent;
+-				uint32_t per_row = stride / 4u;
+-
+-				pg_ring_put(wptr++, pg_pkt7(PG_CP_MEM_WRITE, n + 2u));
+-				pg_ring_put(wptr++, (uint32_t)addr);
+-				pg_ring_put(wptr++, (uint32_t)(addr >> 32));
+-				for (uint32_t i = 0; i < n; i++) {
+-					uint32_t at = sent + i;
+-
+-					pg_ring_put(wptr++, pg_panel_pixel(at / per_row, at % per_row,
+-					    width, height));
+-				}
+-				sent += n;
+-			}
+-			wptr &= PG_RING_WORDS - 1u;
+-			pg_ring_flush();
+-			pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
+-			__asm__ volatile ("dsb sy" ::: "memory");
+-			{
+-				bool drained = false;
+-
+-				/*
+-				 * One second, not 200 ms. Build 0155 gave up after 200 ms
+-				 * at 83% and reported a stop that may only have been the
+-				 * CP falling behind - the ring had 1840 words queued and
+-				 * RBBM_STATUS still said the block was alive. Waiting
+-				 * longer costs boot time only if the CP really has
+-				 * stopped, and then the message says so.
+-				 */
+-				for (uint32_t i = 0; i < 100000; i++) {
+-					rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR);
+-					if (rptr == wptr) {
+-						drained = true;
+-						break;
+-					}
+-					pg_sleep_us(10);
+-				}
+-				if (!drained) {
+-					vm_offset_t cb = pg_smmu_cb(PG_GMU_CTX);
+-
+-					printf("POLARIS GPU: 18 the CP stalled at %u of %u dwords "
+-					    "(%u%%) after %u submissions: RPTR %u WPTR %u, "
+-					    "RBBM_STATUS %#010x; keeping what landed\n",
+-					    sent, words, (uint32_t)((uint64_t)sent * 100u / words),
+-					    batches, rptr, pg_rd(pg_gpu3d + 4u * PG_CP_RB_WPTR),
+-					    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
+-					/*
+-					 * Build 0155 stopped at 83% and 0156 at 65%,
+-					 * which is what a race looks like and also
+-					 * what a fault looks like. The context bank
+-					 * tells them apart: a translation fault leaves
+-					 * FSR non-zero and FAR pointing at the address
+-					 * the CP could not reach, and a stopped stream
+-					 * leaves both at zero.
+-					 */
+-					printf("POLARIS GPU: 18 context bank %u FSR %#010x "
+-					    "FSYNR0 %#010x FAR %#010x%08x INT_0_STATUS "
+-					    "%#010x\n", PG_GMU_CTX, pg_rd(cb + PG_CB_FSR),
+-					    pg_rd(cb + 0x5c), pg_rd(cb + 0x64),
+-					    pg_rd(cb + 0x60),
+-					    pg_rd(pg_gpu3d + 4u * PG_RBBM_INT_STATUS));
+-					pg_cp_watch("the batch did not drain in one second", wptr);
+-					pg_cp_probe("after the fill stopped");
+-					stalled = true;
+-				}
+-			}
+-			batches++;
+-			if (!stalled && (batches % 64u) == 0) {
+-				printf("POLARIS GPU: 18 %u of %u dwords (%u%%), %u submissions\n",
+-				    sent, words, (uint32_t)((uint64_t)sent * 100u / words), batches);
+-			}
+-		}
+-	}
+-	pg_cp_wptr = wptr;
+-	printf("POLARIS GPU: 18 the CP wrote %u of %u dwords (%u%%) in %u submissions at %#llx\n",
+-	    sent, words, (uint32_t)((uint64_t)sent * 100u / words), batches, PG_PANEL_IOVA);
+-	{
+ 		uint32_t per_row = stride / 4u;
+-		uint32_t written_rows = sent / per_row;
++		uint32_t band = (height < 32u ? height : 32u) * per_row;
+ 
+-		if (written_rows > height) {
+-			written_rows = height;
+-		}
+-		if (written_rows == 0) {
+-			printf("POLARIS GPU: 18 nothing was written, so there is nothing to read back\n");
+-			return false;
+-		}
+ 		/*
+-		 * These rows have had seconds to be repainted, so they are not the
+-		 * proof - the rewrite above was. They say how far the fill got and
+-		 * what the surface looked like once it stopped: row 0 was written
+-		 * first and has had the longest exposure, and the last row that
+-		 * landed is in a different level 2 entry of the CP's window, so it
+-		 * is also the evidence that the window is five level 3 pages and not
+-		 * just the first one.
++		 * Thirty two rows at the top and thirty two at the bottom, not the
++		 * whole panel. The whole panel is 2332800 dwords and this CP moves
++		 * them at tens of thousands a second, so a full fill costs a
++		 * minute of boot time to prove something the two ends prove in two
++		 * submissions: the first page of the window and the last page are
++		 * in different level 3 tables - the line above says so - and a
++		 * write that lands at both ends can reach anywhere between them.
+ 		 */
+-		pg_panel_show("after the fill,", 0, width, height, stride);
+-		if (written_rows >= 16u) {
+-			pg_panel_show("after the fill,", written_rows - 1u, width, height, stride);
++		pg_panel_fill(0, band, width, height, stride, &wptr);
++		if (height > 64u) {
++			pg_panel_fill((height - 32u) * per_row, band, width, height, stride,
++			    &wptr);
+ 		}
++		pg_cp_wptr = wptr;
+ 	}
++
++	/*
++	 * These rows have had seconds to be repainted, so they are not the proof -
++	 * the rewrite above was. They say what the far end of the window looks
++	 * like, which is the part of the mapping the first page cannot speak for.
++	 */
++	pg_panel_show("after the fill,", 0, width, height, stride);
++	pg_panel_show("after the fill,", height - 1u, width, height, stride);
+ 	return ok;
+ }
+ 
