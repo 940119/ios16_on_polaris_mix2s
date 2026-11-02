@@ -289,7 +289,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5295,531 @@
+@@ -5067,4 +5295,668 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -743,6 +743,143 @@
 +#define PG_POOL_BASE		0xaf000000ull	/* ramdump_fb_region: 16 MB, below 4 GB, dead */
 +#define PG_POOL_SENTINEL	0xdeadbeefu
 +
++/* ---- handing those pages out ---------------------------------------------------------------------- */
++
++/*
++ * A program's buffer has to be one of these pages, and there are only sixteen
++ * megabytes of them, so they are handed out and taken back rather than carved
++ * once: a program that makes and gives back a buffer of one size every frame
++ * would exhaust the region in seconds otherwise.
++ *
++ * First fit over a sorted, merging free list - the same shape as the address
++ * allocator at the top of this file, and for the same reason: the address a
++ * program gets back has to be the address it had, or Mesa's per-frame texture
++ * walks the window until it runs out. No lock: the user client holds gGPULock
++ * around every call that reaches this, and the boot-time test runs before a
++ * client can exist.
++ *
++ * The CPU side is one mapping of the whole region, made on first use and kept
++ * for good. It is ml_io_map, which is uncached, and that is the point: the GPU
++ * writes past the cache, so a cached view would read back whatever the CPU
++ * left there and call a working GPU broken. One mapping instead of one per
++ * buffer also means nothing has to be unmapped when a buffer is given back,
++ * and no kernel address is ever leaked to a program that makes buffers in a
++ * loop.
++ */
++#define PG_POOL_SIZE		(16ull << 20)	/* ramdump_fb_region, whole */
++#define PG_POOL_SLOTS		64u
++
++struct pg_pool_span {
++	uint64_t base, size;
++};
++
++static struct pg_pool_span pg_pool_free[PG_POOL_SLOTS] = {
++	{ PG_POOL_BASE, PG_POOL_SIZE },
++};
++static unsigned pg_pool_count = 1;
++static uint64_t pg_pool_taken;
++static vm_offset_t pg_pool_window;
++
++uint64_t
++polaris_gpu_pool_alloc(uint64_t bytes)
++{
++	if (bytes == 0) {
++		return 0;
++	}
++	bytes = (bytes + PG_GMU_PAGE_SIZE - 1) & ~(uint64_t)(PG_GMU_PAGE_SIZE - 1);
++	for (unsigned i = 0; i < pg_pool_count; i++) {
++		uint64_t base;
++
++		if (pg_pool_free[i].size < bytes) {
++			continue;
++		}
++		base = pg_pool_free[i].base;
++		pg_pool_free[i].base += bytes;
++		pg_pool_free[i].size -= bytes;
++		if (pg_pool_free[i].size == 0) {
++			memmove(&pg_pool_free[i], &pg_pool_free[i + 1],
++			    (pg_pool_count - i - 1) * sizeof(pg_pool_free[0]));
++			pg_pool_count--;
++		}
++		pg_pool_taken += bytes;
++		return base;
++	}
++	printf("POLARIS GPU: 19 pool: no room for %llu bytes (%llu of %llu taken)\n",
++	    bytes, pg_pool_taken, (uint64_t)PG_POOL_SIZE);
++	return 0;
++}
++
++void
++polaris_gpu_pool_free(uint64_t base, uint64_t bytes)
++{
++	unsigned i = 0;
++
++	if (bytes == 0 || base < PG_POOL_BASE || base + bytes > PG_POOL_BASE + PG_POOL_SIZE) {
++		return;
++	}
++	bytes = (bytes + PG_GMU_PAGE_SIZE - 1) & ~(uint64_t)(PG_GMU_PAGE_SIZE - 1);
++	while (i < pg_pool_count && pg_pool_free[i].base < base) {
++		i++;
++	}
++	/*
++	 * Overlapping a span that is already free is a second free of the same
++	 * buffer; inserting it would hand the same page to two programs, which
++	 * the GPU would then write twice. Refuse it, the way the address
++	 * allocator above does.
++	 */
++	if ((i > 0 && pg_pool_free[i - 1].base + pg_pool_free[i - 1].size > base) ||
++	    (i < pg_pool_count && base + bytes > pg_pool_free[i].base)) {
++		printf("POLARIS GPU: 19 pool: %#llx+%llu is given back twice; refused\n", base, bytes);
++		return;
++	}
++	if (pg_pool_count >= PG_POOL_SLOTS) {
++		printf("POLARIS GPU: 19 pool: the free list is full; %#llx+%llu leaks\n", base, bytes);
++		return;
++	}
++	memmove(&pg_pool_free[i + 1], &pg_pool_free[i],
++	    (pg_pool_count - i) * sizeof(pg_pool_free[0]));
++	pg_pool_free[i].base = base;
++	pg_pool_free[i].size = bytes;
++	pg_pool_count++;
++	if (i + 1 < pg_pool_count &&
++	    pg_pool_free[i].base + pg_pool_free[i].size == pg_pool_free[i + 1].base) {
++		pg_pool_free[i].size += pg_pool_free[i + 1].size;
++		memmove(&pg_pool_free[i + 1], &pg_pool_free[i + 2],
++		    (pg_pool_count - i - 2) * sizeof(pg_pool_free[0]));
++		pg_pool_count--;
++	}
++	if (i > 0 && pg_pool_free[i - 1].base + pg_pool_free[i - 1].size == pg_pool_free[i].base) {
++		pg_pool_free[i - 1].size += pg_pool_free[i].size;
++		memmove(&pg_pool_free[i], &pg_pool_free[i + 1],
++		    (pg_pool_count - i - 1) * sizeof(pg_pool_free[0]));
++		pg_pool_count--;
++	}
++	if (pg_pool_taken >= bytes) {
++		pg_pool_taken -= bytes;
++	}
++}
++
++/*
++ * Where the CPU sees a pool page. The whole region is one uncached mapping; a
++ * caller gets the window's address plus the page's offset into the region.
++ */
++void *
++polaris_gpu_pool_view(uint64_t pa, uint64_t bytes)
++{
++	if (pa < PG_POOL_BASE || bytes == 0 || pa + bytes > PG_POOL_BASE + PG_POOL_SIZE) {
++		return NULL;
++	}
++	if (pg_pool_window == 0) {
++		pg_pool_window = ml_io_map((vm_offset_t)PG_POOL_BASE, (vm_size_t)PG_POOL_SIZE);
++		if (pg_pool_window == 0) {
++			printf("POLARIS GPU: 19 pool: the region at %#llx has no CPU view\n",
++			    (uint64_t)PG_POOL_BASE);
++			return NULL;
++		}
++	}
++	return (void *)(pg_pool_window + (vm_offset_t)(pa - PG_POOL_BASE));
++}
++
 +void
 +polaris_gpu_pool_test(void)
 +{
@@ -823,7 +960,7 @@
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,1173 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -899,6 +1036,9 @@
 +void polaris_gpu_pa_test(const uint64_t *pas, uint32_t pages, uint64_t bytes,
 +    volatile uint32_t *cpu);
 +void polaris_gpu_pool_test(void);
++uint64_t polaris_gpu_pool_alloc(uint64_t bytes);
++void polaris_gpu_pool_free(uint64_t pa, uint64_t bytes);
++void * polaris_gpu_pool_view(uint64_t pa, uint64_t bytes);
 +}
 +
 +/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -1015,6 +1155,14 @@
 +	uint64_t                address;        /* the GPU's for it */
 +	uint64_t                size;
 +	uint32_t                flags;
++	/*
++	 * 0197: the pages a buffer is made of can now be the pool's, below 4 GB,
++	 * rather than this kernel's own memory above it. Such a buffer has a
++	 * physical address to give back and a descriptor wrapped around it, but
++	 * no allocation behind either, so the two are kept apart from `memory`.
++	 */
++	bool                    pool;
++	uint64_t                pa;             /* pool: the first page's physical address */
 +};
 +
 +class PolarisGPUUserClient : public IOUserClient
@@ -1030,14 +1178,21 @@
 +	uint32_t                fStrangers;     /* requests that named a buffer this client does not have */
 +
 +	struct gpu_buffer * buffer(uint32_t handle);
++	struct gpu_buffer * takeSlot(uint32_t * handle);
 +	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size,
 +	    uint32_t flags, uint32_t * handle);
++	struct gpu_buffer * newPoolBuffer(uint64_t pa, uint64_t size, uint32_t flags,
++	    uint32_t * handle);
++	static bool fillPoolBuffer(struct gpu_buffer * b, uint64_t pa, uint64_t size,
++	    uint32_t flags);
++	static void releaseBuffer(struct gpu_buffer * b);
 +	void freeBuffer(struct gpu_buffer * b);
 +	IOReturn gemNew(struct msm_gem_new * request);
 +	IOReturn gemInfo(struct msm_gem_info * request);
 +	IOReturn gemClose(struct drm_gem_close * request);
 +
 +public:
++	static void poolSelfTest(void);
 +	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type,
 +	    OSDictionary * properties) APPLE_KEXT_OVERRIDE;
 +	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
@@ -1097,16 +1252,16 @@
 +}
 +
 +/*
-+ * A handle and an address of the GPU's for `size` bytes of a memory descriptor,
-+ * from byte `from` of it on, in whole pages. Called with gGPULock held; NULL
-+ * means there was no room or the memory could not be entered.
++ * The next free handle, round-robin so that a program that makes and drops
++ * buffers in a loop does not pay for the first slot's cache lines every time.
++ * Called with gGPULock held. A handle is free when it has no memory
++ * descriptor: a pool buffer has one too, wrapped around its physical pages,
++ * and that is deliberate - it is the thing a program maps.
 + */
 +struct gpu_buffer *
-+PolarisGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size,
-+    uint32_t flags, uint32_t * handle)
++PolarisGPUUserClient::takeSlot(uint32_t * handle)
 +{
 +	struct gpu_buffer * b = NULL;
-+	bool mapped = true;
 +
 +	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
 +		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
@@ -1120,6 +1275,25 @@
 +	}
 +	if (b == NULL) {
 +		printf("POLARIS GPU: 19 the client has no handles left\n");
++		return NULL;
++	}
++	bzero(b, sizeof(*b));
++	return b;
++}
++
++/*
++ * A handle and an address of the GPU's for `size` bytes of a memory descriptor,
++ * from byte `from` of it on, in whole pages. Called with gGPULock held; NULL
++ * means there was no room or the memory could not be entered.
++ */
++struct gpu_buffer *
++PolarisGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size,
++    uint32_t flags, uint32_t * handle)
++{
++	struct gpu_buffer * b = takeSlot(handle);
++	bool mapped = true;
++
++	if (b == NULL) {
 +		return NULL;
 +	}
 +	b->address = polaris_gpu_address(size);
@@ -1158,6 +1332,128 @@
 +	return b;
 +}
 +
++/*
++ * A pool buffer: pages that exist already, below 4 GB, that the GPU has been
++ * proved to write (0196). There is no IOBufferMemoryDescriptor to ask for
++ * physical segments, because here the physical address is the input and not
++ * the answer: the pages are entered into the program's window from `pa`, and
++ * the descriptor the program maps is made around that range.
++ *
++ * The descriptor is what makes the handle usable from a program at all.
++ * clientMemoryForType() hands it to IOConnectMapMemory(), and without one the
++ * handle would exist and be unmappable. withPhysicalAddress is the same call
++ * the framebuffer service in this tree uses to wrap a physical range it did
++ * not allocate.
++ *
++ * The program's mapping keeps the descriptor's default cache mode. The GPU
++ * writes with the SMMU's Normal non-cacheable attributes (MAIR0 0xf404ff44,
++ * index 0), so a cached mapping would need an invalidate this build does not
++ * do - but nothing maps a client buffer yet, and putting option bits in now
++ * would be a guess in the one place where a wrong guess looks exactly like a
++ * working buffer. The CPU view below is the uncached window in polaris_gpu.c,
++ * so everything this kernel reads back is what the GPU wrote.
++ */
++bool
++PolarisGPUUserClient::fillPoolBuffer(struct gpu_buffer * b, uint64_t pa, uint64_t size,
++    uint32_t flags)
++{
++	uint8_t * view;
++	bool mapped = true;
++
++	b->address = polaris_gpu_address(size);
++	if (b->address == 0) {
++		return false;
++	}
++	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++		mapped = polaris_gpu_map(b->address + offset, pa + offset,
++		    (flags & MSM_BO_GPU_READONLY) != 0);
++	}
++	polaris_gpu_mapped();
++	if (!mapped) {
++		polaris_gpu_unmap(b->address, size);
++		polaris_gpu_mapped();
++		polaris_gpu_address_free(b->address, size);
++		b->address = 0;
++		printf("POLARIS GPU: 19 a pool buffer of %llu bytes will not enter the GPU's "
++		    "address space\n", size);
++		return false;
++	}
++	b->memory = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) pa,
++	    (IOByteCount) size, kIODirectionInOut);
++	if (b->memory == NULL) {
++		polaris_gpu_unmap(b->address, size);
++		polaris_gpu_mapped();
++		polaris_gpu_address_free(b->address, size);
++		b->address = 0;
++		printf("POLARIS GPU: 19 the pool pages at %#llx will not wrap in a memory "
++		    "descriptor\n", pa);
++		return false;
++	}
++	view = (uint8_t *) polaris_gpu_pool_view(pa, size);
++	if (view == NULL) {
++		polaris_gpu_unmap(b->address, size);
++		polaris_gpu_mapped();
++		polaris_gpu_address_free(b->address, size);
++		b->address = 0;
++		OSSafeReleaseNULL(b->memory);
++		return false;
++	}
++	/*
++	 * What the program gets is zeroed memory, for the reason the old path
++	 * gave: a buffer drawn into before every pixel is written shows whatever
++	 * was there, and here that would be the crash dump's last frame. The view
++	 * is uncached, so the zeros are in the memory the GPU reads, not in a
++	 * cache line in front of it.
++	 */
++	bzero(view, (size_t) size);
++	b->kernel = view;
++	b->pa = pa;
++	b->pool = true;
++	b->size = size;
++	b->flags = flags;
++	return true;
++}
++
++struct gpu_buffer *
++PolarisGPUUserClient::newPoolBuffer(uint64_t pa, uint64_t size, uint32_t flags,
++    uint32_t * handle)
++{
++	struct gpu_buffer * b = takeSlot(handle);
++
++	if (b == NULL) {
++		return NULL;
++	}
++	if (!fillPoolBuffer(b, pa, size, flags)) {
++		bzero(b, sizeof(*b));
++		return NULL;
++	}
++	fBufferCount++;
++	fBufferBytes += size;
++	return b;
++}
++
++/*
++ * Everything a buffer holds, given back. Called with gGPULock held and after
++ * the handle has been cleared, so a second close of it finds nothing; also
++ * called by the boot-time test, which has no handle at all.
++ *
++ * A pool buffer's pages go back to the pool: sixteen megabytes is all there is,
++ * and a window server that makes a surface every time the screen rotates would
++ * have none left by the third one. Its CPU view is not unmapped - it is the
++ * one window over the whole region, and it is not this buffer's to unmap.
++ */
++void
++PolarisGPUUserClient::releaseBuffer(struct gpu_buffer * b)
++{
++	polaris_gpu_unmap(b->address, b->size);
++	polaris_gpu_mapped();
++	polaris_gpu_address_free(b->address, b->size);
++	if (b->pool) {
++		polaris_gpu_pool_free(b->pa, b->size);
++	}
++	OSSafeReleaseNULL(b->memory);
++}
++
 +/* Called with gGPULock held. Nothing has been submitted yet, so nothing can be in the GPU's hands. */
 +void
 +PolarisGPUUserClient::freeBuffer(struct gpu_buffer * slot)
@@ -1168,22 +1464,20 @@
 +	/* out of the handle first, so that a second close of it finds nothing */
 +	slot->memory = NULL;
 +	slot->kernel = NULL;
++	slot->pool = false;
 +	if (fBufferCount > 0) {
 +		fBufferCount--;
 +	}
 +	fBufferBytes -= b->size;
 +
-+	polaris_gpu_unmap(b->address, b->size);
-+	polaris_gpu_mapped();
-+	polaris_gpu_address_free(b->address, b->size);
-+	OSSafeReleaseNULL(b->memory);
++	releaseBuffer(b);
 +}
 +
 +IOReturn
 +PolarisGPUUserClient::gemNew(struct msm_gem_new * request)
 +{
 +	uint64_t size = request->size;
-+	IOBufferMemoryDescriptor * memory;
++	uint64_t pa;
 +	struct gpu_buffer * b;
 +	uint32_t handle = 0;
 +
@@ -1191,26 +1485,31 @@
 +		return kIOReturnBadArgument;
 +	}
 +	size = round_page((vm_size_t) size);
-+	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-+	    kIODirectionInOut, (vm_size_t) size, PAGE_SIZE);
-+	if (memory == NULL) {
-+		printf("POLARIS GPU: 19 no memory for a buffer of %llu bytes\n", size);
++	/*
++	 * 0197: out of the pool, not out of this kernel's memory.
++	 *
++	 * Every buffer this service handed out until now was wired kernel memory,
++	 * and on this machine that is above 4 GB - where the GPU writes a few
++	 * hundred words of a page and stops (0194: 2176 of 16384, sparse). The
++	 * pages below 4 GB are the reserved region 0196 filled through the CP
++	 * without a single word wrong, so a program's buffers come from there.
++	 *
++	 * There is deliberately no fallback to the old path when the pool is
++	 * empty. A buffer above 4 GB is not a slow buffer, it is one the GPU
++	 * silently half-writes, and 0187-0193 were five builds spent looking for
++	 * a fault in the window while the address was the whole story. A refusal
++	 * a program can see beats a buffer that appears to work.
++	 */
++	pa = polaris_gpu_pool_alloc(size);
++	if (pa == 0) {
++		printf("POLARIS GPU: 19 gemNew: %llu bytes, and the pool has none left\n", size);
 +		return kIOReturnNoMemory;
 +	}
-+	/*
-+	 * What the program gets is zeroed memory. msm does not promise that, but
-+	 * a window server that draws into a buffer before writing every pixel of
-+	 * it shows whatever was there, and on this port that was somebody else's
-+	 * frame; the cost is one bzero of a buffer that is about to be written
-+	 * anyway.
-+	 */
-+	bzero(memory->getBytesNoCopy(), (size_t) size);
-+
 +	IOLockLock(gGPULock);
-+	b = newBuffer(memory, 0, size, request->flags, &handle);
++	b = newPoolBuffer(pa, size, request->flags, &handle);
 +	IOLockUnlock(gGPULock);
-+	memory->release();
 +	if (b == NULL) {
++		polaris_gpu_pool_free(pa, size);
 +		return kIOReturnNoMemory;
 +	}
 +	request->handle = handle;
@@ -1257,6 +1556,73 @@
 +	freeBuffer(b);
 +	IOLockUnlock(gGPULock);
 +	return kIOReturnSuccess;
++}
++
++/*
++ * 0197's answer without a user space: make a buffer the way gemNew() makes one,
++ * look at what its descriptor says its pages are, have the CP write the whole
++ * of it, and read it back through the uncached window. All four are needed for
++ * a pass - the pool had room, the pages entered the window, the descriptor is
++ * over those pages, and the GPU wrote them - because each of them has failed
++ * on its own in an earlier build.
++ */
++void
++PolarisGPUUserClient::poolSelfTest(void)
++{
++	struct gpu_buffer b;
++	uint64_t size = 64u << 10;
++	uint64_t pa;
++	uint32_t pages = 0, matching = 0, changed = 0, wrong = 0;
++	IOByteCount length = 0;
++	bool filled;
++
++	bzero(&b, sizeof(b));
++	pa = polaris_gpu_pool_alloc(size);
++	if (pa == 0) {
++		printf("POLARIS GPU: 19 gemnew: the pool has nothing for %llu bytes\n", size);
++		return;
++	}
++	printf("POLARIS GPU: 19 gemnew: %llu bytes from the pool at %#llx..%#llx\n",
++	    size, pa, pa + size - 1);
++	if (!fillPoolBuffer(&b, pa, size, 0)) {
++		polaris_gpu_pool_free(pa, size);
++		return;
++	}
++	for (uint64_t off = 0; off < size; off += 4096) {
++		addr64_t phys = b.memory->getPhysicalSegment(off, &length, kIOMemoryMapperNone);
++
++		pages++;
++		if (phys == pa + off) {
++			matching++;
++		}
++	}
++	printf("POLARIS GPU: 19 gemnew: the handle's buffer sits at %#llx, the program's "
++	    "address is %#llx, %u of %u descriptor segments are the pool's pages\n",
++	    pa, b.address, matching, pages);
++	for (uint64_t w = 0; w < size / 4; w++) {
++		((volatile uint32_t *) b.kernel)[w] = 0xdeadbeefu;
++	}
++	filled = polaris_gpu_fill_batched(b.address, (uint32_t)(size / 4));
++	polaris_gpu_window_report(b.address);
++	for (uint64_t w = 0; w < size / 4; w++) {
++		uint32_t v = ((volatile uint32_t *) b.kernel)[w];
++
++		if (v != 0xdeadbeefu) {
++			changed++;
++			if (v != 0xa5a5a5a5u) {
++				wrong++;
++			}
++		}
++	}
++	printf("POLARIS GPU: 19 gemnew: the CP %s; %u of %llu words changed, %u of those "
++	    "are not 0xa5a5a5a5\n", filled ? "drained" : "did NOT drain", changed,
++	    size / 4, wrong);
++	printf("POLARIS GPU: 19 gemnew: %s\n",
++	    (filled && pages == size / 4096 && matching == pages &&
++	    changed == size / 4 && wrong == 0) ?
++	    "THE POOL BUFFER A CLIENT IS GIVEN IS ONE THE GPU WRITES" :
++	    "the client's pool buffer is not written by the GPU");
++	releaseBuffer(&b);
 +}
 +
 +/* The program's mapping of a buffer: IOConnectMapMemory(type = handle) lands here. */
@@ -1716,6 +2082,15 @@
 +	 * the GPU has somewhere to write.
 +	 */
 +	polaris_gpu_pool_test();
++
++	/*
++	 * 0197: and now the same pages the way a program will get them - through
++	 * the pool allocator, a handle, and a descriptor that IOConnectMapMemory
++	 * would hand to the program. The pool test above says the GPU writes that
++	 * region; this says a buffer taken out of it is a buffer a client can be
++	 * given.
++	 */
++	PolarisGPUUserClient::poolSelfTest();
 +
 +	polaris_gpu_unmap(address, size);
 +	polaris_gpu_mapped();
