@@ -1,0 +1,105 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -327,7 +327,7 @@
+ 	    fScale ? "filling" : "cropping at", fContentW, fContentH, fOffX, fOffY,
+ 	    (fWidth <= SWEET_FB_COLMAP_MAX) ? fWidth : 0);
+ 	IOLog("SWEET FB: blit %s\n", fStage != NULL ?
+-	    "gathers into a staging row, panel gets wide copies" :
++	    "gathers four pixels at a time into a staging row, panel gets wide copies" :
+ 	    "gathers straight into the write-combined panel");
+ 	return true;
+ }
+@@ -569,6 +569,71 @@
+ 	}
+ }
+ 
++/*
++ * One stretched row: panel columns [xlo, xhi) gathered from the layer, with
++ * the two clamped ends filled by sweet_fb_fill().
++ *
++ * Eight pixels at a time, and the stores stay four bytes wide. Both of those
++ * are measured, not assumed - _g186.c runs six shapes of this loop over the
++ * same 1624-row frame:
++ *
++ *   A  one pixel, 4-byte store (0185)          1.15 ms   1.00x
++ *   B  four chains, 4-byte stores              0.95 ms   1.22x
++ *   C  four chains packed into two 64-bit       1.34 ms   0.86x
++ *   D  eight chains, 4-byte stores              0.88 ms   1.31x
++ *   E  walk the source, fill each run           3.05 ms   0.38x
++ *   F  walk the source, at most two stores      3.25 ms   0.35x
++ *
++ * C is the shape this build first tried, on the theory that fewer, wider
++ * stores must be better because the panel likes them. It is worse: packing
++ * four pixels into two 64-bit stores costs four shifts and two ors, and the
++ * store unit was never the limit here - the destination is a 4 KB row that
++ * lives in L1. What the loop is actually short of is independent work, because
++ * every pixel is load-index, add, load-pixel, store. Eight of those chains
++ * issued together keep the load unit busy instead of waiting.
++ *
++ * E and F look like they should win - one source load per run of one or two
++ * destinations, and no index load at all - and lose by 3x, because the run
++ * lengths are data-dependent, so both the branch and the inner loop mispredict
++ * constantly. The map is not a random permutation, it is 1080/750 = 36/25, and
++ * that regularity is exactly what makes a branchy loop expensive.
++ */
++static void
++sweet_fb_gather(uint32_t *stage, const uint32_t *srow, const uint16_t *map,
++    int32_t base, int32_t px0, int32_t xlo, int32_t xhi, int32_t px1,
++    uint32_t lo, uint32_t hi)
++{
++	int32_t x = xlo;
++
++	if (xlo > px0) {
++		sweet_fb_fill(stage + px0, xlo - px0, lo);
++	}
++	for (; x + 7 < xhi; x += 8) {
++		uint32_t p0 = srow[base + map[x + 0]];
++		uint32_t p1 = srow[base + map[x + 1]];
++		uint32_t p2 = srow[base + map[x + 2]];
++		uint32_t p3 = srow[base + map[x + 3]];
++		uint32_t p4 = srow[base + map[x + 4]];
++		uint32_t p5 = srow[base + map[x + 5]];
++		uint32_t p6 = srow[base + map[x + 6]];
++		uint32_t p7 = srow[base + map[x + 7]];
++		stage[x + 0] = p0;
++		stage[x + 1] = p1;
++		stage[x + 2] = p2;
++		stage[x + 3] = p3;
++		stage[x + 4] = p4;
++		stage[x + 5] = p5;
++		stage[x + 6] = p6;
++		stage[x + 7] = p7;
++	}
++	for (; x < xhi; x++) {
++		stage[x] = srow[base + map[x]];
++	}
++	if (xhi < px1) {
++		sweet_fb_fill(stage + xhi, px1 - xhi, hi);
++	}
++}
++
+ static uint32_t sweet_fb_swaps_logged;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+@@ -840,19 +905,8 @@
+ 					}
+ 					lastLy = ly;
+ 					if (stage != NULL) {
+-						/* Clamped left end: constant column sx. */
+-						if (xlo > px0) {
+-							sweet_fb_fill(stage + px0, xlo - px0, srow[sx]);
+-						}
+-						/* Hot range: no clamp, one gather per pixel. */
+-						for (int32_t x = xlo; x < xhi; x++) {
+-							stage[x] = srow[base + fColMap[x]];
+-						}
+-						/* Clamped right end: constant column sx+w-1. */
+-						if (xhi < px1) {
+-							sweet_fb_fill(stage + xhi, px1 - xhi,
+-							    srow[sx + w - 1]);
+-						}
++						sweet_fb_gather(stage, srow, fColMap, base, px0,
++						    xlo, xhi, px1, srow[sx], srow[sx + w - 1]);
+ 						memcpy(drow, stage + px0, (size_t)n * 4);
+ 					} else {
+ 						/* sweetfb_blit=0: gather into the panel. */
