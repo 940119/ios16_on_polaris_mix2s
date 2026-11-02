@@ -69,7 +69,7 @@
  
  /* The GMU reads from memory, not from this processor's cache. */
  static void
-@@ -1405,6 +1436,164 @@
+@@ -1405,6 +1436,191 @@
  	printf("POLARIS GPU: 10 %s: %#llx -> %#llx, descriptor %#llx in slot %u\n", name, iova,
  	    kvtophys(va), l3[((iova >> 12) & 0x1ff)], (uint32_t)((iova >> 12) & 0x1ff));
  	return true;
@@ -208,6 +208,33 @@
 +}
 +
 +/*
++ * One 4 KB page anywhere in the CP's window.
++ *
++ * polaris_gpu_map() refuses addresses outside the program's span because a
++ * client has no business rewriting another window's descriptors. The check in
++ * this file is not a client: it has to enter one physical page at several
++ * addresses, including the panel's, and it can only do that by writing those
++ * descriptors itself. The guard that remains is the window's own extent.
++ */
++bool
++polaris_gpu_map_at(uint64_t iova, uint64_t pa)
++{
++	uint64_t *l3;
++
++	if (iova < PG_CP_SQE_IOVA ||
++	    iova + PG_GMU_PAGE_SIZE >
++	    PG_CP_SQE_IOVA + (uint64_t)PG_CP_WINDOW_L2S * 0x200000ull) {
++		return false;
++	}
++	l3 = (uint64_t *)pg_smmu_l3(iova);
++	if (l3 == NULL) {
++		return false;
++	}
++	l3[(iova >> 12) & 0x1ff] = (pa & PG_PTE_ADDR) | PG_PTE_ATTR | PG_PTE_PAGE;
++	return true;
++}
++
++/*
 + * The descriptors are written; make the SMMU read them. One flush for a whole
 + * buffer, not one a page: 64 pages of descriptors are 512 bytes in one level 3
 + * page, and a dc civac each would be 64 of them for the same cache lines.
@@ -234,7 +261,7 @@
  }
  
  /*
-@@ -4865,7 +5054,7 @@
+@@ -4865,7 +5081,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
  	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
@@ -243,7 +270,7 @@
  	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
  	    "physical, stream 5 bypassed (polarisgpumap=0)");
  	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
-@@ -5049,6 +5238,18 @@
+@@ -5049,6 +5265,18 @@
  	if (upto > 0) {
  		polaris_gpu.state = POLARIS_GPU_STARTING;
  		polaris_gpu_up(upto);
@@ -262,7 +289,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5268,329 @@
+@@ -5067,4 +5295,412 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -336,6 +363,89 @@
 +		return false;
 +	}
 +	return pg_fill_span(iova, words);
++}
++
++/*
++ * The same fill, one packet per write-pointer update.
++ *
++ * Step 18 has written the panel on every build since 0162 and this function has
++ * never written anything, and the difference between them was taken to be the
++ * address. It is not, or not only: step 18 hands the CP PG_DRAW_PER_BATCH
++ * packets and then waits for RPTR to catch up before handing it the next batch,
++ * while this function builds all sixteen chunks first and updates the write
++ * pointer once. Sixteen chunks of 1027 dwords is 16432 dwords, which is more
++ * than the 16384-dword ring: that single burst wraps. Step 18's batches never
++ * do.
++ *
++ * So this is step 18's discipline at the address that has always failed. Same
++ * packet, same window, same pages - only the number of write-pointer updates
++ * changes.
++ */
++static bool
++pg_fill_one(uint64_t iova, uint32_t words)
++{
++	uint32_t wptr = pg_cp_wptr;
++	uint32_t rptr = 0;
++
++	pg_ring_put(wptr++, pg_pkt7(PG_CP_MEM_WRITE, words + 2u));
++	pg_ring_put(wptr++, (uint32_t)iova);
++	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
++	for (uint32_t i = 0; i < words; i++) {
++		pg_ring_put(wptr++, PG_FILL_WORD);
++	}
++	wptr &= PG_RING_WORDS - 1u;
++	pg_ring_flush();
++	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < 20000; i++) {
++		rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u);
++		if (rptr == wptr) {
++			pg_cp_wptr = wptr;
++			return true;
++		}
++		pg_sleep_us(100);
++	}
++	printf("POLARIS GPU: 19 the CP did not drain the chunk at %#llx: RPTR %u WPTR %u\n",
++	    iova, rptr, wptr);
++	return false;
++}
++
++static bool
++pg_fill_batched(uint64_t iova, uint32_t words)
++{
++	uint32_t sent = 0;
++
++	while (sent < words) {
++		uint32_t n = words - sent < PG_FILL_CHUNK ? words - sent : PG_FILL_CHUNK;
++
++		if (!pg_fill_one(iova + 4ull * sent, n)) {
++			return false;
++		}
++		sent += n;
++	}
++	return true;
++}
++
++bool
++polaris_gpu_fill_batched(uint64_t iova, uint32_t words)
++{
++	if (pg_gpu3d == 0 || pg_ring_va[0] == 0 || words == 0 ||
++	    iova < PG_USER_IOVA || iova + 4ull * words > PG_USER_IOVA + PG_USER_SIZE) {
++		return false;
++	}
++	return pg_fill_batched(iova, words);
++}
++
++bool
++polaris_gpu_fill_window_batched(uint64_t iova, uint32_t words)
++{
++	if (pg_gpu3d == 0 || pg_ring_va[0] == 0 || words == 0 ||
++	    iova < PG_CP_SQE_IOVA ||
++	    iova + 4ull * words >
++	    PG_CP_SQE_IOVA + (uint64_t)PG_CP_WINDOW_L2S * 0x200000ull) {
++		return false;
++	}
++	return pg_fill_batched(iova, words);
 +}
 +
 +/*
@@ -525,7 +635,7 @@
 +		if (!mapped) {
 +			printf("POLARIS GPU: 19 pa test A: the window would not take it\n");
 +		} else {
-+			filled = polaris_gpu_fill(second, (uint32_t)words);
++			filled = polaris_gpu_fill_batched(second, (uint32_t)words);
 +			polaris_gpu_window_report(second);
 +			changed = pg_pa_count((volatile uint32_t *)view, words, &wrong);
 +			printf("POLARIS GPU: 19 pa test A: the CP %s; %u of %llu words changed, "
@@ -559,8 +669,8 @@
 +	}
 +	mapped = true;
 +	for (uint32_t i = 0; i < pages && mapped; i++) {
-+		mapped = polaris_gpu_map(PG_PANEL_IOVA + (uint64_t)i * PG_GMU_PAGE_SIZE,
-+		    pas[i], false);
++		mapped = polaris_gpu_map_at(PG_PANEL_IOVA + (uint64_t)i * PG_GMU_PAGE_SIZE,
++		    pas[i]);
 +	}
 +	polaris_gpu_mapped();
 +	for (uint64_t i = 0; i < words; i++) {
@@ -574,7 +684,7 @@
 +	if (!mapped) {
 +		printf("POLARIS GPU: 19 pa test B: the window would not take it\n");
 +	} else {
-+		filled = polaris_gpu_fill_window(PG_PANEL_IOVA, (uint32_t)words);
++		filled = polaris_gpu_fill_window_batched(PG_PANEL_IOVA, (uint32_t)words);
 +		polaris_gpu_window_report(PG_PANEL_IOVA);
 +		changed = pg_pa_count(cpu, words, &wrong);
 +		printf("POLARIS GPU: 19 pa test B: the CP %s; %u of %llu words changed, "
@@ -594,7 +704,7 @@
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,879 @@
+@@ -0,0 +1,916 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -663,6 +773,7 @@
 +void polaris_gpu_mapped(void);
 +void polaris_gpu_unmap(uint64_t address, uint64_t size);
 +bool polaris_gpu_fill(uint64_t iova, uint32_t words);
++bool polaris_gpu_fill_batched(uint64_t iova, uint32_t words);
 +bool polaris_gpu_fill_window(uint64_t iova, uint32_t words);
 +void polaris_gpu_window_sync(void);
 +void polaris_gpu_window_report(uint64_t iova);
@@ -1386,6 +1497,42 @@
 +	printf("POLARIS GPU: 19 test: %s\n",
 +	    (filled && changed == size / 4 && wrong == 0) ?
 +	    "THE GPU WROTE A BUFFER THIS KERNEL OWNS" : "the buffer is not what the GPU was told to write");
++
++	/*
++	 * 0193: the same buffer, the same window, one packet per write-pointer
++	 * update.
++	 *
++	 * Step 18 has written the panel on every build since 0162 and this test
++	 * has written nothing on every build since 0187, and the difference was
++	 * taken to be where the memory is. It is not, or not only: step 18 hands
++	 * the CP PG_DRAW_PER_BATCH packets and then waits for RPTR to catch up
++	 * before handing over the next batch, while this test builds sixteen
++	 * chunks and updates the write pointer once - 16432 dwords against a
++	 * 16384-dword ring, so that single burst wraps where step 18's never do.
++	 * Nothing below changes except how the packets are handed over.
++	 */
++	for (uint64_t i = 0; i < size / 4; i++) {
++		words[i] = before;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	filled = polaris_gpu_fill_batched(address, (uint32_t)(size / 4));
++	changed = 0;
++	wrong = 0;
++	for (uint64_t i = 0; i < size / 4; i++) {
++		if (words[i] != before) {
++			changed++;
++			if (words[i] != 0xa5a5a5a5u) {
++				wrong++;
++			}
++		}
++	}
++	printf("POLARIS GPU: 19 test: one packet per write pointer, the CP %s; %u of %llu "
++	    "words changed, %u of those are not 0xa5a5a5a5\n",
++	    filled ? "drained" : "did NOT drain", changed, size / 4, wrong);
++	printf("POLARIS GPU: 19 test: %s\n",
++	    (filled && changed == size / 4 && wrong == 0) ?
++	    "THE BURST WAS THE WHOLE OF IT" :
++	    "handing the packets over one at a time changes nothing");
 +
 +	/*
 +	 * 0192: the count above has said the same thing for five builds, so
