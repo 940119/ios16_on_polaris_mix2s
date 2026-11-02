@@ -332,9 +332,10 @@
 +	return false;
 +}
  #endif
+
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
-+++ b/bsd/dev/polaris_gpu_service.cpp	2026-11-02 14:04:53.000000000 +0800
-@@ -0,0 +1,711 @@
++++ b/bsd/dev/polaris_gpu_service.cpp
+@@ -0,0 +1,748 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -551,6 +552,23 @@
 +	    IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
 +	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
 +	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++	/*
++	 * Declared by IOUserClient and never defined in this tree: the header
++	 * declares ipc_port_t ** and iokit/Kernel/IOUserClient.cpp still defines
++	 * the older io_object_t * form, so the declared one has no symbol. No
++	 * class in this tree derived from IOUserClient before this file, so
++	 * nobody hit it - the first subclass to emit a vtable is the one that
++	 * fails to link, which was build 0184:
++	 *
++	 *   "IOUserClient::exportObjectToClient(task*, OSObject*, ipc_port**)",
++	 *   referenced from vtable for PolarisGPUUserClient
++	 *
++	 * Overriding it keeps this vtable self-contained and states what the
++	 * service does: it hands no objects to its client, it maps memory and
++	 * answers selectors.
++	 */
++	virtual IOReturn exportObjectToClient(task_t task, OSObject * obj,
++	    ipc_port_t ** clientPort) APPLE_KEXT_OVERRIDE;
 +};
 +
 +OSDefineMetaClassAndStructors(PolarisGPUUserClient, IOUserClient);
@@ -800,6 +818,26 @@
 +		fBuffers = NULL;
 +	}
 +	IOUserClient::free();
++}
++
++IOReturn
++PolarisGPUUserClient::exportObjectToClient(task_t task, OSObject * obj,
++    ipc_port_t ** clientPort)
++{
++	(void)task;
++	if (clientPort != NULL) {
++		*clientPort = NULL;
++	}
++	/*
++	 * LIBKERN_CONSUMED: the reference comes in either way, so it goes out
++	 * either way. Returning kIOReturnUnsupported without releasing would
++	 * leak one object per call, and a program that guessed at this selector
++	 * could do it in a loop.
++	 */
++	if (obj != NULL) {
++		obj->release();
++	}
++	return kIOReturnUnsupported;
 +}
 +
 +IOReturn
