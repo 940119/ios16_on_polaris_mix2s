@@ -49,10 +49,11 @@
  
  static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
  static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
-@@ -1095,6 +1113,19 @@
+@@ -1094,6 +1112,19 @@
+ static bool pg_boot_configured;
  static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
  static bool pg_masks_saved;
- 
++
 +/*
 + * What bsd/dev/polaris_gpu_service.cpp is allowed to call, declared up here
 + * because their definitions have to come after the CP exists: the readiness
@@ -65,14 +66,15 @@
 + */
 +bool polaris_gpu_ready(void);
 +bool polaris_gpu_fill(uint64_t iova, uint32_t words);
-+
+ 
  /* The GMU reads from memory, not from this processor's cache. */
  static void
- pg_to_memory(vm_offset_t start, vm_size_t size)
-@@ -1407,6 +1438,164 @@
+@@ -1405,6 +1436,164 @@
+ 	printf("POLARIS GPU: 10 %s: %#llx -> %#llx, descriptor %#llx in slot %u\n", name, iova,
+ 	    kvtophys(va), l3[((iova >> 12) & 0x1ff)], (uint32_t)((iova >> 12) & 0x1ff));
  	return true;
- }
- 
++}
++
 +/* ---- the program's buffers: addresses in the user window, and their mappings ---------------------- */
 +
 +/*
@@ -229,11 +231,9 @@
 +			l3[(at >> 12) & 0x1ff] = 0;
 +		}
 +	}
-+}
-+
+ }
+ 
  /*
-  * IMPL_DEF1 is at base + 6 pages, and its first word is the micro MMU's
-  * control word. The vendor driver halts the SMMU around the
 @@ -4865,7 +5054,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
@@ -262,7 +262,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5268,116 @@
+@@ -5067,4 +5268,133 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -377,12 +377,28 @@
 +	    pg_rd(pg_gpu3d + 4u * PG_CP_RB_WPTR), pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR),
 +	    pg_cp_wptr, PG_GMU_CTX, pg_rd(cb + PG_CB_FSR), pg_rd(cb + 0x5c),
 +	    pg_rd(cb + 0x64), pg_rd(cb + 0x60), pg_rd(pg_smmu + PG_SMMU_SGFSR));
++	/*
++	 * The panel, for comparison. The CP does write it (step 18 reads the
++	 * pixels back), so its descriptor and the window's are the control
++	 * against which "the fill did nothing" has to be explained. If the two
++	 * differ in the attribute index or in nothing at all, that says which
++	 * half of the chain to look at next.
++	 */
++	if (pg_panel_phys != 0) {
++		uint64_t pi = PG_PANEL_IOVA;
++		uint64_t *pl3 = (uint64_t *)pg_smmu_l3(pi);
++		uint64_t pp = pl3 != NULL ? pl3[(pi >> 12) & 0x1ff] : 0;
++
++		printf("POLARIS GPU: 19 window panel %#llx: pte %#llx (attr %#llx) "
++		    "MAIR0 %#010x; the window's attr %#llx\n", pi, pp, pp & 0xeefull,
++		    pg_rd(cb + PG_CB_MAIR0),
++		    (l3 != NULL ? l3[slot] : 0) & 0xeeull);
++	}
 +}
  #endif
-
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,805 @@
+@@ -0,0 +1,831 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -1055,8 +1071,25 @@
 +	uint32_t before = 0xdeadbeefu, changed = 0, wrong = 0;
 +	bool filled;
 +
-+	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-+	    kIODirectionInOut, POLARIS_GPU_TEST_BYTES, PAGE_SIZE);
++	/*
++	 * Below 4 GB on purpose.
++	 *
++	 * Every run of this test that has failed had its buffer above 4 GB -
++	 * 0x103abc000 in 0187, 0x103ab4000 in 0189 - while the panel, which the
++	 * CP demonstrably does write, sits at 0x9d400000. The descriptors for
++	 * the two are the same in form (valid page, attribute index 0, AF set),
++	 * the fault record is empty, the ring drains, and the packets are
++	 * 64-bit addressed, so the difference worth removing is simply where
++	 * the memory is. A physical mask asks the allocator for pages under
++	 * 4 GB; if the fill lands there, the ceiling was an address one.
++	 */
++	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut, POLARIS_GPU_TEST_BYTES, 0x00000000fffff000ull);
++	if (memory == NULL) {
++		printf("POLARIS GPU: 19 test: nothing under 4 GB; using ordinary memory\n");
++		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut, POLARIS_GPU_TEST_BYTES, PAGE_SIZE);
++	}
 +	if (memory == NULL) {
 +		printf("POLARIS GPU: 19 test: no memory\n");
 +		return;
@@ -1101,6 +1134,15 @@
 +	}
 +	printf("POLARIS GPU: 19 test: %llu bytes at iova %#llx, physical %#llx\n",
 +	    size, address, memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone));
++	{
++		IOByteCount tail = 0;
++		addr64_t last = memory->getPhysicalSegment(size - PAGE_SIZE, &tail,
++		    kIOMemoryMapperNone);
++
++		printf("POLARIS GPU: 19 test: the buffer ends at physical %#llx, %s 4 GB\n",
++		    last + PAGE_SIZE - 1,
++		    (last + PAGE_SIZE - 1) < 0x100000000ull ? "under" : "over");
++	}
 +	{
 +		bool mapped = true;
 +
