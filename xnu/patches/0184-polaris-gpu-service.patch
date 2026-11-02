@@ -6,7 +6,7 @@
  bsd/dev/polaris_gpu.c			standard
  bsd/dev/polaris_wifi.c			standard
  bsd/dev/polaris_qmp.c			standard
- bsd/dev/polaris_modem.c		standard
+ bsd/dev/polaris_modem.c			standard
 +bsd/dev/polaris_gpu_service.cpp		standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
