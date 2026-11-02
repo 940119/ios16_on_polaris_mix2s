@@ -594,7 +594,7 @@
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,870 @@
+@@ -0,0 +1,879 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -1393,10 +1393,19 @@
 +	 * is which of the two differences between this buffer and the panel is
 +	 * the one that matters - where the memory is, or which window it is in -
 +	 * and that is one experiment each, run from a known-good starting point.
-+	 * The pages are handed over one by one because the descriptor does not
-+	 * promise that a 64 KB allocation is contiguous, and the readings in
-+	 * polaris_gpu_pa_test() go through the cache-inhibited view for the same
-+	 * reason the ones above do.
++	 *
++	 * The step is 4 KB and not PAGE_SIZE: the window is built out of 4 KB
++	 * descriptors while the kernel's pages are 16 KB, so a 64 KB buffer is
++	 * sixteen of the former and four of the latter. Stepping by PAGE_SIZE
++	 * hands the check four pages and 64 KB of length, which it refuses - the
++	 * first build of this test did exactly that and said so.
++	 *
++	 * getPhysicalSegment() returns the byte address inside the run, not the
++	 * base of the page holding it, which is why the addresses below are used
++	 * as they come back. The check's own result proves it: if the window's
++	 * pages aliased each other, the fill would have written 0xa5a5a5a5 into
++	 * the first 4 KB of each physical page and the count would have read 4096
++	 * changed words instead of none.
 +	 */
 +	{
 +		uint64_t pas[16];
@@ -1404,22 +1413,22 @@
 +		bool whole = true;
 +
 +		for (uint64_t offset = 0; offset < size && n < 16;
-+		    offset += PAGE_SIZE, n++) {
++		    offset += 4096, n++) {
 +			IOByteCount length = 0;
 +			addr64_t phys = memory->getPhysicalSegment(offset, &length,
 +			    kIOMemoryMapperNone);
 +
-+			if (phys == 0 || (phys & (PAGE_SIZE - 1)) != 0) {
++			if (phys == 0 || (phys & 0xfffull) != 0) {
 +				whole = false;
 +				break;
 +			}
 +			pas[n] = phys;
 +		}
-+		if (whole && (uint64_t)n == size / PAGE_SIZE) {
++		if (whole && (uint64_t)n == size / 4096) {
 +			polaris_gpu_pa_test(pas, n, size, words);
 +		} else {
 +			printf("POLARIS GPU: 19 pa test: %u of %llu pages have no address\n",
-+			    n, size / PAGE_SIZE);
++			    n, size / 4096);
 +		}
 +	}
 +
