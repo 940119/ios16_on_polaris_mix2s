@@ -62,6 +62,7 @@ extern void sweet_usb_probe(void);
 extern void polaris_wifi_probe(void);
 extern void polaris_qmp_probe(void);
 extern void polaris_modem_probe(void);
+extern void polaris_modem_state_kick(void);
 extern void polaris_modem_state_probe(void);
 
 #define REG_CAP         0x00
@@ -742,7 +743,7 @@ sweet_ufs_init(void)
 	 * polarismodem=2. It switches the MSS AHB clock on first, because the RMB
 	 * cannot be read without it, and that is the only write it makes.
 	 */
-	polaris_modem_state_probe();
+	polaris_modem_state_kick();
 	/*
 	 * Last, and off unless polarisgpuprobe=2. Build 0102 showed why: the
 	 * first read of the GPU clock controller parks the calling thread in the
