@@ -5,7 +5,7 @@
  	    (fWidth <= SWEET_FB_COLMAP_MAX) ? fWidth : 0);
  	IOLog("SWEET FB: blit %s\n", fStage != NULL ?
 -	    "gathers into a staging row, panel gets wide copies" :
-+	    "gathers four pixels at a time into a staging row, panel gets wide copies" :
++	    "gathers eight pixels at a time into a staging row, panel gets wide copies" :
  	    "gathers straight into the write-combined panel");
  	return true;
  }
