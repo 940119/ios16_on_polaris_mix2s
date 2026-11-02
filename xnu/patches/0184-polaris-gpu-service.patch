@@ -262,7 +262,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5268,69 @@
+@@ -5067,4 +5268,116 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -330,6 +330,53 @@
 +	}
 +	printf("POLARIS GPU: 19 the CP did not drain the fill: RPTR %u WPTR %u\n", rptr, wptr);
 +	return false;
++}
++
++/*
++ * Clear the context bank's fault record and make it walk the tables again.
++ *
++ * Both are no-ops when nothing is wrong, and both are what a mapping change
++ * owes the SMMU: FSR is one-to-clear and keeps the first fault until someone
++ * clears it, and a translation the SMMU has already cached is not affected by
++ * editing the descriptor underneath it.
++ */
++void
++polaris_gpu_window_sync(void)
++{
++	vm_offset_t cb = pg_smmu_cb(PG_GMU_CTX);
++
++	pg_wr(cb + PG_CB_FSR, 0xffffffffu);
++	pg_wr(cb + PG_CB_TLBIASID, PG_GMU_CTX);
++	pg_wr(cb + PG_CB_TLBSYNC, 1);
++	for (int i = 0; i < 100 && (pg_rd(cb + PG_CB_TLBSTATUS) & 1); i++) {
++		pg_sleep_us(10);
++	}
++}
++
++/*
++ * What the window and the CP say about one address, read back rather than
++ * recomputed. When the CP is asked to fill a buffer and the buffer comes back
++ * unchanged, the chain has four places to break - the level 2 entry, the level
++ * 3 page it points at, the entry inside that page, and the CP never having run
++ * the packet - and this prints all four, plus the fault record that says
++ * whether the walk failed. Build 0160 was three builds of guessing at exactly
++ * this, with the CPU reading every descriptor back as correct.
++ */
++void
++polaris_gpu_window_report(uint64_t iova)
++{
++	uint32_t l2 = (uint32_t)((iova >> 21) & 0x1ff);
++	uint32_t slot = (uint32_t)((iova >> 12) & 0x1ff);
++	uint64_t *l3 = (uint64_t *)pg_smmu_l3(iova);
++	vm_offset_t cb = pg_smmu_cb(PG_GMU_CTX);
++
++	printf("POLARIS GPU: 19 window %#llx: l2[%u] %#llx, l3 %p slot %u pte %#llx\n",
++	    iova, l2, ((uint64_t *)pg_l2_va)[l2], l3, slot, l3 ? l3[slot] : 0);
++	printf("POLARIS GPU: 19 window %#llx: ring WPTR %u RPTR %u cached %u; CB %u "
++	    "FSR %#010x FSYNR0 %#010x FAR %#010x%08x sGFSR %#010x\n", iova,
++	    pg_rd(pg_gpu3d + 4u * PG_CP_RB_WPTR), pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR),
++	    pg_cp_wptr, PG_GMU_CTX, pg_rd(cb + PG_CB_FSR), pg_rd(cb + 0x5c),
++	    pg_rd(cb + 0x64), pg_rd(cb + 0x60), pg_rd(pg_smmu + PG_SMMU_SGFSR));
 +}
  #endif
 
