@@ -289,7 +289,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5295,416 @@
+@@ -5067,4 +5295,551 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -705,10 +705,145 @@
 +	polaris_gpu_window_sync();
 +}
 +
++/* ---- the same packet at an address the allocator can put below 4 GB ------------------------------- */
++
++/*
++ * 0194 finally separated the two variables, on a ring that was not wedged:
++ *
++ *   the panel's own pages, 0x9d400000, through the program's window
++ *       16384 of 16384 words changed, all 0xa5a5a5a5
++ *   the client's pages, 0x103ab4000, through the same window
++ *       1008 of 16384 words changed
++ *   the client's pages, through the panel's window
++ *       0 of 16384 words changed
++ *
++ * Same packet, same window, same page tables, same context bank; the only
++ * difference left is where the memory is. Below 4 GB it is written completely.
++ * Above it, hardly at all, and in whichever window.
++ *
++ * 0191 tried to get there with IOBufferMemoryDescriptor::inTaskWithPhysicalMask
++ * and the mask was ignored. The allocator in this file already knows the way
++ * round that, because the GMU's regions needed it in step 10: kmem_alloc_contig
++ * walks the page array from a remembered index and stops at the first page above
++ * max, so after the machine has handed memory out once the scan starts high and
++ * gives up - while KMA_LOMEM selects a second cursor that starts at page zero.
++ *
++ * So: sixteen separate 4 KB pages, each asked for below 4 GB, each entered into
++ * the program's window at its own address, each read back on its own. One page
++ * per descriptor rather than one contiguous run, because contiguity is not what
++ * the window needs - it maps page by page - and sixteen small requests are far
++ * more likely to succeed than one large one.
++ */
++#define PG_LOW_PAGES	16u		/* 64 KB, the size the client test asks for */
++#define PG_LOW_SENTINEL	0xdeadbeefu
++
++void
++polaris_gpu_lowmem_test(void)
++{
++	vm_offset_t va[PG_LOW_PAGES], view[PG_LOW_PAGES];
++	uint64_t pa[PG_LOW_PAGES];
++	uint64_t iova, bytes = (uint64_t)PG_LOW_PAGES * (uint64_t)PG_GMU_PAGE_SIZE;
++	uint32_t have = 0, landed = 0, changed = 0, wrong = 0;
++	bool filled;
++
++	for (uint32_t i = 0; i < PG_LOW_PAGES; i++) {
++		va[i] = 0;
++		view[i] = 0;
++		pa[i] = 0;
++	}
++	for (uint32_t i = 0; i < PG_LOW_PAGES; i++) {
++		if (kmem_alloc_contig(kernel_map, &va[i], PG_GMU_PAGE_SIZE, 0,
++		    PG_MAX_PAGE_BELOW_4G, 0,
++		    KMA_KOBJECT | KMA_ZERO | KMA_DATA | KMA_LOMEM,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("POLARIS GPU: 19 low: page %u: the allocator has nothing below 4 GB\n", i);
++			break;
++		}
++		pa[i] = kvtophys(va[i]);
++		if (pa[i] == 0 || pa[i] + PG_GMU_PAGE_SIZE > PG_ADDRESS_LIMIT) {
++			printf("POLARIS GPU: 19 low: page %u came back at %#llx, above 4 GB\n", i, pa[i]);
++			va[i] = 0;
++			break;
++		}
++		view[i] = ml_io_map((vm_offset_t)pa[i], PG_GMU_PAGE_SIZE);
++		if (view[i] == 0) {
++			printf("POLARIS GPU: 19 low: page %u at %#llx has no CPU view\n", i, pa[i]);
++			va[i] = 0;
++			break;
++		}
++		have = i + 1u;
++	}
++	if (have == 0) {
++		printf("POLARIS GPU: 19 low: nothing to test\n");
++		return;
++	}
++	iova = polaris_gpu_address(bytes);
++	if (iova == 0) {
++		printf("POLARIS GPU: 19 low: no address in the program's window\n");
++		goto out;
++	}
++	for (uint32_t i = 0; i < have; i++) {
++		for (uint32_t w = 0; w < PG_GMU_PAGE_SIZE / 4u; w++) {
++			((volatile uint32_t *)view[i])[w] = PG_LOW_SENTINEL;
++		}
++		if (!polaris_gpu_map_at(iova + (uint64_t)i * PG_GMU_PAGE_SIZE, pa[i])) {
++			printf("POLARIS GPU: 19 low: page %u will not enter the window\n", i);
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	polaris_gpu_mapped();
++	polaris_gpu_window_sync();
++	printf("POLARIS GPU: 19 low: %u pages below 4 GB, %#llx..%#llx, entered at %#llx\n",
++	    have, pa[0], pa[have - 1u] + PG_GMU_PAGE_SIZE - 1u, iova);
++	filled = polaris_gpu_fill_batched(iova, have * (PG_GMU_PAGE_SIZE / 4u));
++	polaris_gpu_window_report(iova);
++	for (uint32_t i = 0; i < have; i++) {
++		uint32_t page_changed = 0, page_wrong = 0;
++
++		for (uint32_t w = 0; w < PG_GMU_PAGE_SIZE / 4u; w++) {
++			uint32_t v = ((volatile uint32_t *)view[i])[w];
++
++			if (v != PG_LOW_SENTINEL) {
++				page_changed++;
++				if (v != PG_FILL_WORD) {
++					page_wrong++;
++				}
++			}
++		}
++		changed += page_changed;
++		wrong += page_wrong;
++		if (page_changed == PG_GMU_PAGE_SIZE / 4u && page_wrong == 0) {
++			landed++;
++		}
++		printf("POLARIS GPU: 19 low: page %u at %#llx: %u of %u words\n", i, pa[i],
++		    page_changed, PG_GMU_PAGE_SIZE / 4u);
++	}
++	printf("POLARIS GPU: 19 low: the CP %s; %u of %u pages took the fill, %u of %llu "
++	    "words changed, %u of those are not 0xa5a5a5a5\n",
++	    filled ? "drained" : "did NOT drain", landed, have, changed,
++	    (uint64_t)have * (PG_GMU_PAGE_SIZE / 4u), wrong);
++	printf("POLARIS GPU: 19 low: %s\n",
++	    (filled && landed == have && wrong == 0) ?
++	    "THE GPU WRITES DRAM BELOW 4 GB" :
++	    "memory below 4 GB is not written either");
++	polaris_gpu_unmap(iova, bytes);
++	polaris_gpu_mapped();
++	polaris_gpu_address_free(iova, bytes);
++out:
++	/*
++	 * The pages are not given back on purpose. kmem_alloc_contig rounds the
++	 * request up to the kernel's page size - 16 KB here, for a 4 KB ask - and
++	 * kmem_free with a size that is not the one that was allocated is a
++	 * panic, not a leak. This runs once per boot, before anything is built on
++	 * it, so leaking 256 KB is the cheap side of that trade.
++	 */
++	(void)va;
++}
++
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,898 @@
+@@ -0,0 +1,932 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -783,6 +918,7 @@
 +void polaris_gpu_window_report(uint64_t iova);
 +void polaris_gpu_pa_test(const uint64_t *pas, uint32_t pages, uint64_t bytes,
 +    volatile uint32_t *cpu);
++void polaris_gpu_lowmem_test(void);
 +}
 +
 +/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -1505,12 +1641,32 @@
 +	 */
 +	filled = polaris_gpu_fill_batched(address, (uint32_t)(size / 4));
 +	polaris_gpu_window_report(address);
-+	for (uint64_t i = 0; i < size / 4; i++) {
-+		if (words[i] != before) {
-+			changed++;
-+			if (words[i] != 0xa5a5a5a5u) {
-+				wrong++;
++	/*
++	 * Where the changes are, not only how many. 0194 reported 1008 of 16384
++	 * and the count alone cannot say whether that is the first page and a
++	 * half, or sixteen pages with a few words each, and those are different
++	 * faults.
++	 */
++	{
++		uint64_t first = 0, last = 0;
++		bool seen = false;
++
++		for (uint64_t i = 0; i < size / 4; i++) {
++			if (words[i] != before) {
++				changed++;
++				if (!seen) {
++					first = i;
++					seen = true;
++				}
++				last = i;
++				if (words[i] != 0xa5a5a5a5u) {
++					wrong++;
++				}
 +			}
++		}
++		if (seen) {
++			printf("POLARIS GPU: 19 test: the changes run from word %llu to %llu\n",
++			    first, last);
 +		}
 +	}
 +	printf("POLARIS GPU: 19 test: one packet per write pointer, the CP %s; %u of %llu "
@@ -1564,6 +1720,19 @@
 +			    n, size / 4096);
 +		}
 +	}
++
++	/*
++	 * 0195: and now the address the allocator can actually deliver.
++	 *
++	 * 0194 put the two variables apart on a ring that was not wedged: the
++	 * panel's pages fill completely through the program's window, the
++	 * client's pages hardly at all through either window. The address is the
++	 * difference, and the descriptor that came back from
++	 * inTaskWithPhysicalMask in 0191 says the allocator will not help - so
++	 * this asks kmem_alloc_contig with KMA_LOMEM instead, one 4 KB page at a
++	 * time, and runs the same packet at the address it hands back.
++	 */
++	polaris_gpu_lowmem_test();
 +
 +	polaris_gpu_unmap(address, size);
 +	polaris_gpu_mapped();
