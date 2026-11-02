@@ -1,0 +1,1028 @@
+--- a/bsd/conf/files	2026-11-02 14:04:53.000000000 +0800
++++ b/bsd/conf/files	2026-11-02 14:04:53.000000000 +0800
+@@ -114,9 +114,10 @@
+ bsd/dev/polaris_touch_i2c.c		standard
+ bsd/dev/polaris_gpu_diag.c		standard
+ bsd/dev/polaris_gpu.c			standard
+ bsd/dev/polaris_wifi.c			standard
+ bsd/dev/polaris_qmp.c			standard
+ bsd/dev/polaris_modem.c		standard
++bsd/dev/polaris_gpu_service.cpp		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/polaris_gpu.c	2026-11-02 14:04:53.000000000 +0800
++++ b/bsd/dev/polaris_gpu.c	2026-11-02 14:04:53.000000000 +0800
+@@ -19,6 +19,14 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ extern bool polaris_touch_i2c_board(void);
++/*
++ * bsd/dev/polaris_gpu_service.cpp: the IOKit service Mesa's freedreno opens
++ * ("PolarisGPU") and the window server would draw through. Started from here
++ * only when the ladder has left the CP and the tables in place, because a
++ * service that exists and cannot map memory is worse than one that does not
++ * exist: CoreAnimation finds it, uses it, and fails a frame at a time.
++ */
++extern void polaris_gpu_service_start(void);
+ 
+ enum polaris_gpu_stage {
+ 	POLARIS_GPU_BOARD,
+@@ -1081,8 +1089,18 @@
+  * The level 1 entry is unchanged: 0x10000000 >> 30 is 0 for every one of these
+  * five entries, and build 0140's fault was an empty level 1 entry, not an
+  * empty level 2 one.
+- */
+-#define PG_CP_WINDOW_L2S	6u
++ *
++ * Build 0184 adds the user window on top of the six: Mesa's freedreno asks the
++ * kernel for buffers and needs somewhere to put them, and the CP can only
++ * reach what these tables describe. Entries 6..37 are the program's
++ * (PG_USER_IOVA onward, 64 MB), so the window is 38 level 3 pages, 152 KB of
++ * kernel memory, and every mapping in it still goes through pg_smmu_l3().
++ * Nothing already mapped moves: 0x10a00000 (the panel surface) is entry 5.
++ */
++#define PG_CP_WINDOW_L2S	38u
++#define PG_USER_IOVA		0x10c00000ull	/* entry 6: the program's buffers, 64 MB */
++#define PG_USER_SIZE		(32ull << 21)
++#define PG_ADDR_SLOTS		1024u
+ 
+ static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
+ static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
+@@ -1407,6 +1425,164 @@
+ 	return true;
+ }
+ 
++/* ---- the program's buffers: addresses in the user window, and their mappings ---------------------- */
++
++/*
++ * A first-fit allocator over PG_USER_IOVA, with the free spans kept sorted and
++ * merged, so that a program that makes and gives back buffers of the same size
++ * (Mesa does: a texture per frame of an animation) gets the same address back
++ * rather than a new one each time.
++ *
++ * No lock here: the IOKit service takes its own around every call that reaches
++ * this, the way hakios.gpu.cpp keeps gGPULock around hakios_gpu_address().
++ */
++struct pg_addr_span {
++	uint64_t base, size;
++};
++
++static struct pg_addr_span pg_addr_free[PG_ADDR_SLOTS] = {
++	{ PG_USER_IOVA, PG_USER_SIZE },
++};
++static unsigned pg_addr_count = 1;
++static uint32_t pg_addr_live;
++
++uint64_t
++polaris_gpu_address(uint64_t size)
++{
++	if (size == 0 || size > PG_USER_SIZE) {
++		return 0;
++	}
++	size = round_page((vm_size_t)size);
++	if (size > PG_USER_SIZE) {
++		return 0;
++	}
++	for (unsigned i = 0; i < pg_addr_count; i++) {
++		uint64_t base;
++
++		if (pg_addr_free[i].size < size) {
++			continue;
++		}
++		base = pg_addr_free[i].base;
++		pg_addr_free[i].base += size;
++		pg_addr_free[i].size -= size;
++		if (pg_addr_free[i].size == 0) {
++			memmove(&pg_addr_free[i], &pg_addr_free[i + 1],
++			    (pg_addr_count - i - 1) * sizeof(pg_addr_free[0]));
++			pg_addr_count--;
++		}
++		pg_addr_live++;
++		return base;
++	}
++	printf("POLARIS GPU: 19 no room for %llu bytes of GPU addresses (%u free spans)\n",
++	    size, pg_addr_count);
++	return 0;
++}
++
++void
++polaris_gpu_address_free(uint64_t base, uint64_t size)
++{
++	unsigned i = 0;
++
++	if (size == 0 || size > PG_USER_SIZE ||
++	    base < PG_USER_IOVA || base + size > PG_USER_IOVA + PG_USER_SIZE) {
++		return;
++	}
++	size = round_page((vm_size_t)size);
++	while (i < pg_addr_count && pg_addr_free[i].base < base) {
++		i++;
++	}
++	/*
++	 * A span overlapping one already free is a second free of the same
++	 * buffer. Refusing it keeps the list sorted and mergeable; without the
++	 * check a double free produces overlapping free spans and the same
++	 * address is handed to two buffers, which the GPU then writes twice.
++	 */
++	if ((i > 0 && pg_addr_free[i - 1].base + pg_addr_free[i - 1].size > base) ||
++	    (i < pg_addr_count && base + size > pg_addr_free[i].base)) {
++		printf("POLARIS GPU: 19 %#llx+%llu is given back and overlaps a free span; refused\n",
++		    base, size);
++		return;
++	}
++	if (pg_addr_count >= PG_ADDR_SLOTS) {
++		printf("POLARIS GPU: 19 the address table is full; %#llx+%llu leaks\n", base, size);
++		return;
++	}
++	memmove(&pg_addr_free[i + 1], &pg_addr_free[i],
++	    (pg_addr_count - i) * sizeof(pg_addr_free[0]));
++	pg_addr_free[i].base = base;
++	pg_addr_free[i].size = size;
++	pg_addr_count++;
++	if (i + 1 < pg_addr_count &&
++	    pg_addr_free[i].base + pg_addr_free[i].size == pg_addr_free[i + 1].base) {
++		pg_addr_free[i].size += pg_addr_free[i + 1].size;
++		memmove(&pg_addr_free[i + 1], &pg_addr_free[i + 2],
++		    (pg_addr_count - i - 2) * sizeof(pg_addr_free[0]));
++		pg_addr_count--;
++	}
++	if (i > 0 && pg_addr_free[i - 1].base + pg_addr_free[i - 1].size == pg_addr_free[i].base) {
++		pg_addr_free[i - 1].size += pg_addr_free[i].size;
++		memmove(&pg_addr_free[i], &pg_addr_free[i + 1],
++		    (pg_addr_count - i - 1) * sizeof(pg_addr_free[0]));
++		pg_addr_count--;
++	}
++	if (pg_addr_live > 0) {
++		pg_addr_live--;
++	}
++}
++
++/*
++ * One 4 KB page of a program's buffer into the user window. The address has to
++ * be one polaris_gpu_address() gave out: anything else would rewrite another
++ * window's descriptors, which is exactly what pg_smmu_l3() exists to prevent.
++ *
++ * read_only is not honoured yet - every page here gets the same attributes,
++ * the ones the CP's own buffers use. The SMMU on this block does have a
++ * read-only attribute, but nothing has yet proved which bit of it the A630
++ * honours, and guessing would only turn a wrong write into a silent one.
++ */
++bool
++polaris_gpu_map(uint64_t iova, uint64_t pa, bool read_only)
++{
++	uint64_t *l3;
++
++	(void)read_only;
++	if (iova < PG_USER_IOVA || iova >= PG_USER_IOVA + PG_USER_SIZE) {
++		return false;
++	}
++	l3 = (uint64_t *)pg_smmu_l3(iova);
++	if (l3 == NULL) {
++		return false;
++	}
++	l3[(iova >> 12) & 0x1ff] = (pa & PG_PTE_ADDR) | PG_PTE_ATTR | PG_PTE_PAGE;
++	return true;
++}
++
++/*
++ * The descriptors are written; make the SMMU read them. One flush for a whole
++ * buffer, not one a page: 64 pages of descriptors are 512 bytes in one level 3
++ * page, and a dc civac each would be 64 of them for the same cache lines.
++ */
++void
++polaris_gpu_mapped(void)
++{
++	for (unsigned i = 0; i < PG_CP_WINDOW_L2S; i++) {
++		pg_to_memory(pg_l3b_va + (vm_offset_t)i * PG_GMU_PAGE_SIZE, PG_GMU_PAGE_SIZE);
++	}
++}
++
++void
++polaris_gpu_unmap(uint64_t iova, uint64_t size)
++{
++	for (uint64_t off = 0; off < size; off += PG_GMU_PAGE_SIZE) {
++		uint64_t at = iova + off;
++		uint64_t *l3 = (uint64_t *)pg_smmu_l3(at);
++
++		if (l3 != NULL) {
++			l3[(at >> 12) & 0x1ff] = 0;
++		}
++	}
++}
++
+ /*
+  * IMPL_DEF1 is at base + 6 pages, and its first word is the micro MMU's
+  * control word. The vendor driver halts the SMMU around the
+@@ -4865,7 +5041,7 @@
+ 	pg_smmu_mode = (map == 1);
+ 	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
+ 	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
+-	printf("POLARIS GPU: build 0144 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
++	printf("POLARIS GPU: build 0184 up=%d mmu=%d mem=%d regions=%s\n", upto, pg_mmu_way,
+ 	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
+ 	    "physical, stream 5 bypassed (polarisgpumap=0)");
+ 	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
+@@ -5049,6 +5225,18 @@
+ 	if (upto > 0) {
+ 		polaris_gpu.state = POLARIS_GPU_STARTING;
+ 		polaris_gpu_up(upto);
++		/*
++		 * The service is published only once there is something behind it:
++		 * polaris_gpu_ready() is the CP having taken its ring and the SMMU
++		 * tables existing, which is what a buffer needs to be entered into
++		 * the GPU's address space at all. Below that the ladder is still a
++		 * probe, and nothing outside this file may look at it.
++		 */
++		if (polaris_gpu_ready()) {
++			polaris_gpu_service_start();
++		} else {
++			printf("POLARIS GPU: the ladder stopped before the CP; no service published\n");
++		}
+ 		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
+ 		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
+ 		return;
+@@ -5067,4 +5255,69 @@
+ 	polaris_gpu_unwind(&polaris_gpu, true);
+ 	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
+ }
++
++/*
++ * The ladder reached the CP and the tables exist: what the service may answer.
++ * Both are needed - pg_gpu3d for the CP to submit through, pg_l3b_va for a
++ * buffer to have descriptors at all - and neither alone is worth a service.
++ */
++bool
++polaris_gpu_ready(void)
++{
++	return pg_keep_running && pg_gpu3d != 0 && pg_l3b_va != 0;
++}
++
++/* ---- the CP at an address the caller chose, for the service's own test ---------------------------- */
++
++#define PG_FILL_CHUNK	1024u		/* what step 17 uses: 1024 dwords in one CP_MEM_WRITE */
++#define PG_FILL_WORD	0xa5a5a5a5u
++
++/*
++ * Fill `words` dwords at `iova` through the CP and wait for the ring to drain.
++ *
++ * This is step 17's packet at an address the caller chose, and it exists for
++ * one reason: to prove that a buffer the program owns is really reachable by
++ * the GPU before anything is built on it. A descriptor the CPU reads back as
++ * correct proves nothing - build 0160 wrote exactly the right descriptors and
++ * the first write past the fifth table was still a translation fault, because
++ * what the code did with kvtophys() was not what it said.
++ */
++bool
++polaris_gpu_fill(uint64_t iova, uint32_t words)
++{
++	uint32_t wptr = pg_cp_wptr;
++	uint32_t sent = 0;
++	uint32_t rptr = 0;
++
++	if (pg_gpu3d == 0 || pg_ring_va[0] == 0 || words == 0 ||
++	    iova < PG_USER_IOVA || iova + 4ull * words > PG_USER_IOVA + PG_USER_SIZE) {
++		return false;
++	}
++	while (sent < words) {
++		uint32_t n = words - sent < PG_FILL_CHUNK ? words - sent : PG_FILL_CHUNK;
++		uint64_t addr = iova + 4ull * sent;
++
++		pg_ring_put(wptr++, pg_pkt7(PG_CP_MEM_WRITE, n + 2u));
++		pg_ring_put(wptr++, (uint32_t)addr);
++		pg_ring_put(wptr++, (uint32_t)(addr >> 32));
++		for (uint32_t i = 0; i < n; i++) {
++			pg_ring_put(wptr++, PG_FILL_WORD);
++		}
++		sent += n;
++		wptr &= PG_RING_WORDS - 1u;
++	}
++	pg_ring_flush();
++	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < 20000; i++) {
++		rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u);
++		if (rptr == wptr) {
++			pg_cp_wptr = wptr;
++			return true;
++		}
++		pg_sleep_us(100);
++	}
++	printf("POLARIS GPU: 19 the CP did not drain the fill: RPTR %u WPTR %u\n", rptr, wptr);
++	return false;
++}
+ #endif
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ b/bsd/dev/polaris_gpu_service.cpp	2026-11-02 14:04:53.000000000 +0800
+@@ -0,0 +1,711 @@
++/*
++ * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
++ * one CoreAnimation would draw through if it were ever given a GL context.
++ *
++ * Why it exists
++ * -------------
++ * bsd/dev/polaris_gpu.c drives the block from the kernel and stops there: it
++ * can fill memory through the CP, and nothing outside the kernel can ask it to.
++ * Mesa's freedreno, which is what HackiOS's port draws the screen with (and what
++ * the Mi 8 port borrows), is a user-space library that speaks Linux's msm DRM:
++ * it opens "msm", asks for buffers, maps them, submits command buffers and waits
++ * on fences. Between the two there is exactly one thing missing, and this file
++ * is it.
++ *
++ * The ABI is Linux's, unchanged. msm's request numbers are DRM_COMMAND_BASE plus
++ * the value in Mesa's drm-uapi/msm_drm.h, the structures are the ones that
++ * header declares, and the low byte of the ioctl code is the selector a call
++ * arrives on - which is what makes a 227-line libdrm stand-in possible on the
++ * other side (HackiOS's tools/mesa/hakios-drm/hakios.drm.c; ours is the same
++ * shape). Nothing here is invented, because an invented number would be a number
++ * Mesa does not send.
++ *
++ * What is here, and what is not
++ * -----------------------------
++ * Here: the service, a client, buffers (make, describe, give back), the map into
++ * the process, and the submit-queue requests that only need an id. A buffer is
++ * wired memory of this kernel's, entered page by page into the SMMU window that
++ * polaris_gpu.c now keeps for the purpose (PG_USER_IOVA, 64 MB).
++ *
++ * Not here: submit and fences. A submission is a command buffer the program
++ * wrote, and handing one to the CP means deciding what happens when it does not
++ * complete, what a fence is made of, and what the GPU is allowed to do to
++ * memory it was not given. polaris_gpu_fill() below proves the first half of
++ * that (the CP can write a program's buffer at all); the rest is the next build,
++ * and pretending otherwise would put a submit path in front of a fence that
++ * cannot yet say "done".
++ *
++ * How it is checked without a user space
++ * --------------------------------------
++ * `polarisgputest=1` makes the kernel run one round of what a client would do:
++ * make 64 KB, enter it into the GPU's address space, fill it with 0xdeadbeef
++ * from the CPU, have the CP overwrite it with 0xa5a5a5a5, read it back from the
++ * CPU, give it back. The count of words that came back changed is the answer,
++ * and it is the only answer that means anything: a descriptor the CPU reads back
++ * as correct says nothing about whether the GPU can use it (build 0160).
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <kern/task.h>
++#include <mach/mach_time.h>
++#include <mach/vm_param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++extern "C" {
++bool polaris_gpu_ready(void);
++uint64_t polaris_gpu_address(uint64_t size);
++void polaris_gpu_address_free(uint64_t address, uint64_t size);
++bool polaris_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void polaris_gpu_mapped(void);
++void polaris_gpu_unmap(uint64_t address, uint64_t size);
++bool polaris_gpu_fill(uint64_t iova, uint32_t words);
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++/*
++ * Linux's, from Mesa's drm-uapi/msm_drm.h, field for field. The padding is not
++ * decoration: the structures cross a boundary between two compilers, and a
++ * struct that is a different size on either side is a request that arrives
++ * shifted. Every one below is 8-byte aligned the way the uapi declares it.
++ */
++struct msm_timespec {
++	int64_t seconds, nanoseconds;
++};
++struct msm_param {
++	uint32_t pipe, param;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_new {
++	uint64_t size;
++	uint32_t flags, handle;
++};
++struct msm_gem_info {
++	uint32_t handle, info;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_cpu_prep {
++	uint32_t handle, op;
++	struct msm_timespec timeout;
++};
++struct msm_gem_madvise {
++	uint32_t handle, madv, retained;
++};
++struct msm_submitqueue {
++	uint32_t flags, prio, id;
++};
++struct msm_submitqueue_query {
++	uint64_t data;
++	uint32_t id, param, len, pad;
++};
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++
++enum {
++	kDrmGemClose            = 0x09,
++	kMsmGetParam            = 0x40,
++	kMsmSetParam            = 0x41,
++	kMsmGemNew              = 0x42,
++	kMsmGemInfo             = 0x43,
++	kMsmGemCpuPrep          = 0x44,
++	kMsmGemCpuFini          = 0x45,
++	kMsmGemSubmit           = 0x46,
++	kMsmWaitFence           = 0x47,
++	kMsmGemMadvise          = 0x48,
++	kMsmSubmitQueueNew      = 0x4a,
++	kMsmSubmitQueueClose    = 0x4b,
++	kMsmSubmitQueueQuery    = 0x4c,
++};
++
++#define MSM_BO_SCANOUT          0x00000001
++#define MSM_BO_GPU_READONLY     0x00000002
++#define MSM_BO_CACHED           0x00000100
++#define MSM_BO_WC               0x00000200
++#define MSM_BO_UNCACHED         0x00000400
++
++#define MSM_INFO_GET_OFFSET     0
++#define MSM_INFO_GET_IOVA       1
++
++#define GPU_BUFFERS             4096            /* a client's, at most */
++#define GPU_BUFFER_MAX          (256u << 20)    /* one buffer, as msm's own limit */
++
++static IOLock * gGPULock;                       /* around everything that is the GPU's */
++static bool gGPUReported;
++static uint32_t gParamAsked[16];                /* which MSM_PARAM_* were asked, and how often (the first 16) */
++static uint32_t gParamCount;
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class PolarisGPU : public IOService
++{
++	OSDeclareDefaultStructors(PolarisGPU);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PolarisGPU, IOService);
++
++bool
++PolarisGPU::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	/*
++	 * The name is the one drmOpenWithType("msm") looks for: the libdrm
++	 * stand-in has no device nodes to walk, so it asks the registry for a
++	 * service by name and opens that.
++	 */
++	setProperty(kIOUserClientClassKey, "PolarisGPUUserClient");
++	setName("PolarisGPU");
++	registerService();
++	printf("POLARIS GPU: 19 the service is published (PolarisGPU)\n");
++	return true;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++struct gpu_buffer {
++	IOMemoryDescriptor *    memory;         /* NULL: this handle is free */
++	uint8_t *               kernel;         /* where it is in the kernel, when it is ours */
++	uint64_t                address;        /* the GPU's for it */
++	uint64_t                size;
++	uint32_t                flags;
++};
++
++class PolarisGPUUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(PolarisGPUUserClient);
++
++	task_t                  fTask;
++	struct gpu_buffer *     fBuffers;       /* handle n is fBuffers[n - 1] */
++	uint32_t                fNextBuffer;    /* where the search for a free handle starts */
++	uint32_t                fBufferCount;
++	uint64_t                fBufferBytes;
++	uint32_t                fNextQueue;
++	uint32_t                fStrangers;     /* requests that named a buffer this client does not have */
++
++	struct gpu_buffer * buffer(uint32_t handle);
++	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size,
++	    uint32_t flags, uint32_t * handle);
++	void freeBuffer(struct gpu_buffer * b);
++	IOReturn gemNew(struct msm_gem_new * request);
++	IOReturn gemInfo(struct msm_gem_info * request);
++	IOReturn gemClose(struct drm_gem_close * request);
++
++public:
++	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type,
++	    OSDictionary * properties) APPLE_KEXT_OVERRIDE;
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options,
++	    IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PolarisGPUUserClient, IOUserClient);
++
++bool
++PolarisGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type,
++    OSDictionary * properties)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
++		return false;
++	}
++	fTask = owningTask;
++	return true;
++}
++
++bool
++PolarisGPUUserClient::start(IOService * provider)
++{
++	if (!polaris_gpu_ready() || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
++	if (fBuffers == NULL) {
++		printf("POLARIS GPU: 19 a client has no room for its buffer table\n");
++		return false;
++	}
++	printf("POLARIS GPU: 19 a client is attached\n");
++	return true;
++}
++
++struct gpu_buffer *
++PolarisGPUUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > GPU_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		if (handle != 0 && fStrangers++ < 16) {
++			printf("POLARIS GPU: 19 buffer %u is asked for and is not there\n", handle);
++		}
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++/*
++ * A handle and an address of the GPU's for `size` bytes of a memory descriptor,
++ * from byte `from` of it on, in whole pages. Called with gGPULock held; NULL
++ * means there was no room or the memory could not be entered.
++ */
++struct gpu_buffer *
++PolarisGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size,
++    uint32_t flags, uint32_t * handle)
++{
++	struct gpu_buffer * b = NULL;
++	bool mapped = true;
++
++	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			*handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL) {
++		printf("POLARIS GPU: 19 the client has no handles left\n");
++		return NULL;
++	}
++	b->address = polaris_gpu_address(size);
++	if (b->address == 0) {
++		return NULL;
++	}
++	/*
++	 * Page by page, and the physical address asked for each one: this kernel
++	 * runs 16 KB pages while the SMMU's are 4 KB, and a descriptor is per 4 KB.
++	 * The GPU's window is 64 MB of IOVA, so a 256 MB buffer would not fit; the
++	 * limit is the window's, not this loop's.
++	 */
++	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && polaris_gpu_map(b->address + offset, phys,
++		    (flags & MSM_BO_GPU_READONLY) != 0);
++	}
++	polaris_gpu_mapped();
++	if (!mapped) {
++		polaris_gpu_unmap(b->address, size);
++		polaris_gpu_address_free(b->address, size);
++		printf("POLARIS GPU: 19 a buffer of %llu bytes cannot be entered into the GPU's "
++		    "address space\n", size);
++		return NULL;
++	}
++	memory->retain();
++	b->memory = memory;
++	b->kernel = OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL ?
++	    (uint8_t *) OSDynamicCast(IOBufferMemoryDescriptor, memory)->getBytesNoCopy() : NULL;
++	b->size = size;
++	b->flags = flags;
++	fBufferCount++;
++	fBufferBytes += size;
++	return b;
++}
++
++/* Called with gGPULock held. Nothing has been submitted yet, so nothing can be in the GPU's hands. */
++void
++PolarisGPUUserClient::freeBuffer(struct gpu_buffer * slot)
++{
++	struct gpu_buffer saved = *slot;
++	struct gpu_buffer * b = &saved;
++
++	/* out of the handle first, so that a second close of it finds nothing */
++	slot->memory = NULL;
++	slot->kernel = NULL;
++	if (fBufferCount > 0) {
++		fBufferCount--;
++	}
++	fBufferBytes -= b->size;
++
++	polaris_gpu_unmap(b->address, b->size);
++	polaris_gpu_mapped();
++	polaris_gpu_address_free(b->address, b->size);
++	OSSafeReleaseNULL(b->memory);
++}
++
++IOReturn
++PolarisGPUUserClient::gemNew(struct msm_gem_new * request)
++{
++	uint64_t size = request->size;
++	IOBufferMemoryDescriptor * memory;
++	struct gpu_buffer * b;
++	uint32_t handle = 0;
++
++	if (size == 0 || size > GPU_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	size = round_page((vm_size_t) size);
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut, (vm_size_t) size, PAGE_SIZE);
++	if (memory == NULL) {
++		printf("POLARIS GPU: 19 no memory for a buffer of %llu bytes\n", size);
++		return kIOReturnNoMemory;
++	}
++	/*
++	 * What the program gets is zeroed memory. msm does not promise that, but
++	 * a window server that draws into a buffer before writing every pixel of
++	 * it shows whatever was there, and on this port that was somebody else's
++	 * frame; the cost is one bzero of a buffer that is about to be written
++	 * anyway.
++	 */
++	bzero(memory->getBytesNoCopy(), (size_t) size);
++
++	IOLockLock(gGPULock);
++	b = newBuffer(memory, 0, size, request->flags, &handle);
++	IOLockUnlock(gGPULock);
++	memory->release();
++	if (b == NULL) {
++		return kIOReturnNoMemory;
++	}
++	request->handle = handle;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++PolarisGPUUserClient::gemInfo(struct msm_gem_info * request)
++{
++	struct gpu_buffer * b;
++
++	IOLockLock(gGPULock);
++	b = buffer(request->handle);
++	if (b == NULL) {
++		IOLockUnlock(gGPULock);
++		return kIOReturnBadArgument;
++	}
++	switch (request->info) {
++	case MSM_INFO_GET_IOVA:
++		request->value = b->address;
++		break;
++	case MSM_INFO_GET_OFFSET:
++		request->value = 0;
++		break;
++	default:
++		IOLockUnlock(gGPULock);
++		return kIOReturnBadArgument;
++	}
++	IOLockUnlock(gGPULock);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++PolarisGPUUserClient::gemClose(struct drm_gem_close * request)
++{
++	struct gpu_buffer * b;
++
++	IOLockLock(gGPULock);
++	b = buffer(request->handle);
++	if (b == NULL) {
++		IOLockUnlock(gGPULock);
++		return kIOReturnBadArgument;
++	}
++	freeBuffer(b);
++	IOLockUnlock(gGPULock);
++	return kIOReturnSuccess;
++}
++
++/* The program's mapping of a buffer: IOConnectMapMemory(type = handle) lands here. */
++IOReturn
++PolarisGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options,
++    IOMemoryDescriptor ** memory)
++{
++	struct gpu_buffer * b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gGPULock);
++	b = buffer(type);
++	if (b != NULL) {
++		b->memory->retain();
++		*memory = b->memory;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gGPULock);
++	return ret;
++}
++
++IOReturn
++PolarisGPUUserClient::clientClose(void)
++{
++	if (fBuffers != NULL) {
++		IOLockLock(gGPULock);
++		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++			if (fBuffers[i].memory != NULL) {
++				freeBuffer(&fBuffers[i]);
++			}
++		}
++		IOLockUnlock(gGPULock);
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++PolarisGPUUserClient::free(void)
++{
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
++		fBuffers = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++PolarisGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
++{
++	union {
++		struct msm_param param;
++		struct msm_gem_new gemNew;
++		struct msm_gem_info gemInfo;
++		struct msm_gem_cpu_prep cpuPrep;
++		struct msm_gem_madvise madvise;
++		struct msm_submitqueue queue;
++		struct msm_submitqueue_query query;
++		struct drm_gem_close close;
++	} r;
++	size_t size = args->structureInputSize;
++	IOReturn ret = kIOReturnSuccess;
++
++	(void)dispatch;
++	(void)target;
++	(void)reference;
++
++	if (size > sizeof(r) || fBuffers == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!polaris_gpu_ready()) {
++		return kIOReturnNotReady;
++	}
++	bzero(&r, sizeof(r));
++	if (size != 0) {
++		if (args->structureInput == NULL) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(&r, args->structureInput, size);
++	}
++
++	switch (selector) {
++	case kMsmGetParam:
++		/*
++		 * Mesa asks what the hardware is before it will touch it, and the
++		 * answers are the one place where a plausible guess is worse than
++		 * nothing: a wrong GPU_MODEL makes it program the wrong register
++		 * set. So they are recorded, not answered - the log says which ones
++		 * this Mesa wanted, in what order, which is what the next build
++		 * needs to fill them in from the device tree rather than from
++		 * memory. FAULTS and SUSPENDS are zero and truly are zero: nothing
++		 * has been submitted.
++		 */
++		switch (r.param.param) {
++		case 0x09:                              /* MSM_PARAM_FAULTS */
++		case 0x0a:                              /* MSM_PARAM_SUSPENDS */
++			r.param.value = 0;
++			break;
++		default:
++			if (gParamCount < 16) {
++				bool seen = false;
++
++				for (uint32_t i = 0; i < gParamCount; i++) {
++					seen = seen || gParamAsked[i] == r.param.param;
++				}
++				if (!seen) {
++					gParamAsked[gParamCount++] = r.param.param;
++					printf("POLARIS GPU: 19 MSM_PARAM %#x is asked for and not "
++					    "answered\n", r.param.param);
++				}
++			}
++			ret = kIOReturnUnsupported;
++			break;
++		}
++		break;
++	case kMsmSetParam:                              /* the program's name, for Linux's lists */
++	case kMsmGemCpuFini:
++	case kMsmSubmitQueueClose:
++		break;
++	case kMsmGemNew:
++		ret = gemNew(&r.gemNew);
++		break;
++	case kMsmGemInfo:
++		ret = gemInfo(&r.gemInfo);
++		break;
++	case kMsmGemCpuPrep:
++		/*
++		 * "Is the GPU done with this buffer?" Nothing has been submitted, so
++		 * it always is. This is true only while there is no submit path; the
++		 * build that adds one has to make this wait on a fence, and this
++		 * comment is here to be deleted when it does.
++		 */
++		break;
++	case kMsmGemMadvise:                            /* freedreno asks about every buffer it reuses */
++		r.madvise.retained = 1;
++		break;
++	case kMsmSubmitQueueNew:
++		r.queue.id = ++fNextQueue;
++		break;
++	case kMsmSubmitQueueQuery:
++		if (r.query.data != 0 && r.query.len >= sizeof(uint64_t)) {
++			uint64_t zero = 0;
++
++			copyout(&zero, (user_addr_t) r.query.data, sizeof(zero));
++		}
++		break;
++	case kMsmGemSubmit:
++	case kMsmWaitFence:
++		/*
++		 * Not yet, and not silently: a client that gets kIOReturnUnsupported
++		 * from a submit stops, and the log says so. A client that gets 0 and
++		 * a fence that is already done would draw a frame that never reached
++		 * the GPU and never know.
++		 */
++		ret = kIOReturnUnsupported;
++		break;
++	case kDrmGemClose:
++		ret = gemClose(&r.close);
++		break;
++	default:
++		printf("POLARIS GPU: 19 selector %#x is not one of ours\n", selector);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++
++	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
++		size_t out = args->structureOutputSize < size ? args->structureOutputSize : size;
++
++		memcpy(args->structureOutput, &r, out);
++	}
++	return ret;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++/*
++ * One round of what a client would do, in the kernel, because there is no user
++ * space to do it from yet. The question it answers is not "did the kernel keep
++ * its books" - it is "can the GPU write a page this kernel owns through the
++ * window the allocator gave out", and only the count of changed words says that.
++ */
++#define POLARIS_GPU_TEST_BYTES  (64u << 10)
++
++static void
++polaris_gpu_test(void)
++{
++	IOBufferMemoryDescriptor * memory;
++	uint32_t * words;
++	uint64_t address, size;
++	IOByteCount length = 0;
++	uint32_t before = 0xdeadbeefu, changed = 0, wrong = 0;
++	bool filled;
++
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut, POLARIS_GPU_TEST_BYTES, PAGE_SIZE);
++	if (memory == NULL) {
++		printf("POLARIS GPU: 19 test: no memory\n");
++		return;
++	}
++	size = round_page((vm_size_t) memory->getLength());
++	words = (uint32_t *) memory->getBytesNoCopy();
++	for (uint64_t i = 0; i < size / 4; i++) {
++		words[i] = before;
++	}
++
++	IOLockLock(gGPULock);
++	address = polaris_gpu_address(size);
++	IOLockUnlock(gGPULock);
++	if (address == 0) {
++		printf("POLARIS GPU: 19 test: no address\n");
++		memory->release();
++		return;
++	}
++	printf("POLARIS GPU: 19 test: %llu bytes at iova %#llx, physical %#llx\n",
++	    size, address, memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone));
++	{
++		bool mapped = true;
++
++		for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++			IOByteCount length = 0;
++			addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++			mapped = phys != 0 && polaris_gpu_map(address + offset, phys, false);
++		}
++		polaris_gpu_mapped();
++		if (!mapped) {
++			printf("POLARIS GPU: 19 test: the buffer cannot be entered\n");
++			IOLockLock(gGPULock);
++			polaris_gpu_address_free(address, size);
++			IOLockUnlock(gGPULock);
++			memory->release();
++			return;
++		}
++	}
++	filled = polaris_gpu_fill(address, (uint32_t)(size / 4));
++	for (uint64_t i = 0; i < size / 4; i++) {
++		if (words[i] != before) {
++			changed++;
++			if (words[i] != 0xa5a5a5a5u) {
++				wrong++;
++			}
++		}
++	}
++	printf("POLARIS GPU: 19 test: the CP %s the fill; %u of %llu words changed, %u of those "
++	    "are not 0xa5a5a5a5\n", filled ? "drained" : "did NOT drain", changed, size / 4, wrong);
++	printf("POLARIS GPU: 19 test: %s\n",
++	    (filled && changed == size / 4 && wrong == 0) ?
++	    "THE GPU WROTE A BUFFER THIS KERNEL OWNS" : "the buffer is not what the GPU was told to write");
++
++	polaris_gpu_unmap(address, size);
++	polaris_gpu_mapped();
++	IOLockLock(gGPULock);
++	polaris_gpu_address_free(address, size);
++	IOLockUnlock(gGPULock);
++	memory->release();
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++extern "C" void
++polaris_gpu_service_start(void)
++{
++	IOService * provider;
++	PolarisGPU * gpu;
++	int test = 0;
++
++	if (gGPULock == NULL) {
++		gGPULock = IOLockAlloc();
++	}
++	if (gGPULock == NULL) {
++		printf("POLARIS GPU: 19 no lock; no service\n");
++		return;
++	}
++	provider = IOService::getPlatform();
++	gpu = OSTypeAlloc(PolarisGPU);
++	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		printf("POLARIS GPU: 19 cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		printf("POLARIS GPU: 19 the service did not start\n");
++	}
++	gpu->release();
++
++	if (PE_parse_boot_argn("polarisgputest", &test, sizeof(test)) && test != 0) {
++		polaris_gpu_test();
++	}
++}
