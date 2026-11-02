@@ -1,0 +1,105 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -137,6 +137,18 @@
+ 	uint64_t      fSwapSeen;              /* swap count at the last heartbeat */
+ 	uint64_t      fBlitMin, fBlitMax, fBlitSum;     /* mach ticks, per copy */
+ 	uint64_t      fBlitStage;               /* copies served from fStage */
++	/*
++	 * Where the time inside a copy goes. 0185 and 0186 both measured the
++	 * whole copy - 7.9 and 8.1 ms for a full panel - and both guessed at
++	 * the split: the panel write ceiling says 9.33 MB costs 1.0 ms and the
++	 * gather was assumed to be the rest. Neither number was measured, so
++	 * eight-way gather changed nothing and there was no way to see why.
++	 * These three counters are the measurement: ticks inside the gather,
++	 * rows that went through it, and panel pixels actually written.
++	 */
++	uint64_t      fBlitGather;              /* mach ticks inside sweet_fb_gather */
++	uint64_t      fBlitGatherRows;          /* rows that went through the gather */
++	uint64_t      fBlitPixels;              /* panel pixels written in the window */
+ 	uint16_t      fColMap[SWEET_FB_COLMAP_MAX];    /* panel x -> logical x */
+ 	uint32_t     *fStage;                   /* one stretched panel row, cacheable */
+ 	uint64_t      fSwapLast;        /* mach time of the previous swap */
+@@ -214,6 +226,11 @@
+ 	fContentH = fHeight;
+ 	fScale = 0;
+ 	fSrcOffX = 0;
++	/* The split counters are subtracted from each other in the report, so
++	 * they get an explicit zero rather than whatever the allocation held. */
++	fBlitGather = 0;
++	fBlitGatherRows = 0;
++	fBlitPixels = 0;
+ 	if (!native) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+@@ -898,6 +915,7 @@
+ 					uint32_t *drow = (uint32_t *)(void *)
+ 					    (fPixels + (uint64_t)y * fRowBytes + (uint64_t)px0 * 4);
+ 					int32_t n = px1 - px0;
++					fBlitPixels += (uint64_t)n;
+ 					if (stage != NULL && ly == lastLy) {
+ 						memcpy(drow, stage + px0, (size_t)n * 4);
+ 						fBlitStage++;
+@@ -905,8 +923,18 @@
+ 					}
+ 					lastLy = ly;
+ 					if (stage != NULL) {
++						/*
++						 * Time the gather on its own. mach_absolute_time
++						 * is a register read, and it is spent once per
++						 * gathered row rather than once per pixel, so
++						 * what it costs to measure is far below what it
++						 * measures.
++						 */
++						uint64_t g0 = mach_absolute_time();
+ 						sweet_fb_gather(stage, srow, fColMap, base, px0,
+ 						    xlo, xhi, px1, srow[sx], srow[sx + w - 1]);
++						fBlitGather += mach_absolute_time() - g0;
++						fBlitGatherRows++;
+ 						memcpy(drow, stage + px0, (size_t)n * 4);
+ 					} else {
+ 						/* sweetfb_blit=0: gather into the panel. */
+@@ -946,15 +974,43 @@
+ 			}
+ 			fBlitSum += dt;
+ 			if ((++fBlitFrames % 300) == 0 && fBlitSum != 0) {
+-				uint64_t nmin = 0, navg = 0, nmax = 0;
++				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
++				uint64_t us, mbs, perrow;
+ 				absolutetime_to_nanoseconds(fBlitMin, &nmin);
+ 				absolutetime_to_nanoseconds(fBlitSum / fBlitFrames, &navg);
+ 				absolutetime_to_nanoseconds(fBlitMax, &nmax);
++				absolutetime_to_nanoseconds(fBlitSum, &nsum);
++				absolutetime_to_nanoseconds(fBlitGather, &ngath);
++				us = nsum / 1000;
++				if (us == 0) {
++					us = 1;
++				}
++				/* bytes per microsecond is megabytes per second */
++				mbs = (fBlitPixels * 4) / us;
++				perrow = fBlitGatherRows != 0 ?
++				    (ngath / 1000) / fBlitGatherRows : 0;
+ 				IOLog("SWEET FB: blit over %llu frames: min %llu us, avg %llu us, max %llu us, %llu staged\n",
+ 				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
++				/*
++				 * The line that says where the time went. px is what
++				 * actually reached the panel; MB/s divides it by the
++				 * summed time, so a copy that is store-bound shows a
++				 * number near the 9000 MB/s ceiling above and a copy
++				 * that is gather-bound shows a small one with gather
++				 * accounting for most of it. dup is panel rows served
++				 * by repeating the previous row, which cost a memcpy
++				 * and no gather at all.
++				 */
++				IOLog("SWEET FB: blit %llu px at %llu MB/s over %llu us; "
++				    "gather %llu rows %llu us (%llu us/row), %llu dup rows\n",
++				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
++				    perrow, fBlitStage - fBlitGatherRows);
+ 				fBlitFrames = 0;
+ 				fBlitMin = fBlitMax = fBlitSum = 0;
+ 				fBlitStage = 0;
++				fBlitGather = 0;
++				fBlitGatherRows = 0;
++				fBlitPixels = 0;
+ 			}
+ 		} else if (src != 0 && bpe == 4) {
+ 			fBlitsTotal++;
