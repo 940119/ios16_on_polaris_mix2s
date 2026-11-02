@@ -40,6 +40,8 @@
 extern int sweet_ufs_raw_read(uint8_t lun, uint64_t lba, uint32_t count, void *to);
 extern void sweet_log_flush_now(void);
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+extern void thread_deallocate(thread_t);
 
 #define MD_LUN			4
 #define MD_PART_LBA		65536u		/* 0x10000000 bytes / 4096 */
@@ -382,15 +384,29 @@ md_wr(vm_offset_t base, uint32_t off, uint32_t v)
 {
 	*(volatile uint32_t *)(void *)(base + off) = v;
 }
+/*
+ * Every line goes to the flash copy of the ring the moment it is printed.
+ * Build 0175 printed a dozen lines between two flushes and then stopped, which
+ * left no way to tell which one of them did it.
+ */
+#define MD_SAY(...) do {			\
+	printf(__VA_ARGS__);			\
+	sweet_log_flush_now();			\
+} while (0)
 
+/*
+ * A spin, not a sleep. A thread that parks in the interconnect never comes
+ * back, and thread_block() would add a second way to lose one. A millisecond
+ * is short enough to burn.
+ */
 static void
-md_sleep_ms(unsigned ms)
+md_spin_ms(unsigned ms)
 {
-	uint64_t deadline;
+	volatile uint64_t n = (uint64_t)ms * 40000ull;
 
-	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
-	(void)assert_wait_deadline(&md_chan, THREAD_UNINT, deadline);
-	thread_block(THREAD_CONTINUE_NULL);
+	while (n != 0) {
+		n--;
+	}
 }
 
 /* Switch a clock branch on and say whether it came up. */
@@ -400,7 +416,8 @@ md_clock_on(vm_offset_t gcc, uint32_t off, const char *name)
 	uint32_t before = md_rd(gcc, off);
 
 	if (!(before & MD_CBCR_OFF) && (before & 1u)) {
-		printf("POLARIS MODEM: %-18s 0x%05x already on (0x%08x)\n", name, off, before);
+		MD_SAY("POLARIS MODEM:   %-18s +0x%05x 0x%08x already on\n", name, off,
+		    before);
 		return;
 	}
 	md_wr(gcc, off, before | 1u);
@@ -408,32 +425,14 @@ md_clock_on(vm_offset_t gcc, uint32_t off, const char *name)
 		uint32_t v = md_rd(gcc, off);
 
 		if (!(v & MD_CBCR_OFF)) {
-			printf("POLARIS MODEM: %-18s 0x%05x 0x%08x -> 0x%08x on\n", name, off,
-			    before, v);
+			MD_SAY("POLARIS MODEM:   %-18s +0x%05x 0x%08x -> 0x%08x on\n",
+			    name, off, before, v);
 			return;
 		}
-		md_sleep_ms(1);
+		md_spin_ms(1);
 	}
-	printf("POLARIS MODEM: %-18s 0x%05x 0x%08x -> 0x%08x STILL HALTED\n", name, off,
-	    before, md_rd(gcc, off));
-}
-
-static void
-md_dump_clocks(vm_offset_t gcc, const char *when)
-{
-	for (unsigned i = 0; i < sizeof(md_clocks) / sizeof(md_clocks[0]); i++) {
-		uint32_t v = md_rd(gcc, md_clocks[i].off);
-
-		printf("POLARIS MODEM: %s %-18s 0x%05x = 0x%08x %s\n", when, md_clocks[i].name,
-		    md_clocks[i].off, v, (v & MD_CBCR_OFF) ? "OFF" : "on");
-	}
-	{
-		uint32_t v = md_rd(gcc, MD_GCC_APPS_VOTE);
-
-		printf("POLARIS MODEM: %s apps vote          0x%05x = 0x%08x "
-		    "(mss gpll0 div %s)\n", when, MD_GCC_APPS_VOTE, v,
-		    (v & (1u << 17)) ? "voted" : "not voted");
-	}
+	MD_SAY("POLARIS MODEM:   %-18s +0x%05x 0x%08x -> 0x%08x STILL HALTED\n",
+	    name, off, before, md_rd(gcc, off));
 }
 
 /*
@@ -453,77 +452,143 @@ md_mba_status_name(uint32_t v)
 	}
 }
 
+/*
+ * Read a whole table, one register at a time, with a line flushed before each
+ * access. If one of them parks the thread, the last line in the ring is the
+ * name of the register that did it - and that name is the answer, not a loss.
+ */
+static void
+md_read_table(vm_offset_t base, const char *what, const struct md_reg *tbl,
+    unsigned count)
+{
+	for (unsigned i = 0; i < count; i++) {
+		MD_SAY("POLARIS MODEM:   %-20s +0x%03x reading\n", tbl[i].name,
+		    tbl[i].off);
+		MD_SAY("POLARIS MODEM:   %-20s +0x%03x = 0x%08x\n", tbl[i].name,
+		    tbl[i].off, md_rd(base, tbl[i].off));
+	}
+	(void)what;
+}
+
+/*
+ * Level 2 stops after the GCC block: every register there belongs to a
+ * controller that is never powered down, and the GPU probe already read five of
+ * them in this same boot, so that phase is the one that cannot hurt.
+ *
+ * Level 3 adds the two clock writes, the GPLL0 vote and the modem's own blocks.
+ * That is where a read can park the thread, which is exactly why it is a
+ * separate level and why this runs in its own thread.
+ */
 void
 polaris_modem_state_probe(void)
 {
 	vm_offset_t gcc, rmb, q6;
-	uint32_t pbl, mba, mss;
+	int level = polaris_modem_level();
 
-	if (polaris_modem_level() < 2) {
+	if (level < 2) {
 		return;
 	}
-	printf("POLARIS MODEM: ======== build 0175 alive: the modem's own state, "
-	    "registers only, nothing is loaded ========\n");
-	sweet_log_flush_now();
+	MD_SAY("POLARIS MODEM: ======== build 0176 alive: level %d, read first, "
+	    "the clock writes are level 3 ========\n", level);
 
 	gcc = ml_io_map(MD_GCC_PHYS, MD_GCC_SIZE);
 	if (gcc == 0) {
-		printf("POLARIS MODEM: GCC did not map\n");
+		MD_SAY("POLARIS MODEM: GCC did not map\n");
 		return;
 	}
-	md_dump_clocks(gcc, "before");
+	MD_SAY("POLARIS MODEM: phase A: the GCC block, nothing written\n");
+	{
+		uint32_t v = md_rd(gcc, MD_GCC_APPS_VOTE);
+
+		MD_SAY("POLARIS MODEM:   apps vote          +0x52004 = 0x%08x "
+		    "(mss gpll0 div %s)\n", v, (v & (1u << 17)) ? "voted" : "not voted");
+	}
+	md_read_table(gcc, "gcc", md_clocks,
+	    (unsigned)(sizeof(md_clocks) / sizeof(md_clocks[0])));
+	if (level < 3) {
+		MD_SAY("POLARIS MODEM: phase A done; level 3 adds the clock writes "
+		    "and the modem's own blocks\n");
+		return;
+	}
+
+	MD_SAY("POLARIS MODEM: phase B: switching the two AHB branches on\n");
 	md_clock_on(gcc, MD_GCC_MSS_CFG_AHB, "mss_cfg_ahb");
 	md_clock_on(gcc, MD_GCC_BOOT_ROM_AHB, "boot_rom_ahb");
 	{
 		uint32_t v = md_rd(gcc, MD_GCC_APPS_VOTE);
 
 		md_wr(gcc, MD_GCC_APPS_VOTE, v | (1u << 17));
-		printf("POLARIS MODEM: apps vote          0x%05x 0x%08x -> 0x%08x "
-		    "(mss gpll0 div voted)\n", MD_GCC_APPS_VOTE, v,
-		    md_rd(gcc, MD_GCC_APPS_VOTE));
+		MD_SAY("POLARIS MODEM:   apps vote          +0x52004 0x%08x -> 0x%08x "
+		    "(mss gpll0 div voted)\n", v, md_rd(gcc, MD_GCC_APPS_VOTE));
 	}
-	md_dump_clocks(gcc, "after");
-	sweet_log_flush_now();
 
-	/*
-	 * From here the reads go into the modem's own blocks. The clock above is
-	 * what makes them readable at all; if a read still stalls, the line
-	 * before it says which one, and the ring was flushed a moment ago.
-	 */
+	MD_SAY("POLARIS MODEM: phase C: the RMB at %#llx\n",
+	    (unsigned long long)MD_RMB_PHYS);
 	rmb = ml_io_map(MD_RMB_PHYS, MD_MAP_SIZE);
 	if (rmb == 0) {
-		printf("POLARIS MODEM: the RMB at %#llx did not map\n", MD_RMB_PHYS);
+		MD_SAY("POLARIS MODEM: the RMB did not map\n");
 		return;
 	}
-	printf("POLARIS MODEM: RMB at %#llx, reading\n", MD_RMB_PHYS);
-	for (unsigned i = 0; i < sizeof(md_rmb) / sizeof(md_rmb[0]); i++) {
-		printf("POLARIS MODEM:   %-18s +0x%02x reading\n", md_rmb[i].name, md_rmb[i].off);
-		printf("POLARIS MODEM:   %-18s +0x%02x = 0x%08x\n", md_rmb[i].name,
-		    md_rmb[i].off, md_rd(rmb, md_rmb[i].off));
+	md_read_table(rmb, "rmb", md_rmb, (unsigned)(sizeof(md_rmb) / sizeof(md_rmb[0])));
+
+	{
+		uint32_t pbl = md_rd(rmb, 0x04);
+		uint32_t mba = md_rd(rmb, 0x0c);
+		uint32_t mss = md_rd(rmb, 0x40);
+
+		MD_SAY("POLARIS MODEM: the boot ROM %s (PBL_STATUS 0x%x)\n",
+		    pbl ? "ran and handed over" : "never ran", pbl);
+		MD_SAY("POLARIS MODEM: the MBA: %s (MBA_STATUS 0x%x)\n",
+		    md_mba_status_name(mba), mba);
+		MD_SAY("POLARIS MODEM: boot FSM %s (MSS_STATUS 0x%x, bit 0 %d)\n",
+		    (mss & 1u) ? "FINISHED - the modem is up" : "did not finish", mss,
+		    mss & 1u);
 	}
-	pbl = md_rd(rmb, 0x04);
-	mba = md_rd(rmb, 0x0c);
-	mss = md_rd(rmb, 0x40);
 
-	printf("POLARIS MODEM: the boot ROM %s (PBL_STATUS 0x%x)\n",
-	    pbl ? "ran and handed over" : "never ran", pbl);
-	printf("POLARIS MODEM: the MBA: %s (MBA_STATUS 0x%x)\n", md_mba_status_name(mba), mba);
-	printf("POLARIS MODEM: boot FSM %s (MSS_STATUS 0x%x, bit 0 %d)\n",
-	    (mss & 1u) ? "FINISHED - the modem is up" : "did not finish", mss, mss & 1u);
-	sweet_log_flush_now();
-
+	MD_SAY("POLARIS MODEM: phase D: the Q6 control block at %#llx\n",
+	    (unsigned long long)MD_Q6_PHYS);
 	q6 = ml_io_map(MD_Q6_PHYS, MD_MAP_SIZE);
 	if (q6 == 0) {
-		printf("POLARIS MODEM: the Q6 block at %#llx did not map\n", MD_Q6_PHYS);
+		MD_SAY("POLARIS MODEM: the Q6 block did not map\n");
 		return;
 	}
-	printf("POLARIS MODEM: Q6 control at %#llx, reading (this is the block that "
-	    "can stall when it is powered down)\n", MD_Q6_PHYS);
-	for (unsigned i = 0; i < sizeof(md_q6) / sizeof(md_q6[0]); i++) {
-		printf("POLARIS MODEM:   %-24s +0x%03x reading\n", md_q6[i].name, md_q6[i].off);
-		printf("POLARIS MODEM:   %-24s +0x%03x = 0x%08x\n", md_q6[i].name,
-		    md_q6[i].off, md_rd(q6, md_q6[i].off));
+	md_read_table(q6, "q6", md_q6, (unsigned)(sizeof(md_q6) / sizeof(md_q6[0])));
+	MD_SAY("POLARIS MODEM: read only; nothing was written to the modem\n");
+}
+
+/*
+ * Build 0175 called the probe straight from the mount path, and the whole
+ * machine stopped there: whatever parks a thread in this interconnect parked
+ * the thread that was mounting the root filesystem. The probe gets its own
+ * thread now, so a park costs the probe and nothing else - the log thread keeps
+ * flushing and the ring still says where it happened.
+ */
+static boolean_t polaris_modem_kicked;
+
+static void
+polaris_modem_thread(void *arg, wait_result_t wr)
+{
+	(void)arg;
+	(void)wr;
+	polaris_modem_state_probe();
+	MD_SAY("POLARIS MODEM: the state thread returned\n");
+}
+
+void
+polaris_modem_state_kick(void)
+{
+	thread_t thread;
+	int level = polaris_modem_level();
+
+	if (level < 2 || polaris_modem_kicked) {
+		return;
 	}
-	printf("POLARIS MODEM: read only; nothing was written to the modem\n");
+	polaris_modem_kicked = TRUE;
+	if (kernel_thread_start(polaris_modem_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+		MD_SAY("POLARIS MODEM: state thread started, level %d\n", level);
+	} else {
+		MD_SAY("POLARIS MODEM: could not start the state thread\n");
+	}
 }
 #endif
