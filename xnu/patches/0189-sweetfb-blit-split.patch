@@ -31,7 +31,40 @@
  	if (!native) {
  		fLogicalW = SWEET_FB_LOGICAL_W;
  		fLogicalH = SWEET_FB_LOGICAL_H;
-@@ -898,6 +915,7 @@
+@@ -290,6 +307,32 @@
+ 		}
+ 	}
+ 	if (fScale) {
++		/*
++		 * What this kernel's memcpy can deliver to the panel, measured on
++		 * the same mapping, the same row stride and the same bytes per row
++		 * as the blit itself, with the source being the staging row.
++		 *
++		 * The memset below is the panel's own ceiling - 9.33 MB at 9007
++		 * MB/s - and the blit runs at 872 MB/s for 7.02 MB per frame, ten
++		 * times slower than the same mapping absorbs stores. The two
++		 * differ in exactly one thing: memset reads nothing, memcpy reads
++		 * a cached row. So this runs first, on garbage, and the memset
++		 * that follows clears it. If the two numbers are close, the gather
++		 * is where the time goes; if this one is near 872 MB/s, the copy
++		 * routine is, and no change to how pixels are read will help.
++		 */
++		if (fStage != NULL) {
++			uint64_t cbytes = (uint64_t)fWidth * 4 * fHeight;
++			uint64_t c0 = mach_absolute_time();
++			for (uint32_t y = 0; y < fHeight; y++) {
++				memcpy((void *)(fPixels + (uint64_t)y * fRowBytes), fStage,
++				    (size_t)fWidth * 4);
++			}
++			uint64_t cn = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - c0, &cn);
++			IOLog("SWEET FB: panel copy ceiling %llu bytes in %llu us (%llu MB/s)\n",
++			    cbytes, cn / 1000, cn ? cbytes * 1000 / cn : 0);
++		}
+ 		/* Clear the boot splash: the panel is now filled edge to edge, so
+ 		 * nothing outside the first frame's dirty rect may survive.
+ 		 *
+@@ -898,6 +941,7 @@
  					uint32_t *drow = (uint32_t *)(void *)
  					    (fPixels + (uint64_t)y * fRowBytes + (uint64_t)px0 * 4);
  					int32_t n = px1 - px0;
@@ -39,7 +72,7 @@
  					if (stage != NULL && ly == lastLy) {
  						memcpy(drow, stage + px0, (size_t)n * 4);
  						fBlitStage++;
-@@ -905,8 +923,18 @@
+@@ -905,8 +949,18 @@
  					}
  					lastLy = ly;
  					if (stage != NULL) {
@@ -58,7 +91,7 @@
  						memcpy(drow, stage + px0, (size_t)n * 4);
  					} else {
  						/* sweetfb_blit=0: gather into the panel. */
-@@ -946,15 +974,43 @@
+@@ -946,15 +1000,43 @@
  			}
  			fBlitSum += dt;
  			if ((++fBlitFrames % 300) == 0 && fBlitSum != 0) {
