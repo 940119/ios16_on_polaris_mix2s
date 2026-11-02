@@ -335,7 +335,7 @@
 
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,766 @@
+@@ -0,0 +1,793 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -999,7 +999,8 @@
 +polaris_gpu_test(void)
 +{
 +	IOBufferMemoryDescriptor * memory;
-+	uint32_t * words;
++	IOMemoryMap * map;
++	volatile uint32_t * words;
 +	uint64_t address, size;
 +	IOByteCount length = 0;
 +	uint32_t before = 0xdeadbeefu, changed = 0, wrong = 0;
@@ -1012,7 +1013,30 @@
 +		return;
 +	}
 +	size = round_page((vm_size_t) memory->getLength());
-+	words = (uint32_t *) memory->getBytesNoCopy();
++	/*
++	 * The CPU touches the buffer through a cache-inhibited alias, not through
++	 * getBytesNoCopy(). The first build of this test used the descriptor's own
++	 * kernel mapping, which is cacheable, and the read-back said "0 of 16384
++	 * words changed": the CPU had written 0xdeadbeef into L1/L2, the CP wrote
++	 * 0xa5a5a5a5 into DRAM behind it, and the read saw the CPU's own dirty
++	 * lines. A write by a bus master does not invalidate a CPU line, and those
++	 * dirty lines would also be written back over the GPU's data later.
++	 *
++	 * Reading through a mapping that is not cached at all removes the question:
++	 * every word comes from DRAM, which is the only copy the GPU ever touched.
++	 * If the GPU's write did not land, this reads 0xdeadbeef and says so; if it
++	 * landed, this reads 0xa5a5a5a5. The two outcomes are now distinguishable,
++	 * which they were not before.
++	 */
++	map = memory->createMappingInTask(kernel_task, 0,
++	    kIOMapInhibitCache | kIOMapAnywhere, 0, size);
++	if (map == NULL || map->getVirtualAddress() == 0) {
++		printf("POLARIS GPU: 19 test: no uncached view of the buffer\n");
++		OSSafeReleaseNULL(map);
++		memory->release();
++		return;
++	}
++	words = (volatile uint32_t *) map->getVirtualAddress();
 +	for (uint64_t i = 0; i < size / 4; i++) {
 +		words[i] = before;
 +	}
@@ -1022,6 +1046,7 @@
 +	IOLockUnlock(gGPULock);
 +	if (address == 0) {
 +		printf("POLARIS GPU: 19 test: no address\n");
++		map->release();
 +		memory->release();
 +		return;
 +	}
@@ -1042,6 +1067,7 @@
 +			IOLockLock(gGPULock);
 +			polaris_gpu_address_free(address, size);
 +			IOLockUnlock(gGPULock);
++			map->release();
 +			memory->release();
 +			return;
 +		}
@@ -1066,6 +1092,7 @@
 +	IOLockLock(gGPULock);
 +	polaris_gpu_address_free(address, size);
 +	IOLockUnlock(gGPULock);
++	map->release();
 +	memory->release();
 +}
 +
