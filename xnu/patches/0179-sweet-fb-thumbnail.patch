@@ -1,0 +1,79 @@
+diff -Nur a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-02 11:52:19.417292438 +0800
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-02 11:52:19.420101638 +0800
+@@ -267,6 +267,64 @@
+ 	return true;
+ }
+ 
++/*
++ * What is actually on the glass, as text.
++ *
++ * A frozen screen and a black screen look the same from the outside, and so do a
++ * black frame the compositor handed us and a frame we failed to copy. This walks
++ * the panel memory - which the panel scans out by itself, so this is the picture,
++ * not a model of it - and prints it as a 24x24 luminance ramp plus a count of
++ * non-black cells. Twenty lines a minute, so a boot says whether the last frame
++ * had content and whether it ever changed.
++ */
++static void
++sweet_fb_thumbnail(uintptr_t base, uint32_t stride, uint32_t w, uint32_t h)
++{
++	static const char ramp[] = " .:-=+*#%@";
++	const uint32_t cols = 24, rows = 24;
++	uint32_t lit = 0, peak = 0;
++
++	if (base == 0 || stride < w * 4 || w == 0 || h == 0) {
++		IOLog("SWEET FB: thumbnail: no panel memory\n");
++		return;
++	}
++	IOLog("SWEET FB: panel %ux%u stride %u, 24x24, dark to light\n", w, h, stride);
++	for (uint32_t r = 0; r < rows; r++) {
++		char line[cols + 1];
++
++		for (uint32_t c = 0; c < cols; c++) {
++			uint32_t x0 = (uint32_t)((uint64_t)c * w / cols);
++			uint32_t y0 = (uint32_t)((uint64_t)r * h / rows);
++			uint32_t sum = 0, n = 0;
++
++			for (uint32_t sy = 0; sy < 6; sy++) {
++				uint32_t y = y0 + (uint32_t)((uint64_t)sy * (h / rows) / 6);
++				for (uint32_t sx = 0; sx < 6; sx++) {
++					uint32_t x = x0 + (uint32_t)((uint64_t)sx * (w / cols) / 6);
++					uint32_t p = *(volatile uint32_t *)(void *)
++					    (base + (uint64_t)y * stride + (uint64_t)x * 4);
++					uint32_t lum = (((p >> 16) & 0xff) * 3 +
++					    ((p >> 8) & 0xff) * 4 + (p & 0xff) * 2) / 9;
++
++					sum += lum;
++					n++;
++					if ((p & 0x00ffffff) != 0) {
++						lit++;
++					}
++					if (lum > peak) {
++						peak = lum;
++					}
++				}
++			}
++			line[c] = ramp[(sum / n) * 9 / 255];
++		}
++		line[cols] = 0;
++		IOLog("SWEET FB: |%s|\n", line);
++	}
++	IOLog("SWEET FB: %u of %u samples not black, brightest %u of 255\n",
++	    lit, cols * rows * 36, peak);
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -287,6 +345,10 @@
+ 		    swaps - fb->fSwapSeen, fb->fBlitsTotal, fb->fBadRects,
+ 		    fb->fDirty ? 1 : 0, fb->fPowerOff ? 1 : 0);
+ 		fb->fSwapSeen = swaps;
++		if ((fb->fTicks % 3600) == 0) {
++			sweet_fb_thumbnail(fb->fPixels, fb->fRowBytes, fb->fWidth,
++			    fb->fHeight);
++		}
+ 	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
