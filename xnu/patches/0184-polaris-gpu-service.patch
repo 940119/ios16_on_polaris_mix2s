@@ -960,7 +960,7 @@
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,1173 @@
+@@ -0,0 +1,1182 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -1500,16 +1500,25 @@
 +	 * a fault in the window while the address was the whole story. A refusal
 +	 * a program can see beats a buffer that appears to work.
 +	 */
++	/*
++	 * The pool's free list has no lock of its own - it is the GPU lock's, the
++	 * way the address allocator's is - so the pages are taken and entered
++	 * under one hold of it. Taking them outside would let two clients be
++	 * handed the same page.
++	 */
++	IOLockLock(gGPULock);
 +	pa = polaris_gpu_pool_alloc(size);
 +	if (pa == 0) {
++		IOLockUnlock(gGPULock);
 +		printf("POLARIS GPU: 19 gemNew: %llu bytes, and the pool has none left\n", size);
 +		return kIOReturnNoMemory;
 +	}
-+	IOLockLock(gGPULock);
 +	b = newPoolBuffer(pa, size, request->flags, &handle);
-+	IOLockUnlock(gGPULock);
 +	if (b == NULL) {
 +		polaris_gpu_pool_free(pa, size);
++	}
++	IOLockUnlock(gGPULock);
++	if (b == NULL) {
 +		return kIOReturnNoMemory;
 +	}
 +	request->handle = handle;
