@@ -1,0 +1,253 @@
+diff -Nur a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-02 13:23:27.017188100 +0800
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-02 13:23:27.021176800 +0800
+@@ -85,12 +85,24 @@
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+- * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
++ * presented as the iPhone X screen, 375x812 points, and the panel is filled
++ * edge to edge.
++ *
++ * Build 0183: 750x1624 @2x instead of 1125x2436 @3x. The point size stays
++ * 375x812, so the layout is byte for byte the same, but the compositor only
++ * has to touch 1.22 MP per frame instead of 2.74 MP. Nothing here rasterises
++ * on the GPU (no IOAccelerator exists on this port), so backboardd's cost is
++ * proportional to that area and this is the only lever that scales with it.
++ * The price is a horizontal 750 -> 1080 nearest-neighbour upscale in the
++ * blit, which is one gather per pixel against a precomputed column map.
++ *
++ * /chosen display-scale must be 2 for this to mean 375x812 points; that is
++ * changed in the device tree (build 0183's ADT), not here.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
+-#define SWEET_FB_LOGICAL_W              1125
+-#define SWEET_FB_LOGICAL_H              2436
++#define SWEET_FB_LOGICAL_W              750
++#define SWEET_FB_LOGICAL_H              1624
++#define SWEET_FB_COLMAP_MAX             2048
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -124,6 +136,10 @@
+ 	uint64_t      fTicks;                 /* vsync ticks since boot */
+ 	uint64_t      fSwapSeen;              /* swap count at the last heartbeat */
+ 	uint64_t      fBlitMin, fBlitMax, fBlitSum;     /* mach ticks, per copy */
++	uint16_t      fColMap[SWEET_FB_COLMAP_MAX];    /* panel x -> logical x */
++	uint64_t      fSwapLast;        /* mach time of the previous swap */
++	uint64_t      fSwapGapMin, fSwapGapMax, fSwapGapSum;
++	uint64_t      fSwapGapFrames;   /* intervals measured in this window */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -196,34 +212,39 @@
+ 	fContentH = fHeight;
+ 	fScale = 0;
+ 	fSrcOffX = 0;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++	if (!native) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+ 	if (!native && polaris) {
+ 		/*
+-		 * Polaris is 1080x2160 (18:9), the iPhone X logical display is
+-		 * 1125x2436 (19.5:9), so the panel is filled by cropping and
+-		 * squashing rather than by fitting the whole frame:
++		 * Polaris is 1080x2160 (18:9) and the logical display is now
++		 * 750x1624 (19.5:9) at 2x, so the panel is filled by scaling the
++		 * whole frame up rather than by cropping a bigger one:
+ 		 *
+-		 *   horizontal  1125 -> 1080, cropped 1:1 (22 columns per side,
+-		 *               under 8 points, no resampling at all)
+-		 *   vertical    2436 -> 2160, nearest row (the same 11.3%
+-		 *               squeeze the old fit-by-height scale applied)
++		 *   horizontal   750 -> 1080, nearest column (1.44x)
++		 *   vertical    1624 -> 2160, nearest row    (1.33x)
+ 		 *
+-		 * The point is that the horizontal mapping is now the identity,
+-		 * so every destination row is a single memcpy. The old code
+-		 * walked 998x2160 pixels doing 64-bit multiply/shift arithmetic
+-		 * on each one, into panel memory that is mapped uncached: that
+-		 * is what the comment above AppleCLCD::swap() means by "copying
+-		 * 10 MB into the panel on every swap took the whole CPU".
++		 * Until 0182 the logical frame was 1125x2436, i.e. wider than the
++		 * panel, and the horizontal mapping was the identity so each
++		 * destination row was a single memcpy. A frame smaller than the
++		 * panel cannot be memcpy'd, so the blit now gathers: one column
++		 * map, built once here, turns panel x into logical x, and the
++		 * inner loop walks the destination in order (still a linear
++		 * stream into write-combined memory) while re-reading a source
++		 * row that fits in L1.
+ 		 */
+ 		fContentW = fWidth;
+ 		fContentH = fHeight;
+ 		fOffX = 0;
+ 		fOffY = 0;
+-		fSrcOffX = (int32_t)(fLogicalW - fWidth) / 2;
++		fSrcOffX = 0;
+ 		fScale = 1;
++		if (fWidth <= SWEET_FB_COLMAP_MAX && fLogicalW > 0) {
++			for (uint32_t x = 0; x < fWidth; x++) {
++				fColMap[x] = (uint16_t)((uint64_t)x * fLogicalW / fWidth);
++			}
++		}
+ 	} else {
+ 		fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 		fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+@@ -262,8 +283,9 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+-	IOLog("SWEET FB: %s content %ux%u at %d,%d, logical column %d -> panel column 0\n",
+-	    fScale ? "filling" : "cropping at", fContentW, fContentH, fOffX, fOffY, fSrcOffX);
++	IOLog("SWEET FB: %s content %ux%u at %d,%d, panel x -> logical x by a %u-entry map\n",
++	    fScale ? "filling" : "cropping at", fContentW, fContentH, fOffX, fOffY,
++	    (fWidth <= SWEET_FB_COLMAP_MAX) ? fWidth : 0);
+ 	return true;
+ }
+ 
+@@ -494,6 +516,35 @@
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	++sweet_fb_swap_count;
++	/*
++	 * Time between consecutive swaps is the compositor's own frame period:
++	 * present() is not in this path, so it is not contaminated by our copy
++	 * into the panel. Reported every 30 frames because a mostly idle screen
++	 * only produces a few dozen frames a minute.
++	 */
++	uint64_t now = mach_absolute_time();
++	if (fSwapLast != 0) {
++		uint64_t gap = now - fSwapLast;
++		if (fSwapGapFrames == 0 || gap < fSwapGapMin) {
++			fSwapGapMin = gap;
++		}
++		if (gap > fSwapGapMax) {
++			fSwapGapMax = gap;
++		}
++		fSwapGapSum += gap;
++		if (++fSwapGapFrames >= 30) {
++			uint64_t nmin = 0, navg = 0, nmax = 0;
++			absolutetime_to_nanoseconds(fSwapGapMin, &nmin);
++			absolutetime_to_nanoseconds(fSwapGapSum / fSwapGapFrames, &navg);
++			absolutetime_to_nanoseconds(fSwapGapMax, &nmax);
++			IOLog("SWEET FB: swap gap over %llu frames: min %llu avg %llu "
++			    "max %llu us\n", fSwapGapFrames, nmin / 1000,
++			    navg / 1000, nmax / 1000);
++			fSwapGapFrames = 0;
++			fSwapGapMin = fSwapGapMax = fSwapGapSum = 0;
++		}
++	}
++	fSwapLast = now;
+ 	if (sweet_fb_swap_count <= 40 || (sweet_fb_swap_count % 600) == 0) {
+ 		IOLog("SWEET FB: frame %llu rec %u mask 0x%x\n", sweet_fb_swap_count,
+ 		    get32(rec, 0x50), get32(rec, 0x104));
+@@ -607,31 +658,42 @@
+ 		if (src != 0 && bpe == 4 && fScale) {
+ 			fBlitsTotal++;
+ 			/*
+-			 * Fill the panel one destination row at a time. Horizontally
+-			 * the logical frame is cropped 1:1, so a row is a plain
+-			 * memcpy of wc pixels; vertically 2436 logical rows are
+-			 * squeezed into 2160 panel rows, which costs one multiply
+-			 * per row instead of one per pixel.
++			 * Fill the panel one destination row at a time. Vertically the
++			 * logical rows are stretched into panel rows, which costs one
++			 * multiply per row; horizontally the destination column is
++			 * looked up in fColMap and the source pixel gathered, which is
++			 * one multiply-free gather per pixel.
++			 *
++			 * The destination is written in increasing x with no gaps, so
++			 * it stays a linear stream into the write-combined panel
++			 * mapping; only the source is non-linear, and a whole source
++			 * row (750 * 4 B = 3 KB) stays in L1 across the stretch.
+ 			 */
+ 			uint64_t t0 = mach_absolute_time();
+-			int32_t sxc = sx;
+-			int32_t wc = w;
+-			int32_t dx0 = dx - fSrcOffX;
+-			if (dx0 < 0) {
+-				sxc -= dx0;
+-				wc += dx0;
+-				dx0 = 0;
+-			}
+-			if (dx0 + wc > (int32_t)fWidth) {
+-				wc = (int32_t)fWidth - dx0;
+-			}
++			/*
++			 * Panel extent of this rectangle. Logical x -> panel x is
++			 * x * fWidth / fLogicalW, so the rectangle covers
++			 * [dx, dx+w) * fWidth / fLogicalW. px1 is rounded up so the
++			 * last panel column of a small rectangle is never left stale.
++			 */
++			int32_t px0 = (int32_t)(((int64_t)dx * fWidth) / fLogicalW);
++			int32_t px1 = (int32_t)(((int64_t)(dx + w) * fWidth) / fLogicalW) + 1;
++			if (px0 < 0) {
++				px0 = 0;
++			}
++			if (px1 > (int32_t)fWidth) {
++				px1 = (int32_t)fWidth;
++			}
++			/* Source column for logical column dx, relative to the layer. */
++			int32_t base = sx - dx;
++			int32_t lxmax = dx + w - 1;
+ 			/*
+ 			 * Panel rows whose source row falls in [dy, dy+h). py0 may be
+ 			 * one row early (the syy test below drops it), but py1 must be
+ 			 * rounded up or the last row of every dirty rectangle is left
+-			 * stale: the squeeze maps 1.128 panel rows onto one logical
+-			 * row, so the bottom row of a small rectangle often has no
+-			 * exact floor.
++			 * stale: the stretch maps fewer than one panel row onto one
++			 * logical row, so the bottom row of a small rectangle often has
++			 * no exact floor.
+ 			 */
+ 			int32_t py0 = (int32_t)(((int64_t)dy * fHeight) / fLogicalH);
+ 			int32_t py1 = (int32_t)(((int64_t)(dy + h) * fHeight) / fLogicalH) + 1;
+@@ -641,17 +703,41 @@
+ 			if (py1 > (int32_t)fHeight) {
+ 				py1 = (int32_t)fHeight;
+ 			}
+-			if (wc > 0) {
++			bool mapok = fWidth <= SWEET_FB_COLMAP_MAX;
++			if (px1 > px0 && mapok) {
++				for (int32_t y = py0; y < py1; y++) {
++					int32_t ly = (int32_t)(((int64_t)y * fLogicalH) / fHeight);
++					int32_t syy = sy + ly - dy;
++					if (syy < sy || syy >= sy + h) {
++						continue;
++					}
++					const uint32_t *srow = (const uint32_t *)(const void *)
++					    (src + s->offset + (uint64_t)syy * s->bytesPerRow);
++					uint32_t *drow = (uint32_t *)(void *)
++					    (fPixels + (uint64_t)y * fRowBytes);
++					for (int32_t x = px0; x < px1; x++) {
++						int32_t lx = fColMap[x];
++						if (lx < dx) {
++							lx = dx;
++						} else if (lx > lxmax) {
++							lx = lxmax;
++						}
++						drow[x] = srow[base + lx];
++					}
++				}
++			} else if (px1 > px0) {
++				/* No column map (panel wider than the map): 1:1 as before. */
++				int32_t sxc = sx + (px0 - dx);
+ 				for (int32_t y = py0; y < py1; y++) {
+ 					int32_t ly = (int32_t)(((int64_t)y * fLogicalH) / fHeight);
+ 					int32_t syy = sy + ly - dy;
+ 					if (syy < sy || syy >= sy + h) {
+ 						continue;
+ 					}
+-					memcpy((void *)(fPixels + (uint64_t)y * fRowBytes + (uint64_t)dx0 * 4),
++					memcpy((void *)(fPixels + (uint64_t)y * fRowBytes + (uint64_t)px0 * 4),
+ 					    (const void *)(src + s->offset +
+ 					    (uint64_t)syy * s->bytesPerRow + (uint64_t)sxc * 4),
+-					    (size_t)wc * 4);
++					    (size_t)(px1 - px0) * 4);
+ 				}
+ 			}
+ 			uint64_t dt = mach_absolute_time() - t0;
