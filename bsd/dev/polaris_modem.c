@@ -54,7 +54,6 @@ extern void thread_deallocate(thread_t);
  * a kilobyte of stack to read a directory. */
 static uint8_t md_block[MD_BLOCK];
 static uint8_t md_cluster[MD_MAX_CLUSTER];
-static int md_chan;		/* wait channel for the short sleeps below */
 
 static struct {
 	uint32_t bps, spc, reserved, fats, root_ent, fatsz;
@@ -395,47 +394,6 @@ md_wr(vm_offset_t base, uint32_t off, uint32_t v)
 } while (0)
 
 /*
- * A spin, not a sleep. A thread that parks in the interconnect never comes
- * back, and thread_block() would add a second way to lose one. A millisecond
- * is short enough to burn.
- */
-static void
-md_spin_ms(unsigned ms)
-{
-	volatile uint64_t n = (uint64_t)ms * 40000ull;
-
-	while (n != 0) {
-		n--;
-	}
-}
-
-/* Switch a clock branch on and say whether it came up. */
-static void
-md_clock_on(vm_offset_t gcc, uint32_t off, const char *name)
-{
-	uint32_t before = md_rd(gcc, off);
-
-	if (!(before & MD_CBCR_OFF) && (before & 1u)) {
-		MD_SAY("POLARIS MODEM:   %-18s +0x%05x 0x%08x already on\n", name, off,
-		    before);
-		return;
-	}
-	md_wr(gcc, off, before | 1u);
-	for (unsigned i = 0; i < 20u; i++) {
-		uint32_t v = md_rd(gcc, off);
-
-		if (!(v & MD_CBCR_OFF)) {
-			MD_SAY("POLARIS MODEM:   %-18s +0x%05x 0x%08x -> 0x%08x on\n",
-			    name, off, before, v);
-			return;
-		}
-		md_spin_ms(1);
-	}
-	MD_SAY("POLARIS MODEM:   %-18s +0x%05x 0x%08x -> 0x%08x STILL HALTED\n",
-	    name, off, before, md_rd(gcc, off));
-}
-
-/*
  * The four values the MBA reports as it goes, in the order it reports them.
  * Anything outside that list is printed as a raw number rather than dressed up.
  */
@@ -458,16 +416,24 @@ md_mba_status_name(uint32_t v)
  * name of the register that did it - and that name is the answer, not a loss.
  */
 static void
-md_read_table(vm_offset_t base, const char *what, const struct md_reg *tbl,
-    unsigned count)
+md_read_table(vm_offset_t base, const struct md_reg *tbl, unsigned count,
+    boolean_t clock_branch)
 {
 	for (unsigned i = 0; i < count; i++) {
+		uint32_t v;
+
 		MD_SAY("POLARIS MODEM:   %-20s +0x%03x reading\n", tbl[i].name,
 		    tbl[i].off);
-		MD_SAY("POLARIS MODEM:   %-20s +0x%03x = 0x%08x\n", tbl[i].name,
-		    tbl[i].off, md_rd(base, tbl[i].off));
+		v = md_rd(base, tbl[i].off);
+		if (clock_branch) {
+			MD_SAY("POLARIS MODEM:   %-20s +0x%03x = 0x%08x %s\n",
+			    tbl[i].name, tbl[i].off, v,
+			    (v & MD_CBCR_OFF) ? "OFF (halted)" : "on");
+		} else {
+			MD_SAY("POLARIS MODEM:   %-20s +0x%03x = 0x%08x\n",
+			    tbl[i].name, tbl[i].off, v);
+		}
 	}
-	(void)what;
 }
 
 /*
@@ -488,8 +454,8 @@ polaris_modem_state_probe(void)
 	if (level < 2) {
 		return;
 	}
-	MD_SAY("POLARIS MODEM: ======== build 0176 alive: level %d, read first, "
-	    "the clock writes are level 3 ========\n", level);
+	MD_SAY("POLARIS MODEM: ======== build 0177 alive: level %d, the boot ROM "
+	    "branch at 0x38004 is never written again ========\n", level);
 
 	gcc = ml_io_map(MD_GCC_PHYS, MD_GCC_SIZE);
 	if (gcc == 0) {
@@ -503,23 +469,41 @@ polaris_modem_state_probe(void)
 		MD_SAY("POLARIS MODEM:   apps vote          +0x52004 = 0x%08x "
 		    "(mss gpll0 div %s)\n", v, (v & (1u << 17)) ? "voted" : "not voted");
 	}
-	md_read_table(gcc, "gcc", md_clocks,
-	    (unsigned)(sizeof(md_clocks) / sizeof(md_clocks[0])));
+	md_read_table(gcc, md_clocks,
+	    (unsigned)(sizeof(md_clocks) / sizeof(md_clocks[0])), TRUE);
 	if (level < 3) {
-		MD_SAY("POLARIS MODEM: phase A done; level 3 adds the clock writes "
-		    "and the modem's own blocks\n");
+		MD_SAY("POLARIS MODEM: phase A done; level 3 adds the modem's own "
+		    "blocks\n");
 		return;
 	}
 
-	MD_SAY("POLARIS MODEM: phase B: switching the two AHB branches on\n");
-	md_clock_on(gcc, MD_GCC_MSS_CFG_AHB, "mss_cfg_ahb");
-	md_clock_on(gcc, MD_GCC_BOOT_ROM_AHB, "boot_rom_ahb");
-	{
-		uint32_t v = md_rd(gcc, MD_GCC_APPS_VOTE);
+	/*
+	 * 0x38004 is not written here, and must not be. Build 0176 wrote one bit
+	 * into it - 0x00004220 -> 0x00004221 - and the whole SoC stopped on that
+	 * store: no panic, no further output, and it made no difference that the
+	 * store came from its own thread. Reading the same register had just
+	 * worked, and the GPU probe writes to GCC branches at 0x71004 without
+	 * trouble, so this is that one branch, not GCC writes in general.
+	 *
+	 * It is gcc_boot_rom_ahb_clk, which Linux marks BRANCH_HALT_VOTED: its
+	 * CBCR is a vote result, not a control. Whatever the store does on this
+	 * part, the answer is to leave it alone - and the reading below shows it
+	 * is not needed to reach the RMB, because mss_cfg_ahb is already on.
+	 */
+	if (level >= 4) {
+		MD_SAY("POLARIS MODEM: phase B skipped at level 4: nothing is "
+		    "written at all\n");
+	} else {
+		MD_SAY("POLARIS MODEM: phase B: voting GPLL0 to the modem, no branch "
+		    "written\n");
+		{
+			uint32_t v = md_rd(gcc, MD_GCC_APPS_VOTE);
 
-		md_wr(gcc, MD_GCC_APPS_VOTE, v | (1u << 17));
-		MD_SAY("POLARIS MODEM:   apps vote          +0x52004 0x%08x -> 0x%08x "
-		    "(mss gpll0 div voted)\n", v, md_rd(gcc, MD_GCC_APPS_VOTE));
+			md_wr(gcc, MD_GCC_APPS_VOTE, v | (1u << 17));
+			MD_SAY("POLARIS MODEM:   apps vote          +0x52004 0x%08x -> "
+			    "0x%08x (mss gpll0 div voted)\n", v,
+			    md_rd(gcc, MD_GCC_APPS_VOTE));
+		}
 	}
 
 	MD_SAY("POLARIS MODEM: phase C: the RMB at %#llx\n",
@@ -529,7 +513,7 @@ polaris_modem_state_probe(void)
 		MD_SAY("POLARIS MODEM: the RMB did not map\n");
 		return;
 	}
-	md_read_table(rmb, "rmb", md_rmb, (unsigned)(sizeof(md_rmb) / sizeof(md_rmb[0])));
+	md_read_table(rmb, md_rmb, (unsigned)(sizeof(md_rmb) / sizeof(md_rmb[0])), FALSE);
 
 	{
 		uint32_t pbl = md_rd(rmb, 0x04);
@@ -552,7 +536,7 @@ polaris_modem_state_probe(void)
 		MD_SAY("POLARIS MODEM: the Q6 block did not map\n");
 		return;
 	}
-	md_read_table(q6, "q6", md_q6, (unsigned)(sizeof(md_q6) / sizeof(md_q6[0])));
+	md_read_table(q6, md_q6, (unsigned)(sizeof(md_q6) / sizeof(md_q6[0])), FALSE);
 	MD_SAY("POLARIS MODEM: read only; nothing was written to the modem\n");
 }
 
