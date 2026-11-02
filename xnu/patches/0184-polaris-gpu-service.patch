@@ -289,7 +289,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5295,668 @@
+@@ -5067,4 +5295,709 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -758,13 +758,27 @@
 + * around every call that reaches this, and the boot-time test runs before a
 + * client can exist.
 + *
-+ * The CPU side is one mapping of the whole region, made on first use and kept
-+ * for good. It is ml_io_map, which is uncached, and that is the point: the GPU
-+ * writes past the cache, so a cached view would read back whatever the CPU
-+ * left there and call a working GPU broken. One mapping instead of one per
-+ * buffer also means nothing has to be unmapped when a buffer is given back,
-+ * and no kernel address is ever leaked to a program that makes buffers in a
-+ * loop.
++ * The CPU side is one view at a time, of one buffer at a time, made by
++ * ml_io_map, which is uncached, and that part is the point: the GPU writes past
++ * the cache, so a cached view would read back whatever the CPU left there and
++ * call a working GPU broken.
++ *
++ * 0197 tried to make this cheaper by mapping the whole region once - "nothing
++ * to give back, so nothing to keep track of". The kernel's answer was
++ *
++ *   panic(cpu 8 caller 0xfffffff00797e04c): kalloc_alloc(0xffffffe100802040,
++ *         16777216, 0x8021): failed with 3 @vm_kern.c:178
++ *
++ * a sixteen megabyte kalloc and no room for one. The mapping is charged at the
++ * size asked for, so the size asked for is the buffer's.
++ *
++ * This kernel has no ml_io_unmap, so each view is a leak of the buffer's size
++ * in the kernel map. One slot is kept and reused while the same buffer is asked
++ * for again, which is the common case (zero it, fill it, read it back); a
++ * client that cycles through many buffers will leak a little per buffer, and
++ * the fix for that is an unmap or a zero written by the CP, not a bigger slot.
++ * PG_POOL_VIEW_MAX is what one view may ask for until the map's free space is
++ * measured rather than guessed.
 + */
 +#define PG_POOL_SIZE		(16ull << 20)	/* ramdump_fb_region, whole */
 +#define PG_POOL_SLOTS		64u
@@ -778,7 +792,9 @@
 +};
 +static unsigned pg_pool_count = 1;
 +static uint64_t pg_pool_taken;
-+static vm_offset_t pg_pool_window;
++static vm_offset_t pg_pool_window;	/* the one view this build holds */
++static uint64_t pg_pool_view_pa;
++static uint64_t pg_pool_view_bytes;
 +
 +uint64_t
 +polaris_gpu_pool_alloc(uint64_t bytes)
@@ -860,24 +876,49 @@
 +}
 +
 +/*
-+ * Where the CPU sees a pool page. The whole region is one uncached mapping; a
-+ * caller gets the window's address plus the page's offset into the region.
++ * Where the CPU sees a pool buffer.
++ *
++ * One ml_io_map for the buffer, never for the region. 0197 asked for the whole
++ * sixteen megabytes once, on the reasoning that a mapping made once is a
++ * mapping that never has to be given back (this kernel has no ml_io_unmap);
++ * the kernel answered
++ *
++ *   panic: kalloc_alloc(0xffffffe100802040, 16777216, 0x8021): failed with 3
++ *
++ * - a sixteen megabyte kalloc, and there is no room for one. Whatever the
++ * mapping costs, it is charged at the size asked for, so ask for the size of
++ * the buffer. Sixteen pages of it, sixty-four kilobytes, is what 0196 mapped
++ * page by page without trouble.
++ *
++ * PG_POOL_VIEW_MAX is where that stops being safe rather than a preference: a
++ * request larger than it is refused with a line in the log instead of being
++ * handed to the allocator to panic on. Raising it needs a measurement of this
++ * kernel map's free space, not a guess.
 + */
++#define PG_POOL_VIEW_MAX	(64ull << 10)
++
 +void *
 +polaris_gpu_pool_view(uint64_t pa, uint64_t bytes)
 +{
 +	if (pa < PG_POOL_BASE || bytes == 0 || pa + bytes > PG_POOL_BASE + PG_POOL_SIZE) {
 +		return NULL;
 +	}
-+	if (pg_pool_window == 0) {
-+		pg_pool_window = ml_io_map((vm_offset_t)PG_POOL_BASE, (vm_size_t)PG_POOL_SIZE);
-+		if (pg_pool_window == 0) {
-+			printf("POLARIS GPU: 19 pool: the region at %#llx has no CPU view\n",
-+			    (uint64_t)PG_POOL_BASE);
-+			return NULL;
-+		}
++	if (bytes > PG_POOL_VIEW_MAX) {
++		printf("POLARIS GPU: 19 pool: a view of %llu bytes is over the %llu this build "
++		    "asks the kernel map for\n", bytes, (uint64_t)PG_POOL_VIEW_MAX);
++		return NULL;
 +	}
-+	return (void *)(pg_pool_window + (vm_offset_t)(pa - PG_POOL_BASE));
++	if (pg_pool_window != 0 && pg_pool_view_pa == pa && pg_pool_view_bytes == bytes) {
++		return (void *)pg_pool_window;
++	}
++	pg_pool_window = ml_io_map((vm_offset_t)pa, (vm_size_t)bytes);
++	if (pg_pool_window == 0) {
++		printf("POLARIS GPU: 19 pool: the pages at %#llx have no CPU view\n", pa);
++		return NULL;
++	}
++	pg_pool_view_pa = pa;
++	pg_pool_view_bytes = bytes;
++	return (void *)pg_pool_window;
 +}
 +
 +void
