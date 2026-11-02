@@ -1,0 +1,252 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-02 14:25:01.200599200 +0800
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-02 14:25:01.309495500 +0800
+@@ -136,7 +136,9 @@
+ 	uint64_t      fTicks;                 /* vsync ticks since boot */
+ 	uint64_t      fSwapSeen;              /* swap count at the last heartbeat */
+ 	uint64_t      fBlitMin, fBlitMax, fBlitSum;     /* mach ticks, per copy */
++	uint64_t      fBlitStage;               /* copies served from fStage */
+ 	uint16_t      fColMap[SWEET_FB_COLMAP_MAX];    /* panel x -> logical x */
++	uint32_t     *fStage;                   /* one stretched panel row, cacheable */
+ 	uint64_t      fSwapLast;        /* mach time of the previous swap */
+ 	uint64_t      fSwapGapMin, fSwapGapMax, fSwapGapSum;
+ 	uint64_t      fSwapGapFrames;   /* intervals measured in this window */
+@@ -260,12 +262,50 @@
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	/*
++	 * A staging row in ordinary cacheable kernel memory.
++	 *
++	 * The panel mapping is write-combined, and 0183 measured what a four-byte
++	 * store into it costs: 1080x2160 pixels gathered straight into the panel
++	 * took 16.5 ms, i.e. 566 MB/s of useful data. 0182, whose blit was a
++	 * memcpy per row into the same memory, moved the same panel in 4 ms,
++	 * 2.6 GB/s. Same destination, same size, 4.6x the throughput, and the
++	 * only difference is store width: memcpy leaves 16- and 32-byte stores,
++	 * the gather left one 4-byte store per pixel.
++	 *
++	 * So the stretch now gathers into this row first and the panel only ever
++	 * sees a wide linear copy. The gather itself gets faster too, because it
++	 * now reads and writes cacheable memory.
++	 *
++	 * sweetfb_blit=0 keeps the old straight-into-the-panel gather, so the two
++	 * can be compared from one boot to the next.
++	 */
++	int blitmode = 1;
++	PE_parse_boot_argn("sweetfb_blit", &blitmode, sizeof(blitmode));
++	fStage = NULL;
++	if (blitmode != 0) {
++		fStage = (uint32_t *)IOMallocAligned((vm_size_t)fWidth * 4, 64);
++		if (fStage == NULL) {
++			IOLog("SWEET FB: no staging row, the blit gathers into the panel\n");
++		}
++	}
+ 	if (fScale) {
+ 		/* Clear the boot splash: the panel is now filled edge to edge, so
+-		 * nothing outside the first frame's dirty rect may survive. */
++		 * nothing outside the first frame's dirty rect may survive.
++		 *
++		 * This loop is also the write-ceiling probe: fWidth*4 bytes per
++		 * row, no reads at all, so its throughput is the most any copy
++		 * into the panel can ever reach. It runs once, before anything is
++		 * on screen, so timing it costs nothing. */
++		uint64_t w0 = mach_absolute_time();
+ 		for (uint32_t y = 0; y < fHeight; y++) {
+ 			memset((void *)(fPixels + (uint64_t)y * fRowBytes), 0, (size_t)fWidth * 4);
+ 		}
++		uint64_t wn = 0;
++		uint64_t wbytes = (uint64_t)fWidth * 4 * fHeight;
++		absolutetime_to_nanoseconds(mach_absolute_time() - w0, &wn);
++		IOLog("SWEET FB: panel write ceiling %llu bytes in %llu us (%llu MB/s)\n",
++		    wbytes, wn / 1000, wn ? wbytes * 1000 / wn : 0);
+ 	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+@@ -286,6 +326,9 @@
+ 	IOLog("SWEET FB: %s content %ux%u at %d,%d, panel x -> logical x by a %u-entry map\n",
+ 	    fScale ? "filling" : "cropping at", fContentW, fContentH, fOffX, fOffY,
+ 	    (fWidth <= SWEET_FB_COLMAP_MAX) ? fWidth : 0);
++	IOLog("SWEET FB: blit %s\n", fStage != NULL ?
++	    "gathers into a staging row, panel gets wide copies" :
++	    "gathers straight into the write-combined panel");
+ 	return true;
+ }
+ 
+@@ -499,6 +542,33 @@
+ 	return v;
+ }
+ 
++/*
++ * Broadcast one pixel across n panel columns, two at a time.
++ *
++ * Used for the clamped ends of a stretched rectangle, where the source column
++ * is a constant. A four-byte store per pixel into the write-combined panel is
++ * the expensive thing this build is trying to stop doing, so even this small
++ * run goes out as 8-byte stores.
++ */
++static void
++sweet_fb_fill(uint32_t *d, int32_t n, uint32_t v)
++{
++	uint64_t pair = ((uint64_t)v << 32) | (uint64_t)v;
++
++	while (n > 0 && ((uintptr_t)d & 7) != 0) {
++		*d++ = v;
++		n--;
++	}
++	while (n >= 2) {
++		*(uint64_t *)(void *)d = pair;
++		d += 2;
++		n -= 2;
++	}
++	if (n > 0) {
++		*d = v;
++	}
++}
++
+ static uint32_t sweet_fb_swaps_logged;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+@@ -658,16 +728,24 @@
+ 		if (src != 0 && bpe == 4 && fScale) {
+ 			fBlitsTotal++;
+ 			/*
+-			 * Fill the panel one destination row at a time. Vertically the
+-			 * logical rows are stretched into panel rows, which costs one
+-			 * multiply per row; horizontally the destination column is
+-			 * looked up in fColMap and the source pixel gathered, which is
+-			 * one multiply-free gather per pixel.
++			 * Fill the panel one destination row at a time.
+ 			 *
+-			 * The destination is written in increasing x with no gaps, so
+-			 * it stays a linear stream into the write-combined panel
+-			 * mapping; only the source is non-linear, and a whole source
+-			 * row (750 * 4 B = 3 KB) stays in L1 across the stretch.
++			 * Vertically the logical rows are stretched into panel rows;
++			 * horizontally the destination column is looked up in fColMap
++			 * and the source pixel gathered. 0183 did that gather straight
++			 * into the panel and paid 16.5 ms for a full frame, because a
++			 * four-byte store into the write-combined mapping is a whole
++			 * memory transaction. This version gathers into fStage - an
++			 * ordinary cacheable row - and then copies that row into the
++			 * panel with memcpy, which leaves 16- and 32-byte stores.
++			 *
++			 * Two things fall out of that for free. The gather is now
++			 * cached on both sides, so it is a few cycles per pixel
++			 * instead of a memory round trip. And a panel row whose
++			 * logical row has not changed since the previous panel row is
++			 * just another copy of the same staged row: vertical stretch
++			 * is 2160/1624, so a third of the panel rows are duplicates
++			 * and skip the gather entirely.
+ 			 */
+ 			uint64_t t0 = mach_absolute_time();
+ 			/*
+@@ -705,6 +783,45 @@
+ 			}
+ 			bool mapok = fWidth <= SWEET_FB_COLMAP_MAX;
+ 			if (px1 > px0 && mapok) {
++				/*
++				 * fColMap is non-decreasing, so clamping lx to
++				 * [dx, lxmax] only bites at the two ends of the
++				 * rectangle. Find both ends once and the hot range needs
++				 * no comparison at all - the inner loop becomes a load,
++				 * an add, a load and a store.
++				 *
++				 * xlo is the first panel column whose source column is
++				 * already inside the layer; xhi is the first whose
++				 * source column is past it. Between them, no clamp.
++				 */
++				int32_t xlo = px0;
++				int32_t xhi = px1;
++				if (fColMap[px0] < dx) {
++					int32_t lo = px0, hi = px1;
++					while (lo < hi) {
++						int32_t mid = lo + ((hi - lo) >> 1);
++						if (fColMap[mid] < dx) {
++							lo = mid + 1;
++						} else {
++							hi = mid;
++						}
++					}
++					xlo = lo;
++				}
++				if (fColMap[px1 - 1] > lxmax) {
++					int32_t lo = px0, hi = px1;
++					while (lo < hi) {
++						int32_t mid = lo + ((hi - lo) >> 1);
++						if (fColMap[mid] <= lxmax) {
++							lo = mid + 1;
++						} else {
++							hi = mid;
++						}
++					}
++					xhi = lo;
++				}
++				uint32_t *stage = fStage;
++				int32_t lastLy = -1;
+ 				for (int32_t y = py0; y < py1; y++) {
+ 					int32_t ly = (int32_t)(((int64_t)y * fLogicalH) / fHeight);
+ 					int32_t syy = sy + ly - dy;
+@@ -714,15 +831,41 @@
+ 					const uint32_t *srow = (const uint32_t *)(const void *)
+ 					    (src + s->offset + (uint64_t)syy * s->bytesPerRow);
+ 					uint32_t *drow = (uint32_t *)(void *)
+-					    (fPixels + (uint64_t)y * fRowBytes);
+-					for (int32_t x = px0; x < px1; x++) {
+-						int32_t lx = fColMap[x];
+-						if (lx < dx) {
+-							lx = dx;
+-						} else if (lx > lxmax) {
+-							lx = lxmax;
++					    (fPixels + (uint64_t)y * fRowBytes + (uint64_t)px0 * 4);
++					int32_t n = px1 - px0;
++					if (stage != NULL && ly == lastLy) {
++						memcpy(drow, stage + px0, (size_t)n * 4);
++						fBlitStage++;
++						continue;
++					}
++					lastLy = ly;
++					if (stage != NULL) {
++						/* Clamped left end: constant column sx. */
++						if (xlo > px0) {
++							sweet_fb_fill(stage + px0, xlo - px0, srow[sx]);
++						}
++						/* Hot range: no clamp, one gather per pixel. */
++						for (int32_t x = xlo; x < xhi; x++) {
++							stage[x] = srow[base + fColMap[x]];
++						}
++						/* Clamped right end: constant column sx+w-1. */
++						if (xhi < px1) {
++							sweet_fb_fill(stage + xhi, px1 - xhi,
++							    srow[sx + w - 1]);
++						}
++						memcpy(drow, stage + px0, (size_t)n * 4);
++					} else {
++						/* sweetfb_blit=0: gather into the panel. */
++						if (xlo > px0) {
++							sweet_fb_fill(drow, xlo - px0, srow[sx]);
++						}
++						for (int32_t x = xlo; x < xhi; x++) {
++							drow[x - px0] = srow[base + fColMap[x]];
++						}
++						if (xhi < px1) {
++							sweet_fb_fill(drow + (xhi - px0), px1 - xhi,
++							    srow[sx + w - 1]);
+ 						}
+-						drow[x] = srow[base + lx];
+ 					}
+ 				}
+ 			} else if (px1 > px0) {
+@@ -753,10 +896,11 @@
+ 				absolutetime_to_nanoseconds(fBlitMin, &nmin);
+ 				absolutetime_to_nanoseconds(fBlitSum / fBlitFrames, &navg);
+ 				absolutetime_to_nanoseconds(fBlitMax, &nmax);
+-				IOLog("SWEET FB: blit over %llu frames: min %llu us, avg %llu us, max %llu us\n",
+-				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000);
++				IOLog("SWEET FB: blit over %llu frames: min %llu us, avg %llu us, max %llu us, %llu staged\n",
++				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
+ 				fBlitFrames = 0;
+ 				fBlitMin = fBlitMax = fBlitSum = 0;
++				fBlitStage = 0;
+ 			}
+ 		} else if (src != 0 && bpe == 4) {
+ 			fBlitsTotal++;
