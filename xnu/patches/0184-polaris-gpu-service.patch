@@ -289,7 +289,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5295,412 @@
+@@ -5067,4 +5295,416 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -643,7 +643,9 @@
 +			    filled ? "drained" : "did NOT drain", changed, words, wrong,
 +			    (filled && changed == words && wrong == 0) ?
 +			    "THE PROGRAM'S WINDOW REACHES THE PANEL" :
-+			    "the program's window does not reach the panel either");
++			    (changed > 0 ?
++			    "the panel changed but not to what the fill was told to write" :
++			    "the program's window does not reach the panel either"));
 +		}
 +		polaris_gpu_unmap(second, bytes);
 +		polaris_gpu_mapped();
@@ -692,7 +694,9 @@
 +		    filled ? "drained" : "did NOT drain", changed, words, wrong,
 +		    (filled && changed == words && wrong == 0) ?
 +		    "THE PANEL'S WINDOW REACHES MEMORY ABOVE 4 GB" :
-+		    "the panel's window does not reach these pages either");
++		    (changed > 0 ?
++		    "these pages changed but not to what the fill was told to write" :
++		    "the panel's window does not reach these pages either"));
 +	}
 +	for (uint32_t i = 0; i < pages; i++) {
 +		pl3[first + i] = saved[i];
@@ -704,7 +708,7 @@
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,898 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -1482,42 +1486,25 @@
 +	 */
 +	polaris_gpu_window_sync();
 +	polaris_gpu_window_report(address);
-+	filled = polaris_gpu_fill(address, (uint32_t)(size / 4));
-+	polaris_gpu_window_report(address);
-+	for (uint64_t i = 0; i < size / 4; i++) {
-+		if (words[i] != before) {
-+			changed++;
-+			if (words[i] != 0xa5a5a5a5u) {
-+				wrong++;
-+			}
-+		}
-+	}
-+	printf("POLARIS GPU: 19 test: the CP %s the fill; %u of %llu words changed, %u of those "
-+	    "are not 0xa5a5a5a5\n", filled ? "drained" : "did NOT drain", changed, size / 4, wrong);
-+	printf("POLARIS GPU: 19 test: %s\n",
-+	    (filled && changed == size / 4 && wrong == 0) ?
-+	    "THE GPU WROTE A BUFFER THIS KERNEL OWNS" : "the buffer is not what the GPU was told to write");
-+
 +	/*
-+	 * 0193: the same buffer, the same window, one packet per write-pointer
-+	 * update.
++	 * One packet per write-pointer update, which is what step 18 has always
++	 * done and what this test never did.
 +	 *
-+	 * Step 18 has written the panel on every build since 0162 and this test
-+	 * has written nothing on every build since 0187, and the difference was
-+	 * taken to be where the memory is. It is not, or not only: step 18 hands
-+	 * the CP PG_DRAW_PER_BATCH packets and then waits for RPTR to catch up
-+	 * before handing over the next batch, while this test builds sixteen
-+	 * chunks and updates the write pointer once - 16432 dwords against a
-+	 * 16384-dword ring, so that single burst wraps where step 18's never do.
-+	 * Nothing below changes except how the packets are handed over.
++	 * 0193 ran the old single burst first and wedged the command processor:
++	 * sixteen chunks of 1027 dwords is 16432 dwords, more than the 16384-dword
++	 * ring, so the write pointer ended up 48 dwords past where it started and
++	 * the CP - which had already read the first packet's header promising 1027
++	 * dwords - consumed those 48 and then waited for a payload that was never
++	 * going to arrive. RPTR stopped at 5383 and every fill after it in that
++	 * boot read RPTR 5456 forever. The arithmetic is exact: 16432 mod 16384 is
++	 * 48, and 5287 + 48 is 5335, which is the value the ring printed.
++	 *
++	 * So the burst goes away rather than being compared against. It cannot be
++	 * run before anything else without poisoning the ring for the rest of the
++	 * boot, and it has never once written a word.
 +	 */
-+	for (uint64_t i = 0; i < size / 4; i++) {
-+		words[i] = before;
-+	}
-+	__asm__ volatile ("dsb sy" ::: "memory");
 +	filled = polaris_gpu_fill_batched(address, (uint32_t)(size / 4));
-+	changed = 0;
-+	wrong = 0;
++	polaris_gpu_window_report(address);
 +	for (uint64_t i = 0; i < size / 4; i++) {
 +		if (words[i] != before) {
 +			changed++;
@@ -1531,8 +1518,7 @@
 +	    filled ? "drained" : "did NOT drain", changed, size / 4, wrong);
 +	printf("POLARIS GPU: 19 test: %s\n",
 +	    (filled && changed == size / 4 && wrong == 0) ?
-+	    "THE BURST WAS THE WHOLE OF IT" :
-+	    "handing the packets over one at a time changes nothing");
++	    "THE BURST WAS THE WHOLE OF IT" : "the buffer is not what the GPU was told to write");
 +
 +	/*
 +	 * 0192: the count above has said the same thing for five builds, so
