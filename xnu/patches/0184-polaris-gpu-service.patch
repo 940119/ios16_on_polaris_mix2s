@@ -11,8 +11,8 @@
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
---- a/bsd/dev/polaris_gpu.c	2026-11-02 14:04:53.000000000 +0800
-+++ b/bsd/dev/polaris_gpu.c	2026-11-02 14:04:53.000000000 +0800
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
 @@ -19,6 +19,14 @@
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  
@@ -49,7 +49,27 @@
  
  static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
  static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
-@@ -1407,6 +1425,164 @@
+@@ -1095,6 +1113,19 @@
+ static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
+ static bool pg_masks_saved;
+ 
++/*
++ * What bsd/dev/polaris_gpu_service.cpp is allowed to call, declared up here
++ * because their definitions have to come after the CP exists: the readiness
++ * test reads pg_gpu3d, which step 15 assigns, and the fill needs the ring.
++ * polaris_gpu_init() calls the readiness test a few thousand lines before
++ * either definition, so without these two lines the file does not compile -
++ * the first attempt at 0184 failed exactly that way, with "call to undeclared
++ * function 'polaris_gpu_ready'" and then "conflicting types", because an
++ * implicit declaration is int(void) and the real one is bool(void).
++ */
++bool polaris_gpu_ready(void);
++bool polaris_gpu_fill(uint64_t iova, uint32_t words);
++
+ /* The GMU reads from memory, not from this processor's cache. */
+ static void
+ pg_to_memory(vm_offset_t start, vm_size_t size)
+@@ -1407,6 +1438,164 @@
  	return true;
  }
  
@@ -214,7 +234,7 @@
  /*
   * IMPL_DEF1 is at base + 6 pages, and its first word is the micro MMU's
   * control word. The vendor driver halts the SMMU around the
-@@ -4865,7 +5041,7 @@
+@@ -4865,7 +5054,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
  	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
@@ -223,7 +243,7 @@
  	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
  	    "physical, stream 5 bypassed (polarisgpumap=0)");
  	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
-@@ -5049,6 +5225,18 @@
+@@ -5049,6 +5238,18 @@
  	if (upto > 0) {
  		polaris_gpu.state = POLARIS_GPU_STARTING;
  		polaris_gpu_up(upto);
@@ -242,7 +262,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5255,69 @@
+@@ -5067,4 +5268,69 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
