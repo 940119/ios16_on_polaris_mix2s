@@ -262,7 +262,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5268,133 @@
+@@ -5067,4 +5268,329 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -293,17 +293,13 @@
 + * the first write past the fifth table was still a translation fault, because
 + * what the code did with kvtophys() was not what it said.
 + */
-+bool
-+polaris_gpu_fill(uint64_t iova, uint32_t words)
++static bool
++pg_fill_span(uint64_t iova, uint32_t words)
 +{
 +	uint32_t wptr = pg_cp_wptr;
 +	uint32_t sent = 0;
 +	uint32_t rptr = 0;
 +
-+	if (pg_gpu3d == 0 || pg_ring_va[0] == 0 || words == 0 ||
-+	    iova < PG_USER_IOVA || iova + 4ull * words > PG_USER_IOVA + PG_USER_SIZE) {
-+		return false;
-+	}
 +	while (sent < words) {
 +		uint32_t n = words - sent < PG_FILL_CHUNK ? words - sent : PG_FILL_CHUNK;
 +		uint64_t addr = iova + 4ull * sent;
@@ -330,6 +326,38 @@
 +	}
 +	printf("POLARIS GPU: 19 the CP did not drain the fill: RPTR %u WPTR %u\n", rptr, wptr);
 +	return false;
++}
++
++bool
++polaris_gpu_fill(uint64_t iova, uint32_t words)
++{
++	if (pg_gpu3d == 0 || pg_ring_va[0] == 0 || words == 0 ||
++	    iova < PG_USER_IOVA || iova + 4ull * words > PG_USER_IOVA + PG_USER_SIZE) {
++		return false;
++	}
++	return pg_fill_span(iova, words);
++}
++
++/*
++ * The same packet at an address outside the program's span.
++ *
++ * The guard above exists because a client's buffer is supposed to live in
++ * PG_USER_IOVA and nowhere else; a caller that hands the CP an address it did
++ * not allocate is a bug worth refusing. This entry point is for the one caller
++ * that is not a client: the check below, which has to drive the panel's own
++ * window to tell "the address is wrong" apart from "the window is wrong", and
++ * cannot do that from inside the program's span.
++ */
++bool
++polaris_gpu_fill_window(uint64_t iova, uint32_t words)
++{
++	if (pg_gpu3d == 0 || pg_ring_va[0] == 0 || words == 0 ||
++	    iova < PG_CP_SQE_IOVA ||
++	    iova + 4ull * words >
++	    PG_CP_SQE_IOVA + (uint64_t)PG_CP_WINDOW_L2S * 0x200000ull) {
++		return false;
++	}
++	return pg_fill_span(iova, words);
 +}
 +
 +/*
@@ -395,10 +423,178 @@
 +		    (l3 != NULL ? l3[slot] : 0) & 0xeeull);
 +	}
 +}
++/* ---- one packet, two windows, one variable at a time --------------------------------------------- */
++
++/*
++ * Everything about the client test that has failed since 0187 is the same on
++ * every build: the ring drains, the CP reports no fault, the descriptor reads
++ * back as a valid page with attribute index 0, the page tables are the ones the
++ * walk reaches, and the buffer comes back untouched. The panel, driven by the
++ * same CP with the same packet and a descriptor of the same form, is written
++ * and read back by the CPU. Two things differ between the two cases, and every
++ * build so far has varied them together:
++ *
++ *     physical address   0x103aac000, above 4 GB      against 0x9d400000
++ *     window             PG_USER_IOVA, entry 6        against PG_PANEL_IOVA
++ *
++ * So change one at a time, from a known-good starting point in each direction:
++ *
++ *   A  the panel's own first pages, at the address the CPU reads as pixels,
++ *      entered into the program's window. Same physical page the CP demonstrably
++ *      writes, different window. If this fills, the program's window is sound
++ *      and the window is not the variable.
++ *
++ *   B  the client's pages, at the address the client was given, entered into
++ *      the panel's window. Same physical pages that come back untouched,
++ *      different window. If this fills, the panel's window reaches memory above
++ *      4 GB and the address is not the variable.
++ *
++ * A filling and B not names the address. B filling and A not names the window.
++ * Neither filling means the difference is somewhere else again, and the fault
++ * record printed after each run says whether the SMMU saw the write at all.
++ *
++ * A writes 0xa5a5a5a5 over the top sixteen rows of the panel, which is visible
++ * on purpose: a grey band across the top of the screen is the same fact as the
++ * count below it, and the desktop repaints over it.
++ */
++#define PG_PA_PAGES	16u		/* 64 KB, the size the client test asks for */
++#define PG_PA_SENTINEL	0xdeadbeefu
++
++static uint32_t
++pg_pa_count(volatile uint32_t *words, uint64_t n, uint32_t *wrongp)
++{
++	uint32_t changed = 0, wrong = 0;
++
++	for (uint64_t i = 0; i < n; i++) {
++		uint32_t v = words[i];
++
++		if (v != PG_PA_SENTINEL) {
++			changed++;
++			if (v != PG_FILL_WORD) {
++				wrong++;
++			}
++		}
++	}
++	*wrongp = wrong;
++	return changed;
++}
++
++void
++polaris_gpu_pa_test(const uint64_t *pas, uint32_t pages, uint64_t bytes,
++    volatile uint32_t *cpu)
++{
++	uint64_t words, second;
++	uint64_t saved[PG_PA_PAGES];
++	uint64_t *pl3;
++	vm_offset_t view;
++	uint32_t changed, wrong, first;
++	bool filled, mapped;
++
++	if (pas == NULL || cpu == NULL || pages == 0 || pages > PG_PA_PAGES ||
++	    bytes != (uint64_t)pages * (uint64_t)PG_GMU_PAGE_SIZE) {
++		printf("POLARIS GPU: 19 pa test: %u pages and %llu bytes do not agree\n",
++		    pages, bytes);
++		return;
++	}
++	words = bytes / 4ull;
++
++	/*
++	 * A. The panel's first pages, at the address step 18 writes them to, in
++	 * the window the client's buffer lives in.
++	 */
++	if (pg_panel_phys == 0) {
++		printf("POLARIS GPU: 19 pa test A: no panel address to borrow\n");
++	} else if ((view = ml_io_map((vm_offset_t)pg_panel_phys, (vm_size_t)bytes)) == 0) {
++		printf("POLARIS GPU: 19 pa test A: the panel has no CPU view\n");
++	} else if ((second = polaris_gpu_address(bytes)) == 0) {
++		printf("POLARIS GPU: 19 pa test A: no second address in the program's window\n");
++	} else {
++		mapped = true;
++		for (uint32_t i = 0; i < pages && mapped; i++) {
++			mapped = polaris_gpu_map(second + (uint64_t)i * PG_GMU_PAGE_SIZE,
++			    pg_panel_phys + (uint64_t)i * PG_GMU_PAGE_SIZE, false);
++		}
++		polaris_gpu_mapped();
++		for (uint64_t i = 0; i < words; i++) {
++			((volatile uint32_t *)view)[i] = PG_PA_SENTINEL;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		polaris_gpu_window_sync();
++		printf("POLARIS GPU: 19 pa test A: physical %#llx, the panel's own first %llu "
++		    "bytes, through the program's iova %#llx\n", pg_panel_phys, bytes, second);
++		if (!mapped) {
++			printf("POLARIS GPU: 19 pa test A: the window would not take it\n");
++		} else {
++			filled = polaris_gpu_fill(second, (uint32_t)words);
++			polaris_gpu_window_report(second);
++			changed = pg_pa_count((volatile uint32_t *)view, words, &wrong);
++			printf("POLARIS GPU: 19 pa test A: the CP %s; %u of %llu words changed, "
++			    "%u of those are not 0xa5a5a5a5: %s\n",
++			    filled ? "drained" : "did NOT drain", changed, words, wrong,
++			    (filled && changed == words && wrong == 0) ?
++			    "THE PROGRAM'S WINDOW REACHES THE PANEL" :
++			    "the program's window does not reach the panel either");
++		}
++		polaris_gpu_unmap(second, bytes);
++		polaris_gpu_mapped();
++		polaris_gpu_address_free(second, bytes);
++	}
++
++	/*
++	 * B. The client's pages, at the address the client was given, in the
++	 * window step 18 fills the panel through. The panel's descriptors are
++	 * saved and put back afterwards so the display's mapping survives the
++	 * test.
++	 */
++	pl3 = (uint64_t *)pg_smmu_l3(PG_PANEL_IOVA);
++	if (pl3 == NULL ||
++	    pg_smmu_l3(PG_PANEL_IOVA) !=
++	    pg_smmu_l3(PG_PANEL_IOVA + (uint64_t)(pages - 1u) * PG_GMU_PAGE_SIZE)) {
++		printf("POLARIS GPU: 19 pa test B: the panel window has no table to borrow\n");
++		return;
++	}
++	first = (uint32_t)((PG_PANEL_IOVA >> 12) & 0x1ff);
++	for (uint32_t i = 0; i < pages; i++) {
++		saved[i] = pl3[first + i];
++	}
++	mapped = true;
++	for (uint32_t i = 0; i < pages && mapped; i++) {
++		mapped = polaris_gpu_map(PG_PANEL_IOVA + (uint64_t)i * PG_GMU_PAGE_SIZE,
++		    pas[i], false);
++	}
++	polaris_gpu_mapped();
++	for (uint64_t i = 0; i < words; i++) {
++		cpu[i] = PG_PA_SENTINEL;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	polaris_gpu_window_sync();
++	printf("POLARIS GPU: 19 pa test B: physical %#llx..%#llx, the client's own pages, "
++	    "through the panel's iova %#llx\n", pas[0],
++	    pas[pages - 1u] + PG_GMU_PAGE_SIZE - 1u, PG_PANEL_IOVA);
++	if (!mapped) {
++		printf("POLARIS GPU: 19 pa test B: the window would not take it\n");
++	} else {
++		filled = polaris_gpu_fill_window(PG_PANEL_IOVA, (uint32_t)words);
++		polaris_gpu_window_report(PG_PANEL_IOVA);
++		changed = pg_pa_count(cpu, words, &wrong);
++		printf("POLARIS GPU: 19 pa test B: the CP %s; %u of %llu words changed, "
++		    "%u of those are not 0xa5a5a5a5: %s\n",
++		    filled ? "drained" : "did NOT drain", changed, words, wrong,
++		    (filled && changed == words && wrong == 0) ?
++		    "THE PANEL'S WINDOW REACHES MEMORY ABOVE 4 GB" :
++		    "the panel's window does not reach these pages either");
++	}
++	for (uint32_t i = 0; i < pages; i++) {
++		pl3[first + i] = saved[i];
++	}
++	polaris_gpu_mapped();
++	polaris_gpu_window_sync();
++}
++
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,831 @@
+@@ -0,0 +1,870 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -467,8 +663,11 @@
 +void polaris_gpu_mapped(void);
 +void polaris_gpu_unmap(uint64_t address, uint64_t size);
 +bool polaris_gpu_fill(uint64_t iova, uint32_t words);
++bool polaris_gpu_fill_window(uint64_t iova, uint32_t words);
 +void polaris_gpu_window_sync(void);
 +void polaris_gpu_window_report(uint64_t iova);
++void polaris_gpu_pa_test(const uint64_t *pas, uint32_t pages, uint64_t bytes,
++    volatile uint32_t *cpu);
 +}
 +
 +/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -1187,6 +1386,42 @@
 +	printf("POLARIS GPU: 19 test: %s\n",
 +	    (filled && changed == size / 4 && wrong == 0) ?
 +	    "THE GPU WROTE A BUFFER THIS KERNEL OWNS" : "the buffer is not what the GPU was told to write");
++
++	/*
++	 * 0192: the count above has said the same thing for five builds, so
++	 * repeating it again would not add anything. What has not been separated
++	 * is which of the two differences between this buffer and the panel is
++	 * the one that matters - where the memory is, or which window it is in -
++	 * and that is one experiment each, run from a known-good starting point.
++	 * The pages are handed over one by one because the descriptor does not
++	 * promise that a 64 KB allocation is contiguous, and the readings in
++	 * polaris_gpu_pa_test() go through the cache-inhibited view for the same
++	 * reason the ones above do.
++	 */
++	{
++		uint64_t pas[16];
++		uint32_t n = 0;
++		bool whole = true;
++
++		for (uint64_t offset = 0; offset < size && n < 16;
++		    offset += PAGE_SIZE, n++) {
++			IOByteCount length = 0;
++			addr64_t phys = memory->getPhysicalSegment(offset, &length,
++			    kIOMemoryMapperNone);
++
++			if (phys == 0 || (phys & (PAGE_SIZE - 1)) != 0) {
++				whole = false;
++				break;
++			}
++			pas[n] = phys;
++		}
++		if (whole && (uint64_t)n == size / PAGE_SIZE) {
++			polaris_gpu_pa_test(pas, n, size, words);
++		} else {
++			printf("POLARIS GPU: 19 pa test: %u of %llu pages have no address\n",
++			    n, size / PAGE_SIZE);
++		}
++	}
 +
 +	polaris_gpu_unmap(address, size);
 +	polaris_gpu_mapped();
