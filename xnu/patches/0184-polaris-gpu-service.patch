@@ -335,7 +335,7 @@
 
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,748 @@
+@@ -0,0 +1,766 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -553,22 +553,12 @@
 +	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
 +	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
 +	/*
-+	 * Declared by IOUserClient and never defined in this tree: the header
-+	 * declares ipc_port_t ** and iokit/Kernel/IOUserClient.cpp still defines
-+	 * the older io_object_t * form, so the declared one has no symbol. No
-+	 * class in this tree derived from IOUserClient before this file, so
-+	 * nobody hit it - the first subclass to emit a vtable is the one that
-+	 * fails to link, which was build 0184:
-+	 *
-+	 *   "IOUserClient::exportObjectToClient(task*, OSObject*, ipc_port**)",
-+	 *   referenced from vtable for PolarisGPUUserClient
-+	 *
-+	 * Overriding it keeps this vtable self-contained and states what the
-+	 * service does: it hands no objects to its client, it maps memory and
-+	 * answers selectors.
++	 * exportObjectToClient is deliberately not overridden here. This tree
++	 * declares it in IOUserClient.h and defines it in
++	 * iokit/Kernel/IOUserClient.cpp, and the two do not agree on
++	 * io_object_t, so the declaration's mangling has no symbol. The slot
++	 * is filled by defining the declaration itself, below this class.
 +	 */
-+	virtual IOReturn exportObjectToClient(task_t task, OSObject * obj,
-+	    ipc_port_t ** clientPort) APPLE_KEXT_OVERRIDE;
 +};
 +
 +OSDefineMetaClassAndStructors(PolarisGPUUserClient, IOUserClient);
@@ -820,13 +810,41 @@
 +	IOUserClient::free();
 +}
 +
++/*
++ * IOUserClient declares exportObjectToClient in IOUserClient.h and defines it
++ * in iokit/Kernel/IOUserClient.cpp, but the two do not agree on io_object_t.
++ * In the header this file sees, io_object_t is a port type; in the kernel's own
++ * translation unit it is OSObject *. The two spellings mangle differently, so
++ * the kernel carries
++ *
++ *   __ZN12IOUserClient20exportObjectToClientEP4taskP8OSObjectPS3_
++ *
++ * (PS3_ is a substitution for OSObject, so the third parameter there is
++ * OSObject *), while the vtable slot that any C++ subclass inherits asks for
++ * the same three parameters with a port pointer in the third place. Nothing in
++ * the kernel defines that one. No class in this tree derived from
++ * IOUserClient before this file, so nobody hit it - build 0184 was the first
++ * vtable to be emitted, and it failed to link:
++ *
++ *   "IOUserClient::exportObjectToClient(task*, OSObject*, ipc_port**)",
++ *   referenced from vtable for PolarisGPUUserClient
++ *
++ * An override cannot fix that, and the compiler said so on the next attempt:
++ * a parameter of type ipc_port_t ** does not override one of type
++ * io_object_t *. So the slot is filled by defining the declaration itself,
++ * spelled exactly as IOUserClient.h spells it. Whatever io_object_t turns out
++ * to be in this translation unit, this definition mangles the way the vtable
++ * that inherits it asks - the compiler derives both from the same line.
++ *
++ * What it does: this service hands no objects to its client. It maps memory
++ * and answers selectors, so the answer is kIOReturnUnsupported and no port.
++ */
 +IOReturn
-+PolarisGPUUserClient::exportObjectToClient(task_t task, OSObject * obj,
-+    ipc_port_t ** clientPort)
++IOUserClient::exportObjectToClient(task_t task, OSObject * obj, io_object_t * clientObj)
 +{
 +	(void)task;
-+	if (clientPort != NULL) {
-+		*clientPort = NULL;
++	if (clientObj != NULL) {
++		*clientObj = (io_object_t)(uintptr_t)0;
 +	}
 +	/*
 +	 * LIBKERN_CONSUMED: the reference comes in either way, so it goes out
