@@ -1,0 +1,158 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -104,6 +104,14 @@
+ #define SWEET_FB_LOGICAL_H              1624
+ #define SWEET_FB_COLMAP_MAX             2048
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++/*
++ * The horizontal stretch as an exact fraction. gcd(1080,750) is 30, so the
++ * panel is 36 columns per 25 source columns, 30 blocks wide. That makes the
++ * column map periodic with period 36 and lets the gather skip it entirely.
++ */
++#define SWEET_FB_SRC_BLK                25
++#define SWEET_FB_PANEL_BLK              36
++#define SWEET_FB_BLKS                   30
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -149,6 +157,7 @@
+ 	uint64_t      fBlitGather;              /* mach ticks inside sweet_fb_gather */
+ 	uint64_t      fBlitGatherRows;          /* rows that went through the gather */
+ 	uint64_t      fBlitPixels;              /* panel pixels written in the window */
++	bool          fGatherPeriod;            /* gather skips the column map */
+ 	uint16_t      fColMap[SWEET_FB_COLMAP_MAX];    /* panel x -> logical x */
+ 	uint32_t     *fStage;                   /* one stretched panel row, cacheable */
+ 	uint64_t      fSwapLast;        /* mach time of the previous swap */
+@@ -268,6 +277,21 @@
+ 		fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 		fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	}
++	/*
++	 * The unfolded gather is only the right shape when the stretch is exactly
++	 * 36 panel columns per 25 source columns across the whole width. It is on
++	 * this panel (1080 and 750); anything else falls back to the map.
++	 * sweetfb_gather=0 forces the map, so the two can be compared across boots.
++	 */
++	fGatherPeriod = (fWidth == SWEET_FB_PANEL_BLK * SWEET_FB_BLKS &&
++	    fLogicalW == SWEET_FB_SRC_BLK * SWEET_FB_BLKS);
++	{
++		int gmode = 1;
++		PE_parse_boot_argn("sweetfb_gather", &gmode, sizeof(gmode));
++		if (gmode == 0) {
++			fGatherPeriod = false;
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -372,6 +396,9 @@
+ 	IOLog("SWEET FB: blit %s\n", fStage != NULL ?
+ 	    "gathers eight pixels at a time into a staging row, panel gets wide copies" :
+ 	    "gathers straight into the write-combined panel");
++	IOLog("SWEET FB: gather %s\n", fGatherPeriod ?
++	    "unfolds the column map: 36 panel columns per 25 source columns, constants only" :
++	    "indexes the column map, one entry per panel column");
+ 	return true;
+ }
+ 
+@@ -674,6 +701,52 @@
+ 	}
+ 	if (xhi < px1) {
+ 		sweet_fb_fill(stage + xhi, px1 - xhi, hi);
++	}
++}
++
++/*
++ * The same row, with the column map unfolded into constants.
++ *
++ * 0189 measured the loop above at 3.91 us per 1080-pixel row on this core -
++ * about six cycles per pixel, for one index load, one source load and one
++ * store. That is not arithmetic, it is the dependency: load map[x], then load
++ * srow[map[x]], two dependent loads with L1 latency apiece, and shapes E and F
++ * above show what happens when that dependency is traded for branches instead.
++ *
++ * There is a third way, and it comes from the stretch being a fraction rather
++ * than a table. 1080/750 reduces to 36/25, so
++ *
++ *     map[36k + j] = (36k + j) * 25 / 36 = 25k + (j * 25) / 36
++ *
++ * exactly, for every k. The map is periodic with period 36 and the block index
++ * only shifts the source base by 25 words. So a block of 36 panel columns needs
++ * 25 sequential source loads at compile-time offsets and 36 stores at
++ * compile-time offsets: no index load, no branch, no data-dependent address.
++ * Thirty blocks cover the row. _t_period.c checks the identity against the map
++ * the framebuffer builds and finds 0 mismatches in 1080 columns.
++ *
++ * Only valid for the whole row - the caller checks px0 == 0, px1 == fWidth and
++ * a source base of 0 - because the blocks assume source columns 0..749 exist.
++ */
++static void
++sweet_fb_gather_period(uint32_t *stage, const uint32_t *srow)
++{
++	int32_t k;
++
++	for (k = 0; k < SWEET_FB_BLKS; k++) {
++		const uint32_t *s = srow + SWEET_FB_SRC_BLK * k;
++		uint32_t *d = stage + SWEET_FB_PANEL_BLK * k;
++#define SWEET_FB_G(j)	d[j] = s[((j) * SWEET_FB_SRC_BLK) / SWEET_FB_PANEL_BLK]
++		SWEET_FB_G(0);  SWEET_FB_G(1);  SWEET_FB_G(2);  SWEET_FB_G(3);
++		SWEET_FB_G(4);  SWEET_FB_G(5);  SWEET_FB_G(6);  SWEET_FB_G(7);
++		SWEET_FB_G(8);  SWEET_FB_G(9);  SWEET_FB_G(10); SWEET_FB_G(11);
++		SWEET_FB_G(12); SWEET_FB_G(13); SWEET_FB_G(14); SWEET_FB_G(15);
++		SWEET_FB_G(16); SWEET_FB_G(17); SWEET_FB_G(18); SWEET_FB_G(19);
++		SWEET_FB_G(20); SWEET_FB_G(21); SWEET_FB_G(22); SWEET_FB_G(23);
++		SWEET_FB_G(24); SWEET_FB_G(25); SWEET_FB_G(26); SWEET_FB_G(27);
++		SWEET_FB_G(28); SWEET_FB_G(29); SWEET_FB_G(30); SWEET_FB_G(31);
++		SWEET_FB_G(32); SWEET_FB_G(33); SWEET_FB_G(34); SWEET_FB_G(35);
++#undef SWEET_FB_G
+ 	}
+ }
+ 
+@@ -957,8 +1030,14 @@
+ 						 * measures.
+ 						 */
+ 						uint64_t g0 = mach_absolute_time();
+-						sweet_fb_gather(stage, srow, fColMap, base, px0,
+-						    xlo, xhi, px1, srow[sx], srow[sx + w - 1]);
++						if (fGatherPeriod && base == 0 && px0 == 0 &&
++						    px1 == (int32_t)fWidth) {
++							/* Whole row, source base 0: no map, no branches. */
++							sweet_fb_gather_period(stage, srow);
++						} else {
++							sweet_fb_gather(stage, srow, fColMap, base, px0,
++							    xlo, xhi, px1, srow[sx], srow[sx + w - 1]);
++						}
+ 						fBlitGather += mach_absolute_time() - g0;
+ 						fBlitGatherRows++;
+ 						memcpy(drow, stage + px0, (size_t)n * 4);
+@@ -1013,8 +1092,8 @@
+ 				}
+ 				/* bytes per microsecond is megabytes per second */
+ 				mbs = (fBlitPixels * 4) / us;
+-				perrow = fBlitGatherRows != 0 ?
+-				    (ngath / 1000) / fBlitGatherRows : 0;
++				/* ns per gathered row, which is the number to watch */
++				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
+ 				IOLog("SWEET FB: blit over %llu frames: min %llu us, avg %llu us, max %llu us, %llu staged\n",
+ 				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
+ 				/*
+@@ -1025,12 +1104,16 @@
+ 				 * that is gather-bound shows a small one with gather
+ 				 * accounting for most of it. dup is panel rows served
+ 				 * by repeating the previous row, which cost a memcpy
+-				 * and no gather at all.
++				 * and no gather at all - fBlitStage counts exactly those,
++				 * so it is printed as it stands. (0189 subtracted the
++				 * gathered rows from it and underflowed: 160800 dups
++				 * against 487200 gathers is not a difference, it is two
++				 * different counts.)
+ 				 */
+ 				IOLog("SWEET FB: blit %llu px at %llu MB/s over %llu us; "
+-				    "gather %llu rows %llu us (%llu us/row), %llu dup rows\n",
++				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
+ 				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
+-				    perrow, fBlitStage - fBlitGatherRows);
++				    perrow, fBlitStage);
+ 				fBlitFrames = 0;
+ 				fBlitMin = fBlitMax = fBlitSum = 0;
+ 				fBlitStage = 0;
