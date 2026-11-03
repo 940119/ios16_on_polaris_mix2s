@@ -289,7 +289,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5295,1027 @@
+@@ -5067,4 +5295,1058 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1220,6 +1220,37 @@
 +		    (old_at_once && timed_out_as_it_should) ?
 +		    "THE FENCE IS MONOTONIC AND A WAIT FOR ONE THAT WAS NEVER SUBMITTED TIMES OUT" :
 +		    "the fence does not behave like a fence");
++
++		/*
++		 * And now the same submission two thousand times, so the ring wraps.
++		 *
++		 * This is the shape of 0193: a write pointer that is not taken modulo
++		 * the ring, or a submission allowed to run past the end, leaves the CP
++		 * waiting for a payload that was never written and the GPU looks idle
++		 * forever. 2000 x 9 dwords is 18000, more than the 16384 the ring
++		 * holds, so it has to wrap at least once - and every fence still has
++		 * to arrive in order.
++		 */
++		{
++			uint32_t stalls = 0, submitted = 0;
++
++			for (uint32_t i = 0; i < 2000u; i++) {
++				seq = ++pg_fence_seq;
++				if (!pg_submit_one(iova + PG_SUB_IB_PAGE, ib_words,
++				    iova + PG_SUB_FENCE_PAGE, seq)) {
++					stalls++;
++					break;
++				}
++				submitted++;
++			}
++			printf("POLARIS GPU: 19 stress: %u submissions (%u dwords, the ring holds %u), "
++			    "fence reads %u of %u, %u stalls\n", submitted, submitted * 9u,
++			    PG_RING_WORDS, *fence, pg_fence_seq, stalls);
++			printf("POLARIS GPU: 19 stress: %s\n",
++			    (stalls == 0 && *fence == pg_fence_seq && submitted == 2000u) ?
++			    "THE RING WRAPS AND THE CP KEEPS UP: 2000 SUBMISSIONS, NO STALL" :
++			    "the submission path does not survive a wrapped ring");
++		}
 +	}
 +
 +	polaris_gpu_cp_report("after the submissions");
