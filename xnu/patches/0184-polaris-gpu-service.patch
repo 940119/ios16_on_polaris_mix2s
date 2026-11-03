@@ -341,7 +341,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5335,1161 @@
+@@ -5067,4 +5335,1363 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1128,6 +1128,208 @@
 +	return at;
 +}
 +
++
++/* ---- 0211: the first shader this GPU runs --------------------------------------------------------- */
++
++/*
++ * Everything before this executes packets the CP understands. A shader is the
++ * first thing whose *meaning* comes from somewhere else: thirty-two dwords of
++ * ir3 that Mesa assembled from text (see HANDOFF §18), and a set of SP registers
++ * that say how to launch it. Both were derived rather than guessed - the
++ * register values were printed by Mesa's own `A6XX_XXX()` builders in CI, and
++ * the two `CP_LOAD_STATE6` payloads and the buffer descriptor came out of the
++ * same run.
++ *
++ * The shader is three instructions and a terminator: put 0x0209c0de in r1.x,
++ * wait the required cycles, store it to the invocation's slot of buffer 0, end.
++ * Eight invocations, so eight words of 0x0209c0de is the whole judgement.
++ *
++ * What it proves if it passes: instruction fetch from GPU memory, the constant
++ * file, the UAV descriptor, wave launch, and the fence - none of which any
++ * earlier build touched. What it does not prove: anything about rasterisation.
++ */
++#define PG_CS_SHADER_WORDS	32u
++#define PG_CS_RESULT_WORDS	8u
++#define PG_CS_PAGES		4u
++
++static const uint32_t pg_cs_shader[PG_CS_SHADER_WORDS] = {
++	0x0209c0deu, 0x204cc004u, 0x00000000u, 0x00000500u, 0x00674000u, 0xc0260004u,
++	0x00000000u, 0x03000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++};
++
++struct pg_cs_reg {
++	uint32_t reg;
++	uint32_t value;
++};
++
++static const struct pg_cs_reg pg_cs_regs[] = {	/* a630's magic_raw[]: the dev-info corrections every a6xx driver writes. */
++	{ 0x09804, 0x0000001f }, { 0x09805, 0x00000001 }, { 0x0a0f8, 0x00000001 },
++	{ 0x0b600, 0x00108000 }, { 0x08600, 0x00000880 }, { 0x0ae03, 0x00001430 },
++	{ 0x0ae00, 0x00000000 }, { 0x0be04, 0x00080000 }, { 0x09600, 0x00000000 },
++	{ 0x00e12, 0x10000001 }, { 0x08e01, 0x00000001 }, { 0x08e04, 0x04100000 },
++	/* and the compute pipeline, exactly as cs_program_emit_regs() builds it. */
++	{ 0x0ae0f, 0x00000020 },	/* SP_PERFCTR_SHADER_MASK: .cs */
++	{ 0x0ae04, 0x00000000 },	/* SP_NC_MODE_CNTL_2 */
++	{ 0x0ab00, 0x00000005 },	/* SP_MODE_CNTL */
++	{ 0x0bb08, 0x000000bf },	/* SP_UPDATE_CNTL */
++	{ 0x0b987, 0x00000100 },	/* SP_CS_CONST_CONFIG: constlen 0, enabled */
++	{ 0x0a9bb, 0x00400100 },	/* SP_CS_CONFIG: enabled, ntex/nsamp 0, nuav 1 */
++	{ 0x0a9bc, 0x00000001 },	/* SP_CS_INSTR_SIZE: one 128-byte block */
++	{ 0x0a9b0, 0x80100100 },	/* SP_CS_CNTL_0: threadsize/regfootprint/branchstack */
++	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: shared size, const ram mode */
++	{ 0x0b997, 0x00fcfcfc },	/* SP_CS_CONST_CONFIG_0: local id in r0.x */
++	{ 0x0b998, 0x000002fc },	/* SP_CS_WGE_CNTL */
++};
++
++/* Both are defined further down, after the submission helpers they belong with. */
++static bool pg_fence_reached(volatile uint32_t *word, uint32_t seq, uint32_t tries);
++void polaris_gpu_cp_report(const char *why);
++
++void
++polaris_gpu_cs_test(void)
++{
++	uint64_t pa, iova, fence_iova;
++	uint8_t * view;
++	volatile uint32_t * shader;
++	volatile uint32_t * desc;
++	volatile uint32_t * result;
++	volatile uint32_t * fence;
++	uint32_t seq, wptr, rptr = 0, good = 0, i;
++	bool drained = false;
++
++	if (pg_gpu3d == 0 || pg_ring_va[0] == 0) {
++		printf("POLARIS GPU: 20 shader: the CP is not there\n");
++		return;
++	}
++	pa = polaris_gpu_pool_alloc((uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++	if (pa == 0) {
++		printf("POLARIS GPU: 20 shader: the pool has no room\n");
++		return;
++	}
++	view = (uint8_t *)polaris_gpu_pool_view(pa, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++	iova = (view == NULL) ? 0 : polaris_gpu_address((uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++	if (iova == 0) {
++		polaris_gpu_pool_free(pa, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++		printf("POLARIS GPU: 20 shader: no window for it\n");
++		return;
++	}
++	for (i = 0; i < PG_CS_PAGES; i++) {
++		if (!polaris_gpu_map(iova + (uint64_t)i * PG_GMU_PAGE_SIZE,
++		    pa + (uint64_t)i * PG_GMU_PAGE_SIZE, false)) {
++			printf("POLARIS GPU: 20 shader: page %u will not enter the window\n", i);
++			polaris_gpu_address_free(iova, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++			polaris_gpu_pool_free(pa, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++			return;
++		}
++	}
++	polaris_gpu_mapped();
++
++	shader = (volatile uint32_t *)view;
++	desc = (volatile uint32_t *)(view + PG_GMU_PAGE_SIZE);
++	result = (volatile uint32_t *)(view + 2u * PG_GMU_PAGE_SIZE);
++	fence = (volatile uint32_t *)(view + 3u * PG_GMU_PAGE_SIZE);
++	fence_iova = iova + 3u * PG_GMU_PAGE_SIZE;
++
++	for (i = 0; i < PG_CS_SHADER_WORDS; i++) {
++		shader[i] = pg_cs_shader[i];
++	}
++	for (i = 0; i < 16u; i++) {
++		desc[i] = 0;
++	}
++	/*
++	 * The 64-byte buffer view, from fdl6_buffer_view_init(): R32_UINT, linear
++	 * tiling, identity swizzle, A6XX_TEX_BUFFER, width = number of elements.
++	 * It points at the result page, which is the only thing the shader writes.
++	 */
++	desc[0] = 0x12c06880u;				/* fmt / swap / tile / swizzle */
++	desc[1] = PG_CS_RESULT_WORDS;			/* width in elements */
++	desc[2] = 0x80000010u;				/* A6XX_TEX_BUFFER */
++	desc[4] = (uint32_t)(iova + 2u * PG_GMU_PAGE_SIZE);
++	desc[5] = (uint32_t)((iova + 2u * PG_GMU_PAGE_SIZE) >> 32);
++	for (i = 0; i < PG_CS_RESULT_WORDS; i++) {
++		result[i] = 0;
++	}
++
++	for (i = 0; i < sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]); i++) {
++		pg_wr(pg_gpu3d + 4u * pg_cs_regs[i].reg, pg_cs_regs[i].value);
++	}
++	pg_wr(pg_gpu3d + 4u * 0x0a9b4, (uint32_t)iova);			/* SP_CS_BASE */
++	pg_wr(pg_gpu3d + 4u * 0x0a9b5, (uint32_t)(iova >> 32));
++	pg_wr(pg_gpu3d + 4u * 0x0a9f2, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
++	pg_wr(pg_gpu3d + 4u * 0x0a9f3, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++	pg_wr(pg_gpu3d + 4u * 0x0aa00, 1u);				/* SP_CS_USIZE */
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	printf("POLARIS GPU: 20 shader: %u dwords at %#llx, descriptor at %#llx, result at "
++	    "%#llx, fence at %#llx\n", PG_CS_SHADER_WORDS, iova, iova + PG_GMU_PAGE_SIZE,
++	    iova + 2u * PG_GMU_PAGE_SIZE, fence_iova);
++
++	seq = polaris_gpu_fence_next();
++	wptr = pg_cp_wptr;
++	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the shader */
++	pg_ring_put(wptr++, 0x00760000u);		/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
++	pg_ring_put(wptr++, (uint32_t)iova);
++	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
++	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* and the UAV descriptor */
++	pg_ring_put(wptr++, 0x0076c000u);		/* ST6_UAV / INDIRECT / CS_SHADER / 1 */
++	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
++	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++	pg_ring_put(wptr++, pg_pkt7(0x33u, 4u));	/* CP_EXEC_CS, one group in each */
++	pg_ring_put(wptr++, 0u);
++	pg_ring_put(wptr++, 1u);
++	pg_ring_put(wptr++, 1u);
++	pg_ring_put(wptr++, 1u);
++	pg_ring_put(wptr++, pg_pkt7(0x26u, 0u));	/* CP_WAIT_FOR_IDLE */
++	pg_ring_put(wptr++, pg_pkt7(0x46u, 4u));	/* CP_EVENT_WRITE: the fence */
++	pg_ring_put(wptr++, 0x04u);
++	pg_ring_put(wptr++, (uint32_t)fence_iova);
++	pg_ring_put(wptr++, (uint32_t)(fence_iova >> 32));
++	pg_ring_put(wptr++, seq);
++	wptr &= PG_RING_WORDS - 1u;
++	pg_ring_flush();
++	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	pg_cp_wptr = wptr;
++
++	for (i = 0; i < 2000u; i++) {
++		rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u);
++		if (rptr == wptr) {
++			drained = true;
++			break;
++		}
++		pg_sleep_us(100);
++	}
++	if (!drained) {
++		printf("POLARIS GPU: 20 shader: the CP has not taken the ring: RPTR %u WPTR %u\n",
++		    rptr, wptr);
++	}
++	if (pg_fence_reached(fence, seq, 20000u)) {
++		for (i = 0; i < PG_CS_RESULT_WORDS; i++) {
++			if (result[i] == 0x0209c0deu) {
++				good++;
++			}
++		}
++		printf("POLARIS GPU: 20 shader: the fence reads %u; %u of %u result words are "
++		    "0x0209c0de\n", *fence, good, PG_CS_RESULT_WORDS);
++		printf("POLARIS GPU: 20 shader: %s\n", (good == PG_CS_RESULT_WORDS) ?
++		    "THE GPU RAN THE SHADER: ir3 FETCH, THE UAV DESCRIPTOR AND THE DISPATCH ALL WORK" :
++		    "the shader did not run, or it ran without its buffer");
++	} else {
++		printf("POLARIS GPU: 20 shader: no fence after %u us; the CP is at RPTR %u WPTR %u\n",
++		    2000000u, rptr, wptr);
++		polaris_gpu_cp_report("after the dispatch");
++	}
++
++	polaris_gpu_unmap(iova, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++	polaris_gpu_mapped();
++	polaris_gpu_address_free(iova, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++	polaris_gpu_pool_free(pa, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++}
++
 +/* True once `*word` has reached `seq`; waits up to `tries` x 100 us for it. */
 +static bool
 +pg_fence_reached(volatile uint32_t *word, uint32_t seq, uint32_t tries)
@@ -1505,7 +1707,7 @@
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,1799 @@
+@@ -0,0 +1,1805 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -1588,6 +1790,7 @@
 +    uint64_t fence_iova, uint32_t seq);
 +uint32_t polaris_gpu_build_memwrite(volatile uint32_t * ib, uint32_t at, uint64_t target,
 +    uint32_t words, uint32_t value);
++void polaris_gpu_cs_test(void);
 +void polaris_gpu_cp_report(const char *why);
 +void polaris_vfs_probe(void);
 +uint64_t polaris_gpu_pool_alloc(uint64_t bytes);
@@ -3254,6 +3457,11 @@
 +	 * an offset, two command buffers and one fence - through submitCore().
 +	 */
 +	PolarisGPUUserClient::submitSelfTest();
++	/*
++	 * 0211: and now an actual shader - ir3 machine code from Mesa's assembler,
++	 * a UAV descriptor, and a dispatch.
++	 */
++	polaris_gpu_cs_test();
 +	polaris_vfs_probe();
 +
 +	polaris_gpu_unmap(address, size);
