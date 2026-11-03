@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1603 @@
+@@ -5067,4 +5336,1623 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1183,14 +1183,24 @@
 + *   SP_CS_WGE_CNTL   was 0x2fc, which is neither THREAD64 nor a valid linear
 + *                    local id. Zero is THREAD64 and no linear local id.
 + *
-+ * SP_CS_CNTL_0 was 0x80100100: mergedregs, THREADSIZE=THREAD128 and a footprint
-+ * of two registers. That one was not wrong so much as borrowed - the shader it
-+ * came from had merged regs and a 128-wide wave. This one is a hand-written
-+ * kernel that touches r0 and r1 and nothing else, so it asks for THREAD64, no
-+ * merged file, no branch stack, and a full footprint of two. SP_CS_CONST_CONFIG_0
-+ * was 0x00fcfcfc, which is not a set of register numbers at all; ir3 hands this
-+ * register the *regid* of the local invocation sysval, which for r0.x is 0, so
-+ * zero is the value that puts the invocation id in r0.x.
++ * SP_CS_CNTL_0 was 0x80100100 - mergedregs, THREADSIZE=THREAD128, footprint of
++ * two - and 0214 "simplified" it to 0x102 on the theory that a shader touching
++ * only r0 and r1 could not care. 0219 puts it back, and this is why:
++ *
++ * With the descriptor finally reaching the SP (0216 onwards), the store started
++ * faulting on an address that is garbage but *deterministically* so - the low
++ * bits of FAR barely moved between runs (0x...fe9b8d40, then 0x...fc9b8940).
++ * That is not random memory, it is one value times four. `stib` indexes the
++ * buffer with r0.x, so r0.x holds that value, and r0.x is only the invocation id
++ * if the SP was told the same register layout the shader was assembled for. The
++ * ir3 text was compiled with merged regs and a 128-wide wave; running it in a
++ * non-merged THREAD64 context can put the id somewhere else, and then the index
++ * is whatever was in r0 - which faults, and 0215's all-zero descriptor had been
++ * hiding it behind a bounds check that fires before the address is computed.
++ *
++ * SP_CS_CONST_CONFIG_0 was 0x00fcfcfc, which is not a set of register numbers at
++ * all; ir3 hands this register the *regid* of the local invocation sysval, which
++ * for r0.x is 0, so zero is the value that puts the invocation id in r0.x.
 + */
 +static const struct pg_cs_reg pg_cs_regs[] = {	/* a630's magic_raw[]: the dev-info corrections every a6xx driver writes. */
 +	{ 0x09804, 0x0000001f }, { 0x09805, 0x00000001 }, { 0x0a0f8, 0x00000001 },
@@ -1203,9 +1213,9 @@
 +	{ 0x0ab00, 0x00000003 },	/* SP_MODE_CNTL: ISAMMODE_CL, constant demotion */
 +	{ 0x0b987, 0x00000100 },	/* SP_CS_CONST_CONFIG: constlen 0, enabled */
 +	{ 0x0a9bb, 0x00400100 },	/* SP_CS_CONFIG: enabled, ntex 0, nsamp 0, nuav 1 */
-+	{ 0x0b998, 0x00000000 },	/* SP_CS_WGE_CNTL: THREAD64, no linear local id */
++	{ 0x0b998, 0x000002fc },	/* SP_CS_WGE_CNTL: THREAD128, no linear local id */
 +	{ 0x0b997, 0x00000000 },	/* SP_CS_CONST_CONFIG_0: local id into r0.x, no consts */
-+	{ 0x0a9b0, 0x00000102 },	/* SP_CS_CNTL_0: two registers of footprint */
++	{ 0x0a9b0, 0x80100100 },	/* SP_CS_CNTL_0: merged regs, THREAD128, footprint 2 */
 +	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: 1 KB shared, const ram 128 */
 +	{ 0x0a9bc, 0x00000001 },	/* SP_CS_INSTR_SIZE: one 128-byte block */
 +	{ 0x0a9b3, 0x00000000 },	/* SP_CS_PROGRAM_COUNTER_OFFSET: instruction 0 */
@@ -1503,6 +1513,16 @@
 +		    2000000u, rptr, wptr);
 +		polaris_gpu_cp_report("after the dispatch");
 +		polaris_gpu_smmu_fault();
++		/*
++		 * 0219: and the state, on this path too. If the GPU is wedged on the
++		 * store, these say whether it was wedged with the values that were
++		 * written or with something else - which "0 of 8" never did.
++		 */
++		printf("POLARIS GPU: 20 shader: while wedged, the state reads CS_CNTL_0 %08x "
++		    "WGE %08x CONST0 %08x BINDLESS %08x%08x\n",
++		    pg_rd(pg_gpu3d + 4u * 0x0a9b0), pg_rd(pg_gpu3d + 4u * 0x0b998),
++		    pg_rd(pg_gpu3d + 4u * 0x0b997), pg_rd(pg_gpu3d + 4u * 0x0a9e9),
++		    pg_rd(pg_gpu3d + 4u * 0x0a9e8));
 +		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 +		printf("POLARIS GPU: 20 shader: it waited %llu ms\n", ns / 1000000ull);
 +	}
