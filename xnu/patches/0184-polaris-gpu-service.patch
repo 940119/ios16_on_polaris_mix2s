@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1577 @@
+@@ -5067,4 +5336,1594 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1200,7 +1200,6 @@
 +	/* then the compute pipeline, in cs_program_emit()'s own order. */
 +	{ 0x0ae0f, 0x00000020 },	/* SP_PERFCTR_SHADER_MASK: .cs */
 +	{ 0x0ae04, 0x00000000 },	/* SP_NC_MODE_CNTL_2 */
-+	{ 0x0bb08, 0x00003eff },	/* SP_UPDATE_CNTL: six stages, cs, cs_uav, gfx_uav, cs_bindless */
 +	{ 0x0ab00, 0x00000003 },	/* SP_MODE_CNTL: ISAMMODE_CL, constant demotion */
 +	{ 0x0b987, 0x00000100 },	/* SP_CS_CONST_CONFIG: constlen 0, enabled */
 +	{ 0x0a9bb, 0x00400100 },	/* SP_CS_CONFIG: enabled, ntex 0, nsamp 0, nuav 1 */
@@ -1249,14 +1248,19 @@
 +	 * One CP_CONTEXT_REG_BUNCH with every pair. The 64-bit ones go in as
 +	 * <reg><lo><reg+1><hi>, which is what fd_crb::add() does for a reg64.
 +	 */
++	/*
++	 * 0217: addresses first, state second, the latch last.
++	 *
++	 * SP_UPDATE_CNTL is not a configuration register, it is a strobe that says
++	 * "these blocks have new state, take it now". Mesa can put it first because
++	 * it lives inside a state group that the CP applies as a unit; flattened
++	 * into a plain stream it was being written before the base addresses it
++	 * refers to, so the SP latched a CS state whose bindless base was still
++	 * zero - and the first dispatch after that wedged the GPU. The ring drained,
++	 * no fence ever arrived and the SP never came back.
++	 */
 +	{
-+		uint32_t pairs = 2u * (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0])) + 8u;
-+
-+		pg_ring_put(wptr++, pg_pkt7(0x5cu, pairs));	/* CP_CONTEXT_REG_BUNCH */
-+		for (i = 0; i < sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]); i++) {
-+			pg_ring_put(wptr++, pg_cs_regs[i].reg);
-+			pg_ring_put(wptr++, pg_cs_regs[i].value);
-+		}
++		pg_ring_put(wptr++, pg_pkt7(0x5cu, 8u));	/* CP_CONTEXT_REG_BUNCH */
 +		pg_ring_put(wptr++, 0x0a9b4u);			/* SP_CS_BASE */
 +		pg_ring_put(wptr++, (uint32_t)iova);
 +		pg_ring_put(wptr++, 0x0a9b5u);
@@ -1283,19 +1287,28 @@
 +		pg_ring_put(wptr++, 0x0a9e9u);
 +		pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
 +	}
++	{
++		uint32_t n = (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]));
++
++		pg_ring_put(wptr++, pg_pkt7(0x5cu, 2u * n));	/* the program's state */
++		for (i = 0; i < n; i++) {
++			pg_ring_put(wptr++, pg_cs_regs[i].reg);
++			pg_ring_put(wptr++, pg_cs_regs[i].value);
++		}
++	}
 +	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the shader */
 +	pg_ring_put(wptr++, 0x00760000u);		/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
 +	pg_ring_put(wptr++, (uint32_t)iova);
 +	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
 +	/*
-+	 * And the descriptor set entry, preloaded. For SS6_BINDLESS the third
-+	 * dword is not an address at all: it is (set << 28) | slot * 64, so zero
-+	 * for set 0, ssbo 0.
++	 * 0217: the bindless preload packet is gone.
++	 *
++	 * Mesa emits it as CP_LOAD_STATE6 with ST6_UAV / SS6_BINDLESS and a qword
++	 * that is not an address: (set << 28) | slot * 64. With the base register
++	 * wrong it could only make things worse, and the shader can fetch the
++	 * descriptor on demand once the base is right, so it waits until the base
++	 * path is proven.
 +	 */
-+	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG */
-+	pg_ring_put(wptr++, 0x0075c000u);		/* ST6_UAV / BINDLESS / CS_SHADER / 1 */
-+	pg_ring_put(wptr++, 0u);
-+	pg_ring_put(wptr++, 0u);
 +	/*
 +	 * The grid. NDRANGE_1 is the *global* size, i.e. local times groups, while
 +	 * CP_EXEC_CS and KERNEL_GROUP_X take the number of groups.
@@ -1321,6 +1334,9 @@
 +	pg_ring_put(wptr++, 1u);
 +	pg_ring_put(wptr++, 0x0b99bu);			/* SP_CS_KERNEL_GROUP_Z */
 +	pg_ring_put(wptr++, 1u);
++	pg_ring_put(wptr++, pg_pkt7(0x5cu, 2u));	/* the latch, now that the state is in */
++	pg_ring_put(wptr++, 0x0bb08u);			/* SP_UPDATE_CNTL */
++	pg_ring_put(wptr++, 0x00003effu);		/* six stages, cs, cs_uav, gfx_uav, cs_bindless */
 +	pg_ring_put(wptr++, pg_pkt7(0x33u, 4u));	/* CP_EXEC_CS */
 +	pg_ring_put(wptr++, 0u);
 +	pg_ring_put(wptr++, groups);
@@ -1477,6 +1493,7 @@
 +		printf("POLARIS GPU: 20 shader: no fence after %u us; the CP is at RPTR %u WPTR %u\n",
 +		    2000000u, rptr, wptr);
 +		polaris_gpu_cp_report("after the dispatch");
++		polaris_gpu_smmu_fault();
 +		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 +		printf("POLARIS GPU: 20 shader: it waited %llu ms\n", ns / 1000000ull);
 +	}
