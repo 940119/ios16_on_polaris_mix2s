@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1641 @@
+@@ -5067,4 +5336,1660 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1329,14 +1329,22 @@
 +	pg_ring_put(wptr++, (uint32_t)iova);
 +	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
 +	/*
-+	 * 0217: the bindless preload packet is gone.
++	 * 0221: the preload is back, and it is the point of this build.
 +	 *
-+	 * Mesa emits it as CP_LOAD_STATE6 with ST6_UAV / SS6_BINDLESS and a qword
-+	 * that is not an address: (set << 28) | slot * 64. With the base register
-+	 * wrong it could only make things worse, and the shader can fetch the
-+	 * descriptor on demand once the base is right, so it waits until the base
-+	 * path is proven.
++	 * 0217 dropped this packet to change one thing at a time, on the theory that
++	 * a shader can fetch its descriptor on demand. Four builds later the GPU
++	 * still wedges, and the wedge is not a fault: sGFSR stays zero, which is not
++	 * what a translation fault looks like. What it does look like is the SP
++	 * waiting for a descriptor that was never put in front of it - and this
++	 * packet is the thing that puts it there.
++	 *
++	 * For SS6_BINDLESS the third dword is not an address: it is
++	 * (set << 28) | slot * FDL6_TEX_CONST_DWORDS, so zero for set 0, ssbo 0.
 +	 */
++	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG */
++	pg_ring_put(wptr++, 0x0075c000u);		/* ST6_UAV / BINDLESS / CS_SHADER / 1 */
++	pg_ring_put(wptr++, 0u);			/* set 0, ssbo 0 */
++	pg_ring_put(wptr++, 0u);
 +	/*
 +	 * The grid. NDRANGE_1 is the *global* size, i.e. local times groups, while
 +	 * CP_EXEC_CS and KERNEL_GROUP_X take the number of groups.
@@ -1472,6 +1480,17 @@
 +	printf("POLARIS GPU: 20 shader: %u dwords at %#llx, descriptor at %#llx, result at "
 +	    "%#llx, fence at %#llx\n", PG_CS_SHADER_WORDS, iova, iova + PG_GMU_PAGE_SIZE,
 +	    iova + 2u * PG_GMU_PAGE_SIZE, fence_iova);
++
++	/*
++	 * 0221: read the fault registers before anything is dispatched.
++	 *
++	 * The FARs of the last four builds all ended in fc9b8d40 with a different
++	 * top half every time, while sGFSR - the register that latches global faults
++	 * - never left zero. If the same garbage is already sitting in the bank here,
++	 * before this test has issued a single packet, then it was never a fault
++	 * report at all and the last four builds were chasing uninitialised state.
++	 */
++	polaris_gpu_smmu_fault();
 +
 +	seq = polaris_gpu_fence_next();
 +	pg_cs_emit(iova, fence_iova, 1u, seq);
