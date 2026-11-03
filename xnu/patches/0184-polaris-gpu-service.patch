@@ -13,7 +13,14 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/polaris_gpu.c
 +++ b/bsd/dev/polaris_gpu.c
-@@ -19,6 +19,14 @@
+@@ -15,10 +15,21 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
++#include <sys/mount.h>
++#include <sys/vnode.h>
++#include <sys/vfs_context.h>
+ 
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  
  extern bool polaris_touch_i2c_board(void);
@@ -28,7 +35,7 @@
  
  enum polaris_gpu_stage {
  	POLARIS_GPU_BOARD,
-@@ -1081,8 +1089,18 @@
+@@ -1081,8 +1092,18 @@
   * The level 1 entry is unchanged: 0x10000000 >> 30 is 0 for every one of these
   * five entries, and build 0140's fault was an empty level 1 entry, not an
   * empty level 2 one.
@@ -49,7 +56,7 @@
  
  static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
  static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
-@@ -1094,6 +1112,19 @@
+@@ -1094,6 +1115,19 @@
  static bool pg_boot_configured;
  static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
  static bool pg_masks_saved;
@@ -69,7 +76,7 @@
  
  /* The GMU reads from memory, not from this processor's cache. */
  static void
-@@ -1405,6 +1436,191 @@
+@@ -1405,6 +1439,191 @@
  	printf("POLARIS GPU: 10 %s: %#llx -> %#llx, descriptor %#llx in slot %u\n", name, iova,
  	    kvtophys(va), l3[((iova >> 12) & 0x1ff)], (uint32_t)((iova >> 12) & 0x1ff));
  	return true;
@@ -261,7 +268,7 @@
  }
  
  /*
-@@ -4865,7 +5081,7 @@
+@@ -4865,7 +5084,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
  	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
@@ -270,7 +277,7 @@
  	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
  	    "physical, stream 5 bypassed (polarisgpumap=0)");
  	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
-@@ -5049,6 +5265,18 @@
+@@ -5049,6 +5268,18 @@
  	if (upto > 0) {
  		polaris_gpu.state = POLARIS_GPU_STARTING;
  		polaris_gpu_up(upto);
@@ -289,7 +296,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5295,1058 @@
+@@ -5067,4 +5298,1105 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1347,10 +1354,57 @@
 +	return true;
 +}
 +
++
++/* ---- a read-only look at the root volume --------------------------------------------------------- */
++
++/*
++ * The remaining work is all in user space, and this port has no adb, no ssh and
++ * no shell: the only thing that can put a program on the device is the kernel
++ * that already mounts the root volume read-write (`rootrw=1`). Before writing
++ * anything there - or writing code that writes there - three questions have to
++ * be answered, and all three are read-only:
++ *
++ *   is the root really mounted read-write,
++ *   does /System/Library/LaunchDaemons exist,
++ *   does a lookup of it succeed from kernel context at all.
++ *
++ * Nothing here creates, changes or removes anything.
++ */
++void
++polaris_vfs_probe(void)
++{
++	static const char * paths[] = {
++		"/", "/System", "/System/Library", "/System/Library/LaunchDaemons",
++		"/usr", "/usr/lib", "/private/var",
++	};
++	vfs_context_t ctx = vfs_context_current();
++
++	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
++		vnode_t vp = NULL;
++		int err = vnode_lookup(paths[i], 0, &vp, ctx);
++
++		if (err != 0 || vp == NULL) {
++			printf("POLARIS VFS: %s: lookup failed (%d)\n", paths[i], err);
++			continue;
++		}
++		if (i == 0) {
++			mount_t mp = vnode_mount(vp);
++			uint64_t flags = vfs_flags(mp);
++
++			printf("POLARIS VFS: root %s: mount flags %#llx, read-only %s\n", paths[i],
++			    flags, (flags & MNT_RDONLY) != 0 ? "YES" : "no");
++		} else {
++			printf("POLARIS VFS: %s: exists\n", paths[i]);
++		}
++		vnode_put(vp);
++	}
++	printf("POLARIS VFS: ======== the root volume has been read, not written ========\n");
++}
++
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,1507 @@
+@@ -0,0 +1,1509 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -1432,6 +1486,7 @@
 +bool polaris_gpu_submit_ibs(const uint64_t *iova, const uint32_t *words, uint32_t count,
 +    uint64_t fence_iova, uint32_t seq);
 +void polaris_gpu_cp_report(const char *why);
++void polaris_vfs_probe(void);
 +uint64_t polaris_gpu_pool_alloc(uint64_t bytes);
 +void polaris_gpu_pool_free(uint64_t pa, uint64_t bytes);
 +void * polaris_gpu_pool_view(uint64_t pa, uint64_t bytes);
@@ -2815,6 +2870,7 @@
 +	 */
 +	polaris_gpu_submit_test();
 +	PolarisGPUUserClient::paramSelfTest();
++	polaris_vfs_probe();
 +
 +	polaris_gpu_unmap(address, size);
 +	polaris_gpu_mapped();
