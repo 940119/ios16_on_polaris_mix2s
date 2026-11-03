@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1594 @@
+@@ -5067,4 +5336,1603 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1334,9 +1334,18 @@
 +	pg_ring_put(wptr++, 1u);
 +	pg_ring_put(wptr++, 0x0b99bu);			/* SP_CS_KERNEL_GROUP_Z */
 +	pg_ring_put(wptr++, 1u);
++	/*
++	 * 0218: CS_BINDLESS is a bitmap, one bit per descriptor set, not a count.
++	 *
++	 * 0217 wrote 0x1f - "all five sets have a new base" - while only set 0's
++	 * base had ever been written. Sets 1 through 4 still read zero, so the SP
++	 * went to address zero for their descriptors, took whatever it found there
++	 * as a descriptor, and then used the address out of that to DMA. That is
++	 * the garbage FAR: 0x00011c2cfe9b8d40. One bit for the one set that exists.
++	 */
 +	pg_ring_put(wptr++, pg_pkt7(0x5cu, 2u));	/* the latch, now that the state is in */
 +	pg_ring_put(wptr++, 0x0bb08u);			/* SP_UPDATE_CNTL */
-+	pg_ring_put(wptr++, 0x00003effu);		/* six stages, cs, cs_uav, gfx_uav, cs_bindless */
++	pg_ring_put(wptr++, 0x000002ffu);		/* stages, cs, cs_uav, gfx_uav, bindless set 0 */
 +	pg_ring_put(wptr++, pg_pkt7(0x33u, 4u));	/* CP_EXEC_CS */
 +	pg_ring_put(wptr++, 0u);
 +	pg_ring_put(wptr++, groups);
