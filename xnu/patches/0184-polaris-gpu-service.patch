@@ -289,7 +289,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5295,709 @@
+@@ -5067,4 +5295,851 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -998,10 +998,152 @@
 +	polaris_gpu_address_free(iova, bytes);
 +}
 +
++
++/* ---- step 19: a command buffer of the program's, run by address, and a fence ---------------------- */
++
++/*
++ * Everything so far has been this file writing packets into the ring itself.
++ * A program does not do that: it builds its own command buffer somewhere in its
++ * own memory and asks the kernel to have the CP run it (DRM's GEM_SUBMIT). The
++ * two packets that make that possible are the ones the Mi 8 port uses
++ * (bsd/dev/mi8_adreno.c:3010):
++ *
++ *   CP_INDIRECT_BUFFER(3)   address lo, address hi, dwords   - run that buffer
++ *   CP_EVENT_WRITE(4)       EVENT_CACHE_FLUSH_TS, addr, value - write a fence
++ *
++ * The fence is what replaces an interrupt on this port: nothing here has taken
++ * over the GPU's IRQ, so the only way to know a submission finished is to have
++ * the CP write a number into memory and read it back. That is not a shortcut -
++ * it is the same mechanism Linux's a6xx uses for its last fence.
++ *
++ * One submission, three things proven at once: the CP fetched a buffer by its
++ * GPU address, executed the CP_MEM_WRITE inside it, and wrote the fence after
++ * it. Any of the three failing leaves a different line, and none of them can
++ * happen if the SMMU translation of the buffer is wrong.
++ */
++#define PG_SUB_FILL_WORD	0x5a5a5a5au
++#define PG_SUB_DATA_WORDS	256u
++#define PG_SUB_IB_PAGE		0x0000u		/* within the four pages taken from the pool */
++#define PG_SUB_DATA_PAGE	0x1000u
++#define PG_SUB_FENCE_PAGE	0x2000u
++#define PG_SUB_BYTES		(4ull * PG_GMU_PAGE_SIZE)
++
++static uint32_t pg_fence_seq;
++
++void
++polaris_gpu_submit_test(void)
++{
++	uint64_t pa, iova, bytes = PG_SUB_BYTES;
++	uint8_t *view;
++	uint32_t *ib;
++	uint32_t ib_words = 0, wptr, rptr = 0, seq, seen = 0;
++	uint32_t wrote = 0, i;
++	bool drained = false;
++
++	if (pg_gpu3d == 0 || pg_ring_va[0] == 0) {
++		printf("POLARIS GPU: 19 submit: the CP is not there\n");
++		return;
++	}
++	pa = polaris_gpu_pool_alloc(bytes);
++	if (pa == 0) {
++		return;
++	}
++	view = (uint8_t *)polaris_gpu_pool_view(pa, bytes);
++	if (view == NULL) {
++		polaris_gpu_pool_free(pa, bytes);
++		return;
++	}
++	iova = polaris_gpu_address(bytes);
++	if (iova == 0) {
++		polaris_gpu_pool_free(pa, bytes);
++		return;
++	}
++	for (i = 0; i < 4; i++) {
++		if (!polaris_gpu_map(iova + (uint64_t)i * PG_GMU_PAGE_SIZE,
++		    pa + (uint64_t)i * PG_GMU_PAGE_SIZE, false)) {
++			printf("POLARIS GPU: 19 submit: page %u will not enter the window\n", i);
++			polaris_gpu_address_free(iova, bytes);
++			polaris_gpu_pool_free(pa, bytes);
++			return;
++		}
++	}
++	polaris_gpu_mapped();
++
++	/* The target and the fence start at a value the CP cannot produce by accident. */
++	for (i = 0; i < PG_SUB_DATA_WORDS; i++) {
++		((volatile uint32_t *)(view + PG_SUB_DATA_PAGE))[i] = 0xdeadbeefu;
++	}
++	((volatile uint32_t *)(view + PG_SUB_FENCE_PAGE))[0] = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	/* The command buffer: one CP_MEM_WRITE over the target. Built in the pool, not in a stack page. */
++	ib = (uint32_t *)(view + PG_SUB_IB_PAGE);
++	ib[ib_words++] = pg_pkt7(PG_CP_MEM_WRITE, PG_SUB_DATA_WORDS + 2u);
++	ib[ib_words++] = (uint32_t)(iova + PG_SUB_DATA_PAGE);
++	ib[ib_words++] = (uint32_t)((iova + PG_SUB_DATA_PAGE) >> 32);
++	for (i = 0; i < PG_SUB_DATA_WORDS; i++) {
++		ib[ib_words++] = PG_SUB_FILL_WORD;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	seq = ++pg_fence_seq;
++	wptr = pg_cp_wptr;
++	pg_ring_put(wptr++, pg_pkt7(0x3fu, 3u));		/* CP_INDIRECT_BUFFER */
++	pg_ring_put(wptr++, (uint32_t)iova);
++	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
++	pg_ring_put(wptr++, ib_words);
++	pg_ring_put(wptr++, pg_pkt7(0x46u, 4u));		/* CP_EVENT_WRITE */
++	pg_ring_put(wptr++, 0x04u);				/* EVENT_CACHE_FLUSH_TS */
++	pg_ring_put(wptr++, (uint32_t)(iova + PG_SUB_FENCE_PAGE));
++	pg_ring_put(wptr++, (uint32_t)((iova + PG_SUB_FENCE_PAGE) >> 32));
++	pg_ring_put(wptr++, seq);
++	wptr &= PG_RING_WORDS - 1u;
++	pg_ring_flush();
++	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	printf("POLARIS GPU: 19 submit: ib %u dwords at %#llx, target %#llx, fence %#llx, seq %u\n",
++	    ib_words, iova + PG_SUB_IB_PAGE, iova + PG_SUB_DATA_PAGE,
++	    iova + PG_SUB_FENCE_PAGE, seq);
++	for (i = 0; i < 20000; i++) {
++		rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u);
++		if (rptr == wptr) {
++			drained = true;
++			pg_cp_wptr = wptr;
++			break;
++		}
++		pg_sleep_us(100);
++	}
++	for (i = 0; i < 20000; i++) {
++		seen = ((volatile uint32_t *)(view + PG_SUB_FENCE_PAGE))[0];
++		if (seen == seq) {
++			break;
++		}
++		pg_sleep_us(100);
++	}
++	for (i = 0; i < PG_SUB_DATA_WORDS; i++) {
++		if (((volatile uint32_t *)(view + PG_SUB_DATA_PAGE))[i] == PG_SUB_FILL_WORD) {
++			wrote++;
++		}
++	}
++	printf("POLARIS GPU: 19 submit: the CP %s; the fence reads %u of %u; %u of %u target words "
++	    "are 0x5a5a5a5a\n", drained ? "took the ring" : "did NOT take the ring", seen, seq,
++	    wrote, PG_SUB_DATA_WORDS);
++	printf("POLARIS GPU: 19 submit: %s\n",
++	    (drained && seen == seq && wrote == PG_SUB_DATA_WORDS) ?
++	    "THE CP RUNS A PROGRAM'S COMMAND BUFFER, AND THE FENCE SAYS WHEN" :
++	    "the CP did not run the program's command buffer");
++
++	polaris_gpu_unmap(iova, bytes);
++	polaris_gpu_mapped();
++	polaris_gpu_address_free(iova, bytes);
++	polaris_gpu_pool_free(pa, bytes);
++}
++
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,1197 @@
+@@ -0,0 +1,1205 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -1077,6 +1219,7 @@
 +void polaris_gpu_pa_test(const uint64_t *pas, uint32_t pages, uint64_t bytes,
 +    volatile uint32_t *cpu);
 +void polaris_gpu_pool_test(void);
++void polaris_gpu_submit_test(void);
 +uint64_t polaris_gpu_pool_alloc(uint64_t bytes);
 +void polaris_gpu_pool_free(uint64_t pa, uint64_t bytes);
 +void * polaris_gpu_pool_view(uint64_t pa, uint64_t bytes);
@@ -2156,6 +2299,13 @@
 +	 * given.
 +	 */
 +	PolarisGPUUserClient::poolSelfTest();
++
++	/*
++	 * 0200: and now the thing a program actually asks for - a command buffer of
++	 * its own, run by address, with a fence the CP writes when it is done. This
++	 * is the kernel half of DRM's GEM_SUBMIT, proven without a user space.
++	 */
++	polaris_gpu_submit_test();
 +
 +	polaris_gpu_unmap(address, size);
 +	polaris_gpu_mapped();
