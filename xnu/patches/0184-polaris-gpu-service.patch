@@ -289,7 +289,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5295,851 @@
+@@ -5067,4 +5295,867 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1035,7 +1035,7 @@
 +{
 +	uint64_t pa, iova, bytes = PG_SUB_BYTES;
 +	uint8_t *view;
-+	uint32_t *ib;
++	volatile uint32_t *ib;
 +	uint32_t ib_words = 0, wptr, rptr = 0, seq, seen = 0;
 +	uint32_t wrote = 0, i;
 +	bool drained = false;
@@ -1076,8 +1076,23 @@
 +	((volatile uint32_t *)(view + PG_SUB_FENCE_PAGE))[0] = 0;
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +
-+	/* The command buffer: one CP_MEM_WRITE over the target. Built in the pool, not in a stack page. */
-+	ib = (uint32_t *)(view + PG_SUB_IB_PAGE);
++	/*
++	 * The command buffer: one CP_MEM_WRITE over the target, built in the pool
++	 * and not in a stack page.
++	 *
++	 * Written through a volatile pointer, word by word, for the reason the zero
++	 * fill above is: this is a device mapping, where an access that is not
++	 * naturally aligned faults instead of being split. The header is three
++	 * words, so the payload starts at offset twelve - not a multiple of
++	 * sixteen - and clang turned the fill into sixteen-byte stores on 0200:
++	 *
++	 *   panic(cpu 8 caller ...): Unaligned kernel data abort
++	 *   esr 0x96000061 (alignment fault)
++	 *
++	 * volatile is what stops it: every store has to happen on its own, at the
++	 * alignment the pointer has.
++	 */
++	ib = (volatile uint32_t *)(view + PG_SUB_IB_PAGE);
 +	ib[ib_words++] = pg_pkt7(PG_CP_MEM_WRITE, PG_SUB_DATA_WORDS + 2u);
 +	ib[ib_words++] = (uint32_t)(iova + PG_SUB_DATA_PAGE);
 +	ib[ib_words++] = (uint32_t)((iova + PG_SUB_DATA_PAGE) >> 32);
@@ -1102,7 +1117,8 @@
 +	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +
-+	printf("POLARIS GPU: 19 submit: ib %u dwords at %#llx, target %#llx, fence %#llx, seq %u\n",
++	printf("POLARIS GPU: 19 submit: ib %u dwords at %#llx, target %#llx, fence %#llx, seq %u "
++	    "-- 0201: the command buffer is written a word at a time\n",
 +	    ib_words, iova + PG_SUB_IB_PAGE, iova + PG_SUB_DATA_PAGE,
 +	    iova + PG_SUB_FENCE_PAGE, seq);
 +	for (i = 0; i < 20000; i++) {
