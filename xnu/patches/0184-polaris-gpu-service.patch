@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1503 @@
+@@ -5067,4 +5336,1509 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1173,18 +1173,24 @@
 + *
 + * _csregs.py computes each one from Mesa's generated a6xx.xml.h, out of
 + * cs_program_emit() and emit_shader_regs() in fd6_compute.cc / fd6_program.cc.
-+ * Four of them were wrong in 0213, and two of those four would each have been
-+ * enough to stop a wave on their own:
++ * Three of them were wrong in 0213, and the first alone would have stopped the
++ * wave by itself:
 + *
 + *   SP_UPDATE_CNTL   was 0xbf. That is the six stages plus GFX_UAV and leaves
 + *                    out CS_UAV (0x40) - the compute uav block is never latched,
 + *                    so the store has no descriptor to write through.
-+ *   SP_CS_CNTL_0     was 0x80100100, i.e. branchstack 128 and earlypreamble set,
-+ *                    values lifted from a variant that had both. A footprint of
-+ *                    2 registers is right for a shader that touches r0 and r1.
 + *   SP_MODE_CNTL     was 0x5, ISAMMODE_GL. A kernel runs ISAMMODE_CL.
 + *   SP_CS_WGE_CNTL   was 0x2fc, which is neither THREAD64 nor a valid linear
 + *                    local id. Zero is THREAD64 and no linear local id.
++ *
++ * SP_CS_CNTL_0 was 0x80100100: mergedregs, THREADSIZE=THREAD128 and a footprint
++ * of two registers. That one was not wrong so much as borrowed - the shader it
++ * came from had merged regs and a 128-wide wave. This one is a hand-written
++ * kernel that touches r0 and r1 and nothing else, so it asks for THREAD64, no
++ * merged file, no branch stack, and a full footprint of two. SP_CS_CONST_CONFIG_0
++ * was 0x00fcfcfc, which is not a set of register numbers at all; ir3 hands this
++ * register the *regid* of the local invocation sysval, which for r0.x is 0, so
++ * zero is the value that puts the invocation id in r0.x.
 + */
 +static const struct pg_cs_reg pg_cs_regs[] = {	/* a630's magic_raw[]: the dev-info corrections every a6xx driver writes. */
 +	{ 0x09804, 0x0000001f }, { 0x09805, 0x00000001 }, { 0x0a0f8, 0x00000001 },
