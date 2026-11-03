@@ -37,7 +37,15 @@
  
  enum polaris_gpu_stage {
  	POLARIS_GPU_BOARD,
-@@ -1081,8 +1093,18 @@
+@@ -527,6 +539,7 @@
+ #define PG_CB_MAIR1		0x3c
+ #define PG_CB_FSR		0x58
+ #define PG_CB_TLBIASID		0x610
++#define PG_CB_TLBIALL		0x618
+ #define PG_CB_TLBSYNC		0x7f0
+ #define PG_CB_TLBSTATUS		0x7f4
+ 
+@@ -1081,8 +1094,18 @@
   * The level 1 entry is unchanged: 0x10000000 >> 30 is 0 for every one of these
   * five entries, and build 0140's fault was an empty level 1 entry, not an
   * empty level 2 one.
@@ -58,7 +66,7 @@
  
  static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
  static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
-@@ -1095,6 +1117,19 @@
+@@ -1095,6 +1118,19 @@
  static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
  static bool pg_masks_saved;
  
@@ -78,7 +86,7 @@
  /* The GMU reads from memory, not from this processor's cache. */
  static void
  pg_to_memory(vm_offset_t start, vm_size_t size)
-@@ -1407,6 +1442,191 @@
+@@ -1407,6 +1443,226 @@
  	return true;
  }
  
@@ -252,6 +260,41 @@
 +	for (unsigned i = 0; i < PG_CP_WINDOW_L2S; i++) {
 +		pg_to_memory(pg_l3b_va + (vm_offset_t)i * PG_GMU_PAGE_SIZE, PG_GMU_PAGE_SIZE);
 +	}
++	/*
++	 * 0210: and then the SMMU's own copy of those descriptors has to go.
++	 *
++	 * polaris_gpu_map() writes an L3 entry. It cannot take back a translation
++	 * the SMMU has already cached, and nothing noticed until now because
++	 * nothing ever reused an address: every buffer this file made came from a
++	 * bump pointer and every test started from a fresh range.
++	 *
++	 * Then the fence page was given 0x10c10000 - the exact address the
++	 * kernel's own submission test had just unmapped and freed - and the CP
++	 * went on writing the fence into the pages the test had owned while the
++	 * CPU read the new ones. 0209: the command buffers ran, and the fence
++	 * stayed zero for ten seconds.
++	 *
++	 * This is not only the test's problem. A window server frees a surface and
++	 * makes another one and is handed the same address back, which is the same
++	 * sequence; the fix has to be here, at the commit, not in the allocator.
++	 */
++	if (pg_smmu != 0) {
++		vm_offset_t cb = pg_smmu_cb(PG_GMU_CTX);
++
++		pg_wr(cb + PG_CB_FSR, 0xffffffffu);	/* one to clear, as at bring-up */
++		/*
++		 * Both of them: TLBIALL drops every entry this context bank holds and
++		 * does not care what the ASID is, TLBIASID is what bring-up already
++		 * uses and what is known to work on this block. One of the two is
++		 * enough and neither is expensive.
++		 */
++		pg_wr(cb + PG_CB_TLBIALL, 1);
++		pg_wr(cb + PG_CB_TLBIASID, PG_GMU_CTX);
++		pg_wr(cb + PG_CB_TLBSYNC, 1);
++		for (int i = 0; i < 100 && (pg_rd(cb + PG_CB_TLBSTATUS) & 1); i++) {
++			pg_sleep_us(10);
++		}
++	}
 +}
 +
 +void
@@ -270,7 +313,7 @@
  /*
   * IMPL_DEF1 is at base + 6 pages, and its first word is the micro MMU's
   * control word. The vendor driver halts the SMMU around the
-@@ -4865,7 +5085,7 @@
+@@ -4865,7 +5121,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
  	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
@@ -279,7 +322,7 @@
  	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
  	    "physical, stream 5 bypassed (polarisgpumap=0)");
  	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
-@@ -5049,6 +5269,18 @@
+@@ -5049,6 +5305,18 @@
  	if (upto > 0) {
  		polaris_gpu.state = POLARIS_GPU_STARTING;
  		polaris_gpu_up(upto);
@@ -298,7 +341,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5299,1161 @@
+@@ -5067,4 +5335,1161 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1462,7 +1505,7 @@
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,1781 @@
+@@ -0,0 +1,1799 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -2480,6 +2523,7 @@
 +	uint32_t ib_handle = 0, tgt_handle = 0;
 +	uint32_t at = 0, first = 0, second = 0, untouched = 0, refusals = 0;
 +	IOReturn ret;
++	bool arrived = false;
 +	bool ok;
 +
 +	if (gPolarisGPUService == NULL) {
@@ -2530,6 +2574,13 @@
 +	    tgt->address + 4096, 256, 0x0209b6b6u);
 +	printf("POLARIS GPU: 19 call: two command buffers in handle %u: one at byte 0, one "
 +	    "at byte 4096; the second ends at word %u of that buffer\n", ib_handle, at);
++	{
++		volatile uint32_t * s = (volatile uint32_t *) ib->kernel;
++
++		printf("POLARIS GPU: 19 call: ib %#llx %#010x %#010x %#010x %#010x, at word 1024 "
++		    "%#010x; target %#llx; fence page %#llx\n", ib->address, s[0], s[1], s[2],
++		    s[3], s[1024], tgt->address, gFenceIova);
++	}
 +
 +	bzero(bos, sizeof(bos));
 +	bzero(cmds, sizeof(cmds));
@@ -2553,8 +2604,18 @@
 +		goto out;
 +	}
 +	if (c->waitFor(submit.fence, 10000000000ull) != kIOReturnSuccess) {
-+		printf("POLARIS GPU: 19 call: fence %u did not arrive\n", submit.fence);
-+		goto out;
++		/*
++		 * 0209 knew only that the fence did not arrive, and two very different
++		 * faults look the same from there: the CP never ran the command
++		 * buffers, or it ran them and the fence landed somewhere else. So the
++		 * target is read back anyway - the word counts below are what tells
++		 * those two apart - and the CP's own idea of where it is comes with it.
++		 */
++		printf("POLARIS GPU: 19 call: fence %u did not arrive; the target is read back "
++		    "anyway, so the CP's work and the fence are told apart\n", submit.fence);
++		polaris_gpu_cp_report("after the wait");
++	} else {
++		arrived = true;
 +	}
 +
 +	{
@@ -2615,10 +2676,10 @@
 +		}
 +	}
 +
-+	ok = (first == 256 && second == 256 && untouched == 1536 && refusals == 4);
-+	printf("POLARIS GPU: 19 call: fence %u; %u of 256 words at byte 0, %u of 256 at "
++	ok = (arrived && first == 256 && second == 256 && untouched == 1536 && refusals == 4);
++	printf("POLARIS GPU: 19 call: fence %u %s; %u of 256 words at byte 0, %u of 256 at "
 +	    "byte 4096, %u of 1536 left alone; %u of 4 bad requests refused\n", submit.fence,
-+	    first, second, untouched, refusals);
++	    arrived ? "arrived" : "did NOT arrive", first, second, untouched, refusals);
 +	printf("POLARIS GPU: 19 call: %s\n", ok ?
 +	    "A PROGRAM'S SUBMISSION RUNS: HANDLES, AN OFFSET, TWO BUFFERS, ONE FENCE" :
 +	    "the submit path is not the one a program will use");
