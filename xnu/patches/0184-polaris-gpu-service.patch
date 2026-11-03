@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1417 @@
+@@ -5067,4 +5336,1457 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1193,6 +1193,28 @@
 +uint32_t polaris_gpu_fence_next(void);
 +void polaris_gpu_smmu_fault(void);
 +
++/*
++ * 0213: the grid, without which no wave is launched at all.
++ *
++ * 0211 and 0212 wrote the program's registers, loaded the shader and the UAV
++ * descriptor, and dispatched - and the CP completed the dispatch without
++ * starting a single wave, so the fence arrived and the buffer was never touched.
++ * These ten registers are what says how many invocations to run; computerator
++ * emits them after CP_SET_MARKER(RM6_COMPUTE), and so does this.
++ */
++static const struct pg_cs_reg pg_cs_grid[] = {
++	{ 0x0b990, 0x0000001f },	/* SP_CS_NDRANGE_0: dim 3, local 8x1x1 */
++	{ 0x0b991, 0x00000008 },	/* SP_CS_NDRANGE_1: global x = 8 */
++	{ 0x0b992, 0x00000000 },	/* SP_CS_NDRANGE_2 */
++	{ 0x0b993, 0x00000001 },	/* SP_CS_NDRANGE_3: global y = 1 */
++	{ 0x0b994, 0x00000000 },	/* SP_CS_NDRANGE_4 */
++	{ 0x0b995, 0x00000001 },	/* SP_CS_NDRANGE_5: global z = 1 */
++	{ 0x0b996, 0x00000000 },	/* SP_CS_NDRANGE_6 */
++	{ 0x0b999, 0x00000001 },	/* SP_CS_KERNEL_GROUP_X */
++	{ 0x0b99a, 0x00000001 },	/* SP_CS_KERNEL_GROUP_Y */
++	{ 0x0b99b, 0x00000001 },	/* SP_CS_KERNEL_GROUP_Z */
++};
++
 +void
 +polaris_gpu_cs_test(void)
 +{
@@ -1203,8 +1225,10 @@
 +	volatile uint32_t * result;
 +	volatile uint32_t * fence;
 +	uint32_t seq, wptr, rptr = 0, good = 0, i;
++	uint64_t began, ns = 0;
 +	bool drained = false;
 +
++	began = mach_absolute_time();
 +	if (pg_gpu3d == 0 || pg_ring_va[0] == 0) {
 +		printf("POLARIS GPU: 20 shader: the CP is not there\n");
 +		return;
@@ -1306,6 +1330,17 @@
 +	pg_ring_put(wptr++, 0x0076c000u);		/* ST6_UAV / INDIRECT / CS_SHADER / 1 */
 +	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
 +	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++	pg_ring_put(wptr++, pg_pkt7(0x65u, 1u));	/* CP_SET_MARKER */
++	pg_ring_put(wptr++, 8u);			/* RM6_COMPUTE */
++	{
++		uint32_t n = (uint32_t)(sizeof(pg_cs_grid) / sizeof(pg_cs_grid[0]));
++
++		pg_ring_put(wptr++, pg_pkt7(0x5cu, 2u * n));	/* the grid */
++		for (i = 0; i < n; i++) {
++			pg_ring_put(wptr++, pg_cs_grid[i].reg);
++			pg_ring_put(wptr++, pg_cs_grid[i].value);
++		}
++	}
 +	pg_ring_put(wptr++, pg_pkt7(0x33u, 4u));	/* CP_EXEC_CS, one group in each */
 +	pg_ring_put(wptr++, 0u);
 +	pg_ring_put(wptr++, 1u);
@@ -1355,6 +1390,9 @@
 +			polaris_gpu_cp_report("after the dispatch");
 +			polaris_gpu_smmu_fault();
 +		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		printf("POLARIS GPU: 20 shader: the test took %llu ms of boot\n",
++		    ns / 1000000ull);
 +		printf("POLARIS GPU: 20 shader: %s\n", (good == PG_CS_RESULT_WORDS) ?
 +		    "THE GPU RAN THE SHADER: ir3 FETCH, THE UAV DESCRIPTOR AND THE DISPATCH ALL WORK" :
 +		    "the shader did not run, or it ran without its buffer");
@@ -1362,6 +1400,8 @@
 +		printf("POLARIS GPU: 20 shader: no fence after %u us; the CP is at RPTR %u WPTR %u\n",
 +		    2000000u, rptr, wptr);
 +		polaris_gpu_cp_report("after the dispatch");
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		printf("POLARIS GPU: 20 shader: it waited %llu ms\n", ns / 1000000ull);
 +	}
 +
 +	polaris_gpu_unmap(iova, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
