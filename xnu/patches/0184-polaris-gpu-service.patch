@@ -1001,7 +1001,7 @@
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,1182 @@
+@@ -0,0 +1,1197 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -1440,13 +1440,28 @@
 +		return false;
 +	}
 +	/*
-+	 * What the program gets is zeroed memory, for the reason the old path
-+	 * gave: a buffer drawn into before every pixel is written shows whatever
-+	 * was there, and here that would be the crash dump's last frame. The view
-+	 * is uncached, so the zeros are in the memory the GPU reads, not in a
-+	 * cache line in front of it.
++	 * Zeroed word by word, not with bzero.
++	 *
++	 * ml_io_map gives a device mapping - Normal non-cacheable at best, and
++	 * this kernel's is stricter - where an access that is not naturally
++	 * aligned faults instead of being split. bzero's vector path writes
++	 * sixteen bytes at a stride it chooses, and 0198 died on exactly that:
++	 *
++	 *   panic(cpu 8 caller ...): Unaligned kernel data abort
++	 *   pc 0xfffffff00738e5e4  esr 0x96000061 (alignment fault)
++	 *   far 0xffffffe13b17f048
++	 *
++	 * 0x48 is not a multiple of sixteen. The pool test in polaris_gpu.c has
++	 * always written these pages one aligned word at a time for the same
++	 * reason; this now does too.
 +	 */
-+	bzero(view, (size_t) size);
++	{
++		volatile uint32_t * words = (volatile uint32_t *) view;
++
++		for (uint64_t i = 0; i < size / 4; i++) {
++			words[i] = 0;
++		}
++	}
 +	b->kernel = view;
 +	b->pa = pa;
 +	b->pool = true;
@@ -1632,8 +1647,8 @@
 +		printf("POLARIS GPU: 19 gemnew: the pool has nothing for %llu bytes\n", size);
 +		return;
 +	}
-+	printf("POLARIS GPU: 19 gemnew: %llu bytes from the pool at %#llx..%#llx\n",
-+	    size, pa, pa + size - 1);
++	printf("POLARIS GPU: 19 gemnew: %llu bytes from the pool at %#llx..%#llx -- 0199: "
++	    "the view is zeroed a word at a time\n", size, pa, pa + size - 1);
 +	if (!fillPoolBuffer(&b, pa, size, 0)) {
 +		polaris_gpu_pool_free(pa, size);
 +		return;
