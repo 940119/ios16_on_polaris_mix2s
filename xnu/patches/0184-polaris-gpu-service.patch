@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1660 @@
+@@ -5067,4 +5336,1675 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1288,7 +1288,7 @@
 +	 * no fence ever arrived and the SP never came back.
 +	 */
 +	{
-+		pg_ring_put(wptr++, pg_pkt7(0x5cu, 8u));	/* CP_CONTEXT_REG_BUNCH */
++		pg_ring_put(wptr++, pg_pkt7(0x5cu, 24u));	/* CP_CONTEXT_REG_BUNCH */
 +		pg_ring_put(wptr++, 0x0a9b4u);			/* SP_CS_BASE */
 +		pg_ring_put(wptr++, (uint32_t)iova);
 +		pg_ring_put(wptr++, 0x0a9b5u);
@@ -1310,10 +1310,25 @@
 +		 * <addr & ~3> | 3. Compute is descriptor set 0, and SSBO slot 0 is at
 +		 * offset 0 of that set, which is the start of the descriptor page.
 +		 */
-+		pg_ring_put(wptr++, 0x0a9e8u);			/* SP_CS_BINDLESS_BASE(0) */
-+		pg_ring_put(wptr++, ((uint32_t)(iova + PG_GMU_PAGE_SIZE) & ~3u) | 3u);
-+		pg_ring_put(wptr++, 0x0a9e9u);
-+		pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++		/*
++		 * 0222: all five descriptor sets, not just set 0.
++		 *
++		 * 0221 finally proved the fault is real - FAR was zero before the
++		 * dispatch and garbage after it - so the SP is reading a descriptor from
++		 * somewhere that is not ours. It reads the set named by the base field in
++		 * the `stib` encoding, which is not something this file can know: the
++		 * ir3 text does not carry it and the assembler chose it. Writing the same
++		 * base into all five sets makes that choice irrelevant, and it is what
++		 * Mesa does - it is why Mesa can set CS_BINDLESS to 0x1f without lying.
++		 *
++		 * SP_CS_BINDLESS_BASE(i) is 0x0a9e8 + 2 * i, a 64-bit register each.
++		 */
++		for (i = 0; i < 5u; i++) {
++			pg_ring_put(wptr++, 0x0a9e8u + 2u * i);	/* SP_CS_BINDLESS_BASE(i) */
++			pg_ring_put(wptr++, ((uint32_t)(iova + PG_GMU_PAGE_SIZE) & ~3u) | 3u);
++			pg_ring_put(wptr++, 0x0a9e9u + 2u * i);
++			pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++		}
 +	}
 +	{
 +		uint32_t n = (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]));
@@ -1371,17 +1386,17 @@
 +	pg_ring_put(wptr++, 0x0b99bu);			/* SP_CS_KERNEL_GROUP_Z */
 +	pg_ring_put(wptr++, 1u);
 +	/*
-+	 * 0218: CS_BINDLESS is a bitmap, one bit per descriptor set, not a count.
++	 * CS_BINDLESS is a bitmap, one bit per descriptor set, not a count.
 +	 *
-+	 * 0217 wrote 0x1f - "all five sets have a new base" - while only set 0's
-+	 * base had ever been written. Sets 1 through 4 still read zero, so the SP
-+	 * went to address zero for their descriptors, took whatever it found there
-+	 * as a descriptor, and then used the address out of that to DMA. That is
-+	 * the garbage FAR: 0x00011c2cfe9b8d40. One bit for the one set that exists.
++	 * 0218 learned that the hard way: it wrote 0x1f - "all five sets have a new
++	 * base" - while only set 0's base had been written, so the SP went to address
++	 * zero for the other four. 0222 makes the 0x1f honest instead: all five bases
++	 * are now the same descriptor page, so whichever set the shader's store names
++	 * it lands on a descriptor we built.
 +	 */
 +	pg_ring_put(wptr++, pg_pkt7(0x5cu, 2u));	/* the latch, now that the state is in */
 +	pg_ring_put(wptr++, 0x0bb08u);			/* SP_UPDATE_CNTL */
-+	pg_ring_put(wptr++, 0x000002ffu);		/* stages, cs, cs_uav, gfx_uav, bindless set 0 */
++	pg_ring_put(wptr++, 0x00003effu);		/* stages, cs, cs_uav, gfx_uav, all five sets */
 +	pg_ring_put(wptr++, pg_pkt7(0x33u, 4u));	/* CP_EXEC_CS */
 +	pg_ring_put(wptr++, 0u);
 +	pg_ring_put(wptr++, groups);
