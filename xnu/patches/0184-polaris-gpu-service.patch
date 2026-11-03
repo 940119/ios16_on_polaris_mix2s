@@ -2131,7 +2131,7 @@
 +	    request->nr_bos * sizeof(bos[0])) != 0 ||
 +	    copyin((user_addr_t) request->cmds, cmds,
 +	    request->nr_cmds * sizeof(cmds[0])) != 0) {
-+		return kIOReturnBadAddress;
++		return kIOReturnBadArgument;
 +	}
 +
 +	IOLockLock(gGPULock);
