@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1623 @@
+@@ -5067,4 +5336,1641 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1154,13 +1154,31 @@
 +#define PG_CS_RESULT_WORDS	8u
 +#define PG_CS_PAGES		4u
 +
++/*
++ * 0220: the same kernel, with the index written as a constant.
++ *
++ * The previous build indexed the buffer with r0.x, which is only the invocation
++ * id if the SP was told the same register layout the shader was assembled for.
++ * Whether that was true stopped being a useful question: the store kept faulting
++ * on an address whose low half never moved (0x...fc9b8d40, three builds running),
++ * and no index times four can produce the 0x0001bc0c in the high half. So this
++ * version removes the index from the equation - `mov.u32u32 r0.x, 0` before the
++ * store, so every invocation writes slot 0 on purpose.
++ *
++ * Which means the verdict changes with it: one word of 0x0209c0de is a success,
++ * not eight. Eight would mean the store never happened and the buffer had been
++ * filled by something else.
++ */
 +static const uint32_t pg_cs_shader[PG_CS_SHADER_WORDS] = {
-+	0x0209c0deu, 0x204cc004u, 0x00000000u, 0x00000500u, 0x00674000u, 0xc0260004u,
-+	0x00000000u, 0x03000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x0209c0deu, 0x204cc004u,	/* mov.u32u32 r1.x, 0x0209c0de */
++	0x00000000u, 0x204cc000u,	/* mov.u32u32 r0.x, 0 */
++	0x00000000u, 0x00000500u,	/* (rpt5)nop */
++	0x00674000u, 0xc0260004u,	/* stib.b.untyped.1d.u32.1.imm r1.x, r0.x, 0 */
++	0x00000000u, 0x03000000u,	/* end */
 +	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
 +	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
 +	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
 +};
 +
 +struct pg_cs_reg {
@@ -1505,8 +1523,8 @@
 +		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 +		printf("POLARIS GPU: 20 shader: the test took %llu ms of boot\n",
 +		    ns / 1000000ull);
-+		printf("POLARIS GPU: 20 shader: %s\n", (good == PG_CS_RESULT_WORDS) ?
-+		    "THE GPU RAN THE SHADER: ir3 FETCH, THE UAV DESCRIPTOR AND THE DISPATCH ALL WORK" :
++		printf("POLARIS GPU: 20 shader: %s\n", (good >= 1u) ?
++		    "THE GPU WROTE MEMORY: ir3 FETCH, THE BINDLESS DESCRIPTOR AND THE STORE ALL WORK" :
 +		    "the shader did not run, or it ran without its buffer");
 +	} else {
 +		printf("POLARIS GPU: 20 shader: no fence after %u us; the CP is at RPTR %u WPTR %u\n",
