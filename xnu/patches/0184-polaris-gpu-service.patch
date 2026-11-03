@@ -1411,7 +1411,7 @@
 +			vnode_put(root);
 +			break;
 +		}
-+		IOSleep(500);
++		pg_sleep_us(500 * 1000);
 +	}
 +	ctx = vfs_context_current();
 +	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
