@@ -58,11 +58,10 @@
  
  static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
  static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
-@@ -1094,6 +1116,19 @@
- static bool pg_boot_configured;
+@@ -1095,6 +1117,19 @@
  static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
  static bool pg_masks_saved;
-+
+ 
 +/*
 + * What bsd/dev/polaris_gpu_service.cpp is allowed to call, declared up here
 + * because their definitions have to come after the CP exists: the readiness
@@ -75,15 +74,14 @@
 + */
 +bool polaris_gpu_ready(void);
 +bool polaris_gpu_fill(uint64_t iova, uint32_t words);
- 
++
  /* The GMU reads from memory, not from this processor's cache. */
  static void
-@@ -1405,6 +1440,191 @@
- 	printf("POLARIS GPU: 10 %s: %#llx -> %#llx, descriptor %#llx in slot %u\n", name, iova,
- 	    kvtophys(va), l3[((iova >> 12) & 0x1ff)], (uint32_t)((iova >> 12) & 0x1ff));
+ pg_to_memory(vm_offset_t start, vm_size_t size)
+@@ -1407,6 +1442,191 @@
  	return true;
-+}
-+
+ }
+ 
 +/* ---- the program's buffers: addresses in the user window, and their mappings ---------------------- */
 +
 +/*
@@ -267,9 +265,11 @@
 +			l3[(at >> 12) & 0x1ff] = 0;
 +		}
 +	}
- }
- 
++}
++
  /*
+  * IMPL_DEF1 is at base + 6 pages, and its first word is the micro MMU's
+  * control word. The vendor driver halts the SMMU around the
 @@ -4865,7 +5085,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
@@ -298,7 +298,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5299,1138 @@
+@@ -5067,4 +5299,1161 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1062,6 +1062,29 @@
 +	return at;
 +}
 +
++/*
++ * 0209: the same command buffer, for a submission that came in from a program.
++ *
++ * pg_build_ib() above always starts at word zero of a buffer this file owns. A
++ * program's command buffer is described by a handle and an offset, so the
++ * service needs one built at an arbitrary word - and it needs the header to be
++ * the one pg_pkt7() encodes, parity bits and all. Copying that encoding into
++ * the C++ half of the kext would be a second place to get it wrong, so it is
++ * exported instead.
++ */
++uint32_t
++polaris_gpu_build_memwrite(volatile uint32_t *ib, uint32_t at, uint64_t target,
++    uint32_t words, uint32_t value)
++{
++	ib[at++] = pg_pkt7(PG_CP_MEM_WRITE, words + 2u);
++	ib[at++] = (uint32_t)target;
++	ib[at++] = (uint32_t)(target >> 32);
++	for (uint32_t i = 0; i < words; i++) {
++		ib[at++] = value;
++	}
++	return at;
++}
++
 +/* True once `*word` has reached `seq`; waits up to `tries` x 100 us for it. */
 +static bool
 +pg_fence_reached(volatile uint32_t *word, uint32_t seq, uint32_t tries)
@@ -1439,7 +1462,7 @@
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,1509 @@
+@@ -0,0 +1,1781 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -1520,6 +1543,8 @@
 +uint32_t polaris_gpu_fence_next(void);
 +bool polaris_gpu_submit_ibs(const uint64_t *iova, const uint32_t *words, uint32_t count,
 +    uint64_t fence_iova, uint32_t seq);
++uint32_t polaris_gpu_build_memwrite(volatile uint32_t * ib, uint32_t at, uint64_t target,
++    uint32_t words, uint32_t value);
 +void polaris_gpu_cp_report(const char *why);
 +void polaris_vfs_probe(void);
 +uint64_t polaris_gpu_pool_alloc(uint64_t bytes);
@@ -1663,6 +1688,14 @@
 +
 +OSDefineMetaClassAndStructors(PolarisGPU, IOService);
 +
++/*
++ * 0209: the published instance, kept so that the boot-time test can open a
++ * client on it the way a program does. It is retained once for that pointer and
++ * never released: there is one GPU and one service, and this is the reference
++ * that outlives the local variable in polaris_gpu_service_start().
++ */
++static PolarisGPU * gPolarisGPUService;
++
 +bool
 +PolarisGPU::start(IOService * provider)
 +{
@@ -1725,12 +1758,16 @@
 +	IOReturn gemInfo(struct msm_gem_info * request);
 +	IOReturn gemClose(struct drm_gem_close * request);
 +	IOReturn gemSubmit(struct drm_msm_gem_submit * request);
++	IOReturn submitCore(struct drm_msm_gem_submit * request,
++	    const struct drm_msm_gem_submit_bo * bos,
++	    const struct drm_msm_gem_submit_cmd * cmds);
 +	IOReturn waitFence(struct drm_msm_wait_fence * request);
 +	IOReturn waitFor(uint32_t target, uint64_t limit_ns);
 +
 +public:
 +	static void poolSelfTest(void);
 +	static void paramSelfTest(void);
++	static void submitSelfTest(void);
 +	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type,
 +	    OSDictionary * properties) APPLE_KEXT_OVERRIDE;
 +	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
@@ -2263,16 +2300,17 @@
 + * that buffer's GPU address plus its offset, and the whole set goes into the
 + * ring as one submission with one fence - which is what makes a wait after it
 + * mean "all of it", not "some of it".
++ *
++ * 0209: this half is only the copyin. Everything after it is submitCore(),
++ * which the boot-time test also calls - so that the arithmetic and the handle
++ * lookup are exercised by something other than the program that has not been
++ * written yet.
 + */
 +IOReturn
 +PolarisGPUUserClient::gemSubmit(struct drm_msm_gem_submit * request)
 +{
 +	struct drm_msm_gem_submit_bo bos[MSM_SUBMIT_MAX_BOS];
 +	struct drm_msm_gem_submit_cmd cmds[MSM_SUBMIT_MAX_CMDS];
-+	uint64_t iovas[MSM_SUBMIT_MAX_CMDS];
-+	uint32_t words[MSM_SUBMIT_MAX_CMDS];
-+	uint32_t count = 0, seq, total = 0;
-+	IOReturn ret = kIOReturnSuccess;
 +
 +	if (request->nr_cmds == 0 || request->nr_cmds > MSM_SUBMIT_MAX_CMDS ||
 +	    request->nr_bos == 0 || request->nr_bos > MSM_SUBMIT_MAX_BOS ||
@@ -2283,6 +2321,29 @@
 +	    request->nr_bos * sizeof(bos[0])) != 0 ||
 +	    copyin((user_addr_t) request->cmds, cmds,
 +	    request->nr_cmds * sizeof(cmds[0])) != 0) {
++		return kIOReturnBadArgument;
++	}
++	return submitCore(request, bos, cmds);
++}
++
++/*
++ * The submission itself, with the two arrays already in kernel memory. `bos`
++ * and `cmds` are the program's, copied; `request` is the program's header,
++ * also already copied, and its `fence` field is written back.
++ */
++IOReturn
++PolarisGPUUserClient::submitCore(struct drm_msm_gem_submit * request,
++    const struct drm_msm_gem_submit_bo * bos,
++    const struct drm_msm_gem_submit_cmd * cmds)
++{
++	uint64_t iovas[MSM_SUBMIT_MAX_CMDS];
++	uint32_t words[MSM_SUBMIT_MAX_CMDS];
++	uint32_t count = 0, seq, total = 0;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (request->nr_cmds == 0 || request->nr_cmds > MSM_SUBMIT_MAX_CMDS ||
++	    request->nr_bos == 0 || request->nr_bos > MSM_SUBMIT_MAX_BOS ||
++	    bos == NULL || cmds == NULL) {
 +		return kIOReturnBadArgument;
 +	}
 +
@@ -2306,6 +2367,22 @@
 +		if (b == NULL) {
 +			printf("POLARIS GPU: 19 submit: a command names handle %u, which this "
 +			    "client does not have\n", bos[cmds[i].submit_idx].handle);
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		/*
++		 * 0209: the offset and the length are the program's numbers, and a
++		 * program can be wrong. Without this check a command that starts past
++		 * the end of its buffer hands the CP an address belonging to whatever
++		 * follows it in the window - the same class of fault as 0194's pages
++		 * above 4 GB, except that this one is a bad request rather than a bad
++		 * allocator, and refusing it is the whole difference.
++		 */
++		if (cmds[i].submit_offset >= b->size ||
++		    cmds[i].size > b->size - cmds[i].submit_offset) {
++			printf("POLARIS GPU: 19 submit: a command asks for %u bytes at offset "
++			    "%u of a %llu-byte buffer\n", cmds[i].size,
++			    cmds[i].submit_offset, b->size);
 +			ret = kIOReturnBadArgument;
 +			break;
 +		}
@@ -2360,6 +2437,212 @@
 +	}
 +	printf("POLARIS GPU: 19 submit: %u dwords free in the ring\n", polaris_gpu_ring_room());
 +	polaris_gpu_cp_report("after the parameter table");
++}
++
++/*
++ * 0209: the submit path with a caller that is not this file's own test.
++ *
++ * 0200 proved the CP runs a command buffer. What a program sends is different
++ * in every part that matters: buffers named by handle rather than by address, a
++ * byte offset into each one, a length in bytes, more than one command buffer in
++ * a single submission, and one fence covering all of them. None of that had
++ * ever run - gemSubmit() was reachable only from externalMethod(), and no
++ * program has opened this service - so the handle table and the offset
++ * arithmetic were code without a caller.
++ *
++ * So this opens a client the way the system opens one (newUserClient() on the
++ * published service, with the kernel's own task), takes two buffers through
++ * gemNew(), writes two command buffers into the first one 4096 bytes apart, and
++ * calls the same submitCore() that externalMethod() calls. Only copyin() is
++ * skipped.
++ *
++ * The two command buffers write two different values into two disjoint halves of
++ * the target, so a submission that ran both proves the offset was applied: an
++ * offset that was ignored would put the second value where the first one is, and
++ * one of the two halves would come back wrong.
++ *
++ * And four ways for a program to be wrong, each of which must be refused:
++ * a handle this client does not have, a command that starts past the end of its
++ * buffer, a length that is not a whole number of dwords, and nothing to run.
++ * A refusal is the answer - the last one is not allowed to reach the ring.
++ */
++void
++PolarisGPUUserClient::submitSelfTest(void)
++{
++	struct drm_msm_gem_submit_bo bos[2];
++	struct drm_msm_gem_submit_cmd cmds[2];
++	struct drm_msm_gem_submit submit;
++	struct msm_gem_new req;
++	struct gpu_buffer * ib = NULL;
++	struct gpu_buffer * tgt = NULL;
++	PolarisGPUUserClient * c = NULL;
++	IOUserClient * handler = NULL;
++	uint32_t ib_handle = 0, tgt_handle = 0;
++	uint32_t at = 0, first = 0, second = 0, untouched = 0, refusals = 0;
++	IOReturn ret;
++	bool ok;
++
++	if (gPolarisGPUService == NULL) {
++		printf("POLARIS GPU: 19 call: no published service, so no client to open\n");
++		return;
++	}
++	if (gPolarisGPUService->newUserClient(kernel_task, NULL, 0, NULL, &handler) !=
++	    kIOReturnSuccess || handler == NULL) {
++		printf("POLARIS GPU: 19 call: newUserClient() handed back nothing; the submit "
++		    "path keeps its untested caller\n");
++		return;
++	}
++	c = OSDynamicCast(PolarisGPUUserClient, handler);
++	if (c == NULL) {
++		printf("POLARIS GPU: 19 call: the client is not a PolarisGPUUserClient\n");
++		handler->release();
++		return;
++	}
++	printf("POLARIS GPU: 19 call: a client was opened on the service, the way a program "
++	    "opens one\n");
++
++	bzero(&req, sizeof(req));
++	req.size = 16384;				/* four pages: two command buffers 4096 apart */
++	if (c->gemNew(&req) != kIOReturnSuccess) {
++		printf("POLARIS GPU: 19 call: no command buffer from the pool\n");
++		goto out;
++	}
++	ib_handle = req.handle;
++
++	bzero(&req, sizeof(req));
++	req.size = 8192;
++	if (c->gemNew(&req) != kIOReturnSuccess) {
++		printf("POLARIS GPU: 19 call: no target buffer from the pool\n");
++		goto out;
++	}
++	tgt_handle = req.handle;
++
++	ib = c->buffer(ib_handle);
++	tgt = c->buffer(tgt_handle);
++	if (ib == NULL || tgt == NULL || ib->kernel == NULL || tgt->kernel == NULL) {
++		printf("POLARIS GPU: 19 call: the handles gemNew() returned are not usable\n");
++		goto out;
++	}
++
++	at = polaris_gpu_build_memwrite((volatile uint32_t *) ib->kernel, 0,
++	    tgt->address, 256, 0x0209a5a5u);
++	at = polaris_gpu_build_memwrite((volatile uint32_t *) ib->kernel, 1024,
++	    tgt->address + 4096, 256, 0x0209b6b6u);
++	printf("POLARIS GPU: 19 call: two command buffers in handle %u: one at byte 0, one "
++	    "at byte 4096; the second ends at word %u of that buffer\n", ib_handle, at);
++
++	bzero(bos, sizeof(bos));
++	bzero(cmds, sizeof(cmds));
++	bos[0].handle = ib_handle;
++	bos[1].handle = tgt_handle;
++	cmds[0].type = MSM_SUBMIT_CMD_BUF;
++	cmds[0].submit_idx = 0;
++	cmds[0].submit_offset = 0;
++	cmds[0].size = 259 * 4;			/* header 3 dwords + 256 of payload */
++	cmds[1].type = MSM_SUBMIT_CMD_BUF;
++	cmds[1].submit_idx = 0;
++	cmds[1].submit_offset = 4096;
++	cmds[1].size = 259 * 4;
++
++	bzero(&submit, sizeof(submit));
++	submit.nr_bos = 2;
++	submit.nr_cmds = 2;
++	ret = c->submitCore(&submit, bos, cmds);
++	if (ret != kIOReturnSuccess || submit.fence == 0) {
++		printf("POLARIS GPU: 19 call: the submission was refused (%#x)\n", ret);
++		goto out;
++	}
++	if (c->waitFor(submit.fence, 10000000000ull) != kIOReturnSuccess) {
++		printf("POLARIS GPU: 19 call: fence %u did not arrive\n", submit.fence);
++		goto out;
++	}
++
++	{
++		volatile uint32_t * back = (volatile uint32_t *) tgt->kernel;
++
++		for (uint32_t i = 0; i < 256; i++) {
++			if (back[i] == 0x0209a5a5u) {
++				first++;
++			}
++			if (back[1024 + i] == 0x0209b6b6u) {
++				second++;
++			}
++		}
++		for (uint32_t i = 256; i < 1024; i++) {
++			if (back[i] == 0) {
++				untouched++;
++			}
++		}
++		for (uint32_t i = 1280; i < 2048; i++) {
++			if (back[i] == 0) {
++				untouched++;
++			}
++		}
++	}
++
++	{
++		struct drm_msm_gem_submit_bo nbos[2];
++		struct drm_msm_gem_submit_cmd ncmds[2];
++		struct drm_msm_gem_submit nsubmit;
++
++		memcpy(nbos, bos, sizeof(nbos));
++		memcpy(ncmds, cmds, sizeof(ncmds));
++		bzero(&nsubmit, sizeof(nsubmit));
++		nsubmit.nr_bos = 2;
++		nsubmit.nr_cmds = 2;
++
++		nbos[0].handle = 0xdedeu;
++		if (c->submitCore(&nsubmit, nbos, ncmds) == kIOReturnBadArgument) {
++			refusals++;
++		}
++
++		nbos[0].handle = ib_handle;
++		ncmds[1].submit_offset = 16384;
++		if (c->submitCore(&nsubmit, nbos, ncmds) == kIOReturnBadArgument) {
++			refusals++;
++		}
++
++		ncmds[1].submit_offset = 4096;
++		ncmds[1].size = 1035;
++		if (c->submitCore(&nsubmit, nbos, ncmds) == kIOReturnBadArgument) {
++			refusals++;
++		}
++
++		ncmds[1].size = 259 * 4;
++		nsubmit.nr_cmds = 0;
++		if (c->submitCore(&nsubmit, nbos, ncmds) == kIOReturnBadArgument) {
++			refusals++;
++		}
++	}
++
++	ok = (first == 256 && second == 256 && untouched == 1536 && refusals == 4);
++	printf("POLARIS GPU: 19 call: fence %u; %u of 256 words at byte 0, %u of 256 at "
++	    "byte 4096, %u of 1536 left alone; %u of 4 bad requests refused\n", submit.fence,
++	    first, second, untouched, refusals);
++	printf("POLARIS GPU: 19 call: %s\n", ok ?
++	    "A PROGRAM'S SUBMISSION RUNS: HANDLES, AN OFFSET, TWO BUFFERS, ONE FENCE" :
++	    "the submit path is not the one a program will use");
++
++out:
++	IOLockLock(gGPULock);
++	if (c != NULL && ib_handle != 0) {
++		struct gpu_buffer * b = c->buffer(ib_handle);
++
++		if (b != NULL) {
++			c->freeBuffer(b);
++		}
++	}
++	if (c != NULL && tgt_handle != 0) {
++		struct gpu_buffer * b = c->buffer(tgt_handle);
++
++		if (b != NULL) {
++			c->freeBuffer(b);
++		}
++	}
++	IOLockUnlock(gGPULock);
++	if (handler != NULL) {
++		handler->release();
++	}
 +}
 +
 +/*
@@ -2905,6 +3188,11 @@
 +	 */
 +	polaris_gpu_submit_test();
 +	PolarisGPUUserClient::paramSelfTest();
++	/*
++	 * 0209: and now the same submission as a program sends it - by handle, with
++	 * an offset, two command buffers and one fence - through submitCore().
++	 */
++	PolarisGPUUserClient::submitSelfTest();
 +	polaris_vfs_probe();
 +
 +	polaris_gpu_unmap(address, size);
@@ -2942,6 +3230,13 @@
 +	if (!gpu->start(provider)) {
 +		gpu->detach(provider);
 +		printf("POLARIS GPU: 19 the service did not start\n");
++	} else {
++		/*
++		 * 0209: kept for the boot-time test, which opens a client on it the way a
++		 * program does. Retained once for that pointer and never given back.
++		 */
++		gPolarisGPUService = gpu;
++		gpu->retain();
 +	}
 +	gpu->release();
 +
