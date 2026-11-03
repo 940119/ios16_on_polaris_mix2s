@@ -289,7 +289,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5295,910 @@
+@@ -5067,4 +5295,997 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1199,10 +1199,97 @@
 +	polaris_gpu_pool_free(pa, bytes);
 +}
 +
++
++/* ---- the three entry points the DRM service submits through -------------------------------------- */
++
++/*
++ * 0202 proved the mechanism; these are the same packets with the test stripped
++ * out, so that a program's command buffers can be handed in by the IOKit
++ * service instead of by this file's own self test.
++ *
++ * The room check is the one that matters and the one 0193 paid for: the ring is
++ * 16384 dwords, and a submission larger than what is left does not wrap - the
++ * CP reads the first packet header, eats the words that are there, and then
++ * waits for a payload that was never written. The GPU looks idle and always
++ * will. So ask first, and if there is no room, wait for the CP rather than
++ * write past the end.
++ */
++uint32_t
++polaris_gpu_ring_room(void)
++{
++	uint32_t rptr, wptr;
++
++	if (pg_gpu3d == 0) {
++		return 0;
++	}
++	rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u);
++	wptr = pg_cp_wptr & (PG_RING_WORDS - 1u);
++	return (rptr + PG_RING_WORDS - wptr - 1u) % PG_RING_WORDS;
++}
++
++uint32_t
++polaris_gpu_fence_next(void)
++{
++	return ++pg_fence_seq;
++}
++
++/*
++ * `count` command buffers, each an address and a dword count, followed by the
++ * fence. Returns false only when nothing was written: once the packets are in
++ * the ring the submission is the CP's, drain or no drain.
++ */
++bool
++polaris_gpu_submit_ibs(const uint64_t *iova, const uint32_t *words, uint32_t count,
++    uint64_t fence_iova, uint32_t seq)
++{
++	uint32_t need = 5u * count + 6u;
++	uint32_t wptr, rptr = 0;
++
++	if (pg_gpu3d == 0 || pg_ring_va[0] == 0 || iova == NULL || words == NULL ||
++	    count == 0 || count > 64u || seq == 0) {
++		return false;
++	}
++	for (uint32_t i = 0; i < 2000u && polaris_gpu_ring_room() < need; i++) {
++		pg_sleep_us(100);
++	}
++	if (polaris_gpu_ring_room() < need) {
++		printf("POLARIS GPU: 19 submit: no room in the ring for %u dwords (%u free)\n",
++		    need, polaris_gpu_ring_room());
++		return false;
++	}
++	wptr = pg_cp_wptr;
++	for (uint32_t i = 0; i < count; i++) {
++		pg_ring_put(wptr++, pg_pkt7(0x3fu, 3u));		/* CP_INDIRECT_BUFFER */
++		pg_ring_put(wptr++, (uint32_t)iova[i]);
++		pg_ring_put(wptr++, (uint32_t)(iova[i] >> 32));
++		pg_ring_put(wptr++, words[i]);
++	}
++	pg_ring_put(wptr++, pg_pkt7(0x46u, 4u));			/* CP_EVENT_WRITE */
++	pg_ring_put(wptr++, 0x04u);					/* EVENT_CACHE_FLUSH_TS */
++	pg_ring_put(wptr++, (uint32_t)fence_iova);
++	pg_ring_put(wptr++, (uint32_t)(fence_iova >> 32));
++	pg_ring_put(wptr++, seq);
++	wptr &= PG_RING_WORDS - 1u;
++	pg_ring_flush();
++	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	pg_cp_wptr = wptr;
++	for (uint32_t i = 0; i < 2000u; i++) {
++		rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u);
++		if (rptr == wptr) {
++			return true;
++		}
++		pg_sleep_us(100);
++	}
++	printf("POLARIS GPU: 19 submit: the ring was written but the CP has not caught up: "
++	    "RPTR %u WPTR %u (the fence will say when)\n", rptr, wptr);
++	return true;
++}
++
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,1205 @@
+@@ -0,0 +1,1494 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -1279,6 +1366,10 @@
 +    volatile uint32_t *cpu);
 +void polaris_gpu_pool_test(void);
 +void polaris_gpu_submit_test(void);
++uint32_t polaris_gpu_ring_room(void);
++uint32_t polaris_gpu_fence_next(void);
++bool polaris_gpu_submit_ibs(const uint64_t *iova, const uint32_t *words, uint32_t count,
++    uint64_t fence_iova, uint32_t seq);
 +uint64_t polaris_gpu_pool_alloc(uint64_t bytes);
 +void polaris_gpu_pool_free(uint64_t pa, uint64_t bytes);
 +void * polaris_gpu_pool_view(uint64_t pa, uint64_t bytes);
@@ -1326,6 +1417,54 @@
 +struct drm_gem_close {
 +	uint32_t handle, pad;
 +};
++/*
++ * Linux's submit structures, field for field, from include/uapi/drm/msm_drm.h
++ * (a copy is in the workspace root, fetched from the kernel tree rather than
++ * remembered). A field out of place here would not fail - it would submit
++ * somebody else's addresses.
++ */
++struct drm_msm_gem_submit_cmd {
++	uint32_t type;           /* MSM_SUBMIT_CMD_x */
++	uint32_t submit_idx;     /* index into bos[] */
++	uint32_t submit_offset;  /* byte offset into that buffer */
++	uint32_t size;           /* bytes of command stream */
++	uint32_t pad;
++	uint32_t nr_relocs;
++	uint64_t relocs;         /* union with iova */
++};
++struct drm_msm_gem_submit_bo {
++	uint32_t flags;          /* MSM_SUBMIT_BO_x */
++	uint32_t handle;
++	uint64_t presumed;
++};
++struct drm_msm_gem_submit {
++	uint32_t flags;
++	uint32_t fence;          /* out */
++	uint32_t nr_bos;
++	uint32_t nr_cmds;
++	uint64_t bos;
++	uint64_t cmds;
++	int32_t fence_fd;
++	uint32_t queueid;
++	uint64_t in_syncobjs;
++	uint64_t out_syncobjs;
++	uint32_t nr_in_syncobjs;
++	uint32_t nr_out_syncobjs;
++	uint32_t syncobj_stride;
++	uint32_t pad;
++};
++struct drm_msm_wait_fence {
++	uint32_t fence;
++	uint32_t flags;
++	struct msm_timespec timeout;
++	uint32_t queueid;
++	uint32_t pad;
++};
++
++#define MSM_SUBMIT_CMD_BUF		0x0001
++#define MSM_PREP_NOSYNC			0x04
++#define MSM_SUBMIT_MAX_CMDS		8	/* one submission's command buffers */
++#define MSM_SUBMIT_MAX_BOS		8	/* one submission's buffers */
 +
 +enum {
 +	kDrmGemClose            = 0x09,
@@ -1433,9 +1572,13 @@
 +	IOReturn gemNew(struct msm_gem_new * request);
 +	IOReturn gemInfo(struct msm_gem_info * request);
 +	IOReturn gemClose(struct drm_gem_close * request);
++	IOReturn gemSubmit(struct drm_msm_gem_submit * request);
++	IOReturn waitFence(struct drm_msm_wait_fence * request);
++	IOReturn waitFor(uint32_t target, uint64_t limit_ns);
 +
 +public:
 +	static void poolSelfTest(void);
++	static void paramSelfTest(void);
 +	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type,
 +	    OSDictionary * properties) APPLE_KEXT_OVERRIDE;
 +	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
@@ -1825,6 +1968,236 @@
 +	return kIOReturnSuccess;
 +}
 +
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++/*
++ * 0203: the fence page, the parameters, and the submit path.
++ *
++ * One pool page the CP writes a number into after every submission. It is the
++ * whole of this port's completion mechanism: no GPU interrupt is wired, so
++ * "is it done" is a word in memory, and the only question a wait can ask is
++ * whether that word has reached a number. 0202 proved the CP writes it and that
++ * the numbers only go up; this hands the same thing to a program.
++ */
++static uint64_t gFencePa;
++static uint64_t gFenceIova;
++static volatile uint32_t * gFenceView;
++static uint32_t gLastFence;
++
++/* Called with gGPULock held. One page, once. */
++static bool
++fencePage(void)
++{
++	uint64_t pa, iova;
++	void * view;
++
++	if (gFenceView != NULL) {
++		return true;
++	}
++	pa = polaris_gpu_pool_alloc(4096);
++	if (pa == 0) {
++		printf("POLARIS GPU: 19 submit: the pool has no page for the fence\n");
++		return false;
++	}
++	view = polaris_gpu_pool_view(pa, 4096);
++	if (view == NULL) {
++		polaris_gpu_pool_free(pa, 4096);
++		return false;
++	}
++	iova = polaris_gpu_address(4096);
++	if (iova == 0 || !polaris_gpu_map(iova, pa, false)) {
++		polaris_gpu_pool_free(pa, 4096);
++		printf("POLARIS GPU: 19 submit: the fence page will not enter the window\n");
++		return false;
++	}
++	polaris_gpu_mapped();
++	((volatile uint32_t *) view)[0] = 0;
++	gFencePa = pa;
++	gFenceIova = iova;
++	gFenceView = (volatile uint32_t *) view;
++	printf("POLARIS GPU: 19 submit: the fence lives at %#llx (physical %#llx)\n", iova, pa);
++	return true;
++}
++
++/*
++ * What this GPU is, in Linux's parameter numbers. Only the ones this port can
++ * answer from something it has measured are here; everything else stays
++ * kIOReturnUnsupported, which the log records, because a plausible guess about
++ * GPU_ID or VA_SIZE makes a client program the wrong registers or hand us
++ * addresses we cannot translate.
++ */
++static bool
++gpuParam(uint32_t id, uint64_t * value)
++{
++	switch (id) {
++	case 0x01:					/* MSM_PARAM_GPU_ID */
++		*value = 630;				/* the model, which is what a driver selects on */
++		break;
++	case 0x02:					/* MSM_PARAM_GMEM_SIZE */
++		*value = 0x80000ull;			/* 512 KB, a630's on-chip GMEM */
++		break;
++	case 0x03:					/* MSM_PARAM_CHIP_ID */
++		*value = 0x06030001ull;			/* read off this chip during bring-up */
++		break;
++	case 0x04:					/* MSM_PARAM_MAX_FREQ */
++		*value = 710000000ull;			/* a630's top bin on sdm845 */
++		break;
++	case 0x05:					/* MSM_PARAM_TIMESTAMP */
++		*value = 0;
++		break;
++	case 0x07:					/* MSM_PARAM_PRIORITIES */
++		*value = 1;				/* one submit queue exists */
++		break;
++	case 0x08:					/* MSM_PARAM_PP_PGTABLE */
++		*value = 0;				/* deprecated in Linux; zero there too */
++		break;
++	case 0x09:					/* MSM_PARAM_FAULTS */
++	case 0x0a:					/* MSM_PARAM_SUSPENDS */
++		*value = 0;				/* nothing has faulted; nothing suspends */
++		break;
++	case 0x0e:					/* MSM_PARAM_VA_START */
++		*value = 0x10c00000ull;			/* PG_USER_IOVA */
++		break;
++	case 0x0f:					/* MSM_PARAM_VA_SIZE */
++		*value = 64ull << 20;			/* PG_USER_SIZE */
++		break;
++	default:
++		return false;
++	}
++	return true;
++}
++
++/* Wait until the fence word has reached `target`. Zero means "ten seconds", never forever. */
++IOReturn
++PolarisGPUUserClient::waitFor(uint32_t target, uint64_t limit_ns)
++{
++	uint64_t began, elapsed = 0;
++
++	if (gFenceView == NULL) {
++		return kIOReturnNotReady;
++	}
++	if (limit_ns == 0) {
++		limit_ns = 10ull * 1000000000ull;
++	}
++	began = mach_absolute_time();
++	for (;;) {
++		if (*gFenceView >= target) {
++			return kIOReturnSuccess;
++		}
++		if (elapsed >= limit_ns) {
++			printf("POLARIS GPU: 19 submit: WAIT_FENCE %u: the fence is at %u after %llu us\n",
++			    target, *gFenceView, elapsed / 1000);
++			return kIOReturnTimeout;
++		}
++		IOSleep(1);
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &elapsed);
++	}
++}
++
++IOReturn
++PolarisGPUUserClient::waitFence(struct drm_msm_wait_fence * request)
++{
++	uint64_t limit = 0;
++
++	if (request->timeout.seconds > 0 || request->timeout.nanoseconds > 0) {
++		limit = (uint64_t)request->timeout.seconds * 1000000000ull +
++		    (uint64_t)request->timeout.nanoseconds;
++	}
++	return waitFor(request->fence, limit);
++}
++
++/*
++ * GEM_SUBMIT. The buffers are looked up by handle, each command's address is
++ * that buffer's GPU address plus its offset, and the whole set goes into the
++ * ring as one submission with one fence - which is what makes a wait after it
++ * mean "all of it", not "some of it".
++ */
++IOReturn
++PolarisGPUUserClient::gemSubmit(struct drm_msm_gem_submit * request)
++{
++	struct drm_msm_gem_submit_bo bos[MSM_SUBMIT_MAX_BOS];
++	struct drm_msm_gem_submit_cmd cmds[MSM_SUBMIT_MAX_CMDS];
++	uint64_t iovas[MSM_SUBMIT_MAX_CMDS];
++	uint32_t words[MSM_SUBMIT_MAX_CMDS];
++	uint32_t count = 0, seq, total = 0;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (request->nr_cmds == 0 || request->nr_cmds > MSM_SUBMIT_MAX_CMDS ||
++	    request->nr_bos == 0 || request->nr_bos > MSM_SUBMIT_MAX_BOS ||
++	    request->bos == 0 || request->cmds == 0) {
++		return kIOReturnBadArgument;
++	}
++	if (copyin((user_addr_t) request->bos, bos,
++	    request->nr_bos * sizeof(bos[0])) != 0 ||
++	    copyin((user_addr_t) request->cmds, cmds,
++	    request->nr_cmds * sizeof(cmds[0])) != 0) {
++		return kIOReturnBadAddress;
++	}
++
++	IOLockLock(gGPULock);
++	if (!fencePage()) {
++		IOLockUnlock(gGPULock);
++		return kIOReturnNoMemory;
++	}
++	for (uint32_t i = 0; i < request->nr_cmds; i++) {
++		struct gpu_buffer * b;
++
++		if (cmds[i].type != MSM_SUBMIT_CMD_BUF) {
++			continue;			/* a restore buffer: nothing to run now */
++		}
++		if (cmds[i].submit_idx >= request->nr_bos || cmds[i].size == 0 ||
++		    (cmds[i].size & 3u) != 0) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		b = buffer(bos[cmds[i].submit_idx].handle);
++		if (b == NULL) {
++			printf("POLARIS GPU: 19 submit: a command names handle %u, which this "
++			    "client does not have\n", bos[cmds[i].submit_idx].handle);
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		iovas[count] = b->address + cmds[i].submit_offset;
++		words[count] = cmds[i].size / 4u;
++		total += words[count];
++		count++;
++	}
++	if (ret == kIOReturnSuccess && count == 0) {
++		ret = kIOReturnBadArgument;
++	}
++	if (ret == kIOReturnSuccess) {
++		seq = polaris_gpu_fence_next();
++		if (!polaris_gpu_submit_ibs(iovas, words, count, gFenceIova, seq)) {
++			ret = kIOReturnNoResources;
++		} else {
++			gLastFence = seq;
++			request->fence = seq;
++			printf("POLARIS GPU: 19 submit: %u buffers, %u words, fence %u\n",
++			    count, total, seq);
++		}
++	}
++	IOLockUnlock(gGPULock);
++	return ret;
++}
++
++/* The values a program will be given, printed at boot so that a wrong one is visible. */
++void
++PolarisGPUUserClient::paramSelfTest(void)
++{
++	static const uint32_t ids[] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x07, 0x08, 0x09, 0x0a,
++	    0x0e, 0x0f };
++	uint64_t value;
++
++	for (uint32_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
++		if (gpuParam(ids[i], &value)) {
++			printf("POLARIS GPU: 19 param %#04x = %#llx\n", ids[i], value);
++		} else {
++			printf("POLARIS GPU: 19 param %#04x is asked and not answered\n", ids[i]);
++		}
++	}
++	printf("POLARIS GPU: 19 submit: %u dwords free in the ring\n", polaris_gpu_ring_room());
++}
++
 +/*
 + * 0197's answer without a user space: make a buffer the way gemNew() makes one,
 + * look at what its descriptor says its pages are, have the CP write the whole
@@ -1999,6 +2372,8 @@
 +		struct msm_submitqueue queue;
 +		struct msm_submitqueue_query query;
 +		struct drm_gem_close close;
++		struct drm_msm_gem_submit submit;
++		struct drm_msm_wait_fence wait;
 +	} r;
 +	size_t size = args->structureInputSize;
 +	IOReturn ret = kIOReturnSuccess;
@@ -2026,19 +2401,15 @@
 +		/*
 +		 * Mesa asks what the hardware is before it will touch it, and the
 +		 * answers are the one place where a plausible guess is worse than
-+		 * nothing: a wrong GPU_MODEL makes it program the wrong register
-+		 * set. So they are recorded, not answered - the log says which ones
-+		 * this Mesa wanted, in what order, which is what the next build
-+		 * needs to fill them in from the device tree rather than from
-+		 * memory. FAULTS and SUSPENDS are zero and truly are zero: nothing
-+		 * has been submitted.
++		 * nothing: a wrong GPU_ID makes it program the wrong register set.
++		 * 0203 answers the ones this port has measured (gpuParam), and keeps
++		 * recording the rest - each one that shows up here is an answer the
++		 * next build owes, and the log is where the list lives.
 +		 */
-+		switch (r.param.param) {
-+		case 0x09:                              /* MSM_PARAM_FAULTS */
-+		case 0x0a:                              /* MSM_PARAM_SUSPENDS */
-+			r.param.value = 0;
++		if (gpuParam(r.param.param, &r.param.value)) {
 +			break;
-+		default:
++		}
++		{
 +			if (gParamCount < 16) {
 +				bool seen = false;
 +
@@ -2052,7 +2423,6 @@
 +				}
 +			}
 +			ret = kIOReturnUnsupported;
-+			break;
 +		}
 +		break;
 +	case kMsmSetParam:                              /* the program's name, for Linux's lists */
@@ -2067,11 +2437,20 @@
 +		break;
 +	case kMsmGemCpuPrep:
 +		/*
-+		 * "Is the GPU done with this buffer?" Nothing has been submitted, so
-+		 * it always is. This is true only while there is no submit path; the
-+		 * build that adds one has to make this wait on a fence, and this
-+		 * comment is here to be deleted when it does.
++		 * 0203: this used to be a no-op because nothing was ever submitted.
++		 * Now a submission may still be in the CP's hands, and the honest
++		 * answer to "may I touch this buffer" is to wait for the last fence -
++		 * unless the program says it does not want to wait.
 +		 */
++		if ((r.cpuPrep.op & MSM_PREP_NOSYNC) == 0 && gLastFence != 0) {
++			uint64_t limit = 0;
++
++			if (r.cpuPrep.timeout.seconds > 0 || r.cpuPrep.timeout.nanoseconds > 0) {
++				limit = (uint64_t)r.cpuPrep.timeout.seconds * 1000000000ull +
++				    (uint64_t)r.cpuPrep.timeout.nanoseconds;
++			}
++			ret = waitFor(gLastFence, limit);
++		}
 +		break;
 +	case kMsmGemMadvise:                            /* freedreno asks about every buffer it reuses */
 +		r.madvise.retained = 1;
@@ -2087,14 +2466,10 @@
 +		}
 +		break;
 +	case kMsmGemSubmit:
++		ret = gemSubmit(&r.submit);
++		break;
 +	case kMsmWaitFence:
-+		/*
-+		 * Not yet, and not silently: a client that gets kIOReturnUnsupported
-+		 * from a submit stops, and the log says so. A client that gets 0 and
-+		 * a fence that is already done would draw a frame that never reached
-+		 * the GPU and never know.
-+		 */
-+		ret = kIOReturnUnsupported;
++		ret = waitFence(&r.wait);
 +		break;
 +	case kDrmGemClose:
 +		ret = gemClose(&r.close);
@@ -2365,6 +2740,7 @@
 +	 * is the kernel half of DRM's GEM_SUBMIT, proven without a user space.
 +	 */
 +	polaris_gpu_submit_test();
++	PolarisGPUUserClient::paramSelfTest();
 +
 +	polaris_gpu_unmap(address, size);
 +	polaris_gpu_mapped();
