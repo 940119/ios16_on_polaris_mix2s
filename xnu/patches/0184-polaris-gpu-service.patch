@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1557 @@
+@@ -5067,4 +5336,1577 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1177,8 +1177,8 @@
 + * wave by itself:
 + *
 + *   SP_UPDATE_CNTL   was 0xbf. That is the six stages plus GFX_UAV and leaves
-+ *                    out CS_UAV (0x40) - the compute uav block is never latched,
-+ *                    so the store has no descriptor to write through.
++ *                    out CS_UAV (0x40); 0216 adds CS_BINDLESS (0x1f << 9) as
++ *                    well, without which the descriptor set is never latched.
 + *   SP_MODE_CNTL     was 0x5, ISAMMODE_GL. A kernel runs ISAMMODE_CL.
 + *   SP_CS_WGE_CNTL   was 0x2fc, which is neither THREAD64 nor a valid linear
 + *                    local id. Zero is THREAD64 and no linear local id.
@@ -1200,7 +1200,7 @@
 +	/* then the compute pipeline, in cs_program_emit()'s own order. */
 +	{ 0x0ae0f, 0x00000020 },	/* SP_PERFCTR_SHADER_MASK: .cs */
 +	{ 0x0ae04, 0x00000000 },	/* SP_NC_MODE_CNTL_2 */
-+	{ 0x0bb08, 0x000000ff },	/* SP_UPDATE_CNTL: six stages, cs, cs_uav, gfx_uav */
++	{ 0x0bb08, 0x00003eff },	/* SP_UPDATE_CNTL: six stages, cs, cs_uav, gfx_uav, cs_bindless */
 +	{ 0x0ab00, 0x00000003 },	/* SP_MODE_CNTL: ISAMMODE_CL, constant demotion */
 +	{ 0x0b987, 0x00000100 },	/* SP_CS_CONST_CONFIG: constlen 0, enabled */
 +	{ 0x0a9bb, 0x00400100 },	/* SP_CS_CONFIG: enabled, ntex 0, nsamp 0, nuav 1 */
@@ -1250,7 +1250,7 @@
 +	 * <reg><lo><reg+1><hi>, which is what fd_crb::add() does for a reg64.
 +	 */
 +	{
-+		uint32_t pairs = 2u * (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0])) + 10u;
++		uint32_t pairs = 2u * (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0])) + 8u;
 +
 +		pg_ring_put(wptr++, pg_pkt7(0x5cu, pairs));	/* CP_CONTEXT_REG_BUNCH */
 +		for (i = 0; i < sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]); i++) {
@@ -1261,21 +1261,41 @@
 +		pg_ring_put(wptr++, (uint32_t)iova);
 +		pg_ring_put(wptr++, 0x0a9b5u);
 +		pg_ring_put(wptr++, (uint32_t)(iova >> 32));
-+		pg_ring_put(wptr++, 0x0a9f2u);			/* SP_CS_UAV_BASE */
-+		pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
-+		pg_ring_put(wptr++, 0x0a9f3u);
++		/*
++		 * 0216: the descriptor set, not the old UAV block.
++		 *
++		 * gen >= 6 lowers every SSBO access to the bindless form
++		 * (ir3_gallium.c: `lower_to_bindless = gen >= 6`), so a store does not
++		 * read a descriptor out of an SP_CS_UAV_BASE block - it takes a
++		 * descriptor *index* and adds it to the set base held here. 0211-0215
++		 * filled the old block, which this shader never looks at, so it read a
++		 * descriptor of zeros: width 0, and a store against a zero-length
++		 * buffer is dropped without a fault. That is exactly what "waves run,
++		 * 218 ms of them, and not one word changes" looks like.
++		 *
++		 * DESC_SIZE lives in the low two bits of the same qword
++		 * (BINDLESS_DESCRIPTOR_64B = 3), which is why the address goes in as
++		 * <addr & ~3> | 3. Compute is descriptor set 0, and SSBO slot 0 is at
++		 * offset 0 of that set, which is the start of the descriptor page.
++		 */
++		pg_ring_put(wptr++, 0x0a9e8u);			/* SP_CS_BINDLESS_BASE(0) */
++		pg_ring_put(wptr++, ((uint32_t)(iova + PG_GMU_PAGE_SIZE) & ~3u) | 3u);
++		pg_ring_put(wptr++, 0x0a9e9u);
 +		pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
-+		pg_ring_put(wptr++, 0x0aa00u);			/* SP_CS_USIZE */
-+		pg_ring_put(wptr++, 1u);
 +	}
 +	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the shader */
 +	pg_ring_put(wptr++, 0x00760000u);		/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
 +	pg_ring_put(wptr++, (uint32_t)iova);
 +	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
-+	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* and the UAV descriptor */
-+	pg_ring_put(wptr++, 0x0076c000u);		/* ST6_UAV / INDIRECT / CS_SHADER / 1 */
-+	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
-+	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++	/*
++	 * And the descriptor set entry, preloaded. For SS6_BINDLESS the third
++	 * dword is not an address at all: it is (set << 28) | slot * 64, so zero
++	 * for set 0, ssbo 0.
++	 */
++	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG */
++	pg_ring_put(wptr++, 0x0075c000u);		/* ST6_UAV / BINDLESS / CS_SHADER / 1 */
++	pg_ring_put(wptr++, 0u);
++	pg_ring_put(wptr++, 0u);
 +	/*
 +	 * The grid. NDRANGE_1 is the *global* size, i.e. local times groups, while
 +	 * CP_EXEC_CS and KERNEL_GROUP_X take the number of groups.
@@ -1428,10 +1448,10 @@
 +		    "%08x %08x\n", result[0], result[1], result[2], result[3], result[4],
 +		    result[5], result[6], result[7]);
 +		printf("POLARIS GPU: 20 shader: the registers read back SP_CS_BASE %08x%08x "
-+		    "INSTR_SIZE %08x UAV_BASE %08x%08x USIZE %08x\n",
++		    "INSTR_SIZE %08x BINDLESS_BASE %08x%08x\n",
 +		    pg_rd(pg_gpu3d + 4u * 0x0a9b5), pg_rd(pg_gpu3d + 4u * 0x0a9b4),
-+		    pg_rd(pg_gpu3d + 4u * 0x0a9bc), pg_rd(pg_gpu3d + 4u * 0x0a9f3),
-+		    pg_rd(pg_gpu3d + 4u * 0x0a9f2), pg_rd(pg_gpu3d + 4u * 0x0aa00));
++		    pg_rd(pg_gpu3d + 4u * 0x0a9bc), pg_rd(pg_gpu3d + 4u * 0x0a9e9),
++		    pg_rd(pg_gpu3d + 4u * 0x0a9e8));
 +		/*
 +		 * 0214: these four say whether the state really landed in the
 +		 * context the dispatch used. If CP_SET_MARKER is doing its job
