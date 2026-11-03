@@ -37,15 +37,17 @@
  
  enum polaris_gpu_stage {
  	POLARIS_GPU_BOARD,
-@@ -527,6 +539,7 @@
+@@ -526,7 +538,9 @@
+ #define PG_CB_MAIR0		0x38
  #define PG_CB_MAIR1		0x3c
  #define PG_CB_FSR		0x58
++#define PG_CB_FAR		0x60
  #define PG_CB_TLBIASID		0x610
 +#define PG_CB_TLBIALL		0x618
  #define PG_CB_TLBSYNC		0x7f0
  #define PG_CB_TLBSTATUS		0x7f4
  
-@@ -1081,8 +1094,18 @@
+@@ -1081,8 +1095,18 @@
   * The level 1 entry is unchanged: 0x10000000 >> 30 is 0 for every one of these
   * five entries, and build 0140's fault was an empty level 1 entry, not an
   * empty level 2 one.
@@ -66,7 +68,7 @@
  
  static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
  static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
-@@ -1095,6 +1118,19 @@
+@@ -1095,6 +1119,19 @@
  static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
  static bool pg_masks_saved;
  
@@ -86,7 +88,7 @@
  /* The GMU reads from memory, not from this processor's cache. */
  static void
  pg_to_memory(vm_offset_t start, vm_size_t size)
-@@ -1407,6 +1443,226 @@
+@@ -1407,6 +1444,226 @@
  	return true;
  }
  
@@ -313,7 +315,7 @@
  /*
   * IMPL_DEF1 is at base + 6 pages, and its first word is the micro MMU's
   * control word. The vendor driver halts the SMMU around the
-@@ -4865,7 +5121,7 @@
+@@ -4865,7 +5122,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
  	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
@@ -322,7 +324,7 @@
  	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
  	    "physical, stream 5 bypassed (polarisgpumap=0)");
  	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
-@@ -5049,6 +5305,18 @@
+@@ -5049,6 +5306,18 @@
  	if (upto > 0) {
  		polaris_gpu.state = POLARIS_GPU_STARTING;
  		polaris_gpu_up(upto);
@@ -341,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5335,1364 @@
+@@ -5067,4 +5336,1417 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1189,6 +1191,7 @@
 +static bool pg_fence_reached(volatile uint32_t *word, uint32_t seq, uint32_t tries);
 +void polaris_gpu_cp_report(const char *why);
 +uint32_t polaris_gpu_fence_next(void);
++void polaris_gpu_smmu_fault(void);
 +
 +void
 +polaris_gpu_cs_test(void)
@@ -1255,14 +1258,14 @@
 +		result[i] = 0;
 +	}
 +
-+	for (i = 0; i < sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]); i++) {
-+		pg_wr(pg_gpu3d + 4u * pg_cs_regs[i].reg, pg_cs_regs[i].value);
-+	}
-+	pg_wr(pg_gpu3d + 4u * 0x0a9b4, (uint32_t)iova);			/* SP_CS_BASE */
-+	pg_wr(pg_gpu3d + 4u * 0x0a9b5, (uint32_t)(iova >> 32));
-+	pg_wr(pg_gpu3d + 4u * 0x0a9f2, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
-+	pg_wr(pg_gpu3d + 4u * 0x0a9f3, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
-+	pg_wr(pg_gpu3d + 4u * 0x0aa00, 1u);				/* SP_CS_USIZE */
++	/*
++	 * 0212: through the ring, not by CPU store.
++	 *
++	 * computerator writes these with fd_crb, which is a CP_CONTEXT_REG_BUNCH
++	 * packet, and 0211 wrote them with pg_wr() instead. The GPU ran the
++	 * dispatch and the fence arrived, and not one word of the buffer was
++	 * touched - which is what a register block the CP never saw looks like.
++	 */
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +
 +	printf("POLARIS GPU: 20 shader: %u dwords at %#llx, descriptor at %#llx, result at "
@@ -1271,6 +1274,30 @@
 +
 +	seq = polaris_gpu_fence_next();
 +	wptr = pg_cp_wptr;
++	/*
++	 * One CP_CONTEXT_REG_BUNCH with every pair, then the two state loads. The
++	 * 64-bit ones go in as <reg><lo><reg+1><hi>, which is what fd_crb::add()
++	 * does for a reg64.
++	 */
++	{
++		uint32_t pairs = 2u * (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0])) + 10u;
++
++		pg_ring_put(wptr++, pg_pkt7(0x5cu, pairs));	/* CP_CONTEXT_REG_BUNCH */
++		for (i = 0; i < sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]); i++) {
++			pg_ring_put(wptr++, pg_cs_regs[i].reg);
++			pg_ring_put(wptr++, pg_cs_regs[i].value);
++		}
++		pg_ring_put(wptr++, 0x0a9b4u);			/* SP_CS_BASE */
++		pg_ring_put(wptr++, (uint32_t)iova);
++		pg_ring_put(wptr++, 0x0a9b5u);
++		pg_ring_put(wptr++, (uint32_t)(iova >> 32));
++		pg_ring_put(wptr++, 0x0a9f2u);			/* SP_CS_UAV_BASE */
++		pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
++		pg_ring_put(wptr++, 0x0a9f3u);
++		pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++		pg_ring_put(wptr++, 0x0aa00u);			/* SP_CS_USIZE */
++		pg_ring_put(wptr++, 1u);
++	}
 +	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the shader */
 +	pg_ring_put(wptr++, 0x00760000u);		/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
 +	pg_ring_put(wptr++, (uint32_t)iova);
@@ -1316,6 +1343,18 @@
 +		}
 +		printf("POLARIS GPU: 20 shader: the fence reads %u; %u of %u result words are "
 +		    "0x0209c0de\n", *fence, good, PG_CS_RESULT_WORDS);
++		printf("POLARIS GPU: 20 shader: the words read %08x %08x %08x %08x %08x %08x "
++		    "%08x %08x\n", result[0], result[1], result[2], result[3], result[4],
++		    result[5], result[6], result[7]);
++		printf("POLARIS GPU: 20 shader: the registers read back SP_CS_BASE %08x%08x "
++		    "INSTR_SIZE %08x UAV_BASE %08x%08x USIZE %08x\n",
++		    pg_rd(pg_gpu3d + 4u * 0x0a9b5), pg_rd(pg_gpu3d + 4u * 0x0a9b4),
++		    pg_rd(pg_gpu3d + 4u * 0x0a9bc), pg_rd(pg_gpu3d + 4u * 0x0a9f3),
++		    pg_rd(pg_gpu3d + 4u * 0x0a9f2), pg_rd(pg_gpu3d + 4u * 0x0aa00));
++		if (good != PG_CS_RESULT_WORDS) {
++			polaris_gpu_cp_report("after the dispatch");
++			polaris_gpu_smmu_fault();
++		}
 +		printf("POLARIS GPU: 20 shader: %s\n", (good == PG_CS_RESULT_WORDS) ?
 +		    "THE GPU RAN THE SHADER: ir3 FETCH, THE UAV DESCRIPTOR AND THE DISPATCH ALL WORK" :
 +		    "the shader did not run, or it ran without its buffer");
@@ -1384,6 +1423,22 @@
 + * being busy; the status register also carries the hang interrupt, which no
 + * build has seen yet.
 + */
++/* 0212: what the SMMU thinks, for the case where the GPU ran and wrote nothing. */
++void
++polaris_gpu_smmu_fault(void)
++{
++	vm_offset_t cb;
++
++	if (pg_smmu == 0) {
++		return;
++	}
++	cb = pg_smmu_cb(PG_GMU_CTX);
++	printf("POLARIS GPU: 20 smmu: sGFSR %#010x sGFSYNR0 %#010x; bank 2 FSR %#010x FAR "
++	    "%#010x%08x\n", pg_rd(pg_smmu + PG_SMMU_SGFSR),
++	    pg_rd(pg_smmu + PG_SMMU_SGFSYNR0), pg_rd(cb + PG_CB_FSR),
++	    pg_rd(cb + PG_CB_FAR + 4u), pg_rd(cb + PG_CB_FAR));
++}
++
 +void
 +polaris_gpu_cp_report(const char *why)
 +{
