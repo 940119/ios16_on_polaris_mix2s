@@ -13,9 +13,11 @@
  bsd/dev/unix_startup.c			standard
 --- a/bsd/dev/polaris_gpu.c
 +++ b/bsd/dev/polaris_gpu.c
-@@ -15,10 +15,21 @@
+@@ -14,11 +14,23 @@
+ #include <sys/systm.h>
  #include <pexpert/pexpert.h>
  #include <kern/clock.h>
++#include <kern/thread.h>
  #include <mach/mach_time.h>
 +#include <sys/mount.h>
 +#include <sys/vnode.h>
@@ -35,7 +37,7 @@
  
  enum polaris_gpu_stage {
  	POLARIS_GPU_BOARD,
-@@ -1081,8 +1092,18 @@
+@@ -1081,8 +1093,18 @@
   * The level 1 entry is unchanged: 0x10000000 >> 30 is 0 for every one of these
   * five entries, and build 0140's fault was an empty level 1 entry, not an
   * empty level 2 one.
@@ -56,7 +58,7 @@
  
  static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
  static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
-@@ -1094,6 +1115,19 @@
+@@ -1094,6 +1116,19 @@
  static bool pg_boot_configured;
  static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
  static bool pg_masks_saved;
@@ -76,7 +78,7 @@
  
  /* The GMU reads from memory, not from this processor's cache. */
  static void
-@@ -1405,6 +1439,191 @@
+@@ -1405,6 +1440,191 @@
  	printf("POLARIS GPU: 10 %s: %#llx -> %#llx, descriptor %#llx in slot %u\n", name, iova,
  	    kvtophys(va), l3[((iova >> 12) & 0x1ff)], (uint32_t)((iova >> 12) & 0x1ff));
  	return true;
@@ -268,7 +270,7 @@
  }
  
  /*
-@@ -4865,7 +5084,7 @@
+@@ -4865,7 +5085,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
  	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
@@ -277,7 +279,7 @@
  	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
  	    "physical, stream 5 bypassed (polarisgpumap=0)");
  	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
-@@ -5049,6 +5268,18 @@
+@@ -5049,6 +5269,18 @@
  	if (upto > 0) {
  		polaris_gpu.state = POLARIS_GPU_STARTING;
  		polaris_gpu_up(upto);
@@ -296,7 +298,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5298,1105 @@
+@@ -5067,4 +5299,1138 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1370,15 +1372,48 @@
 + *
 + * Nothing here creates, changes or removes anything.
 + */
++static void polaris_vfs_probe_thread(void *, int);
++
 +void
 +polaris_vfs_probe(void)
++{
++	thread_t thread = NULL;
++
++	if (kernel_thread_start((thread_continue_t) polaris_vfs_probe_thread, NULL,
++	    &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("POLARIS VFS: no thread to wait for the root with\n");
++	}
++}
++
++static void
++polaris_vfs_probe_thread(void * arg, int pending)
 +{
 +	static const char * paths[] = {
 +		"/", "/System", "/System/Library", "/System/Library/LaunchDaemons",
 +		"/usr", "/usr/lib", "/private/var",
 +	};
-+	vfs_context_t ctx = vfs_context_current();
++	vfs_context_t ctx;
 +
++	(void) arg;
++	(void) pending;
++	/*
++	 * Not yet, most likely: this driver starts during the bring-up, before
++	 * the root volume is mounted, and the first run of this probe answered
++	 * ENOENT to every path including "/". Wait for it instead of guessing a
++	 * delay - sixty seconds at half a second a look.
++	 */
++	for (unsigned i = 0; i < 120; i++) {
++		vnode_t root = NULL;
++
++		if (vnode_lookup("/", 0, &root, vfs_context_current()) == 0 && root != NULL) {
++			vnode_put(root);
++			break;
++		}
++		IOSleep(500);
++	}
++	ctx = vfs_context_current();
 +	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
 +		vnode_t vp = NULL;
 +		int err = vnode_lookup(paths[i], 0, &vp, ctx);
