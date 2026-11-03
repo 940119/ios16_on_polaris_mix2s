@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1509 @@
+@@ -5067,4 +5336,1557 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1219,26 +1219,105 @@
 +void polaris_gpu_smmu_fault(void);
 +
 +/*
-+ * 0213: the grid, without which no wave is launched at all.
++ * 0215: one dispatch, as a function, so that the caller can change the grid.
 + *
-+ * 0211 and 0212 wrote the program's registers, loaded the shader and the UAV
-+ * descriptor, and dispatched - and the CP completed the dispatch without
-+ * starting a single wave, so the fence arrived and the buffer was never touched.
-+ * These ten registers are what says how many invocations to run; computerator
-+ * emits them after CP_SET_MARKER(RM6_COMPUTE), and so does this.
++ * 0211 through 0214 all ended at "0 of 8", and that number cannot tell two very
++ * different failures apart: a wave that never launched, and a wave that ran with
++ * its store going nowhere. Time can. A wave costs something to launch, so one
++ * group and sixty-five thousand groups take the same time only if nothing was
++ * launched at all; if waves are running, the second is tens of milliseconds
++ * longer. Neither the shader nor the descriptor enters into that comparison,
++ * which is what makes it worth doing: both of them are still suspects.
 + */
-+static const struct pg_cs_reg pg_cs_grid[] = {
-+	{ 0x0b990, 0x0000001f },	/* SP_CS_NDRANGE_0: dim 3, local 8x1x1 */
-+	{ 0x0b991, 0x00000008 },	/* SP_CS_NDRANGE_1: global x = 8 */
-+	{ 0x0b992, 0x00000000 },	/* SP_CS_NDRANGE_2 */
-+	{ 0x0b993, 0x00000001 },	/* SP_CS_NDRANGE_3: global y = 1 */
-+	{ 0x0b994, 0x00000000 },	/* SP_CS_NDRANGE_4 */
-+	{ 0x0b995, 0x00000001 },	/* SP_CS_NDRANGE_5: global z = 1 */
-+	{ 0x0b996, 0x00000000 },	/* SP_CS_NDRANGE_6 */
-+	{ 0x0b999, 0x00000001 },	/* SP_CS_KERNEL_GROUP_X */
-+	{ 0x0b99a, 0x00000001 },	/* SP_CS_KERNEL_GROUP_Y */
-+	{ 0x0b99b, 0x00000001 },	/* SP_CS_KERNEL_GROUP_Z */
-+};
++static void
++pg_cs_emit(uint64_t iova, uint64_t fence_iova, uint32_t groups, uint32_t seq)
++{
++	uint32_t wptr = pg_cp_wptr;
++	uint32_t i;
++
++	/*
++	 * The marker goes first: an a6xx keeps more than one register context and
++	 * CP_SET_MARKER says which one the packets that follow write into. Then
++	 * CP_SET_MODE(1) so the state is applied now rather than deferred to the
++	 * next draw. This is fd6_launch_grid()'s order.
++	 */
++	pg_ring_put(wptr++, pg_pkt7(0x65u, 1u));	/* CP_SET_MARKER */
++	pg_ring_put(wptr++, 8u);			/* RM6_COMPUTE */
++	pg_ring_put(wptr++, pg_pkt7(0x63u, 1u));	/* CP_SET_MODE */
++	pg_ring_put(wptr++, 1u);			/* apply, do not defer */
++	/*
++	 * One CP_CONTEXT_REG_BUNCH with every pair. The 64-bit ones go in as
++	 * <reg><lo><reg+1><hi>, which is what fd_crb::add() does for a reg64.
++	 */
++	{
++		uint32_t pairs = 2u * (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0])) + 10u;
++
++		pg_ring_put(wptr++, pg_pkt7(0x5cu, pairs));	/* CP_CONTEXT_REG_BUNCH */
++		for (i = 0; i < sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]); i++) {
++			pg_ring_put(wptr++, pg_cs_regs[i].reg);
++			pg_ring_put(wptr++, pg_cs_regs[i].value);
++		}
++		pg_ring_put(wptr++, 0x0a9b4u);			/* SP_CS_BASE */
++		pg_ring_put(wptr++, (uint32_t)iova);
++		pg_ring_put(wptr++, 0x0a9b5u);
++		pg_ring_put(wptr++, (uint32_t)(iova >> 32));
++		pg_ring_put(wptr++, 0x0a9f2u);			/* SP_CS_UAV_BASE */
++		pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
++		pg_ring_put(wptr++, 0x0a9f3u);
++		pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++		pg_ring_put(wptr++, 0x0aa00u);			/* SP_CS_USIZE */
++		pg_ring_put(wptr++, 1u);
++	}
++	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the shader */
++	pg_ring_put(wptr++, 0x00760000u);		/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
++	pg_ring_put(wptr++, (uint32_t)iova);
++	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
++	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* and the UAV descriptor */
++	pg_ring_put(wptr++, 0x0076c000u);		/* ST6_UAV / INDIRECT / CS_SHADER / 1 */
++	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
++	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++	/*
++	 * The grid. NDRANGE_1 is the *global* size, i.e. local times groups, while
++	 * CP_EXEC_CS and KERNEL_GROUP_X take the number of groups.
++	 */
++	pg_ring_put(wptr++, pg_pkt7(0x5cu, 20u));	/* CP_CONTEXT_REG_BUNCH, ten pairs */
++	pg_ring_put(wptr++, 0x0b990u);			/* SP_CS_NDRANGE_0 */
++	pg_ring_put(wptr++, 0x0000001fu);		/* dim 3, local 8x1x1 */
++	pg_ring_put(wptr++, 0x0b991u);			/* SP_CS_NDRANGE_1 */
++	pg_ring_put(wptr++, 8u * groups);		/* global x */
++	pg_ring_put(wptr++, 0x0b992u);			/* SP_CS_NDRANGE_2 */
++	pg_ring_put(wptr++, 0u);			/* offset x */
++	pg_ring_put(wptr++, 0x0b993u);			/* SP_CS_NDRANGE_3 */
++	pg_ring_put(wptr++, 1u);			/* global y */
++	pg_ring_put(wptr++, 0x0b994u);			/* SP_CS_NDRANGE_4 */
++	pg_ring_put(wptr++, 0u);			/* offset y */
++	pg_ring_put(wptr++, 0x0b995u);			/* SP_CS_NDRANGE_5 */
++	pg_ring_put(wptr++, 1u);			/* global z */
++	pg_ring_put(wptr++, 0x0b996u);			/* SP_CS_NDRANGE_6 */
++	pg_ring_put(wptr++, 0u);			/* offset z */
++	pg_ring_put(wptr++, 0x0b999u);			/* SP_CS_KERNEL_GROUP_X */
++	pg_ring_put(wptr++, groups);
++	pg_ring_put(wptr++, 0x0b99au);			/* SP_CS_KERNEL_GROUP_Y */
++	pg_ring_put(wptr++, 1u);
++	pg_ring_put(wptr++, 0x0b99bu);			/* SP_CS_KERNEL_GROUP_Z */
++	pg_ring_put(wptr++, 1u);
++	pg_ring_put(wptr++, pg_pkt7(0x33u, 4u));	/* CP_EXEC_CS */
++	pg_ring_put(wptr++, 0u);
++	pg_ring_put(wptr++, groups);
++	pg_ring_put(wptr++, 1u);
++	pg_ring_put(wptr++, 1u);
++	pg_ring_put(wptr++, pg_pkt7(0x26u, 0u));	/* CP_WAIT_FOR_IDLE */
++	pg_ring_put(wptr++, pg_pkt7(0x46u, 4u));	/* CP_EVENT_WRITE: the fence */
++	pg_ring_put(wptr++, 0x04u);
++	pg_ring_put(wptr++, (uint32_t)fence_iova);
++	pg_ring_put(wptr++, (uint32_t)(fence_iova >> 32));
++	pg_ring_put(wptr++, seq);
++	wptr &= PG_RING_WORDS - 1u;
++	pg_ring_flush();
++	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	pg_cp_wptr = wptr;
++}
 +
 +void
 +polaris_gpu_cs_test(void)
@@ -1321,83 +1400,9 @@
 +	    "%#llx, fence at %#llx\n", PG_CS_SHADER_WORDS, iova, iova + PG_GMU_PAGE_SIZE,
 +	    iova + 2u * PG_GMU_PAGE_SIZE, fence_iova);
 +
-+	/*
-+	 * 0214: the marker goes first, and that is the whole point of this build.
-+	 *
-+	 * An a6xx keeps more than one register context, and CP_SET_MARKER is what
-+	 * says which one the packets that follow write into. 0211-0213 put the
-+	 * marker immediately before CP_EXEC_CS, i.e. *after* all of the state, so
-+	 * every CS register landed in whichever context was current before, and the
-+	 * dispatch then ran against an empty compute context. That is exactly the
-+	 * picture: ring drained, fence arrived, no wave, no SMMU fault, not one word
-+	 * of the buffer touched.
-+	 *
-+	 * fd6_launch_grid() emits it first, then CP_SET_MODE(1) so that the state
-+	 * that follows is applied now instead of deferred to the next draw, then
-+	 * the state group, then the shader, then the grid. This is that order.
-+	 */
 +	seq = polaris_gpu_fence_next();
++	pg_cs_emit(iova, fence_iova, 1u, seq);
 +	wptr = pg_cp_wptr;
-+	pg_ring_put(wptr++, pg_pkt7(0x65u, 1u));	/* CP_SET_MARKER */
-+	pg_ring_put(wptr++, 8u);			/* RM6_COMPUTE */
-+	pg_ring_put(wptr++, pg_pkt7(0x63u, 1u));	/* CP_SET_MODE */
-+	pg_ring_put(wptr++, 1u);			/* apply, do not defer */
-+	/*
-+	 * One CP_CONTEXT_REG_BUNCH with every pair. The 64-bit ones go in as
-+	 * <reg><lo><reg+1><hi>, which is what fd_crb::add() does for a reg64.
-+	 */
-+	{
-+		uint32_t pairs = 2u * (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0])) + 10u;
-+
-+		pg_ring_put(wptr++, pg_pkt7(0x5cu, pairs));	/* CP_CONTEXT_REG_BUNCH */
-+		for (i = 0; i < sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]); i++) {
-+			pg_ring_put(wptr++, pg_cs_regs[i].reg);
-+			pg_ring_put(wptr++, pg_cs_regs[i].value);
-+		}
-+		pg_ring_put(wptr++, 0x0a9b4u);			/* SP_CS_BASE */
-+		pg_ring_put(wptr++, (uint32_t)iova);
-+		pg_ring_put(wptr++, 0x0a9b5u);
-+		pg_ring_put(wptr++, (uint32_t)(iova >> 32));
-+		pg_ring_put(wptr++, 0x0a9f2u);			/* SP_CS_UAV_BASE */
-+		pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
-+		pg_ring_put(wptr++, 0x0a9f3u);
-+		pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
-+		pg_ring_put(wptr++, 0x0aa00u);			/* SP_CS_USIZE */
-+		pg_ring_put(wptr++, 1u);
-+	}
-+	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the shader */
-+	pg_ring_put(wptr++, 0x00760000u);		/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
-+	pg_ring_put(wptr++, (uint32_t)iova);
-+	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
-+	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* and the UAV descriptor */
-+	pg_ring_put(wptr++, 0x0076c000u);		/* ST6_UAV / INDIRECT / CS_SHADER / 1 */
-+	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
-+	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
-+	{
-+		uint32_t n = (uint32_t)(sizeof(pg_cs_grid) / sizeof(pg_cs_grid[0]));
-+
-+		pg_ring_put(wptr++, pg_pkt7(0x5cu, 2u * n));	/* the grid */
-+		for (i = 0; i < n; i++) {
-+			pg_ring_put(wptr++, pg_cs_grid[i].reg);
-+			pg_ring_put(wptr++, pg_cs_grid[i].value);
-+		}
-+	}
-+	pg_ring_put(wptr++, pg_pkt7(0x33u, 4u));	/* CP_EXEC_CS, one group in each */
-+	pg_ring_put(wptr++, 0u);
-+	pg_ring_put(wptr++, 1u);
-+	pg_ring_put(wptr++, 1u);
-+	pg_ring_put(wptr++, 1u);
-+	pg_ring_put(wptr++, pg_pkt7(0x26u, 0u));	/* CP_WAIT_FOR_IDLE */
-+	pg_ring_put(wptr++, pg_pkt7(0x46u, 4u));	/* CP_EVENT_WRITE: the fence */
-+	pg_ring_put(wptr++, 0x04u);
-+	pg_ring_put(wptr++, (uint32_t)fence_iova);
-+	pg_ring_put(wptr++, (uint32_t)(fence_iova >> 32));
-+	pg_ring_put(wptr++, seq);
-+	wptr &= PG_RING_WORDS - 1u;
-+	pg_ring_flush();
-+	pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
-+	__asm__ volatile ("dsb sy" ::: "memory");
-+	pg_cp_wptr = wptr;
 +
 +	for (i = 0; i < 2000u; i++) {
 +		rptr = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u);
@@ -1454,6 +1459,49 @@
 +		polaris_gpu_cp_report("after the dispatch");
 +		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 +		printf("POLARIS GPU: 20 shader: it waited %llu ms\n", ns / 1000000ull);
++	}
++
++	/*
++	 * 0215: the probe. Same shader, same descriptor, same everything - only the
++	 * grid changes, and the clock says whether anything was launched.
++	 *
++	 * Sixty-five thousand groups is half a million invocations. If the SP is
++	 * really starting waves, that cannot take the same time as one group: wave
++	 * launch alone is on the order of microseconds each, so the difference shows
++	 * up in tens of milliseconds. If the two times match, nothing is being
++	 * launched and the descriptor was never the problem - which is the one thing
++	 * "0 of 8" could not tell us.
++	 *
++	 * The third line goes back to one group, so that a slow second run cannot be
++	 * explained away as "the GPU got busy afterwards".
++	 */
++	{
++		static const uint32_t probe[] = { 65536u, 1u };
++		uint32_t k;
++
++		for (k = 0; k < sizeof(probe) / sizeof(probe[0]); k++) {
++			uint64_t at = mach_absolute_time();
++			uint32_t rp = 0, ms;
++			bool took = false, seen;
++
++			seq = polaris_gpu_fence_next();
++			pg_cs_emit(iova, fence_iova, probe[k], seq);
++			wptr = pg_cp_wptr;
++			for (i = 0; i < 20000u; i++) {
++				rp = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u);
++				if (rp == wptr) {
++					took = true;
++					break;
++				}
++				pg_sleep_us(100);
++			}
++			seen = pg_fence_reached(fence, seq, 20000u);
++			absolutetime_to_nanoseconds(mach_absolute_time() - at, &ns);
++			ms = (uint32_t)(ns / 1000000ull);
++			printf("POLARIS GPU: 20 shader: probe %u: %u groups, ring %s, fence %s, "
++			    "%u ms\n", k, probe[k], took ? "drained" : "STUCK",
++			    seen ? "arrived" : "MISSING", ms);
++		}
 +	}
 +
 +	polaris_gpu_unmap(iova, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
