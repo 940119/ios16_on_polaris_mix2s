@@ -68,10 +68,11 @@
  
  static vm_offset_t pg_l1_va, pg_l2_va, pg_l3_va;	/* one page each; adjacency is not needed */
  static vm_offset_t pg_l3b_va;			/* the CP's window: PG_CP_WINDOW_L2S pages */
-@@ -1095,6 +1119,19 @@
+@@ -1094,6 +1118,19 @@
+ static bool pg_boot_configured;
  static uint32_t pg_old_ao_mask, pg_old_h2h_mask;
  static bool pg_masks_saved;
- 
++
 +/*
 + * What bsd/dev/polaris_gpu_service.cpp is allowed to call, declared up here
 + * because their definitions have to come after the CP exists: the readiness
@@ -84,14 +85,15 @@
 + */
 +bool polaris_gpu_ready(void);
 +bool polaris_gpu_fill(uint64_t iova, uint32_t words);
-+
+ 
  /* The GMU reads from memory, not from this processor's cache. */
  static void
- pg_to_memory(vm_offset_t start, vm_size_t size)
-@@ -1407,6 +1444,226 @@
+@@ -1405,6 +1442,226 @@
+ 	printf("POLARIS GPU: 10 %s: %#llx -> %#llx, descriptor %#llx in slot %u\n", name, iova,
+ 	    kvtophys(va), l3[((iova >> 12) & 0x1ff)], (uint32_t)((iova >> 12) & 0x1ff));
  	return true;
- }
- 
++}
++
 +/* ---- the program's buffers: addresses in the user window, and their mappings ---------------------- */
 +
 +/*
@@ -310,11 +312,9 @@
 +			l3[(at >> 12) & 0x1ff] = 0;
 +		}
 +	}
-+}
-+
+ }
+ 
  /*
-  * IMPL_DEF1 is at base + 6 pages, and its first word is the micro MMU's
-  * control word. The vendor driver halts the SMMU around the
 @@ -4865,7 +5122,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1457 @@
+@@ -5067,4 +5336,1503 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1138,9 +1138,9 @@
 + * first thing whose *meaning* comes from somewhere else: thirty-two dwords of
 + * ir3 that Mesa assembled from text (see HANDOFF §18), and a set of SP registers
 + * that say how to launch it. Both were derived rather than guessed - the
-+ * register values were printed by Mesa's own `A6XX_XXX()` builders in CI, and
-+ * the two `CP_LOAD_STATE6` payloads and the buffer descriptor came out of the
-+ * same run.
++ * register values are arithmetic over Mesa's own generated headers
++ * (A6XX_..._MASK / _SHIFT in a6xx.xml.h), and the two `CP_LOAD_STATE6` payloads
++ * and the buffer descriptor came out of the same chain.
 + *
 + * The shader is three instructions and a terminator: put 0x0209c0de in r1.x,
 + * wait the required cycles, store it to the invocation's slot of buffer 0, end.
@@ -1168,23 +1168,42 @@
 +	uint32_t value;
 +};
 +
++/*
++ * 0214: every value below is arithmetic now.
++ *
++ * _csregs.py computes each one from Mesa's generated a6xx.xml.h, out of
++ * cs_program_emit() and emit_shader_regs() in fd6_compute.cc / fd6_program.cc.
++ * Four of them were wrong in 0213, and two of those four would each have been
++ * enough to stop a wave on their own:
++ *
++ *   SP_UPDATE_CNTL   was 0xbf. That is the six stages plus GFX_UAV and leaves
++ *                    out CS_UAV (0x40) - the compute uav block is never latched,
++ *                    so the store has no descriptor to write through.
++ *   SP_CS_CNTL_0     was 0x80100100, i.e. branchstack 128 and earlypreamble set,
++ *                    values lifted from a variant that had both. A footprint of
++ *                    2 registers is right for a shader that touches r0 and r1.
++ *   SP_MODE_CNTL     was 0x5, ISAMMODE_GL. A kernel runs ISAMMODE_CL.
++ *   SP_CS_WGE_CNTL   was 0x2fc, which is neither THREAD64 nor a valid linear
++ *                    local id. Zero is THREAD64 and no linear local id.
++ */
 +static const struct pg_cs_reg pg_cs_regs[] = {	/* a630's magic_raw[]: the dev-info corrections every a6xx driver writes. */
 +	{ 0x09804, 0x0000001f }, { 0x09805, 0x00000001 }, { 0x0a0f8, 0x00000001 },
 +	{ 0x0b600, 0x00108000 }, { 0x08600, 0x00000880 }, { 0x0ae03, 0x00001430 },
 +	{ 0x0ae00, 0x00000000 }, { 0x0be04, 0x00080000 }, { 0x09600, 0x00000000 },
 +	{ 0x00e12, 0x10000001 }, { 0x08e01, 0x00000001 }, { 0x08e04, 0x04100000 },
-+	/* and the compute pipeline, exactly as cs_program_emit_regs() builds it. */
++	/* then the compute pipeline, in cs_program_emit()'s own order. */
 +	{ 0x0ae0f, 0x00000020 },	/* SP_PERFCTR_SHADER_MASK: .cs */
 +	{ 0x0ae04, 0x00000000 },	/* SP_NC_MODE_CNTL_2 */
-+	{ 0x0ab00, 0x00000005 },	/* SP_MODE_CNTL */
-+	{ 0x0bb08, 0x000000bf },	/* SP_UPDATE_CNTL */
++	{ 0x0bb08, 0x000000ff },	/* SP_UPDATE_CNTL: six stages, cs, cs_uav, gfx_uav */
++	{ 0x0ab00, 0x00000003 },	/* SP_MODE_CNTL: ISAMMODE_CL, constant demotion */
 +	{ 0x0b987, 0x00000100 },	/* SP_CS_CONST_CONFIG: constlen 0, enabled */
-+	{ 0x0a9bb, 0x00400100 },	/* SP_CS_CONFIG: enabled, ntex/nsamp 0, nuav 1 */
++	{ 0x0a9bb, 0x00400100 },	/* SP_CS_CONFIG: enabled, ntex 0, nsamp 0, nuav 1 */
++	{ 0x0b998, 0x00000000 },	/* SP_CS_WGE_CNTL: THREAD64, no linear local id */
++	{ 0x0b997, 0x00000000 },	/* SP_CS_CONST_CONFIG_0: local id into r0.x, no consts */
++	{ 0x0a9b0, 0x00000102 },	/* SP_CS_CNTL_0: two registers of footprint */
++	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: 1 KB shared, const ram 128 */
 +	{ 0x0a9bc, 0x00000001 },	/* SP_CS_INSTR_SIZE: one 128-byte block */
-+	{ 0x0a9b0, 0x80100100 },	/* SP_CS_CNTL_0: threadsize/regfootprint/branchstack */
-+	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: shared size, const ram mode */
-+	{ 0x0b997, 0x00fcfcfc },	/* SP_CS_CONST_CONFIG_0: local id in r0.x */
-+	{ 0x0b998, 0x000002fc },	/* SP_CS_WGE_CNTL */
++	{ 0x0a9b3, 0x00000000 },	/* SP_CS_PROGRAM_COUNTER_OFFSET: instruction 0 */
 +};
 +
 +/* Both are defined further down, after the submission helpers they belong with. */
@@ -1296,12 +1315,30 @@
 +	    "%#llx, fence at %#llx\n", PG_CS_SHADER_WORDS, iova, iova + PG_GMU_PAGE_SIZE,
 +	    iova + 2u * PG_GMU_PAGE_SIZE, fence_iova);
 +
++	/*
++	 * 0214: the marker goes first, and that is the whole point of this build.
++	 *
++	 * An a6xx keeps more than one register context, and CP_SET_MARKER is what
++	 * says which one the packets that follow write into. 0211-0213 put the
++	 * marker immediately before CP_EXEC_CS, i.e. *after* all of the state, so
++	 * every CS register landed in whichever context was current before, and the
++	 * dispatch then ran against an empty compute context. That is exactly the
++	 * picture: ring drained, fence arrived, no wave, no SMMU fault, not one word
++	 * of the buffer touched.
++	 *
++	 * fd6_launch_grid() emits it first, then CP_SET_MODE(1) so that the state
++	 * that follows is applied now instead of deferred to the next draw, then
++	 * the state group, then the shader, then the grid. This is that order.
++	 */
 +	seq = polaris_gpu_fence_next();
 +	wptr = pg_cp_wptr;
++	pg_ring_put(wptr++, pg_pkt7(0x65u, 1u));	/* CP_SET_MARKER */
++	pg_ring_put(wptr++, 8u);			/* RM6_COMPUTE */
++	pg_ring_put(wptr++, pg_pkt7(0x63u, 1u));	/* CP_SET_MODE */
++	pg_ring_put(wptr++, 1u);			/* apply, do not defer */
 +	/*
-+	 * One CP_CONTEXT_REG_BUNCH with every pair, then the two state loads. The
-+	 * 64-bit ones go in as <reg><lo><reg+1><hi>, which is what fd_crb::add()
-+	 * does for a reg64.
++	 * One CP_CONTEXT_REG_BUNCH with every pair. The 64-bit ones go in as
++	 * <reg><lo><reg+1><hi>, which is what fd_crb::add() does for a reg64.
 +	 */
 +	{
 +		uint32_t pairs = 2u * (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0])) + 10u;
@@ -1330,8 +1367,6 @@
 +	pg_ring_put(wptr++, 0x0076c000u);		/* ST6_UAV / INDIRECT / CS_SHADER / 1 */
 +	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
 +	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
-+	pg_ring_put(wptr++, pg_pkt7(0x65u, 1u));	/* CP_SET_MARKER */
-+	pg_ring_put(wptr++, 8u);			/* RM6_COMPUTE */
 +	{
 +		uint32_t n = (uint32_t)(sizeof(pg_cs_grid) / sizeof(pg_cs_grid[0]));
 +
@@ -1386,6 +1421,17 @@
 +		    pg_rd(pg_gpu3d + 4u * 0x0a9b5), pg_rd(pg_gpu3d + 4u * 0x0a9b4),
 +		    pg_rd(pg_gpu3d + 4u * 0x0a9bc), pg_rd(pg_gpu3d + 4u * 0x0a9f3),
 +		    pg_rd(pg_gpu3d + 4u * 0x0a9f2), pg_rd(pg_gpu3d + 4u * 0x0aa00));
++		/*
++		 * 0214: these four say whether the state really landed in the
++		 * context the dispatch used. If CP_SET_MARKER is doing its job
++		 * they read back as written; if they read 0 the writes went
++		 * somewhere else and the dispatch ran against an empty context.
++		 */
++		printf("POLARIS GPU: 20 shader: the state reads back UPDATE_CNTL %08x "
++		    "CS_CONFIG %08x CS_CNTL_0 %08x CS_CNTL_1 %08x WGE %08x CONST %08x\n",
++		    pg_rd(pg_gpu3d + 4u * 0x0bb08), pg_rd(pg_gpu3d + 4u * 0x0a9bb),
++		    pg_rd(pg_gpu3d + 4u * 0x0a9b0), pg_rd(pg_gpu3d + 4u * 0x0a9b1),
++		    pg_rd(pg_gpu3d + 4u * 0x0b998), pg_rd(pg_gpu3d + 4u * 0x0b987));
 +		if (good != PG_CS_RESULT_WORDS) {
 +			polaris_gpu_cp_report("after the dispatch");
 +			polaris_gpu_smmu_fault();
