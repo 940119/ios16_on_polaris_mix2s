@@ -341,7 +341,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5335,1363 @@
+@@ -5067,4 +5335,1364 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1188,6 +1188,7 @@
 +/* Both are defined further down, after the submission helpers they belong with. */
 +static bool pg_fence_reached(volatile uint32_t *word, uint32_t seq, uint32_t tries);
 +void polaris_gpu_cp_report(const char *why);
++uint32_t polaris_gpu_fence_next(void);
 +
 +void
 +polaris_gpu_cs_test(void)
