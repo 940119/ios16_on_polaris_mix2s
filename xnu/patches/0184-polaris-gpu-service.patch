@@ -289,7 +289,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5295,997 @@
+@@ -5067,4 +5295,1027 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1097,6 +1097,35 @@
 +	return false;
 +}
 +
++/*
++ * Where the CP is, for the day something hangs.
++ *
++ * IB1/IB2 and their remaining counts are the Mi 8 port's report
++ * (mi8_adreno.c:3067) and the cheapest way to tell "the CP never took the
++ * buffer" from "the CP is inside it at word N". RBBM_STATUS bit 0 is the core
++ * being busy; the status register also carries the hang interrupt, which no
++ * build has seen yet.
++ */
++void
++polaris_gpu_cp_report(const char *why)
++{
++	uint64_t ib1, ib2;
++	uint32_t rem1, rem2;
++
++	if (pg_gpu3d == 0) {
++		return;
++	}
++	ib1 = ((uint64_t)pg_rd(pg_gpu3d + 4u * 0x0929) << 32) | pg_rd(pg_gpu3d + 4u * 0x0928);
++	rem1 = pg_rd(pg_gpu3d + 4u * 0x092a);
++	ib2 = ((uint64_t)pg_rd(pg_gpu3d + 4u * 0x092c) << 32) | pg_rd(pg_gpu3d + 4u * 0x092b);
++	rem2 = pg_rd(pg_gpu3d + 4u * 0x092d);
++	printf("POLARIS GPU: 19 cp: %s: IB1 %#llx remaining %u, IB2 %#llx remaining %u; "
++	    "RBBM_STATUS %#010x INT_0 %#010x; RPTR %u WPTR %u\n", why, ib1, rem1, ib2, rem2,
++	    pg_rd(pg_gpu3d + 4u * 0x0210), pg_rd(pg_gpu3d + 4u * 0x0201),
++	    pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u),
++	    pg_rd(pg_gpu3d + 4u * PG_CP_RB_WPTR));
++}
++
 +void
 +polaris_gpu_submit_test(void)
 +{
@@ -1193,6 +1222,7 @@
 +		    "the fence does not behave like a fence");
 +	}
 +
++	polaris_gpu_cp_report("after the submissions");
 +	polaris_gpu_unmap(iova, bytes);
 +	polaris_gpu_mapped();
 +	polaris_gpu_address_free(iova, bytes);
@@ -1289,7 +1319,7 @@
  #endif
 --- /dev/null	1970-01-01 00:00:00.000000000 +0000
 +++ b/bsd/dev/polaris_gpu_service.cpp
-@@ -0,0 +1,1494 @@
+@@ -0,0 +1,1507 @@
 +/*
 + * PolarisGPU: the IOKit service a program opens to use the Adreno 630, and the
 + * one CoreAnimation would draw through if it were ever given a GL context.
@@ -1370,6 +1400,7 @@
 +uint32_t polaris_gpu_fence_next(void);
 +bool polaris_gpu_submit_ibs(const uint64_t *iova, const uint32_t *words, uint32_t count,
 +    uint64_t fence_iova, uint32_t seq);
++void polaris_gpu_cp_report(const char *why);
 +uint64_t polaris_gpu_pool_alloc(uint64_t bytes);
 +void polaris_gpu_pool_free(uint64_t pa, uint64_t bytes);
 +void * polaris_gpu_pool_view(uint64_t pa, uint64_t bytes);
@@ -2188,6 +2219,17 @@
 +	    0x0e, 0x0f };
 +	uint64_t value;
 +
++	/*
++	 * 0204: the fence page is made here rather than on the first submit, so
++	 * that a boot log says whether the one page the whole completion
++	 * mechanism rests on can be taken and entered at all.
++	 */
++	if (fencePage()) {
++		printf("POLARIS GPU: 19 submit: the service's fence page is ready at %#llx\n",
++		    gFenceIova);
++	} else {
++		printf("POLARIS GPU: 19 submit: no fence page; a submission could not be waited on\n");
++	}
 +	for (uint32_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
 +		if (gpuParam(ids[i], &value)) {
 +			printf("POLARIS GPU: 19 param %#04x = %#llx\n", ids[i], value);
@@ -2196,6 +2238,7 @@
 +		}
 +	}
 +	printf("POLARIS GPU: 19 submit: %u dwords free in the ring\n", polaris_gpu_ring_room());
++	polaris_gpu_cp_report("after the parameter table");
 +}
 +
 +/*
