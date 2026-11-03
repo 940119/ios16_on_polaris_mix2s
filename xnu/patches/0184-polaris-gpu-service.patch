@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1675 @@
+@@ -5067,4 +5336,1729 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1257,7 +1257,8 @@
 + * which is what makes it worth doing: both of them are still suspects.
 + */
 +static void
-+pg_cs_emit(uint64_t iova, uint64_t fence_iova, uint32_t groups, uint32_t seq)
++pg_cs_emit(uint64_t iova, uint64_t fence_iova, uint32_t groups, uint32_t seq,
++    bool launch)
 +{
 +	uint32_t wptr = pg_cp_wptr;
 +	uint32_t i;
@@ -1360,6 +1361,26 @@
 +	pg_ring_put(wptr++, 0x0075c000u);		/* ST6_UAV / BINDLESS / CS_SHADER / 1 */
 +	pg_ring_put(wptr++, 0u);			/* set 0, ssbo 0 */
 +	pg_ring_put(wptr++, 0u);
++	/*
++	 * 0223: with launch false the state is written, the fence is armed, and no
++	 * dispatch is ever issued. That separates "the CP/SP chokes on this state"
++	 * from "the shader wedges while running", which is the one thing eleven
++	 * builds of register archaeology could not decide.
++	 */
++	if (!launch) {
++		pg_ring_put(wptr++, pg_pkt7(0x26u, 0u));	/* CP_WAIT_FOR_IDLE */
++		pg_ring_put(wptr++, pg_pkt7(0x46u, 4u));	/* CP_EVENT_WRITE: the fence */
++		pg_ring_put(wptr++, 0x04u);
++		pg_ring_put(wptr++, (uint32_t)fence_iova);
++		pg_ring_put(wptr++, (uint32_t)(fence_iova >> 32));
++		pg_ring_put(wptr++, seq);
++		wptr &= PG_RING_WORDS - 1u;
++		pg_ring_flush();
++		pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		pg_cp_wptr = wptr;
++		return;
++	}
 +	/*
 +	 * The grid. NDRANGE_1 is the *global* size, i.e. local times groups, while
 +	 * CP_EXEC_CS and KERNEL_GROUP_X take the number of groups.
@@ -1507,8 +1528,41 @@
 +	 */
 +	polaris_gpu_smmu_fault();
 +
++	/*
++	 * 0223: first, the same state with no dispatch at all. If this fence never
++	 * arrives then the bindless state itself wedges the CP or the SP, and the
++	 * shader was never the problem. If it arrives, the state is fine and the
++	 * wedge lives inside the dispatch - which is what "the store faults at a
++	 * garbage address" has been saying all along, without proof.
++	 */
++	{
++		uint64_t at = mach_absolute_time();
++		uint32_t ms;
++		bool seen;
++
++		seq = polaris_gpu_fence_next();
++		pg_cs_emit(iova, fence_iova, 1u, seq, false);
++		seen = pg_fence_reached(fence, seq, 20000u);
++		absolutetime_to_nanoseconds(mach_absolute_time() - at, &ns);
++		ms = (uint32_t)(ns / 1000000ull);
++		printf("POLARIS GPU: 20 shader: state only, no dispatch: fence %s, %u ms\n",
++		    seen ? "arrived" : "MISSING", ms);
++		if (!seen) {
++			printf("POLARIS GPU: 20 shader: the bindless state itself wedges the "
++			    "CP; the shader never ran\n");
++			polaris_gpu_cp_report("after the state-only write");
++			polaris_gpu_smmu_fault();
++			polaris_gpu_unmap(iova, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++			polaris_gpu_mapped();
++			polaris_gpu_address_free(iova,
++			    (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++			polaris_gpu_pool_free(pa, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
++			return;
++		}
++	}
++
 +	seq = polaris_gpu_fence_next();
-+	pg_cs_emit(iova, fence_iova, 1u, seq);
++	pg_cs_emit(iova, fence_iova, 1u, seq, true);
 +	wptr = pg_cp_wptr;
 +
 +	for (i = 0; i < 2000u; i++) {
@@ -1603,7 +1657,7 @@
 +			bool took = false, seen;
 +
 +			seq = polaris_gpu_fence_next();
-+			pg_cs_emit(iova, fence_iova, probe[k], seq);
++			pg_cs_emit(iova, fence_iova, probe[k], seq, true);
 +			wptr = pg_cp_wptr;
 +			for (i = 0; i < 20000u; i++) {
 +				rp = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u);
