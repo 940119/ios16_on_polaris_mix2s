@@ -1,0 +1,83 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -555,12 +555,38 @@
+ 	    lit, cols * rows, hue_cells, peak);
+ }
+ 
++/*
++ * 0239: a picture on demand.
++ *
++ * The thumbnail above is printed twice a minute, which is the right rate for
++ * watching a boot and the wrong rate for watching a gesture: by the time it
++ * fires, the screen has moved on. This lets the touch driver ask for one and
++ * have it taken a few frames later, so the ring holds the screen as it was
++ * shortly after a swipe - which is the difference between "the compositor never
++ * drew the unlock" and "the unlock happened and the picture is the home screen".
++ *
++ * The countdown runs in vsyncFired rather than in a timer of its own because the
++ * frame being asked about is the one the panel is scanning out, and this is the
++ * only place that knows when that changes.
++ */
++static volatile int sweet_fb_dump_in;
++
++extern "C" void
++sweet_fb_dump_request(int frames)
++{
++	sweet_fb_dump_in = frames > 0 ? frames : 1;
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++
++	if (sweet_fb_dump_in > 0 && --sweet_fb_dump_in == 0) {
++		sweet_fb_thumbnail(fb->fPixels, fb->fRowBytes, fb->fWidth, fb->fHeight);
++	}
+ 
+ 	/*
+ 	 * One line a second, whatever else happens. "new" is what the display has
+--- a/bsd/dev/polaris_touch_i2c.c
++++ b/bsd/dev/polaris_touch_i2c.c
+@@ -18,6 +18,7 @@
+ 
+ extern bool polaris_touch_i2c_board(void);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_fb_dump_request(int frames);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ 
+@@ -327,11 +328,22 @@
+ static void
+ pt_release(void)
+ {
++	bool any = false;
++
+ 	for (unsigned i = 0; i < MAX_FINGERS; ++i) {
+ 		if (pt_down[i]) {
+ 			sweet_hid_touch((int)i, 0, pt_x[i], pt_y[i]);
+ 			pt_down[i] = false;
+-		}
++			any = true;
++		}
++	}
++	/*
++	 * 0239: one picture per gesture. Thirty frames is half a second, which is
++	 * long enough for the unlock animation to be somewhere and short enough that
++	 * the next touch has not started yet.
++	 */
++	if (any) {
++		sweet_fb_dump_request(30);
+ 	}
+ }
+ 
+@@ -502,6 +514,7 @@
+ 					if (pt_down[slot]) {
+ 						sweet_hid_touch((int)slot, 0, pt_x[slot], pt_y[slot]);
+ 						pt_down[slot] = false;
++						sweet_fb_dump_request(30);
+ 					}
+ 					continue;
+ 				}
