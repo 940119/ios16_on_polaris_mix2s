@@ -365,7 +365,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5351,1954 @@
+@@ -5067,4 +5351,1982 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1348,7 +1348,26 @@
 +	{ 0x0bb08, 0x000000bf },	/* SP_UPDATE_CNTL: stages + cs + gfx_uav */
 +	{ 0x0b987, 0x00000100 },	/* SP_CS_CONST_CONFIG: constlen 0, enabled */
 +	{ 0x0a9bb, 0x00400100 },	/* SP_CS_CONFIG: enabled, nuav 1 */
-+	{ 0x0a9bc, 0x00000001 },	/* SP_CS_INSTR_SIZE: one 128-byte block */
++	/*
++	 * 0240: the program length - the one number this build exists to change.
++	 *
++	 * 0216 put 1 here, on the reading that SP_CS_INSTR_SIZE counts 128-byte
++	 * blocks and that a 32-dword shader is exactly one of them. The readback
++	 * says the field did take the 1, the wave runs (65536 groups cost 218 ms
++	 * against 0 ms for a single group), the fence arrives, the SMMU reports no
++	 * fault - and neither store writes a word. The bindless stib failing is
++	 * explainable, a descriptor can be discarded; the stg failing is not, its
++	 * address is a 64-bit value in a register and nothing consults a table.
++	 *
++	 * A wave that executes but never reaches its fifth instruction is what a
++	 * length field read in the wrong unit looks like. If the unit is 16 bytes
++	 * the value should have been 8; if it is one instruction, 16; if it is a
++	 * dword, 32. Thirty-two covers all three readings at once and still fits
++	 * inside the page the shader lives in - 512 bytes of a 4096-byte page, the
++	 * remainder zero, which decodes as nop - so it is the value that cannot be
++	 * too small under any of them.
++	 */
++	{ 0x0a9bc, 0x00000020 },	/* SP_CS_INSTR_SIZE: 32, the largest of the three readings */
 +	{ 0x0a9b0, 0x80100100 },	/* SP_CS_CNTL_0: merged regs, THREAD128, footprint 2 */
 +	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: 1 KB shared, const ram 128 */
 +	{ 0x0b997, 0x00fcfcfc },	/* SP_CS_CONST_CONFIG_0: every constid INVALID */
@@ -1603,6 +1622,15 @@
 +		printf("POLARIS GPU: 20 shader: the stg target %#llx went into "
 +		    "word %u of the shader (%u marker%s found)\n", target,
 +		    at, patched, patched == 1u ? "" : "s");
++		/*
++		 * 0240: and what the page holds, read back through the same uncached
++		 * mapping the SP fetches from. If these eight words are not the
++		 * program then nothing further down this function means anything:
++		 * the SP would be executing something else.
++		 */
++		printf("POLARIS GPU: 20 shader: the page holds %08x %08x %08x %08x "
++		    "%08x %08x %08x %08x\n", shader[0], shader[1], shader[2],
++		    shader[3], shader[4], shader[5], shader[6], shader[7]);
 +	}
 +	for (i = 0; i < PG_CS_DESC_SLOTS * 16u; i++) {
 +		desc[i] = 0;
