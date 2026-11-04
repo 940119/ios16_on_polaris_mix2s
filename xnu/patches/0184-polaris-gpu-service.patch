@@ -365,7 +365,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5351,1982 @@
+@@ -5067,4 +5351,1993 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1367,7 +1367,7 @@
 +	 * remainder zero, which decodes as nop - so it is the value that cannot be
 +	 * too small under any of them.
 +	 */
-+	{ 0x0a9bc, 0x00000020 },	/* SP_CS_INSTR_SIZE: 32, the largest of the three readings */
++	{ 0x0a9bc, PG_CS_SHADER_WORDS },	/* SP_CS_INSTR_SIZE: 32, the largest of the three readings */
 +	{ 0x0a9b0, 0x80100100 },	/* SP_CS_CNTL_0: merged regs, THREAD128, footprint 2 */
 +	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: 1 KB shared, const ram 128 */
 +	{ 0x0b997, 0x00fcfcfc },	/* SP_CS_CONST_CONFIG_0: every constid INVALID */
@@ -1438,7 +1438,18 @@
 +	pg_ring_put(wptr++, (uint32_t)(shader_base >> 32));
 +	pg_ring_put(wptr++, 0x0a9bcu);			/* SP_CS_INSTR_SIZE, as computerator
 +							 * writes it a second time */
-+	pg_ring_put(wptr++, 1u);
++	/*
++	 * 0242: and this is the write that was winning.
++	 *
++	 * 0240 changed the value in pg_cs_ctx[] and the readback still said 1,
++	 * because this packet rewrites the same register after the context bunch
++	 * has already set it. The comment on the line above explains the shape -
++	 * computerator does write SP_CS_INSTR_SIZE a second time - but the value
++	 * was copied along with the shape, and a literal 1 in two places is a
++	 * value that will disagree with itself the moment one of them is fixed.
++	 * Both now name the program length.
++	 */
++	pg_ring_put(wptr++, PG_CS_SHADER_WORDS);
 +
 +	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the shader */
 +	pg_ring_put(wptr++, 0x00760000u);		/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
