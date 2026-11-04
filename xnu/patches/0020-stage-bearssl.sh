@@ -3,7 +3,47 @@
 set -euo pipefail
 [[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0
 [[ -f libkern/crypto/corecrypto_aes.c ]] || exit 1
+
+# bearssl.org started answering 502 and two builds in a row died on the fetch,
+# so the tree is vendored as a tarball beside this script.  The archive holds the
+# exact files the code below used to produce -- it was committed from a build
+# tree that staged them successfully -- so a build that unpacks it compiles the
+# same bytes as one that cloned the repository.  The clone stays as a fallback
+# for a checkout that has no vendor directory.
 bearssl_sha=7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
+vendor_sha=74a1ec0c169fc8e092267bf06107620e2eb29f0cc546810bc470b52e5c008718
+vendor=
+for candidate in \
+    "$(cd "$(dirname "$0")" && pwd)/../vendor/bearssl-sweet.tgz" \
+    "$PWD/../../../src/xnu/vendor/bearssl-sweet.tgz" \
+    "$PWD/../../../../xnu/vendor/bearssl-sweet.tgz"; do
+    if [[ -f "$candidate" ]]; then
+        vendor="$candidate"
+        break
+    fi
+done
+
+if [[ -n "$vendor" ]]; then
+    got=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$vendor")
+    if [[ "$got" != "$vendor_sha" ]]; then
+        echo "vendor tarball is $got, expected $vendor_sha" >&2
+        exit 1
+    fi
+    if [[ -e libkern/crypto/sweet_bearssl ]]; then
+        echo "refusing to overwrite existing AES source: libkern/crypto/sweet_bearssl" >&2
+        exit 1
+    fi
+    mkdir -p libkern/crypto
+    tar -xzf "$vendor" -C .
+    if [[ ! -f libkern/crypto/sweet_bearssl/src/inner.h ]]; then
+        echo "vendor tarball did not unpack into libkern/crypto" >&2
+        exit 1
+    fi
+    echo "Staged BearSSL portable AES, MD5, SHA-1 and SHA-384/512 ($bearssl_sha) for SWEET from the vendor tarball"
+    exit 0
+fi
+
+echo "no vendor tarball found, cloning $bearssl_sha from bearssl.org" >&2
 bearssl_tmp=$(mktemp -d)
 trap 'rm -rf "$bearssl_tmp"' EXIT
 git init -q "$bearssl_tmp"
