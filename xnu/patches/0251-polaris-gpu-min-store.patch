@@ -1,0 +1,88 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -6293,6 +6293,47 @@
+ 	0x00000000u, 0x00000000u,
+ };
+ 
++/*
++ * 0251: the same store, with every instruction that is not the store removed.
++ *
++ * 0248 settled what the ten-instruction shader does: it runs (the empty-kernel
++ * probes from 0224 prove a wave executes), it fetches (0234 proved an unmapped
++ * instruction fetch faults), it dispatches (0248's grid readback is exact), and
++ * its CP control write faults - but its own stg to the same unmapped page does
++ * not. The store at word 8 simply never commits, and its address in r2.xy is
++ * right on the host side (0247 printed the patched immediate and it is correct).
++ *
++ * Two things surround that store and neither has ever been ruled out: the
++ * (rpt5)nop delay block before it, and the nop(sy) sync right after it, plus a
++ * second store (stib) further down that shares the memory-write barrier class.
++ * A bare program with nothing but the two address movs, the value mov, the stg
++ * and the end removes all of them at once. The one nop between the value mov
++ * and the stg is kept as the assembler's minimum delay slot; the rest of the
++ * array is zero, which decodes as nop.
++ *
++ * The same 0xfeed0001 marker sits in the first immediate, so the upload-time
++ * patch loop and its printout work unchanged, and polariscsp still chooses the
++ * target (result page, VA 0, or the unmapped page).
++ */
++static const uint32_t pg_cs_shader_min[PG_CS_SHADER_WORDS] = {
++	0xfeed0001u, 0x204cc008u,	/* mov.u32u32 r2.x, 0xfeed0001 */
++	0x00000000u, 0x204cc009u,	/* mov.u32u32 r2.y, 0 */
++	0x0badf00du, 0x204cc004u,	/* mov.u32u32 r1.x, 0xbadf00d */
++	0x00000000u, 0x00000000u,	/* nop (one delay slot) */
++	0x01800008u, 0xc0c61100u,	/* stg.u32 g[r2.x+0], r1.x, 1 */
++	0x00000000u, 0x03000000u,	/* end */
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++};
++
+ struct pg_cs_reg {
+ 	uint32_t reg;
+ 	uint32_t value;
+@@ -6479,6 +6520,7 @@
+  */
+ static uint32_t pg_cs_update_cntl = 0x000000bfu;
+ static uint32_t pg_cs_instr_size = PG_CS_SHADER_WORDS;
++static bool pg_cs_min_shader;		/* 0251: run the store-only program */
+ static bool pg_cs_args_read;
+ 
+ static void
+@@ -6503,9 +6545,13 @@
+ 		pg_cs_target_mode = (uint32_t)v & 3u;
+ 		pg_cs_cpctl = (((uint32_t)v & 4u) != 0);
+ 	}
++	if (PE_parse_boot_argn("polariscsmin", &v, sizeof(v)) && v) {
++		pg_cs_min_shader = true;
++	}
+ 	printf("POLARIS GPU: 20 shader: update_cntl %#x, instr_size %u, target "
+-	    "mode %u, CP control %s\n", pg_cs_update_cntl, pg_cs_instr_size,
+-	    pg_cs_target_mode, pg_cs_cpctl ? "armed" : "off");
++	    "mode %u, CP control %s, program %s\n", pg_cs_update_cntl, pg_cs_instr_size,
++	    pg_cs_target_mode, pg_cs_cpctl ? "armed" : "off",
++	    pg_cs_min_shader ? "store only" : "full");
+ }
+ 
+ static void
+@@ -6760,8 +6806,11 @@
+ 		}
+ 
+ 		for (i = 0; i < PG_CS_SHADER_WORDS; i++) {
+-			shader[i] = pg_cs_shader[i];
+-			if (pg_cs_shader[i] == 0xfeed0001u) {
++			const uint32_t *prog = pg_cs_min_shader ? pg_cs_shader_min :
++			    pg_cs_shader;
++
++			shader[i] = prog[i];
++			if (prog[i] == 0xfeed0001u) {
+ 				shader[i] = (uint32_t)target;
+ 				at = i;
+ 				patched++;
