@@ -1,0 +1,232 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -242,31 +242,38 @@
+ 	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
+ 	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
+ 	    usb_rd(dwc, 0xc720));
+-	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
++	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x "
++	    "GHWPARAMS0 0x%08x GHWPARAMS7 0x%08x\n",
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+-	    usb_rd(dwc, 0xc140));
++	    usb_rd(dwc, 0xc124), usb_rd(dwc, 0xc140));
+ 	/*
+ 	 * 0257 read-only probe: the two capabilities that decide whether the
+ 	 * two remaining USB theories are even testable.
+ 	 *
+-	 * GHWPARAMS1 0xc144: bit 1 EN_PWROPT (clock gating), bit 24 64BIT_ACCESS
+-	 *   (1 = the core has 64-bit register access - our DMA buffer sits at
+-	 *    0x103b84000, above 4 GiB, so if this is 0 the event buffer address
+-	 *    is silently wrong and no event can ever be delivered).
+-	 * GHWPARAMS3 0xc14c: bit 0 64BIT_PHY (1 = 64-bit address capability).
+-	 * GHWPARAMS6 0xc158: bit 1 SRPSUPPORT, bit 0 HNPSUPPORT - the OTG
+-	 *   session-request path (GOTGCTL.SesReq) is only usable if SRP is
+-	 *   supported; a pure-device core has neither and can never raise a
+-	 *   B-session on its own, which is the deadlock we hit at 0256.
+-	 * GUCTL1 0xc11c: DEV_IPGATE (bit 17), DEV_L1_EXIT_BY_HW (bit 24) etc.
++	 * 0258: every GHWPARAMS offset here was 0x1c too high.
++	 *
++	 * The block runs GHWPARAMS0 0xc124 through GHWPARAMS7 0xc140, one dword
++	 * apart. This code read 0xc144/0xc14c/0xc158 and called them 1, 3 and 6 -
++	 * that is GHWPARAMS1+0x1c, GHWPARAMS3+0x1c, GHWPARAMS6+0x1c, i.e.
++	 * GDBGFIFOSPACE, GDBGLTSSM and whatever sits past the block. So 0257's
++	 * three "hardware capability" readings, including the srp=0/hnp=0 that
++	 * killed the OTG route, were never hardware capabilities at all.
++	 *
++	 *   GHWPARAMS1 0xc128  bit 24 64BIT_REG, bit 1 EN_PWROPT
++	 *   GHWPARAMS3 0xc130  bit 0 is NOT 64bit_phy; that field lives in
++	 *                      GHWPARAMS3 bits 5:4. Bit 0 is
++	 *                      GHWPARAMS3_HSPHY_DWIDTH low bit, so the old
++	 *                      "64bit_phy" decode was wrong even at the right
++	 *                      address.
++	 *   GHWPARAMS6 0xc13c  bit 1 SRPSUPPORT, bit 0 HNPSUPPORT
+ 	 */
+-	printf("SWEET USB: GHWPARAMS1 0x%08x (64bit_reg %d pwropt %d) GHWPARAMS3 0x%08x (64bit_phy %d) "
+-	    "GHWPARAMS6 0x%08x (srp %d hnp %d) GUCTL1 0x%08x\n",
+-	    usb_rd(dwc, 0xc144), !!(usb_rd(dwc, 0xc144) & (1u << 24)),
+-	    !!(usb_rd(dwc, 0xc144) & (1u << 1)),
+-	    usb_rd(dwc, 0xc14c), !!(usb_rd(dwc, 0xc14c) & 1u),
+-	    usb_rd(dwc, 0xc158), !!(usb_rd(dwc, 0xc158) & (1u << 1)),
+-	    !!(usb_rd(dwc, 0xc158) & 1u),
++	printf("SWEET USB: GHWPARAMS1 0x%08x (64bit_reg %d pwropt %d) GHWPARAMS3 0x%08x "
++	    "(hsp hy_dwidth %u) GHWPARAMS6 0x%08x (srp %d hnp %d) GUCTL1 0x%08x\n",
++	    usb_rd(dwc, 0xc128), !!(usb_rd(dwc, 0xc128) & (1u << 24)),
++	    !!(usb_rd(dwc, 0xc128) & (1u << 1)),
++	    usb_rd(dwc, 0xc130), (usb_rd(dwc, 0xc130) >> 4) & 0x3u,
++	    usb_rd(dwc, 0xc13c), !!(usb_rd(dwc, 0xc13c) & (1u << 1)),
++	    !!(usb_rd(dwc, 0xc13c) & 1u),
+ 	    usb_rd(dwc, 0xc11c));
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+@@ -425,15 +432,20 @@
+ #define DSTS_LNKST(v)   (((v) >> 18) & 0xfu)
+ 
+ /*
+- * GSTS tells whether the controller thinks a cable is on the port at all, and
+- * it is the one register the four attach attempts never looked at. Bits 12, 13
+- * and 14 are BSessVld, BCable and BValid in Linux's core.h; build 0154 read
+- * GSTS 0x7e800000, i.e. all three clear, which is why no bus reset ever came.
+- * Print them by name so the next round does not have to decode the hex.
++ * GSTS tells whether the controller thinks a cable is on the port at all.
++ * Bits 12 through 16 are BSessVld, BCable, BValid, AValid and CSRTimeout in
++ * Linux's core.h; 0258 also reads CurMod in bit 0.
++ *
++ * This comment used to claim that 0154 "read GSTS 0x7e800000, all three
++ * clear". It did not: 0xc118 is GUCTL, and GSTS is 0xc114. The three bits that
++ * looked dead were GUCTL's bits 12-14, which have nothing to do with the
++ * cable. The real GSTS is read for the first time in this build.
+  */
+ #define GSTS_BSESSVLD   (1u << 12)
+ #define GSTS_BCABLE     (1u << 13)
+ #define GSTS_BVALID     (1u << 14)
++#define GSTS_AVALID     (1u << 15)
++#define GSTS_CSRTIMEOUT (1u << 16)
+ 
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+@@ -748,6 +760,7 @@
+ static void ud_tx_kick_locked(void);
+ static void ud_link_event(bool up);
+ static void ud_vbus_override_quiet(void);
++static void ud_otg_override(void);
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+@@ -1258,10 +1271,47 @@
+  * So now every strategy runs the DT qcom,qusb-phy-init-seq first, which
+  * ends by clearing POWER_DOWN, and the log prints the PLL lock bit.
+  */
+-#define GSTS                0xc118
++/*
++ * 0258: GSTS is 0xc114, not 0xc118.
++ *
++ * The DWC3 global block is a fixed run: GCTL 0xc110, GSTS 0xc114,
++ * GUCTL 0xc118, GUCTL1 0xc11c, GSNPSID 0xc120, GHWPARAMS0 0xc124. The three
++ * reads this build trusts prove the run is where it should be - GUCTL1 reads
++ * 0x000c0002, GSNPSID 0x5533300a, GHWPARAMS0 0x4020400a - so 0xc114 has to be
++ * GSTS and 0xc118 has to be GUCTL.
++ *
++ * Until now this file read 0xc118 and called it GSTS. Everything derived from
++ * "GSTS is stuck at 0x7e800000, cable/session/bvalid all clear" - the whole
++ * deadlock in 0254-0257 - was therefore derived from GUCTL. GUCTL's bits 12,
++ * 13 and 14 happen to be zero, which is exactly why the three "session" bits
++ * looked dead. Nobody has ever read the real GSTS on this machine.
++ */
++#define GSTS                0xc114
++#define GUCTL               0xc118
++/*
++ * The OTG control block, never touched by this driver. GHWPARAMS0 reads
++ * 0x4020400a, whose low bits decode to op_mode 2 = OTG (a value the earlier
++ * notes misread as "device only"), so the block should be live. It carries the
++ * only VBUS override in the controller that is independent of the PHY:
++ *
++ *   VBvalidOvval / VBvalidOvEn   claim VBUS is present, and enable the claim
++ *   BvalidOvval  / BvalidOvEn    same for the B-device session
++ */
++#define GOTGCTL             0xc000
++#define GUSBCFG             0xc00c
++
++#define GOTGCTL_SESREQSCS    (1u << 0)
++#define GOTGCTL_SESREQ       (1u << 1)
++#define GOTGCTL_VBVALIDOVVAL (1u << 2)
++#define GOTGCTL_BVALIDOVVAL  (1u << 3)
++#define GOTGCTL_AVALIDOVVAL  (1u << 4)
++#define GOTGCTL_VBVALIDOVEN  (1u << 5)
++#define GOTGCTL_BVALIDOVEN   (1u << 6)
++#define GOTGCTL_AVALIDOVEN   (1u << 7)
+ #define GUSB2PHYCFG         0xc200
+ #define GUSB3PIPECTL        0xc2c0
+-#define GHWPARAMS7          0xc15c
++#define GHWPARAMS0          0xc124
++#define GHWPARAMS7          0xc140
+ #define GRXFIFOSIZ          0xc300
+ #define GTXFIFOSIZ(n)       (0xc320 + 0x4 * (n))
+ 
+@@ -1705,6 +1755,12 @@
+ 	 * never reset the bus. Re-assert it here, before every RUN_STOP set.
+ 	 */
+ 	ud_vbus_override_quiet();
++	/*
++	 * 0258: and the controller's own override, immediately before the run.
++	 * Order matters for the same reason pre_run_stop does: the core latches
++	 * the session inputs when RUN_STOP goes to 1.
++	 */
++	ud_otg_override();
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (w = 0; w < (int)(ms / 5); w++) {
+ 		uint32_t cnt;
+@@ -1872,9 +1928,11 @@
+ 	uint32_t d = dwc_rd(DSTS);
+ 	uint32_t g = dwc_rd(GSTS);
+ 
+-	printf("SWEET USB:   %-8s cs=%d spd=%u susp=%d b22=%d bsessvld=%d DSTS 0x%08x GSTS 0x%08x ev 0x%08x\n",
++	printf("SWEET USB:   %-8s cs=%d spd=%u susp=%d b22=%d cable=%d sess=%d bvalid=%d "
++	    "DSTS 0x%08x GSTS 0x%08x ev 0x%08x\n",
+ 	    tag, !!(d & 1), (d >> 1) & 7u, !!(d & (1u << 8)), !!(d & DSTS_DEVCTRLHLT),
+-	    !!(g & (1u << 30)), d, g, dwc_rd(GEVNTCOUNT) & 0xffff);
++	    !!(g & GSTS_BCABLE), !!(g & GSTS_BSESSVLD), !!(g & GSTS_BVALID),
++	    d, g, dwc_rd(GEVNTCOUNT) & 0xffff);
+ }
+ 
+ 
+@@ -2021,6 +2079,47 @@
+ }
+ 
+ /*
++ * 0258: the override that lives inside the controller, not the wrapper.
++ *
++ * QSCRATCH's UTMI_OTG_VBUS_VALID is a message to the wrapper: it asks the
++ * glue to emit a connect-done event. It does not change what the core believes
++ * about the wire, which is why 0255 could write it before every run_stop and
++ * still watch the link stay disconnected.
++ *
++ * GOTGCTL is different in kind. VBvalidOvval/VBvalidOvEn and
++ * BvalidOvval/BvalidOvEn are the OTG state machine's own inputs: with the
++ * override enabled the core is told, inside its own logic, that VBUS is valid
++ * and that a B-device session exists. That is upstream of the point where the
++ * core decides whether to drive UTMI TermSelect, and TermSelect is what closes
++ * the 1.5k pull-up on D+.
++ *
++ * Whether this block responds at all is the measurement. GHWPARAMS0's low
++ * bits read 2, which is op_mode OTG rather than the "device only" the earlier
++ * notes took them for, so it should. A read-back that matches the write means
++ * the block is live; a read-back unchanged means this controller does not
++ * expose it in the current mode and the next step is elsewhere.
++ */
++static void
++ud_otg_override(void)
++{
++	uint32_t before = dwc_rd(GOTGCTL);
++	uint32_t want = before | GOTGCTL_VBVALIDOVEN | GOTGCTL_VBVALIDOVVAL |
++	    GOTGCTL_BVALIDOVEN | GOTGCTL_BVALIDOVVAL;
++	uint32_t after;
++	uint32_t g;
++
++	dwc_wr(GOTGCTL, want);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	after = dwc_rd(GOTGCTL);
++	g = dwc_rd(GSTS);
++	printf("SWEET USB: GOTGCTL 0x%08x -> 0x%08x (wanted 0x%08x)%s\n",
++	    before, after, want, (after & want) == want ? " [took]" : " [REFUSED]");
++	printf("SWEET USB: GSTS 0x%08x (cable %d sess %d bvalid %d avalid %d csr %d curmod %d)\n",
++	    g, !!(g & GSTS_BCABLE), !!(g & GSTS_BSESSVLD), !!(g & GSTS_BVALID),
++	    !!(g & GSTS_AVALID), !!(g & GSTS_CSRTIMEOUT), !!(g & 1u));
++}
++
++/*
+  * The wrapper state a working high-speed gadget sits in.
+  *
+  * This used to claim that HS_PHY_CTRL 0x10000000 had "UTMI_CLK_EN clear" and
+@@ -2532,8 +2631,10 @@
+ 	ud.dma_pa = ptoa_64(pn);
+ 	printf("SWEET USB: DMA buffer pa 0x%llx (%s 4GiB) UD_SIZE 0x%x UD_EVT 0x%x\n",
+ 	    ud.dma_pa, ud.dma_pa >= 0x100000000ULL ? ">=" : "<", (unsigned)UD_SIZE, (unsigned)UD_EVT);
+-	printf("SWEET USB: pre-config GHWPARAMS0 0x%08x GCTL 0x%08x GUSB2PHYCFG 0x%08x DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
+-	    dwc_rd(0xc140), dwc_rd(GCTL), dwc_rd(0xc200), dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS));
++	printf("SWEET USB: pre-config GHWPARAMS0 0x%08x GHWPARAMS7 0x%08x GCTL 0x%08x "
++	    "GUSB2PHYCFG 0x%08x DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
++	    dwc_rd(GHWPARAMS0), dwc_rd(GHWPARAMS7), dwc_rd(GCTL), dwc_rd(0xc200),
++	    dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS));
+ 	ud_if_create();
+ 
+ 	ud_fifo_dump();
