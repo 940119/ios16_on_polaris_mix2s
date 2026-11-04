@@ -1,0 +1,55 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -3832,6 +3832,52 @@
+ 	printf("POLARIS GPU: 16 RBBM_SECVID_TRUST_CNTL %#010x: %s\n", trust,
+ 	    trust == 0 ? "already out of secure mode" : "still secure: the zap would be the way out");
+ 	/*
++	 * 0252 read-only probe (polarissecvid=1): the whole SECVID block, read
++	 * back before the zap decision. Nothing here is written. The point is to
++	 * see what the boot loader left in the security registers - in particular
++	 * whether RBBM_SECVID_TRUST_CNTL is 1 because "still secure" (the normal
++	 * state before a zap) or because the boot loader has already locked the
++	 * set-once register, which decides whether a direct write of 0 could ever
++	 * take the core out of secure mode.
++	 *
++	 * Linux, when it has no zap, writes RBBM_SECVID_TRUST_CNTL = 0 directly
++	 * (a6xx_gpu.c / adreno_a6xx.c). The device tree's secvid-set-once quirk
++	 * means "the secure->non-secure switch happens once", not "a write reboots
++	 * the phone"; the real risk of a wrong write is a permissions violation,
++	 * not a guaranteed reboot. So the question this probe answers is only
++	 * whether the register is still writable at all - and the TSB registers
++	 * step 14 already wrote give the comparison: if they read back the values
++	 * step 14 put there, the block is writable; if they read back something
++	 * else, the boot loader has latched them.
++	 */
++	{
++		int v = 0;
++
++		if (PE_parse_boot_argn("polarissecvid", &v, sizeof(v)) && v) {
++			uint32_t tsb_cntl    = pg_rd(pg_gpu3d + 4u * 0x0f803u);
++			uint32_t tsb_base_lo = pg_rd(pg_gpu3d + 4u * 0x0f800u);
++			uint32_t tsb_base_hi = pg_rd(pg_gpu3d + 4u * 0x0f801u);
++			uint32_t tsb_size    = pg_rd(pg_gpu3d + 4u * 0x0f802u);
++			uint32_t tsb_mode    = pg_rd(pg_gpu3d + 4u * 0x0f810u);
++			uint32_t rbbm_clk    = pg_rd(pg_gpu3d + 4u * PG_RBBM_CLOCK_CNTL);
++			uint32_t rbbm_status = pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS);
++
++			printf("POLARIS GPU: 16 secvid: TRUST_CNTL %#010x TSB_CNTL %#010x "
++			    "TSB_BASE %#010x %#010x TSB_SIZE %#010x TSB_ADDR_MODE %#010x; "
++			    "RBBM_CLOCK_CNTL %#010x RBBM_STATUS %#010x\n", trust,
++			    tsb_cntl, tsb_base_lo, tsb_base_hi, tsb_size, tsb_mode,
++			    rbbm_clk, rbbm_status);
++			printf("POLARIS GPU: 16 secvid: TSB step-14 wrote {0,0,0,0,1}; "
++			    "readback { %#x, %#x, %#x, %#x, %#x } -> %s (the TSB took the "
++			    "kernel's write; the TRUST_CNTL has never been written and its "
++			    "writability is the open question)\n", tsb_cntl, tsb_base_lo,
++			    tsb_base_hi, tsb_size, tsb_mode,
++			    (tsb_cntl == 0 && tsb_base_lo == 0 && tsb_base_hi == 0 &&
++			    tsb_size == 0 && tsb_mode == 1) ?
++			    "matches step 14" : "differs from step 14");
++		}
++	}
++	/*
+ 	 * 0143 stopped here: TrustZone answered PAS_SUPPORTED(13) with 0, the zap
+ 	 * never loaded, and the ladder returned before the CP had written a single
+ 	 * word. But the CP had already fetched and executed CP_ME_INIT through this
