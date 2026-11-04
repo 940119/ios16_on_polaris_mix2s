@@ -1,0 +1,203 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -6206,7 +6206,37 @@
+  *
+  * The flag only chooses the target, so an ordinary boot is unchanged.
+  */
+-static bool pg_cs_fault_target;
++/*
++ * 0248: one argument, four experiments, and the control for the instrument.
++ *
++ * 0247's fault probe said "the store did not run", but that verdict assumes the
++ * SMMU bank we read reports a GPU data fault. It has never been shown to: the
++ * 0234 fault was an instruction fetch (or the CP's preload of it), the 0224
++ * FARs were garbage already sitting in the bank before any packet was sent, and
++ * sGFSR has never left zero. A channel that never reports a fault makes every
++ * "no fault" verdict worthless, so the control has to be a write we know the
++ * GPU performs - CP_EVENT_WRITE to the same unmapped page, the exact packet the
++ * fence uses and the exact page the descriptors already aim at.
++ *
++ *   polariscsp=<n>   bits 0:1 choose the stg immediate, bit 2 arms the control
++ *     0  result page          1  VA 0
++ *     2  page with no PTE     3  result page + 4 (word 1)
++ *     4  the CP control write, on top of whichever target bits 0:1 selected
++ *
++ * VA 0 is the interesting one. If stg is an a5xx-style descriptor-relative
++ * store, an immediate of zero writes word 0 of the result page and the sentinel
++ * finally appears; if it is the a6xx absolute-VA store that ir3_a6xx.c emits,
++ * zero is a page with no PTE and the SMMU has to answer. Either outcome says
++ * more than another register readback.
++ *
++ * The same build also prints the ten grid registers after the dispatch. They
++ * have never been read back: they go out in a second context bunch behind
++ * CP_SET_MARKER, and a wave whose global or local size never landed is a wave
++ * with zero active threads - launch overhead, no stores, no faults, and a
++ * perfectly good fence. That is the one shape that fits every log so far.
++ */
++static uint32_t pg_cs_target_mode;
++static bool pg_cs_cpctl;
+ 
+ /*
+  * 0225: back to the classic UAV block, and this is the correction that matters.
+@@ -6466,13 +6496,16 @@
+ 	if (PE_parse_boot_argn("polariscsinstr", &v, sizeof(v))) {
+ 		pg_cs_instr_size = (uint32_t)v;
+ 	}
+-	if (PE_parse_boot_argn("polariscsmiss", &v, sizeof(v))) {
+-		pg_cs_fault_target = (v != 0);
+-	}
+-	printf("POLARIS GPU: 20 shader: update_cntl %#x, instr_size %u, store "
+-	    "target %s\n", pg_cs_update_cntl, pg_cs_instr_size,
+-	    pg_cs_fault_target ? "is the page with no PTE (fault probe)" :
+-	    "is the result page");
++	if (PE_parse_boot_argn("polariscsmiss", &v, sizeof(v)) && v) {
++		pg_cs_target_mode = 2u;	/* the 0247 spelling still works */
++	}
++	if (PE_parse_boot_argn("polariscsp", &v, sizeof(v))) {
++		pg_cs_target_mode = (uint32_t)v & 3u;
++		pg_cs_cpctl = (((uint32_t)v & 4u) != 0);
++	}
++	printf("POLARIS GPU: 20 shader: update_cntl %#x, instr_size %u, target "
++	    "mode %u, CP control %s\n", pg_cs_update_cntl, pg_cs_instr_size,
++	    pg_cs_target_mode, pg_cs_cpctl ? "armed" : "off");
+ }
+ 
+ static void
+@@ -6649,10 +6682,9 @@
+ 	 * first register access, so "is it in the ring" answers "did this kernel run"
+ 	 * without needing a second source.
+ 	 */
+-	printf("POLARIS GPU: 20 shader: ======== build 0247 alive: the global "
+-	    "store's address is the fault probe - with polariscsmiss=1 it is a page "
+-	    "no PTE has entered, so the SMMU says whether the SP reaches the store "
+-	    "=======\n");
++	printf("POLARIS GPU: 20 shader: ======== build 0248 alive: the grid is "
++	    "read back, the store's immediate is selectable, and the CP writes the "
++	    "unmapped page as the control for the SMMU ========\n");
+ 	/*
+ 	 * 0247: before the shader is written, because the flag decides what goes
+ 	 * into its first immediate. pg_cs_emit() calls this too; it reads once.
+@@ -6702,9 +6734,30 @@
+ 	 * the evidence that the patch happened at all.
+ 	 */
+ 	{
+-		uint64_t target = pg_cs_fault_target ? PG_CS_MISSING_IOVA :
+-		    (iova + 2u * PG_GMU_PAGE_SIZE);
++		uint64_t target;
+ 		uint32_t at = PG_CS_SHADER_WORDS, patched = 0;
++
++		/*
++		 * 0248: four addresses from one build. Mode 1 is VA 0, which is
++		 * both a fault probe and the test of whether stg's operand is an
++		 * absolute VA or an offset into the UAV descriptor (see the note
++		 * beside pg_cs_target_mode). Mode 3 writes word 1 instead of word
++		 * 0, so a store that lands there cannot be a stale sentinel.
++		 */
++		switch (pg_cs_target_mode) {
++		case 1u:
++			target = 0;
++			break;
++		case 2u:
++			target = PG_CS_MISSING_IOVA;
++			break;
++		case 3u:
++			target = iova + 2u * PG_GMU_PAGE_SIZE + 4u;
++			break;
++		default:
++			target = iova + 2u * PG_GMU_PAGE_SIZE;
++			break;
++		}
+ 
+ 		for (i = 0; i < PG_CS_SHADER_WORDS; i++) {
+ 			shader[i] = pg_cs_shader[i];
+@@ -6890,14 +6943,14 @@
+ 		    "%#010x%08x\n", iova + 2u * PG_GMU_PAGE_SIZE, PG_CS_MISSING_IOVA, fsr0,
+ 		    (uint32_t)(far0 >> 32), (uint32_t)far0, fsr1, (uint32_t)(far1 >> 32),
+ 		    (uint32_t)far1);
+-		if (pg_cs_fault_target) {
++		if (pg_cs_target_mode != 0u) {
+ 			/*
+-			 * 0247: this run moved the fault to the store's own operand, so
+-			 * the answer is no longer about descriptors at all.
++			 * 0247/0248: this run moved the fault to the store's own
++			 * operand, so the answer is no longer about descriptors.
+ 			 */
+ 			printf("POLARIS GPU: 20 shader: %s\n", changed ?
+ 			    "THE STORE RAN: the SMMU faults on the page the stg names, so the SP executes instruction 8 and the missing word is a property of the address, not of the launch" :
+-			    "THE STORE DID NOT RUN: the page the stg names raised nothing, so the SP never reaches instruction 8 and every earlier \"no store\" was that same fact");
++			    "THE STORE DID NOT RAISE A FAULT: either the SP never reaches instruction 8, or this bank does not report GPU data faults - the CP control below separates them");
+ 		} else {
+ 			printf("POLARIS GPU: 20 shader: %s\n", changed ?
+ 			    "A DESCRIPTOR WAS READ: an unmapped target raised a fault, so the store is running and the index is not 0" :
+@@ -6954,6 +7007,25 @@
+ 		    pg_rd(pg_gpu3d + 4u * 0x0a9b0), pg_rd(pg_gpu3d + 4u * 0x0a9b1),
+ 		    pg_rd(pg_gpu3d + 4u * 0x0b998), pg_rd(pg_gpu3d + 4u * 0x0b987));
+ 		/*
++		 * 0248: the ten grid registers, which no log has ever shown.
++		 *
++		 * They are written in a second CP_CONTEXT_REG_BUNCH, after
++		 * CP_SET_MARKER, so they are the one part of the state that a
++		 * broken latch could drop without touching anything above. If
++		 * NDRANGE_0 is not 0x1f or NDRANGE_1 is zero, the SP was told to
++		 * run zero threads: a wave still costs something to launch and
++		 * drain, the fence still arrives, and neither store can write.
++		 * That is the shape every one of these logs has had.
++		 */
++		printf("POLARIS GPU: 20 shader: the grid reads NDRANGE %08x %08x %08x "
++		    "%08x %08x %08x %08x GROUP %08x %08x %08x SP_STATUS %08x\n",
++		    pg_rd(pg_gpu3d + 4u * 0x0b990), pg_rd(pg_gpu3d + 4u * 0x0b991),
++		    pg_rd(pg_gpu3d + 4u * 0x0b992), pg_rd(pg_gpu3d + 4u * 0x0b993),
++		    pg_rd(pg_gpu3d + 4u * 0x0b994), pg_rd(pg_gpu3d + 4u * 0x0b995),
++		    pg_rd(pg_gpu3d + 4u * 0x0b996), pg_rd(pg_gpu3d + 4u * 0x0b999),
++		    pg_rd(pg_gpu3d + 4u * 0x0b99a), pg_rd(pg_gpu3d + 4u * 0x0b99b),
++		    pg_rd(pg_gpu3d + 4u * 0x0ae0c));
++		/*
+ 		 * 0226: the store runs and no fault is reported, so it landed on an
+ 		 * address that is mapped - just not the one this test reads. Rather than
+ 		 * reason about which address that could be, look for the value in the
+@@ -7055,6 +7127,45 @@
+ 			    "%u ms\n", k, probe[k], took ? "drained" : "STUCK",
+ 			    seen ? "arrived" : "MISSING", ms);
+ 		}
++	}
++
++	/*
++	 * 0248: the control for the instrument, last so it cannot disturb any
++	 * of the readings above.
++	 *
++	 * CP_EVENT_WRITE to the page with no PTE is the same packet shape the
++	 * fence uses, aimed at the same page the descriptors point at. The fence
++	 * arriving is proof that this packet really performs a write through
++	 * bank 2; if it faults there and a shader store to that page did not,
++	 * then "no fault" meant "the store did not run". If it does not fault
++	 * either, then the bank never reports GPU data faults and 0247's
++	 * verdict - and every "no descriptor was read" before it - is void.
++	 */
++	if (pg_cs_cpctl) {
++		uint32_t fsr_a = 0, fsr_b = 0, w = pg_cp_wptr;
++		uint64_t far_a = pg_smmu_far(&fsr_a), far_b;
++
++		seq = polaris_gpu_fence_next();
++		pg_ring_put(w++, pg_pkt7(0x46u, 4u));		/* CP_EVENT_WRITE */
++		pg_ring_put(w++, 0x04u);
++		pg_ring_put(w++, (uint32_t)PG_CS_MISSING_IOVA);
++		pg_ring_put(w++, (uint32_t)(PG_CS_MISSING_IOVA >> 32));
++		pg_ring_put(w++, seq);
++		w &= PG_RING_WORDS - 1u;
++		pg_ring_flush();
++		pg_wr(pg_gpu3d + 4u * PG_CP_RB_WPTR, w);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		pg_cp_wptr = w;
++		pg_sleep_us(20000);
++		far_b = pg_smmu_far(&fsr_b);
++		printf("POLARIS GPU: 20 shader: the CP wrote %#llx: FSR %#010x -> "
++		    "%#010x FAR %#010x%08x -> %#010x%08x; %s\n",
++		    PG_CS_MISSING_IOVA, fsr_a, fsr_b, (uint32_t)(far_a >> 32),
++		    (uint32_t)far_a, (uint32_t)(far_b >> 32), (uint32_t)far_b,
++		    (far_a != far_b || fsr_a != fsr_b) ?
++		    "THE BANK REPORTS A GPU WRITE: 0247's silence is a real absence" :
++		    "THE BANK IS SILENT: 0247's verdict cannot stand");
++		polaris_gpu_smmu_fault();
+ 	}
+ 
+ 	polaris_gpu_unmap(iova, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
