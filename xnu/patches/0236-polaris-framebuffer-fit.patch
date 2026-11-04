@@ -1,0 +1,101 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -227,6 +227,7 @@
+ 	}
+ 	int native = 0;
+ 	int polaris = 0;
++	bool fit_mode = false;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	PE_parse_boot_argn("sweetfb_polaris", &polaris, sizeof(polaris));
+ 	fLogicalW = fWidth;
+@@ -268,9 +269,49 @@
+ 		fOffY = 0;
+ 		fSrcOffX = 0;
+ 		fScale = 1;
++		/*
++		 * 0236: the stretch is fixed in the mapping, not in the size.
++		 *
++		 * 0233 tried changing the logical height to 1500 so that both axes
++		 * would be 36/25, and the compositor stopped presenting: iOS builds
++		 * its display surface from the device tree as 750x1624 and does not
++		 * re-read the size afterwards, so a driver that answers 750x1500
++		 * leaves it waiting. The logical size has to stay 1624.
++		 *
++		 * What can change is how 750x1624 is laid onto 1080x2160. Stretching
++		 * each axis on its own is what made circles 8.3% wide. Fitting by
++		 * height instead uses one factor for both: 2160/1624, which makes
++		 * the image 998 columns wide and leaves 41 black columns each side.
++		 * Nothing is cropped and nothing is distorted; the cost is 3.8% of
++		 * the panel width.
++		 *
++		 * Off by default, because a boot-arg is enough to try it and a
++		 * default that changes the panel is how 0233 broke. Turn it on with
++		 * sweetfb_fit=1.
++		 */
++		{
++			int fit = 0;
++			PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
++			if (fit == 1 && fLogicalH > 0 && fHeight > 0) {
++				int32_t fitw = (int32_t)(((int64_t)fLogicalW * fHeight) /
++				    fLogicalH);
++				if (fitw > 0 && fitw <= (int32_t)fWidth) {
++					fContentW = (uint32_t)fitw;
++					fSrcOffX = ((int32_t)fWidth - fitw) / 2;
++					fit_mode = true;
++				}
++			}
++		}
+ 		if (fWidth <= SWEET_FB_COLMAP_MAX && fLogicalW > 0) {
+ 			for (uint32_t x = 0; x < fWidth; x++) {
+-				fColMap[x] = (uint16_t)((uint64_t)x * fLogicalW / fWidth);
++				int32_t lx = (int32_t)x - fSrcOffX;
++				if (lx < 0) {
++					lx = 0;
++				}
++				if ((uint32_t)lx >= fContentW) {
++					lx = (int32_t)fContentW - 1;
++				}
++				fColMap[x] = (uint16_t)((uint64_t)lx * fLogicalW / fContentW);
+ 			}
+ 		}
+ 	} else {
+@@ -283,7 +324,8 @@
+ 	 * this panel (1080 and 750); anything else falls back to the map.
+ 	 * sweetfb_gather=0 forces the map, so the two can be compared across boots.
+ 	 */
+-	fGatherPeriod = (fWidth == SWEET_FB_PANEL_BLK * SWEET_FB_BLKS &&
++	fGatherPeriod = !fit_mode &&
++	    (fWidth == SWEET_FB_PANEL_BLK * SWEET_FB_BLKS &&
+ 	    fLogicalW == SWEET_FB_SRC_BLK * SWEET_FB_BLKS);
+ 	{
+ 		int gmode = 1;
+@@ -935,13 +977,22 @@
+ 			 * [dx, dx+w) * fWidth / fLogicalW. px1 is rounded up so the
+ 			 * last panel column of a small rectangle is never left stale.
+ 			 */
+-			int32_t px0 = (int32_t)(((int64_t)dx * fWidth) / fLogicalW);
+-			int32_t px1 = (int32_t)(((int64_t)(dx + w) * fWidth) / fLogicalW) + 1;
+-			if (px0 < 0) {
+-				px0 = 0;
+-			}
+-			if (px1 > (int32_t)fWidth) {
+-				px1 = (int32_t)fWidth;
++			/*
++			 * 0236: fContentW and fSrcOffX, not fWidth and 0. In the
++			 * default mapping the two are the same numbers, so this
++			 * changes nothing; with sweetfb_fit=1 the extent starts at
++			 * the left bar and is 998 columns wide instead of 1080.
++			 */
++			int32_t px0 = (int32_t)fSrcOffX +
++			    (int32_t)(((int64_t)dx * fContentW) / fLogicalW);
++			int32_t px1 = (int32_t)fSrcOffX +
++			    (int32_t)(((int64_t)(dx + w) * fContentW) / fLogicalW) + 1;
++			int32_t pxend = (int32_t)fSrcOffX + (int32_t)fContentW;
++			if (px0 < (int32_t)fSrcOffX) {
++				px0 = (int32_t)fSrcOffX;
++			}
++			if (px1 > pxend) {
++				px1 = pxend;
+ 			}
+ 			/* Source column for logical column dx, relative to the layer. */
+ 			int32_t base = sx - dx;
