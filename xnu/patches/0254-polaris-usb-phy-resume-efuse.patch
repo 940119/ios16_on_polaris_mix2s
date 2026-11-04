@@ -1,0 +1,73 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1417,23 +1417,31 @@
+ 	 * access of that build was a read and the core stopped there, because
+ 	 * a read to a block that is not answering waits instead of failing.
+ 	 *
+-	 * 0x22, not 0x23. Bit 0 of this register is POWER_DOWN: writing 0x23
+-	 * asserted it and left the PHY powered down, which is the exact
+-	 * opposite of a resume and of what the comment above asks for. Every
+-	 * build from 0106 to 0115 did that, and it is why the endpoint command
+-	 * engine stalled in three of the four strategies while the one that
+-	 * runs the vendor init table (which ends on 0x22) configured ep0
+-	 * straight away. 0x22 is also the last entry of the DT init sequence
+-	 * and the value the working stock kernel leaves behind.
+-	 */
++	 * 0254: the whole point of "resume" is to keep ABL's efuse-trimmed
++	 * configuration (PLL_STATUS 0x64, TUNE1 0x72) and only lift the
++	 * power-down gate. But 0106's sweep showed clearing POWER_DOWN (bit 0)
++	 * drops PLL_STATUS from 0x64 to 0x17 and it never comes back, which is
++	 * why every resume so far left the PHY with the PLL unlocked and the
++	 * host saw no device. Linux's qusb2_phy_power_on() does the full dance:
++	 * it first sets disable_ctrl (CLAMP_N_EN | FREEZIO_N | POWER_DOWN, the
++	 * 0x23 ABL left behind), then writes the init table, then clears only
++	 * POWER_DOWN, then waits 150 us + 100 us for the PLL to re-lock. This
++	 * build mirrors that order but keeps ABL's efuse trim instead of the
++	 * DT defaults: hold 0x23 (the locked state), clear only bit 0 to 0x22,
++	 * and give the PLL its two settle delays before trusting PLL_STATUS.
++	 */
++	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, 0x23);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(100);
+ 	qusb2_wr(phy, QUSB2_PORT_POWERDOWN, 0x22);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(150);
++	delay(100);
+ 
+ 	uint32_t pll0 = qusb2_rd(phy, QUSB2_PLL_STATUS);
+ 	uint32_t pd0  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
+ 	printf("SWEET USB: QUSB2 resume in: PLL_STATUS 0x%02x POWERDOWN 0x%02x TUNE1 0x%02x\n",
+ 	    pll0, pd0, qusb2_rd(phy, QUSB2_PORT_TUNE1));
+-
+-	delay(200);
+ 
+ 	uint32_t pd  = qusb2_rd(phy, QUSB2_PORT_POWERDOWN);
+ 	uint32_t pll = qusb2_rd(phy, QUSB2_PLL_STATUS);
+@@ -2499,13 +2507,24 @@
+ 	 * runstop+table+utmi last, in case the core wants to be halted while
+ 	 * its endpoints are programmed.
+ 	 */
++	/*
++	 * 0254: resume+utmi goes first. It is the only strategy that keeps
++	 * ABL's efuse-trimmed PHY configuration (TUNE1 0x72) instead of the DT
++	 * defaults (0x07) - and the efuse trim is what makes the HS transceiver
++	 * actually drive D+. Every earlier run let table+utmi win first (it is
++	 * the only one that configured ep0), so the efuse-preserving resume
++	 * never got a chance to be the one that raises the pull-up and is
++	 * listened to. The order matters: the loop stops at the first strategy
++	 * that configures ep0, and that one is the only one whose attach is
++	 * then awaited.
++	 */
+ 	static const char *names[] = {
+-		"noreset", "table+utmi", "resume+utmi", "runstop+table+utmi"
++		"resume+utmi", "table+utmi", "noreset", "runstop+table+utmi"
+ 	};
+ 	static const unsigned order[] = {
++		UD_F_RESUME | UD_F_UTMI | UD_F_CLKGT,
++		UD_F_PHYINIT | UD_F_UTMI | UD_F_CLKGT,
+ 		UD_F_NORESET,
+-		UD_F_PHYINIT | UD_F_UTMI | UD_F_CLKGT,
+-		UD_F_RESUME | UD_F_UTMI | UD_F_CLKGT,
+ 		UD_F_PHYINIT | UD_F_UTMI | UD_F_CLKGT | UD_F_RUNSTOP,
+ 	};
+ 	int won = -1;
