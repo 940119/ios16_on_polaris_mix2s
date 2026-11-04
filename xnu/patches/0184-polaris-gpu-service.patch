@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1729 @@
+@@ -5067,4 +5336,1772 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1153,6 +1153,13 @@
 +#define PG_CS_SHADER_WORDS	32u
 +#define PG_CS_RESULT_WORDS	8u
 +#define PG_CS_PAGES		4u
++/*
++ * 0228: the descriptor page holds exactly this many 64-byte buffer views, and the
++ * result page holds exactly this many 64-byte blocks. 4096 / 64 = 64, so the two
++ * pages line up one for one and each slot can be given a target of its own.
++ */
++#define PG_CS_DESC_SLOTS	64u
++#define PG_CS_SLOT_BYTES	64u
 +
 +/*
 + * 0225: back to the classic UAV block, and this is the correction that matters.
@@ -1300,7 +1307,7 @@
 +		pg_ring_put(wptr++, 0x0a9f3u);
 +		pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
 +		pg_ring_put(wptr++, 0x0aa00u);			/* SP_CS_USIZE */
-+		pg_ring_put(wptr++, 1u);
++		pg_ring_put(wptr++, PG_CS_DESC_SLOTS);		/* 0228: all 64 are valid */
 +	}
 +	{
 +		uint32_t n = (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]));
@@ -1319,9 +1326,12 @@
 +	 * 0225: and the descriptor itself, loaded indirectly from the block the
 +	 * pointer above names - ST6_UAV, SS6_INDIRECT, one unit, address 0x10c15000.
 +	 * This is the pair of packets cs_program_emit_regs() produces.
++	 *
++	 * 0228: sixty-four units, not one. NUM_UNIT is bits 31:22 of the first word,
++	 * so 64 of them is 0x40 << 22 = 0x10000000 on top of the old 0x0036c000.
 +	 */
 +	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG */
-+	pg_ring_put(wptr++, 0x0076c000u);		/* ST6_UAV / INDIRECT / CS_SHADER / 1 */
++	pg_ring_put(wptr++, 0x1036c000u);		/* ST6_UAV / INDIRECT / CS_SHADER / 64 */
 +	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
 +	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
 +	/*
@@ -1408,7 +1418,7 @@
 +	volatile uint32_t * desc;
 +	volatile uint32_t * result;
 +	volatile uint32_t * fence;
-+	uint32_t seq, wptr, rptr = 0, good = 0, i;
++	uint32_t seq, wptr, rptr = 0, good = 0, i, s, hit = PG_CS_DESC_SLOTS;
 +	uint64_t began, ns = 0;
 +	bool drained = false;
 +
@@ -1449,34 +1459,42 @@
 +	for (i = 0; i < PG_CS_SHADER_WORDS; i++) {
 +		shader[i] = pg_cs_shader[i];
 +	}
-+	for (i = 0; i < 16u; i++) {
++	for (i = 0; i < PG_CS_DESC_SLOTS * 16u; i++) {
 +		desc[i] = 0;
 +	}
 +	/*
-+	 * The 64-byte buffer view, from fdl6_buffer_view_init(): R32_UINT, linear
-+	 * tiling, identity swizzle, A6XX_TEX_BUFFER, width = number of elements.
-+	 * It points at the result page, which is the only thing the shader writes.
-+	 */
-+	desc[0] = 0x12c06880u;				/* fmt / swap / tile / swizzle */
-+	desc[1] = PG_CS_RESULT_WORDS;			/* width in elements */
-+	desc[2] = 0x80000010u;				/* A6XX_TEX_BUFFER */
-+	/*
-+	 * 0227: the descriptor points at the descriptor page itself.
++	 * 0228: all sixty-four slots, each pointing somewhere different.
 +	 *
-+	 * Everything about the descriptor is now confirmed - the disassembly says the
-+	 * store is the classic form with index 0, the block it reads from is
-+	 * SP_CS_UAV_BASE, and the sixteen words are byte for byte what
-+	 * fdl6_buffer_view_init() produces. So the question is no longer "does the
-+	 * shader find its buffer" but "does a store reach memory at all".
++	 * 0227 pointed the one descriptor this test built at the page it lives in, so
++	 * that any store at all would overwrite descriptor[0] in a page already being
++	 * read back. It did not: that word was still 0x12c06880. So the shader is not
++	 * writing to the address in our descriptor - either it reads a different slot,
++	 * or it never consults this page.
 +	 *
-+	 * Pointing the buffer at the page the descriptor lives in answers that in one
-+	 * look: a successful store overwrites descriptor[0] with 0x0209c0de, in a page
-+	 * this test already reads back and scans. If that word is still 0x12c06880
-+	 * afterwards, no store of any kind is landing, whatever the descriptor says.
++	 * Writing one descriptor leaves the other sixty-three as zeros, and a zero
++	 * descriptor means a zero width, which the bounds check discards silently, with
++	 * no fault and no write. That is indistinguishable from "nothing happened",
++	 * which is exactly what the last three builds saw. So fill all of them, and
++	 * give each a target of its own: slot k writes into block k of the result page.
++	 * Whichever index the hardware uses, the block that changes names it.
 +	 */
-+	desc[4] = (uint32_t)(iova + PG_GMU_PAGE_SIZE);
-+	desc[5] = (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32);
-+	for (i = 0; i < PG_CS_RESULT_WORDS; i++) {
++	for (s = 0; s < PG_CS_DESC_SLOTS; s++) {
++		volatile uint32_t * d = desc + s * 16u;
++		uint64_t target = iova + 2u * PG_GMU_PAGE_SIZE +
++		    (uint64_t)s * PG_CS_SLOT_BYTES;
++
++		/*
++		 * The 64-byte buffer view, from fdl6_buffer_view_init(): R32_UINT,
++		 * linear tiling, identity swizzle, A6XX_TEX_BUFFER, width in elements.
++		 * Verified byte for byte against Mesa's own output (HANDOFF §21.4).
++		 */
++		d[0] = 0x12c06880u;			/* fmt / swap / tile / swizzle */
++		d[1] = PG_CS_RESULT_WORDS;		/* width in elements */
++		d[2] = 0x80000010u;			/* A6XX_TEX_BUFFER */
++		d[4] = (uint32_t)target;
++		d[5] = (uint32_t)(target >> 32);
++	}
++	for (i = 0; i < PG_CS_DESC_SLOTS * 16u; i++) {
 +		result[i] = 0;
 +	}
 +
@@ -1555,13 +1573,32 @@
 +		    rptr, wptr);
 +	}
 +	if (pg_fence_reached(fence, seq, 20000u)) {
-+		for (i = 0; i < PG_CS_RESULT_WORDS; i++) {
-+			if (result[i] == 0x0209c0deu) {
-+				good++;
++		/*
++		 * 0228: which slot did it use? Each of the sixty-four descriptors points
++		 * at its own 64-byte block of the result page, so the block that took the
++		 * store is the index the hardware resolved - a fact no read of a register
++		 * could have produced.
++		 */
++		for (i = 0; i < PG_CS_DESC_SLOTS; i++) {
++			if (result[i * 16u] == 0x0209c0deu) {
++				hit = i;
++				break;
 +			}
 +		}
-+		printf("POLARIS GPU: 20 shader: the fence reads %u; %u of %u result words are "
-+		    "0x0209c0de\n", *fence, good, PG_CS_RESULT_WORDS);
++		if (hit < PG_CS_DESC_SLOTS) {
++			for (i = 0; i < PG_CS_RESULT_WORDS; i++) {
++				if (result[hit * 16u + i] == 0x0209c0deu) {
++					good++;
++				}
++			}
++			printf("POLARIS GPU: 20 shader: slot %u took the store: %u of %u words "
++			    "in block %u are 0x0209c0de\n", hit, good, PG_CS_RESULT_WORDS, hit);
++		} else {
++			good = 0;
++			printf("POLARIS GPU: 20 shader: the fence reads %u; no slot took the "
++			    "store, %u of %u descriptors pointed at their own block\n",
++			    *fence, PG_CS_DESC_SLOTS, PG_CS_DESC_SLOTS);
++		}
 +		printf("POLARIS GPU: 20 shader: the words read %08x %08x %08x %08x %08x %08x "
 +		    "%08x %08x\n", result[0], result[1], result[2], result[3], result[4],
 +		    result[5], result[6], result[7]);
@@ -1589,7 +1626,7 @@
 +		 * sentinel is in a page it has no business being in, the offset says
 +		 * exactly what the shader thought it was writing to.
 +		 */
-+		if (good != PG_CS_RESULT_WORDS) {
++		if (hit >= PG_CS_DESC_SLOTS) {
 +			volatile uint32_t *all = (volatile uint32_t *)view;
 +			uint32_t hits = 0, words = PG_CS_PAGES * (PG_GMU_PAGE_SIZE / 4u);
 +
@@ -1612,8 +1649,14 @@
 +		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 +		printf("POLARIS GPU: 20 shader: the test took %llu ms of boot\n",
 +		    ns / 1000000ull);
-+		printf("POLARIS GPU: 20 shader: %s\n", (good >= 1u) ? "unexpected: the store returned" :
-+		    "THE WAVE RAN: an empty kernel completes, so ir3 fetch and dispatch work");
++		if (hit < PG_CS_DESC_SLOTS) {
++			printf("POLARIS GPU: 20 shader: THE STORE LANDED IN SLOT %u: the "
++			    "descriptor, the index and the buffer all work\n", hit);
++		} else {
++			printf("POLARIS GPU: 20 shader: NO STORE LANDED: the wave runs, the "
++			    "fault registers stay clean, and all %u descriptors were valid\n",
++			    PG_CS_DESC_SLOTS);
++		}
 +	} else {
 +		printf("POLARIS GPU: 20 shader: no fence after %u us; the CP is at RPTR %u WPTR %u\n",
 +		    2000000u, rptr, wptr);
