@@ -1,0 +1,105 @@
+diff -Nur a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -6394,6 +6394,60 @@
+  * prefilled instruction cache would otherwise hide the fetch this build is
+  * trying to provoke. Every ordinary call passes iova, so nothing else changes.
+  */
++/*
++ * 0246: the two values that decide whether a wave reaches its seventh
++ * instruction, as boot arguments.
++ *
++ * The 0245 boot settled the length question: with SP_CS_INSTR_SIZE written as
++ * 32 the register reads back 32, which proves the ring write lands and that
++ * 0242's diagnosis - the second write overwriting the first - was right. Word 0
++ * still reads 0. What the same log also says, and what makes this build worth
++ * doing, is that the wave does run: 65536 groups cost 218 ms against 0 ms for
++ * one group, and an unmapped store target raised no SMMU fault. A wave that
++ * executes and touches nothing is a wave that stops early, so the remaining
++ * candidates are all about how far it is allowed to go.
++ *
++ * There are two of them and they are both single numbers, which is the reason
++ * this goes in as a boot argument instead of as two more builds:
++ *
++ *   polariscsinstr   SP_CS_INSTR_SIZE. 0240's comment enumerates three possible
++ *                    units for this field - 16 bytes, one instruction, one
++ *                    dword - and picks 32 because it is the largest of the
++ *                    three. Bytes are not in that list, and under bytes 32 is
++ *                    only eight dwords. 128 covers that reading too.
++ *   polariscsupd     SP_UPDATE_CNTL. The table ships 0xbf, and the comment
++ *                    beside it says 0xbf leaves out CS_UAV (0x40) and
++ *                    CS_BINDLESS (0x1f << 9) and that the missing CS_UAV alone
++ *                    would stop the wave. The value that comment describes is
++ *                    0x3eff. It has been in the prose since 0216 and never in
++ *                    the table.
++ *
++ * Both defaults are the values the table already carries, so a boot without the
++ * arguments behaves exactly as 0245 did.
++ */
++static uint32_t pg_cs_update_cntl = 0x000000bfu;
++static uint32_t pg_cs_instr_size = PG_CS_SHADER_WORDS;
++static bool pg_cs_args_read;
++
++static void
++pg_cs_read_args(void)
++{
++	int v;
++
++	if (pg_cs_args_read) {
++		return;
++	}
++	pg_cs_args_read = true;
++	if (PE_parse_boot_argn("polariscsupd", &v, sizeof(v))) {
++		pg_cs_update_cntl = (uint32_t)v;
++	}
++	if (PE_parse_boot_argn("polariscsinstr", &v, sizeof(v))) {
++		pg_cs_instr_size = (uint32_t)v;
++	}
++	printf("POLARIS GPU: 20 shader: update_cntl %#x, instr_size %u\n",
++	    pg_cs_update_cntl, pg_cs_instr_size);
++}
++
+ static void
+ pg_cs_emit(uint64_t iova, uint64_t fence_iova, uint32_t groups, uint32_t seq,
+     bool launch, uint64_t shader_base)
+@@ -6401,6 +6455,8 @@
+ 	uint32_t wptr = pg_cp_wptr;
+ 	uint32_t i, n;
+ 
++	pg_cs_read_args();
++
+ 	/* fd_ncrb on a6xx: one type-4 packet per register. */
+ 	for (i = 0; i < sizeof(pg_cs_ncr) / sizeof(pg_cs_ncr[0]); i++) {
+ 		pg_ring_put(wptr++, pg_pkt4(pg_cs_ncr[i].reg, 1u));
+@@ -6411,8 +6467,16 @@
+ 	n = (uint32_t)(sizeof(pg_cs_ctx) / sizeof(pg_cs_ctx[0]));
+ 	pg_ring_put(wptr++, pg_pkt7(0x5cu, 2u * (n + 3u)));	/* CP_CONTEXT_REG_BUNCH */
+ 	for (i = 0; i < n; i++) {
++		uint32_t value = pg_cs_ctx[i].value;
++
++		/* 0246: two entries are overridable; see pg_cs_read_args(). */
++		if (pg_cs_ctx[i].reg == 0x0bb08u) {
++			value = pg_cs_update_cntl;
++		} else if (pg_cs_ctx[i].reg == 0x0a9bcu) {
++			value = pg_cs_instr_size;
++		}
+ 		pg_ring_put(wptr++, pg_cs_ctx[i].reg);
+-		pg_ring_put(wptr++, pg_cs_ctx[i].value);
++		pg_ring_put(wptr++, value);
+ 	}
+ 	pg_ring_put(wptr++, 0x0a9b4u);			/* SP_CS_BASE */
+ 	pg_ring_put(wptr++, (uint32_t)shader_base);
+@@ -6430,8 +6494,12 @@
+ 	 * was copied along with the shape, and a literal 1 in two places is a
+ 	 * value that will disagree with itself the moment one of them is fixed.
+ 	 * Both now name the program length.
++	 *
++	 * 0246: and both now name pg_cs_instr_size, not the constant it defaults
++	 * to, because this is the write that actually lands. Leaving the override
++	 * out of this line would test the register table and boot the old value.
+ 	 */
+-	pg_ring_put(wptr++, PG_CS_SHADER_WORDS);
++	pg_ring_put(wptr++, pg_cs_instr_size);
+ 
+ 	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the shader */
+ 	pg_ring_put(wptr++, 0x00760000u);		/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
