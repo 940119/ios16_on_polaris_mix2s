@@ -365,7 +365,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5351,1869 @@
+@@ -5067,4 +5351,1866 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1281,25 +1281,37 @@
 +};
 +
 +/*
-+ * cs_program_emit_regs(), in its own order. Two things here differ from 0228:
-+ * SP_UPDATE_CNTL is the second register of the block rather than the last packet
-+ * of the stream, and SP_CS_CONFIG now names sixty-four UAVs instead of one, so the
-+ * count matches the block the descriptor page holds.
++ * cs_program_emit_regs(), in its own order.
 + *
-+ * The latch at the top is not a mistake: the whole block is one
-+ * CP_CONTEXT_REG_BUNCH, which the CP applies as a unit, so position inside it
-+ * carries no order. Writing it as its own packet at the end (0217 through 0228)
-+ * gave it an order it was never meant to have.
++ * 0232: every value here now equals the one in ir3/cs-regs.txt, the dump that
++ * computerator produced for this exact kernel - one instruction block, constlen
++ * 0, one buffer, THREAD128. Three had drifted, and each was a guess that the
++ * dump contradicts:
++ *
++ *   SP_MODE_CNTL            was 0x3 (ISAMMODE_CL + demotion), the dump says 0x5
++ *                           (ISAMMODE_GL + demotion). 0214 changed this on the
++ *                           reasoning that a kernel runs CL; Mesa, running this
++ *                           kernel, disagrees.
++ *   SP_CS_CONFIG            was 0x10400100, which is nuav 65 - 0228 OR-ed 64
++ *                           into a field that already read 1. The dump says
++ *                           nuav 1, and one is what is actually loaded.
++ *   SP_CS_CONST_CONFIG_0    was 0, naming constant 0 for both the workgroup id
++ *                           and the local id. The dump says 0x00fcfcfc, which is
++ *                           INVALID_REG in all four slots: this kernel takes no
++ *                           sysvals, so the SP must be told to write none.
++ *
++ * None of the three has ever been correct at the same time as the others, so the
++ * state block as a whole has never matched a configuration known to work.
 + */
 +static const struct pg_cs_reg pg_cs_ctx[] = {
-+	{ 0x0ab00, 0x00000003 },	/* SP_MODE_CNTL: ISAMMODE_CL, constant demotion */
++	{ 0x0ab00, 0x00000005 },	/* SP_MODE_CNTL: ISAMMODE_GL, constant demotion */
 +	{ 0x0bb08, 0x000000bf },	/* SP_UPDATE_CNTL: stages + cs + gfx_uav */
 +	{ 0x0b987, 0x00000100 },	/* SP_CS_CONST_CONFIG: constlen 0, enabled */
-+	{ 0x0a9bb, 0x10400100 },	/* SP_CS_CONFIG: enabled, nuav 64 */
++	{ 0x0a9bb, 0x00400100 },	/* SP_CS_CONFIG: enabled, nuav 1 */
 +	{ 0x0a9bc, 0x00000001 },	/* SP_CS_INSTR_SIZE: one 128-byte block */
 +	{ 0x0a9b0, 0x80100100 },	/* SP_CS_CNTL_0: merged regs, THREAD128, footprint 2 */
 +	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: 1 KB shared, const ram 128 */
-+	{ 0x0b997, 0x00000000 },	/* SP_CS_CONST_CONFIG_0: local id into r0.x, no consts */
++	{ 0x0b997, 0x00fcfcfc },	/* SP_CS_CONST_CONFIG_0: every constid INVALID */
 +	{ 0x0b998, 0x000002fc },	/* SP_CS_WGE_CNTL: THREAD128, no linear local id */
 +};
 +
@@ -1369,34 +1381,23 @@
 +	pg_ring_put(wptr++, (uint32_t)iova);
 +	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
 +	/*
-+	 * 0231: the descriptor goes into the packet instead of being pointed at.
++	 * 0232: back to SS6_INDIRECT, and to the address cs_uav_emit() uses - the
++	 * descriptor page itself.
 +	 *
-+	 * 0225 through 0230 loaded it with SS6_INDIRECT, which asks the SP to fetch it
-+	 * from a GPU address. 0230 settled that path: aiming every descriptor at a page
-+	 * with no PTE produced no fault at all, so nothing ever read that page. Rather
-+	 * than guess where the SP looks instead, hand it the sixteen words directly -
-+	 * SS6_DIRECT, num_unit 1, payload in the ring. Whatever lookup was broken is
-+	 * now out of the picture.
++	 * 0231 hand-delivered the descriptor as SS6_DIRECT and got exactly what
++	 * 0230 got: no store, no fault. Two very different packet shapes with the
++	 * same silence is not a property of either shape. What both builds shared
++	 * was the state block they were loaded into, and 0232 is the first build
++	 * whose block matches ir3/cs-regs.txt in every register. So this goes back
++	 * to the form the reference driver uses and lets the block be the variable.
 +	 *
-+	 * The address in this copy is the result page, so the same eight-word judgement
-+	 * as before applies. The descriptor page stays as 0230 left it - all sixty-four
-+	 * slots aimed at a page with no PTE - which makes this build a three-way test:
-+	 * the result page changes if the inline descriptor is used, the fault registers
-+	 * change if the page is fetched after all, and neither means neither.
++	 * num_unit is one descriptor - one 64-byte unit - which is what
++	 * cs_uav_emit() passes for one buffer.
 +	 */
-+	pg_ring_put(wptr++, pg_pkt7(0x34u, 19u));	/* CP_LOAD_STATE6_FRAG: 3 + 16 */
-+	pg_ring_put(wptr++, 0x0074c000u);		/* ST6_UAV / DIRECT / CS_SHADER / 1 */
-+	pg_ring_put(wptr++, 0u);			/* EXT_SRC_ADDR, unused for DIRECT */
-+	pg_ring_put(wptr++, 0u);
-+	pg_ring_put(wptr++, 0x12c06880u);		/* R32_UINT, linear, identity swizzle */
-+	pg_ring_put(wptr++, PG_CS_RESULT_WORDS);	/* width in elements */
-+	pg_ring_put(wptr++, 0x80000010u);		/* A6XX_TEX_BUFFER */
-+	pg_ring_put(wptr++, 0u);
-+	pg_ring_put(wptr++, (uint32_t)(iova + 2u * PG_GMU_PAGE_SIZE));
-+	pg_ring_put(wptr++, (uint32_t)((iova + 2u * PG_GMU_PAGE_SIZE) >> 32));
-+	for (i = 0; i < 10u; i++) {
-+		pg_ring_put(wptr++, 0u);
-+	}
++	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: 3 */
++	pg_ring_put(wptr++, 0x0076c000u);		/* ST6_UAV / INDIRECT / CS / 1 */
++	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
++	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
 +
 +	/* cs_uav_emit(): the pointer and the count, after the preload. */
 +	pg_ring_put(wptr++, pg_pkt7(0x5cu, 6u));
@@ -1496,8 +1497,9 @@
 +	 * first register access, so "is it in the ring" answers "did this kernel run"
 +	 * without needing a second source.
 +	 */
-+	printf("POLARIS GPU: 20 shader: ======== build 0231 alive: the descriptor rides "
-+	    "in the packet (SS6_DIRECT), not at an address ========\n");
++	printf("POLARIS GPU: 20 shader: ======== build 0232 alive: every register now "
++	    "agrees with cs-regs.txt, and the descriptor sits at its address "
++	    "again ========\n");
 +	if (pg_gpu3d == 0 || pg_ring_va[0] == 0) {
 +		printf("POLARIS GPU: 20 shader: the CP is not there\n");
 +		return;
@@ -1538,25 +1540,20 @@
 +		desc[i] = 0;
 +	}
 +	/*
-+	 * 0230: all sixty-four slots, each pointing at a page that has never been
-+	 * mapped.
++	 * 0232: slot 0 aims at the result page, the other sixty-three at the page
++	 * with no PTE.
 +	 *
-+	 * 0227 aimed the one descriptor at the page it lives in, so that any store at
-+	 * all would overwrite descriptor[0] in a page already being read back: nothing.
-+	 * 0228 filled all sixty-four, each aimed at its own block of the result page:
-+	 * nothing either, and USIZE read back 64. So the descriptor block is in place
-+	 * and no store lands. The one question left is whether the shader's store uses
-+	 * that block at all.
-+	 *
-+	 * An unmapped address answers it in one line. A descriptor that is read and
-+	 * honoured sends the store into a page with no PTE, and the SMMU latches the
-+	 * fault. A descriptor that is never read changes nothing, and the fault
-+	 * registers stay exactly as they were before the dispatch. Either answer is
-+	 * worth more than the last three builds, which could not tell the two apart.
++	 * USIZE is 1, so only the first descriptor is in the state buffer at all;
++	 * the rest are there so that a store which resolves to any other index
++	 * reports itself as a fault instead of vanishing. That is the whole point of
++	 * keeping both targets in one build: a sentinel in the result page means the
++	 * descriptor worked, a fault means one was read but not slot 0, and silence
++	 * means the store still is not happening.
 +	 */
 +	for (s = 0; s < PG_CS_DESC_SLOTS; s++) {
 +		volatile uint32_t * d = desc + s * 16u;
-+		uint64_t target = PG_CS_MISSING_IOVA;
++		uint64_t target = (s == 0) ? (iova + 2u * PG_GMU_PAGE_SIZE) :
++		    PG_CS_MISSING_IOVA;
 +
 +		/*
 +		 * The 64-byte buffer view, from fdl6_buffer_view_init(): R32_UINT,
@@ -1653,10 +1650,9 @@
 +		    rptr, wptr);
 +	}
 +	/*
-+	 * 0230: did aiming the descriptors at a page with no PTE change the fault
-+	 * registers? This is the one question the last three builds could not answer:
-+	 * 0227 and 0228 both proved that no store lands on a mapped page, but not
-+	 * whether the store ever looks at the descriptor it was given.
++	 * 0232: slot 0 is mapped, the rest are not, so this one read answers both
++	 * questions at once - whether any descriptor is consulted (a fault) and
++	 * whether slot 0 is the one the store wants (the sentinel, read below).
 +	 *
 +	 * Printed before the fence is waited on, because a store into an unmapped page
 +	 * is exactly the case where the CP may stop answering.
@@ -1665,14 +1661,15 @@
 +		uint32_t fsr1 = 0;
 +		uint64_t far1 = pg_smmu_far(&fsr1);
 +
-+		printf("POLARIS GPU: 20 shader: the descriptors point at %#llx; SMMU "
-+		    "before FSR %#010x FAR %#010x%08x, after FSR %#010x FAR "
-+		    "%#010x%08x\n", PG_CS_MISSING_IOVA, fsr0, (uint32_t)(far0 >> 32),
-+		    (uint32_t)far0, fsr1, (uint32_t)(far1 >> 32), (uint32_t)far1);
++		printf("POLARIS GPU: 20 shader: slot 0 points at %#llx, the other slots at "
++		    "%#llx; SMMU before FSR %#010x FAR %#010x%08x, after FSR %#010x FAR "
++		    "%#010x%08x\n", iova + 2u * PG_GMU_PAGE_SIZE, PG_CS_MISSING_IOVA, fsr0,
++		    (uint32_t)(far0 >> 32), (uint32_t)far0, fsr1, (uint32_t)(far1 >> 32),
++		    (uint32_t)far1);
 +		printf("POLARIS GPU: 20 shader: %s\n",
 +		    (far1 != far0 || fsr1 != fsr0) ?
-+		    "THE STORE USES THE DESCRIPTOR: a target with no PTE raised a fault" :
-+		    "THE STORE NEVER REACHES THE DESCRIPTOR BLOCK: an unmapped target changed nothing");
++		    "A DESCRIPTOR WAS READ: an unmapped target raised a fault, so the store is running and the index is not 0" :
++		    "NO DESCRIPTOR WAS READ: an unmapped target changed nothing, so the store is not reaching the UAV block at all");
 +	}
 +
 +	if (pg_fence_reached(fence, seq, 20000u)) {
