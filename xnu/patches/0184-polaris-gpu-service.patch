@@ -365,7 +365,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5351,1924 @@
+@@ -5067,4 +5351,1866 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1347,15 +1347,10 @@
 + * The state values are unchanged from 0219-0228: those were derived from the same
 + * file and have been read back correct since. What changes is where each packet
 + * sits and which channel each register goes through.
-+ * 0234: shader_base is new, and exists only so that the caller can point the
-+ * wave at an address that has no PTE. It feeds both places the shader's address
-+ * appears - the CS block's SP_CS_BASE and the CP_LOAD_STATE6 source - because a
-+ * prefilled instruction cache would otherwise hide the fetch this build is
-+ * trying to provoke. Every ordinary call passes iova, so nothing else changes.
 + */
 +static void
 +pg_cs_emit(uint64_t iova, uint64_t fence_iova, uint32_t groups, uint32_t seq,
-+    bool launch, uint64_t shader_base)
++    bool launch)
 +{
 +	uint32_t wptr = pg_cp_wptr;
 +	uint32_t i, n;
@@ -1374,17 +1369,17 @@
 +		pg_ring_put(wptr++, pg_cs_ctx[i].value);
 +	}
 +	pg_ring_put(wptr++, 0x0a9b4u);			/* SP_CS_BASE */
-+	pg_ring_put(wptr++, (uint32_t)shader_base);
++	pg_ring_put(wptr++, (uint32_t)iova);
 +	pg_ring_put(wptr++, 0x0a9b5u);
-+	pg_ring_put(wptr++, (uint32_t)(shader_base >> 32));
++	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
 +	pg_ring_put(wptr++, 0x0a9bcu);			/* SP_CS_INSTR_SIZE, as computerator
 +							 * writes it a second time */
 +	pg_ring_put(wptr++, 1u);
 +
 +	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the shader */
 +	pg_ring_put(wptr++, 0x00760000u);		/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
-+	pg_ring_put(wptr++, (uint32_t)shader_base);
-+	pg_ring_put(wptr++, (uint32_t)(shader_base >> 32));
++	pg_ring_put(wptr++, (uint32_t)iova);
++	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
 +	/*
 +	 * 0232: back to SS6_INDIRECT, and to the address cs_uav_emit() uses - the
 +	 * descriptor page itself.
@@ -1502,9 +1497,9 @@
 +	 * first register access, so "is it in the ring" answers "did this kernel run"
 +	 * without needing a second source.
 +	 */
-+	printf("POLARIS GPU: 20 shader: ======== build 0234 alive: the wave is pointed "
-+	    "at a page with no PTE, so the fault detector has to say whether it can "
-+	    "see an SP fault ========\n");
++	printf("POLARIS GPU: 20 shader: ======== build 0232 alive: every register now "
++	    "agrees with cs-regs.txt, and the descriptor sits at its address "
++	    "again ========\n");
 +	if (pg_gpu3d == 0 || pg_ring_va[0] == 0) {
 +		printf("POLARIS GPU: 20 shader: the CP is not there\n");
 +		return;
@@ -1606,59 +1601,6 @@
 +	far0 = pg_smmu_far(&fsr0);
 +
 +	/*
-+	 * 0234: first, ask whether a fault from the SP can be seen at all.
-+	 *
-+	 * Twenty builds have treated "FSR and FAR did not change" as proof that a
-+	 * store did not happen, and 0221 had already noticed that the FARs held
-+	 * leftovers while sGFSR never left zero. Every one of those verdicts rests on
-+	 * an assumption nobody has tested: that these two registers report a fault
-+	 * raised by the shader processor.
-+	 *
-+	 * This asks the question directly. The wave is pointed at a page in the
-+	 * window that no PTE has ever entered, one group, nothing else changed. If
-+	 * the SP fetches an instruction from there, it must fault, and the fault must
-+	 * appear in FSR or FAR if these registers are the right ones. If they do not
-+	 * move, then they are not, and every "no fault" conclusion from 0221 to 0232
-+	 * - including the one that retired the descriptor page in 0230 - is void.
-+	 *
-+	 * Either answer is worth this build: one way the fault detector is real and
-+	 * the store genuinely is not executing; the other way twenty builds have been
-+	 * reading a register that reports nothing.
-+	 */
-+	{
-+		uint64_t at = mach_absolute_time();
-+		uint64_t farB;
-+		uint32_t fsrB = 0, ms;
-+		bool seen;
-+
-+		seq = polaris_gpu_fence_next();
-+		pg_cs_emit(iova, fence_iova, 1u, seq, true, PG_CS_MISSING_IOVA);
-+		seen = pg_fence_reached(fence, seq, 5000u);
-+		farB = pg_smmu_far(&fsrB);
-+		absolutetime_to_nanoseconds(mach_absolute_time() - at, &ns);
-+		ms = (uint32_t)(ns / 1000000ull);
-+		printf("POLARIS GPU: 20 shader: SP_CS_BASE %#llx has no PTE; 1 group: "
-+		    "fence %s, %u ms; SMMU FSR %#010x FAR %#010x%08x\n",
-+		    PG_CS_MISSING_IOVA, seen ? "arrived" : "MISSING", ms, fsrB,
-+		    (uint32_t)(farB >> 32), (uint32_t)farB);
-+		printf("POLARIS GPU: 20 shader: %s\n",
-+		    (farB != far0 || fsrB != fsr0) ?
-+		    "AN SP FAULT IS VISIBLE: the SMMU reports instruction fetches, so silence after a store means the store never ran" :
-+		    "AN SP FAULT IS INVISIBLE: an instruction fetch from a page with no PTE changed nothing, so these registers do not report SP faults and no earlier no-fault verdict means anything");
-+		if (!seen) {
-+			printf("POLARIS GPU: 20 shader: the CP stopped answering after the "
-+			    "unmapped fetch; the rest of this test needs a live ring\n");
-+			polaris_gpu_cp_report("after the unmapped instruction fetch");
-+			polaris_gpu_smmu_fault();
-+			polaris_gpu_unmap(iova, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
-+			polaris_gpu_mapped();
-+			polaris_gpu_address_free(iova, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
-+			polaris_gpu_pool_free(pa, (uint64_t)PG_CS_PAGES * PG_GMU_PAGE_SIZE);
-+			return;
-+		}
-+	}
-+
-+	/*
 +	 * 0223: first, the same state with no dispatch at all. If this fence never
 +	 * arrives then the bindless state itself wedges the CP or the SP, and the
 +	 * shader was never the problem. If it arrives, the state is fine and the
@@ -1671,7 +1613,7 @@
 +		bool seen;
 +
 +		seq = polaris_gpu_fence_next();
-+		pg_cs_emit(iova, fence_iova, 1u, seq, false, iova);
++		pg_cs_emit(iova, fence_iova, 1u, seq, false);
 +		seen = pg_fence_reached(fence, seq, 20000u);
 +		absolutetime_to_nanoseconds(mach_absolute_time() - at, &ns);
 +		ms = (uint32_t)(ns / 1000000ull);
@@ -1692,7 +1634,7 @@
 +	}
 +
 +	seq = polaris_gpu_fence_next();
-+	pg_cs_emit(iova, fence_iova, 1u, seq, true, iova);
++	pg_cs_emit(iova, fence_iova, 1u, seq, true);
 +	wptr = pg_cp_wptr;
 +
 +	for (i = 0; i < 2000u; i++) {
@@ -1856,7 +1798,7 @@
 +			bool took = false, seen;
 +
 +			seq = polaris_gpu_fence_next();
-+			pg_cs_emit(iova, fence_iova, probe[k], seq, true, iova);
++			pg_cs_emit(iova, fence_iova, probe[k], seq, true);
 +			wptr = pg_cp_wptr;
 +			for (i = 0; i < 20000u; i++) {
 +				rp = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u);
