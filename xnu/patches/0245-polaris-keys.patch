@@ -1,0 +1,251 @@
+diff -Nur a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -3,6 +3,33 @@
+  * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ *
++ * 0245 adds the wiring this phone actually has, selected with sweetkeys=2, and
++ * leaves sweetkeys=1 exactly as it was:
++ *
++ *	polaris (Mi MIX 2S, SDM845, PM8998 on slave 0)
++ *	  power		PON KPDPWR, peripheral 0x0800, status 0x0810 bit 0
++ *	  volume down	PON RESIN,  the same status, bit 1
++ *	  volume up	PM8998 GPIO6, peripheral 0xc500, status 0xc510 bit 0
++ *			(active low: the pin is pulled up and the key shorts it)
++ *
++ * Both facts are in this phone's own device tree and both agree with what the
++ * Mi 8 port already runs: /soc/gpio_keys/vol_up points at pin 6 of the PM8998's
++ * own gpio controller, pinctrl key_vol_up configures "gpio6" as an input with a
++ * pull-up, and the PON node exposes kpdpwr and resin as its first two
++ * interrupts (pon_1 = KEY_POWER 116, pon_2 = KEY_VOLUMEDOWN 114). redwood_buttons.c
++ * on the Mi 8 - the same PM8998 - reads the same two peripherals as 0x008 and
++ * 0x0c5 with KPDPWR on bit 0 and RESIN on bit 1 (its EXP-0064).
++ *
++ * The SM6150 numbers below are kept for the board they were measured on, where
++ * volume-up is a PM6150L pin (slave 4, 0xc100). They are wrong for this phone in
++ * exactly one place: the GPIO peripheral. The arbiter itself is right - core
++ * 0xc440000, observer 0xe600000 and configuration 0xc40a000 are the three
++ * regions named "core", "obsrvr" and "cnfg" in this phone's spmi-pmic-arb node.
++ *
++ * One more thing this file learned from the Mi 8: every ml_io_map() takes I/O
++ * window for good, and three drivers mapping the same arbiter ran the window
++ * out at boot. The three maps are taken once, here, and kept.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -16,6 +43,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern void sweet_log_flush_now(void);
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0c440000u
+@@ -25,10 +53,24 @@
+ #define KEYS_GPIO_RT     0xc110u
+ #define KEYS_NO_APID     0xffffu
+ 
++/* The two PPIDs as the other board numbers them. */
++#define KEYS_SM6150_PON_PPID	0x008u
++#define KEYS_SM6150_GPIO_PPID	0x4c1u
++
++/* 0245: and as this phone numbers them. */
++#define KEYS_POLARIS_PON_PPID	0x008u		/* slave 0, registers 0x0800 */
++#define KEYS_POLARIS_GPIO_PPID	0x0c5u		/* slave 0, GPIO6 at 0xc500 */
++#define KEYS_POLARIS_GPIO_RT	0xc510u
++#define KEYS_POLARIS_GPIO_MODE	0xc540u
++#define KEYS_POLARIS_GPIO_EN	0xc546u
++#define KEYS_POLARIS_GPIO_SUB	0xc505u
++
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
++static bool keys_polaris;			/* 0245: which wiring this boot uses */
++static uint16_t keys_gpio_rt = KEYS_GPIO_RT;	/* and where its volume-up status is */
+ static int keys_sleep_chan;
+ 
+ static uint32_t
+@@ -96,12 +138,13 @@
+ {
+ 	int state[3] = {0, 0, 0};
+ 	unsigned errors = 0;
++	int raw_pon = -1, raw_gpio = -1;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++		bool gok = keys_read(keys_gpio_apid, keys_gpio_rt, &gpio);
+ 		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+ 		if (!pok || !gok) {
+ 			if ((errors++ % 250u) == 0) {
+@@ -111,10 +154,26 @@
+ 		} else {
+ 			errors = 0;
+ 		}
++		/*
++		 * 0245: the raw bytes, whenever they move. The Mi 8 port found the
++		 * key bits this way (its EXP-0064) rather than trusting a register
++		 * map, and it costs one comparison per poll: if a press moves a bit
++		 * other than the three named below, this line says which.
++		 */
++		if (pok && (int)pon != raw_pon) {
++			printf("SWEET KEYS: raw pon %#04x (was %#04x)\n", pon,
++			    raw_pon < 0 ? 0 : raw_pon);
++			raw_pon = pon;
++		}
++		if (gok && (int)gpio != raw_gpio) {
++			printf("SWEET KEYS: raw gpio %#04x (was %#04x)\n", gpio,
++			    raw_gpio < 0 ? 0 : raw_gpio);
++			raw_gpio = gpio;
++		}
+ 		for (int k = 0; k < 3; ++k) {
+ 			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+ 				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
++				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
+ 			}
+@@ -128,18 +187,29 @@
+ {
+ 	int enabled = 1;
+ 	thread_t thread;
+-	if (!sweet_touch_board()) {
+-		printf("SWEET KEYS: SM7150 not confirmed; PMIC driver prohibited\n");
+-		return;
+-	}
+ 	if (keys_started) {
+ 		return;
+ 	}
+ 	keys_started = true;
+ 	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+-		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+-		return;
++		printf("SWEET KEYS: disabled (sweetkeys=%d)\n", enabled);
++		return;
++	}
++	/*
++	 * 0245: sweetkeys=2 is this phone's wiring, and it is chosen before the
++	 * SM7150 gate because that gate exists to keep this driver off boards
++	 * whose PMIC wiring was never checked - this one has been checked, twice:
++	 * the device tree's gpio_keys/vol_up and PON interrupts, and the Mi 8
++	 * port's own PPIDs for the same PM8998.
++	 */
++	keys_polaris = (enabled >= 2);
++	if (!keys_polaris && !sweet_touch_board()) {
++		printf("SWEET KEYS: SM7150 not confirmed; PMIC driver prohibited\n");
++		return;
++	}
++	if (keys_polaris) {
++		keys_gpio_rt = KEYS_POLARIS_GPIO_RT;
+ 	}
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+ 	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+@@ -150,29 +220,80 @@
+ 	}
+ 	keys_version = keys_rd(keys_core, 0);
+ 	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
++	printf("SWEET KEYS: ======== build 0245 alive: %s wiring, arbiter at %#x ========\n",
++	    keys_polaris ? "pm8998 (this phone)" : "sm6150 (the board this file was written on)",
++	    KEYS_CORE_PA);
++	sweet_log_flush_now();
+ 	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
+ 	    count == 0 || count > 512) {
+ 		printf("SWEET KEYS: unsupported arbiter version=%#x apids=%u\n",
+ 		    keys_version, count);
+ 		return;
+ 	}
+-	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	keys_pon_apid = keys_find_apid(keys_polaris ? KEYS_POLARIS_PON_PPID : KEYS_SM6150_PON_PPID,
++	    count);
++	keys_gpio_apid = keys_find_apid(keys_polaris ? KEYS_POLARIS_GPIO_PPID : KEYS_SM6150_GPIO_PPID,
++	    count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	bool gok = keys_read(keys_gpio_apid, keys_gpio_rt, &gpio);
++	bool mok = keys_read(keys_gpio_apid,
++	    keys_polaris ? KEYS_POLARIS_GPIO_MODE : 0xc140, &mode);
++	bool eok = keys_read(keys_gpio_apid,
++	    keys_polaris ? KEYS_POLARIS_GPIO_EN : 0xc146, &en);
++	bool sok = keys_read(keys_gpio_apid,
++	    keys_polaris ? KEYS_POLARIS_GPIO_SUB : 0xc105, &subtype);
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio-apid=%u ppid pon=%#x gpio=%#x "
++	    "pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+ 	    keys_version, count, keys_pon_apid, keys_gpio_apid,
++	    keys_polaris ? KEYS_POLARIS_PON_PPID : KEYS_SM6150_PON_PPID,
++	    keys_polaris ? KEYS_POLARIS_GPIO_PPID : KEYS_SM6150_GPIO_PPID,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+-	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
++	sweet_log_flush_now();
++	/*
++	 * 0245: when a PPID is not in the table, print the table. The arbiter
++	 * keeps one entry per APID; a scan of the first entries names every
++	 * peripheral the firmware published, which is the one thing that turns
++	 * "the key does nothing" into "the pin is somewhere else".
++	 */
++	if (keys_pon_apid == KEYS_NO_APID || keys_gpio_apid == KEYS_NO_APID) {
++		uint32_t shown = count < 48u ? count : 48u;
++
++		printf("SWEET KEYS: a PPID is missing, so the arbiter's table, %u of %u:\n",
++		    shown, count);
++		for (uint32_t i = 0; i < shown; ++i) {
++			uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
++			if (map == 0) {
++				continue;
++			}
++			printf("SWEET KEYS:   apid %2u ppid %#05x owner %u\n", i,
++			    (map >> 8) & 0xfffu, keys_rd(keys_cnfg, 0x700u + 4u * i) & 7u);
++		}
++		sweet_log_flush_now();
++	}
++	/*
++	 * GPIO configuration belongs to firmware. Diagnose, never repair it here.
++	 *
++	 * 0245: on this phone the answer is printed and the key is kept. The
++	 * encoding below was measured on the other board's pin controller; the
++	 * PM8998's mode byte is a different layout, and withholding a key because
++	 * a register this kernel has never read before disagrees with a guess is
++	 * the wrong way round. The raw status line in the poll thread is what
++	 * says whether the pin moves.
++	 */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+ 	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+-		keys_gpio_apid = KEYS_NO_APID;
++		if (keys_polaris) {
++			printf("SWEET KEYS: pm8998 gpio6 %s as an input by the sm6150 rule "
++			    "(mode %#x en %#x subtype %#x); kept, the raw line decides\n",
++			    (dir == 0 || dir == 2) ? "looks" : "does not look", mode, en,
++			    subtype);
++		} else {
++			printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up "
++			    "withheld, PMIC unchanged\n");
++			keys_gpio_apid = KEYS_NO_APID;
++		}
+ 	}
+ 	if (!pok && !gok) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+@@ -180,8 +301,10 @@
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
++		printf("SWEET KEYS: polling every 20 ms; power, volume up, volume down\n");
+ 	} else {
+ 		printf("SWEET KEYS: kernel_thread_start failed %d\n", kr);
+ 	}
++	sweet_log_flush_now();
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
