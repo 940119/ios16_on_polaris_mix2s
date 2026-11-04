@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1726 @@
+@@ -5067,4 +5336,1691 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1155,24 +1155,27 @@
 +#define PG_CS_PAGES		4u
 +
 +/*
-+ * 0224: a kernel that does nothing at all.
++ * 0225: back to the classic UAV block, and this is the correction that matters.
 + *
-+ * 0223 settled the state question - the whole bindless state, written with no
-+ * dispatch, hands the fence back in zero milliseconds - so the wedge is inside
-+ * the dispatch. What has never been verified is the premise underneath every
-+ * build since 0215: that a wave actually executes instructions. The 218 ms that
-+ * sixty-five thousand groups cost is consistent with that, and equally
-+ * consistent with sixty-five thousand launches that fail one after another.
++ * 0216 moved the descriptor to the bindless descriptor set because ir3_gallium.c
++ * says `lower_to_bindless = gen >= 6`. That line is true, and it applies to
++ * shaders that arrive through NIR. This one does not: it is parsed straight out of
++ * text by ir3_parse_asm, and the emitter that Mesa ships for exactly that case -
++ * computerator's cs_program_emit_regs(), which is what produced ir3/cs-regs.txt -
++ * puts the descriptor in the old block and loads it with
++ * CP_LOAD_STATE6 / ST6_UAV / SS6_INDIRECT, not SS6_BINDLESS.
 + *
-+ * So this shader is `end` and nothing else. No store, no descriptor, no index -
-+ * the wave has one instruction to run and cannot touch memory.
-+ *
-+ * If the fence arrives, waves do execute and every earlier failure belongs to
-+ * the descriptor or the store. If it wedges, the problem was never in the store
-+ * and eleven builds were spent downstream of it.
++ * 0224 proved the difference is real: an empty kernel runs to completion in 58 ms
++ * with no SMMU fault at all, while the same state with a store wedges and faults.
++ * So the wave executes, the state is right, and the only thing left is how the
++ * store finds its buffer. It finds it here.
 + */
 +static const uint32_t pg_cs_shader[PG_CS_SHADER_WORDS] = {
-+	0x00000000u, 0x03000000u,	/* end - and nothing else */
++	0x0209c0deu, 0x204cc004u,	/* mov.u32u32 r1.x, 0x0209c0de */
++	0x00000000u, 0x204cc000u,	/* mov.u32u32 r0.x, 0 */
++	0x00000000u, 0x00000500u,	/* (rpt5)nop */
++	0x00674000u, 0xc0260004u,	/* stib.b.untyped.1d.u32.1.imm r1.x, r0.x, 0 */
++	0x00000000u, 0x03000000u,	/* end */
 +	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
 +	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
 +	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
@@ -1272,62 +1275,32 @@
 +	pg_ring_put(wptr++, pg_pkt7(0x63u, 1u));	/* CP_SET_MODE */
 +	pg_ring_put(wptr++, 1u);			/* apply, do not defer */
 +	/*
-+	 * One CP_CONTEXT_REG_BUNCH with every pair. The 64-bit ones go in as
-+	 * <reg><lo><reg+1><hi>, which is what fd_crb::add() does for a reg64.
-+	 */
-+	/*
-+	 * 0217: addresses first, state second, the latch last.
++	 * Addresses first, the program's state next, the latch last.
 +	 *
 +	 * SP_UPDATE_CNTL is not a configuration register, it is a strobe that says
 +	 * "these blocks have new state, take it now". Mesa can put it first because
 +	 * it lives inside a state group that the CP applies as a unit; flattened
-+	 * into a plain stream it was being written before the base addresses it
-+	 * refers to, so the SP latched a CS state whose bindless base was still
-+	 * zero - and the first dispatch after that wedged the GPU. The ring drained,
-+	 * no fence ever arrived and the SP never came back.
++	 * into a plain stream it would be written before the addresses it refers to.
++	 * The 64-bit ones go in as <reg><lo><reg+1><hi>, which is what fd_crb::add()
++	 * does for a reg64.
 +	 */
 +	{
-+		pg_ring_put(wptr++, pg_pkt7(0x5cu, 24u));	/* CP_CONTEXT_REG_BUNCH */
++		pg_ring_put(wptr++, pg_pkt7(0x5cu, 10u));	/* CP_CONTEXT_REG_BUNCH */
 +		pg_ring_put(wptr++, 0x0a9b4u);			/* SP_CS_BASE */
 +		pg_ring_put(wptr++, (uint32_t)iova);
 +		pg_ring_put(wptr++, 0x0a9b5u);
 +		pg_ring_put(wptr++, (uint32_t)(iova >> 32));
 +		/*
-+		 * 0216: the descriptor set, not the old UAV block.
-+		 *
-+		 * gen >= 6 lowers every SSBO access to the bindless form
-+		 * (ir3_gallium.c: `lower_to_bindless = gen >= 6`), so a store does not
-+		 * read a descriptor out of an SP_CS_UAV_BASE block - it takes a
-+		 * descriptor *index* and adds it to the set base held here. 0211-0215
-+		 * filled the old block, which this shader never looks at, so it read a
-+		 * descriptor of zeros: width 0, and a store against a zero-length
-+		 * buffer is dropped without a fault. That is exactly what "waves run,
-+		 * 218 ms of them, and not one word changes" looks like.
-+		 *
-+		 * DESC_SIZE lives in the low two bits of the same qword
-+		 * (BINDLESS_DESCRIPTOR_64B = 3), which is why the address goes in as
-+		 * <addr & ~3> | 3. Compute is descriptor set 0, and SSBO slot 0 is at
-+		 * offset 0 of that set, which is the start of the descriptor page.
++		 * The classic block: a pointer and a count. The descriptors live at
++		 * SP_CS_UAV_BASE and there are SP_CS_USIZE of them, which is what
++		 * cs_program_emit_regs() leaves for a text-assembled compute shader.
 +		 */
-+		/*
-+		 * 0222: all five descriptor sets, not just set 0.
-+		 *
-+		 * 0221 finally proved the fault is real - FAR was zero before the
-+		 * dispatch and garbage after it - so the SP is reading a descriptor from
-+		 * somewhere that is not ours. It reads the set named by the base field in
-+		 * the `stib` encoding, which is not something this file can know: the
-+		 * ir3 text does not carry it and the assembler chose it. Writing the same
-+		 * base into all five sets makes that choice irrelevant, and it is what
-+		 * Mesa does - it is why Mesa can set CS_BINDLESS to 0x1f without lying.
-+		 *
-+		 * SP_CS_BINDLESS_BASE(i) is 0x0a9e8 + 2 * i, a 64-bit register each.
-+		 */
-+		for (i = 0; i < 5u; i++) {
-+			pg_ring_put(wptr++, 0x0a9e8u + 2u * i);	/* SP_CS_BINDLESS_BASE(i) */
-+			pg_ring_put(wptr++, ((uint32_t)(iova + PG_GMU_PAGE_SIZE) & ~3u) | 3u);
-+			pg_ring_put(wptr++, 0x0a9e9u + 2u * i);
-+			pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
-+		}
++		pg_ring_put(wptr++, 0x0a9f2u);			/* SP_CS_UAV_BASE */
++		pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
++		pg_ring_put(wptr++, 0x0a9f3u);
++		pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++		pg_ring_put(wptr++, 0x0aa00u);			/* SP_CS_USIZE */
++		pg_ring_put(wptr++, 1u);
 +	}
 +	{
 +		uint32_t n = (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]));
@@ -1343,22 +1316,14 @@
 +	pg_ring_put(wptr++, (uint32_t)iova);
 +	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
 +	/*
-+	 * 0221: the preload is back, and it is the point of this build.
-+	 *
-+	 * 0217 dropped this packet to change one thing at a time, on the theory that
-+	 * a shader can fetch its descriptor on demand. Four builds later the GPU
-+	 * still wedges, and the wedge is not a fault: sGFSR stays zero, which is not
-+	 * what a translation fault looks like. What it does look like is the SP
-+	 * waiting for a descriptor that was never put in front of it - and this
-+	 * packet is the thing that puts it there.
-+	 *
-+	 * For SS6_BINDLESS the third dword is not an address: it is
-+	 * (set << 28) | slot * FDL6_TEX_CONST_DWORDS, so zero for set 0, ssbo 0.
++	 * 0225: and the descriptor itself, loaded indirectly from the block the
++	 * pointer above names - ST6_UAV, SS6_INDIRECT, one unit, address 0x10c15000.
++	 * This is the pair of packets cs_program_emit_regs() produces.
 +	 */
 +	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG */
-+	pg_ring_put(wptr++, 0x0075c000u);		/* ST6_UAV / BINDLESS / CS_SHADER / 1 */
-+	pg_ring_put(wptr++, 0u);			/* set 0, ssbo 0 */
-+	pg_ring_put(wptr++, 0u);
++	pg_ring_put(wptr++, 0x0076c000u);		/* ST6_UAV / INDIRECT / CS_SHADER / 1 */
++	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
++	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
 +	/*
 +	 * 0223: with launch false the state is written, the fence is armed, and no
 +	 * dispatch is ever issued. That separates "the CP/SP chokes on this state"
@@ -1415,7 +1380,7 @@
 +	 */
 +	pg_ring_put(wptr++, pg_pkt7(0x5cu, 2u));	/* the latch, now that the state is in */
 +	pg_ring_put(wptr++, 0x0bb08u);			/* SP_UPDATE_CNTL */
-+	pg_ring_put(wptr++, 0x00003effu);		/* stages, cs, cs_uav, gfx_uav, all five sets */
++	pg_ring_put(wptr++, 0x000000ffu);		/* stages, cs, cs_uav, gfx_uav */
 +	pg_ring_put(wptr++, pg_pkt7(0x33u, 4u));	/* CP_EXEC_CS */
 +	pg_ring_put(wptr++, 0u);
 +	pg_ring_put(wptr++, groups);
@@ -1587,10 +1552,10 @@
 +		    "%08x %08x\n", result[0], result[1], result[2], result[3], result[4],
 +		    result[5], result[6], result[7]);
 +		printf("POLARIS GPU: 20 shader: the registers read back SP_CS_BASE %08x%08x "
-+		    "INSTR_SIZE %08x BINDLESS_BASE %08x%08x\n",
++		    "INSTR_SIZE %08x UAV_BASE %08x%08x USIZE %08x\n",
 +		    pg_rd(pg_gpu3d + 4u * 0x0a9b5), pg_rd(pg_gpu3d + 4u * 0x0a9b4),
-+		    pg_rd(pg_gpu3d + 4u * 0x0a9bc), pg_rd(pg_gpu3d + 4u * 0x0a9e9),
-+		    pg_rd(pg_gpu3d + 4u * 0x0a9e8));
++		    pg_rd(pg_gpu3d + 4u * 0x0a9bc), pg_rd(pg_gpu3d + 4u * 0x0a9f3),
++		    pg_rd(pg_gpu3d + 4u * 0x0a9f2), pg_rd(pg_gpu3d + 4u * 0x0aa00));
 +		/*
 +		 * 0214: these four say whether the state really landed in the
 +		 * context the dispatch used. If CP_SET_MARKER is doing its job
