@@ -1,0 +1,130 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -158,6 +158,27 @@
+ 	uint64_t      fBlitGatherRows;          /* rows that went through the gather */
+ 	uint64_t      fBlitPixels;              /* panel pixels written in the window */
+ 	bool          fGatherPeriod;            /* gather skips the column map */
++	/*
++	 * 0249: what the two bars of sweetfb_fit=1 are filled with.
++	 *
++	 * Fit is the only undistorted mapping of a 750x1624 frame onto this
++	 * 1080x2160 panel: 2160/1624 gives 997 content columns, so 83 panel
++	 * columns have no source. They are left at whatever the panel was
++	 * cleared to, which is black. Nothing about that is a scaling problem -
++	 * a 19.5:9 frame cannot both stay uniform and fill an 18:9 panel - so
++	 * the only zero-cost fix is to paint those columns from the frame's
++	 * outermost ones instead of leaving them black.
++	 *
++	 *   0  off, the bars stay black (exactly the 0244 behaviour)
++	 *   1  clamp: the outermost source column is repeated into the bar
++	 *   2  mirror: the outermost columns are reflected into the bar
++	 *
++	 * Icons and text all sit inside the content area with a margin, so
++	 * neither mode changes a single pixel of them; and because the logical
++	 * size, the surface and the touch mapping are untouched, the whole iOS
++	 * software stack is unaware this exists.
++	 */
++	int           fEdgeMode;               /* 0 bars, 1 clamp, 2 mirror */
+ 	uint16_t      fColMap[SWEET_FB_COLMAP_MAX];    /* panel x -> logical x */
+ 	uint32_t     *fStage;                   /* one stretched panel row, cacheable */
+ 	uint64_t      fSwapLast;        /* mach time of the previous swap */
+@@ -236,6 +257,7 @@
+ 	fContentH = fHeight;
+ 	fScale = 0;
+ 	fSrcOffX = 0;
++	fEdgeMode = 0;
+ 	/* The split counters are subtracted from each other in the report, so
+ 	 * they get an explicit zero rather than whatever the allocation held. */
+ 	fBlitGather = 0;
+@@ -299,17 +321,45 @@
+ 					fContentW = (uint32_t)fitw;
+ 					fSrcOffX = ((int32_t)fWidth - fitw) / 2;
+ 					fit_mode = true;
++					/*
++					 * 0249: the bar fill only means anything when the
++					 * bars exist, so the argument is read here and not
++					 * in the common path. A boot without it is 0244
++					 * byte for byte.
++					 */
++					PE_parse_boot_argn("sweetfb_edge", &fEdgeMode,
++					    sizeof(fEdgeMode));
++					if (fEdgeMode < 0 || fEdgeMode > 2) {
++						fEdgeMode = 0;
++					}
+ 				}
+ 			}
+ 		}
+ 		if (fWidth <= SWEET_FB_COLMAP_MAX && fLogicalW > 0) {
+ 			for (uint32_t x = 0; x < fWidth; x++) {
+ 				int32_t lx = (int32_t)x - fSrcOffX;
+-				if (lx < 0) {
+-					lx = 0;
+-				}
+-				if ((uint32_t)lx >= fContentW) {
+-					lx = (int32_t)fContentW - 1;
++				if (fEdgeMode == 2) {
++					/*
++					 * Mirror: reflect the bar back across its own inner
++					 * edge, so the left bar shows the content's first
++					 * columns in reverse and the right bar shows its last
++					 * columns in reverse. lx<0 maps to -1-lx, lx>=fContentW
++					 * maps to 2*fContentW-1-lx, both folded once so any
++					 * bar wider than the content reflects and repeats.
++					 */
++					if (lx < 0) {
++						lx = -1 - lx;
++					}
++					if ((uint32_t)lx >= fContentW) {
++						lx = 2 * (int32_t)fContentW - 1 - lx;
++					}
++				} else {
++					if (lx < 0) {
++						lx = 0;
++					}
++					if ((uint32_t)lx >= fContentW) {
++						lx = (int32_t)fContentW - 1;
++					}
+ 				}
+ 				fColMap[x] = (uint16_t)((uint64_t)lx * fLogicalW / fContentW);
+ 			}
+@@ -441,6 +491,9 @@
+ 	IOLog("SWEET FB: gather %s\n", fGatherPeriod ?
+ 	    "unfolds the column map: 36 panel columns per 25 source columns, constants only" :
+ 	    "indexes the column map, one entry per panel column");
++	IOLog("SWEET FB: edge %s\n", fEdgeMode == 0 ? "off, the bars stay black" :
++	    fEdgeMode == 1 ? "clamp: the bars repeat the outermost columns" :
++	    "mirror: the bars reflect the outermost columns");
+ 	return true;
+ }
+ 
+@@ -1014,11 +1067,25 @@
+ 			int32_t px1 = (int32_t)fSrcOffX +
+ 			    (int32_t)(((int64_t)(dx + w) * fContentW) / fLogicalW) + 1;
+ 			int32_t pxend = (int32_t)fSrcOffX + (int32_t)fContentW;
+-			if (px0 < (int32_t)fSrcOffX) {
+-				px0 = (int32_t)fSrcOffX;
+-			}
+-			if (px1 > pxend) {
+-				px1 = pxend;
++			if (fEdgeMode != 0) {
++				/*
++				 * 0249: with the bars painted, every panel column
++				 * belongs to the row, so the extent is the whole panel
++				 * width. fColMap already maps the bar columns to the
++				 * outermost source columns (clamp) or their reflection
++				 * (mirror), so the gather below fills them from real
++				 * pixels instead of leaving whatever the panel was
++				 * cleared to.
++				 */
++				px0 = 0;
++				px1 = (int32_t)fWidth;
++			} else {
++				if (px0 < (int32_t)fSrcOffX) {
++					px0 = (int32_t)fSrcOffX;
++				}
++				if (px1 > pxend) {
++					px1 = pxend;
++				}
+ 			}
+ 			/* Source column for logical column dx, relative to the layer. */
+ 			int32_t base = sx - dx;
