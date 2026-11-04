@@ -1,0 +1,68 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -101,24 +101,7 @@
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
+ #define SWEET_FB_LOGICAL_W              750
+-/*
+- * 0233: 1500, not 1624, so that both axes stretch by the same fraction.
+- *
+- * The panel is 1080x2160, which is 18:9. 750x1624 is 19.5:9 - the iPhone X
+- * aspect - and 0183 through 0190 mapped it onto the panel independently per
+- * axis: 1080/750 = 36/25 = 1.44 across, 2160/1624 = 1.33 down. Two different
+- * factors is a distortion, not a scale: circles came out 8.3% wider than tall,
+- * and that is what makes the screen look stretched.
+- *
+- * 750x1500 is 18:9, the panel's own aspect, so 1080/750 and 2160/1500 are both
+- * 36/25 and the mapping is uniform again - the same picture, undistorted, still
+- * filling every pixel of the panel. The cost is 124 logical rows: iOS lays out
+- * 375x750 points instead of 375x812, so slightly less fits vertically and each
+- * point is 8% larger. Boot-arg sweetfb_stretch=1 goes back to 1624 for
+- * comparison.
+- */
+-#define SWEET_FB_LOGICAL_H              1500
+-#define SWEET_FB_STRETCH_H              1624
++#define SWEET_FB_LOGICAL_H              1624
+ #define SWEET_FB_COLMAP_MAX             2048
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ /*
+@@ -258,34 +241,17 @@
+ 	fBlitGatherRows = 0;
+ 	fBlitPixels = 0;
+ 	if (!native) {
+-		int stretch = 0;
+-
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+-		/*
+-		 * 0233: the escape hatch. sweetfb_stretch=1 restores the 19.5:9
+-		 * logical height, which is one build older and one 8.3%
+-		 * non-uniform, so the two can be compared across boots without
+-		 * editing the driver.
+-		 */
+-		PE_parse_boot_argn("sweetfb_stretch", &stretch, sizeof(stretch));
+-		if (stretch == 1) {
+-			fLogicalH = SWEET_FB_STRETCH_H;
+-		}
+ 	}
+ 	if (!native && polaris) {
+ 		/*
+-		 * Polaris is 1080x2160 (18:9) and the logical display is 750x1500
+-		 * (18:9) at 2x, so the whole frame is scaled up by the same
+-		 * fraction on both axes:
++		 * Polaris is 1080x2160 (18:9) and the logical display is now
++		 * 750x1624 (19.5:9) at 2x, so the panel is filled by scaling the
++		 * whole frame up rather than by cropping a bigger one:
+ 		 *
+-		 *   horizontal   750 -> 1080, nearest column (36/25)
+-		 *   vertical    1500 -> 2160, nearest row    (36/25)
+-		 *
+-		 * 0233: those two have to agree. Through 0190 the vertical axis
+-		 * was 1624 -> 2160 (1.33) while the horizontal was 1.44, and the
+-		 * difference is a visible stretch - see the note on
+-		 * SWEET_FB_LOGICAL_H.
++		 *   horizontal   750 -> 1080, nearest column (1.44x)
++		 *   vertical    1624 -> 2160, nearest row    (1.33x)
+ 		 *
+ 		 * Until 0182 the logical frame was 1125x2436, i.e. wider than the
+ 		 * panel, and the horizontal mapping was the identity so each
