@@ -365,7 +365,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5351,1866 @@
+@@ -5067,4 +5351,1954 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1171,6 +1171,19 @@
 + * What it proves if it passes: instruction fetch from GPU memory, the constant
 + * file, the UAV descriptor, wave launch, and the fence - none of which any
 + * earlier build touched. What it does not prove: anything about rasterisation.
++ *
++ * 0237: and a store that cannot be discarded. The program above now writes the
++ * result page twice - once with stg, whose address is a 64-bit value in r2.xy
++ * and needs no descriptor of any kind, and once with the stib above, whose
++ * sentinel is unchanged so the two are told apart by the value that survives.
++ *
++ * The reason is the one thing this shader never said out loud: stib.b is spelled
++ * with a `.b`, and in ir3 that flag is IR3_INSTR_B - bindless. A bindless store
++ * reads its descriptor out of the bindless descriptor set, not out of the UAV
++ * state block that CP_LOAD_STATE6 fills, so every build from 0216 to 0232 has
++ * been loading a descriptor into a place this instruction never looks. A null
++ * descriptor is discarded by design, which is exactly what "the fence arrives,
++ * no fault, page untouched" has been describing for a dozen builds.
 + */
 +#define PG_CS_SHADER_WORDS	32u
 +#define PG_CS_RESULT_WORDS	8u
@@ -1208,15 +1221,42 @@
 + * store finds its buffer. It finds it here.
 + */
 +static const uint32_t pg_cs_shader[PG_CS_SHADER_WORDS] = {
-+	0x0209c0deu, 0x204cc004u,	/* mov.u32u32 r1.x, 0x0209c0de */
-+	0x00000000u, 0x204cc000u,	/* mov.u32u32 r0.x, 0 */
-+	0x00000000u, 0x00000500u,	/* (rpt5)nop */
-+	0x00674000u, 0xc0260004u,	/* stib.b.untyped.1d.u32.1.imm r1.x, r0.x, 0 */
-+	0x00000000u, 0x03000000u,	/* end */
-+	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	/*
++	 * Assembled by Mesa's own ir3 assembler (ir3-asm4), from:
++	 *
++	 *   mov.u32u32 r2.x, 0xfeed0001
++	 *   mov.u32u32 r2.y, 0
++	 *   mov.u32u32 r1.x, 0xbadf00d
++	 *   (rpt5)nop
++	 *   stg.u32 g[r2.x], r1.x, 1
++	 *   nop
++	 *   (sy)mov.u32u32 r1.x, 0x209c0de
++	 *   mov.u32u32 r0.x, 0
++	 *   (rpt5)nop
++	 *   stib.b.untyped.1d.u32.1.imm r1.x, r0.x, 0
++	 *   end
++	 *   nop
++	 *   nop
++	 *   nop
++	 *   nop
++	 *   nop
++	 */
++	0xfeed0001u, 0x204cc008u,
++	0x00000000u, 0x204cc009u,
++	0x0badf00du, 0x204cc004u,
++	0x00000000u, 0x00000500u,
++	0x01800008u, 0xc0c61100u,
++	0x00000000u, 0x00000000u,
++	0x0209c0deu, 0x304cc004u,
++	0x00000000u, 0x204cc000u,
++	0x00000000u, 0x00000500u,
++	0x00674000u, 0xc0260004u,
++	0x00000000u, 0x03000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
 +};
 +
 +struct pg_cs_reg {
@@ -1347,10 +1387,15 @@
 + * The state values are unchanged from 0219-0228: those were derived from the same
 + * file and have been read back correct since. What changes is where each packet
 + * sits and which channel each register goes through.
++ * 0234: shader_base is new, and exists only so that the caller can point the
++ * wave at an address that has no PTE. It feeds both places the shader's address
++ * appears - the CS block's SP_CS_BASE and the CP_LOAD_STATE6 source - because a
++ * prefilled instruction cache would otherwise hide the fetch this build is
++ * trying to provoke. Every ordinary call passes iova, so nothing else changes.
 + */
 +static void
 +pg_cs_emit(uint64_t iova, uint64_t fence_iova, uint32_t groups, uint32_t seq,
-+    bool launch)
++    bool launch, uint64_t shader_base)
 +{
 +	uint32_t wptr = pg_cp_wptr;
 +	uint32_t i, n;
@@ -1369,17 +1414,17 @@
 +		pg_ring_put(wptr++, pg_cs_ctx[i].value);
 +	}
 +	pg_ring_put(wptr++, 0x0a9b4u);			/* SP_CS_BASE */
-+	pg_ring_put(wptr++, (uint32_t)iova);
++	pg_ring_put(wptr++, (uint32_t)shader_base);
 +	pg_ring_put(wptr++, 0x0a9b5u);
-+	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
++	pg_ring_put(wptr++, (uint32_t)(shader_base >> 32));
 +	pg_ring_put(wptr++, 0x0a9bcu);			/* SP_CS_INSTR_SIZE, as computerator
 +							 * writes it a second time */
 +	pg_ring_put(wptr++, 1u);
 +
 +	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the shader */
 +	pg_ring_put(wptr++, 0x00760000u);		/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
-+	pg_ring_put(wptr++, (uint32_t)iova);
-+	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
++	pg_ring_put(wptr++, (uint32_t)shader_base);
++	pg_ring_put(wptr++, (uint32_t)(shader_base >> 32));
 +	/*
 +	 * 0232: back to SS6_INDIRECT, and to the address cs_uav_emit() uses - the
 +	 * descriptor page itself.
@@ -1486,7 +1531,7 @@
 +	volatile uint32_t * desc;
 +	volatile uint32_t * result;
 +	volatile uint32_t * fence;
-+	uint32_t seq, wptr, rptr = 0, good = 0, i, s, hit = PG_CS_DESC_SLOTS;
++	uint32_t seq, wptr, rptr = 0, good = 0, i, s;
 +	uint32_t fsr0 = 0;
 +	uint64_t began, ns = 0, far0 = 0;
 +	bool drained = false;
@@ -1497,9 +1542,9 @@
 +	 * first register access, so "is it in the ring" answers "did this kernel run"
 +	 * without needing a second source.
 +	 */
-+	printf("POLARIS GPU: 20 shader: ======== build 0232 alive: every register now "
-+	    "agrees with cs-regs.txt, and the descriptor sits at its address "
-+	    "again ========\n");
++	printf("POLARIS GPU: 20 shader: ======== build 0237 alive: a global store "
++	    "writes the result page before the SSBO store runs, so one word names "
++	    "which of them executes ========\n");
 +	if (pg_gpu3d == 0 || pg_ring_va[0] == 0) {
 +		printf("POLARIS GPU: 20 shader: the CP is not there\n");
 +		return;
@@ -1533,8 +1578,31 @@
 +	fence = (volatile uint32_t *)(view + 3u * PG_GMU_PAGE_SIZE);
 +	fence_iova = iova + 3u * PG_GMU_PAGE_SIZE;
 +
-+	for (i = 0; i < PG_CS_SHADER_WORDS; i++) {
-+		shader[i] = pg_cs_shader[i];
++	/*
++	 * 0237: the shader's stg target, patched in at upload time.
++	 *
++	 * The result page's address is not known until the window is allocated, so
++	 * the shader carries the marker 0xfeed0001 in the immediate of a mov and this
++	 * loop replaces it here. Searching for the marker instead of hard-coding a
++	 * word index means the array can be reassembled and reordered without this
++	 * code silently patching the wrong instruction - and the index it prints is
++	 * the evidence that the patch happened at all.
++	 */
++	{
++		uint64_t target = iova + 2u * PG_GMU_PAGE_SIZE;
++		uint32_t at = PG_CS_SHADER_WORDS, patched = 0;
++
++		for (i = 0; i < PG_CS_SHADER_WORDS; i++) {
++			shader[i] = pg_cs_shader[i];
++			if (pg_cs_shader[i] == 0xfeed0001u) {
++				shader[i] = (uint32_t)target;
++				at = i;
++				patched++;
++			}
++		}
++		printf("POLARIS GPU: 20 shader: the stg target %#llx went into "
++		    "word %u of the shader (%u marker%s found)\n", target,
++		    at, patched, patched == 1u ? "" : "s");
 +	}
 +	for (i = 0; i < PG_CS_DESC_SLOTS * 16u; i++) {
 +		desc[i] = 0;
@@ -1601,6 +1669,19 @@
 +	far0 = pg_smmu_far(&fsr0);
 +
 +	/*
++	 * 0234 asked its question and this build does not ask it again.
++	 *
++	 * That probe pointed SP_CS_BASE and the CP_LOAD_STATE6 source at a page no PTE
++	 * has ever entered. The SMMU answered FSR 0x402 with FAR on that page and the
++	 * fence never came back: an instruction fetch from an unmapped page is
++	 * reported, so the SP really does start this shader, and every "no fault"
++	 * verdict from 0221 to 0232 was read from a working register pair. What is
++	 * left to explain is the store alone.
++	 *
++	 * Keeping the probe would cost more than it is worth here: it wedges the CP
++	 * and returns, and this build has to read one word of memory afterwards.
++	 */
++	/*
 +	 * 0223: first, the same state with no dispatch at all. If this fence never
 +	 * arrives then the bindless state itself wedges the CP or the SP, and the
 +	 * shader was never the problem. If it arrives, the state is fine and the
@@ -1613,7 +1694,7 @@
 +		bool seen;
 +
 +		seq = polaris_gpu_fence_next();
-+		pg_cs_emit(iova, fence_iova, 1u, seq, false);
++		pg_cs_emit(iova, fence_iova, 1u, seq, false, iova);
 +		seen = pg_fence_reached(fence, seq, 20000u);
 +		absolutetime_to_nanoseconds(mach_absolute_time() - at, &ns);
 +		ms = (uint32_t)(ns / 1000000ull);
@@ -1634,7 +1715,7 @@
 +	}
 +
 +	seq = polaris_gpu_fence_next();
-+	pg_cs_emit(iova, fence_iova, 1u, seq, true);
++	pg_cs_emit(iova, fence_iova, 1u, seq, true, iova);
 +	wptr = pg_cp_wptr;
 +
 +	for (i = 0; i < 2000u; i++) {
@@ -1674,29 +1755,32 @@
 +
 +	if (pg_fence_reached(fence, seq, 20000u)) {
 +		/*
-+		 * 0228: which slot did it use? Each of the sixty-four descriptors points
-+		 * at its own 64-byte block of the result page, so the block that took the
-+		 * store is the index the hardware resolved - a fact no read of a register
-+		 * could have produced.
++		 * 0237: one word, three answers.
++		 *
++		 * Both stores in this shader write word 0 of the result page, and the SSBO
++		 * store runs after the global one, so whichever sentinel is sitting there
++		 * names the last store that executed:
++		 *
++		 *   0x0209c0de  the SSBO store ran too - the descriptor, the index and the
++		 *               buffer were never the problem
++		 *   0x0badf00d  only the global store ran: the CS does execute its
++		 *               instructions, and the UAV path is what swallows the write
++		 *   0           neither ran, so the wave never reaches instruction 7
 +		 */
-+		for (i = 0; i < PG_CS_DESC_SLOTS; i++) {
-+			if (result[i * 16u] == 0x0209c0deu) {
-+				hit = i;
-+				break;
-+			}
-+		}
-+		if (hit < PG_CS_DESC_SLOTS) {
-+			for (i = 0; i < PG_CS_RESULT_WORDS; i++) {
-+				if (result[hit * 16u + i] == 0x0209c0deu) {
-+					good++;
-+				}
-+			}
-+			printf("POLARIS GPU: 20 shader: slot %u took the store: %u of %u words "
-+			    "in block %u are 0x0209c0de\n", hit, good, PG_CS_RESULT_WORDS, hit);
++		if (result[0] == 0x0209c0deu) {
++			good = 2;
++			printf("POLARIS GPU: 20 shader: word 0 reads 0x0209c0de: the SSBO store "
++			    "ran as well, so the descriptor, the index and the buffer all work "
++			    "and the problem was never in the UAV path\n");
++		} else if (result[0] == 0x0badf00du) {
++			good = 1;
++			printf("POLARIS GPU: 20 shader: word 0 reads 0x0badf00d: the global "
++			    "store ran and the SSBO store did not, so the CS executes its "
++			    "instructions and the UAV path is what discards the write\n");
 +		} else {
 +			good = 0;
-+			printf("POLARIS GPU: 20 shader: the fence reads %u; no block of the "
-+			    "result page took the store\n", *fence);
++			printf("POLARIS GPU: 20 shader: word 0 reads %08x: neither store ran, "
++			    "so the wave does not reach instruction 7\n", result[0]);
 +		}
 +		printf("POLARIS GPU: 20 shader: the words read %08x %08x %08x %08x %08x %08x "
 +		    "%08x %08x\n", result[0], result[1], result[2], result[3], result[4],
@@ -1725,12 +1809,12 @@
 +		 * sentinel is in a page it has no business being in, the offset says
 +		 * exactly what the shader thought it was writing to.
 +		 */
-+		if (hit >= PG_CS_DESC_SLOTS) {
++		if (good == 0) {
 +			volatile uint32_t *all = (volatile uint32_t *)view;
 +			uint32_t hits = 0, words = PG_CS_PAGES * (PG_GMU_PAGE_SIZE / 4u);
 +
 +			for (i = 0; i < words; i++) {
-+				if (all[i] != 0x0209c0deu) {
++				if (all[i] != 0x0209c0deu && all[i] != 0x0badf00du) {
 +					continue;
 +				}
 +				if (hits < 6u) {
@@ -1748,12 +1832,16 @@
 +		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 +		printf("POLARIS GPU: 20 shader: the test took %llu ms of boot\n",
 +		    ns / 1000000ull);
-+		if (hit < PG_CS_DESC_SLOTS) {
-+			printf("POLARIS GPU: 20 shader: THE STORE LANDED IN SLOT %u: the "
-+			    "descriptor, the index and the buffer all work\n", hit);
++		if (good == 2) {
++			printf("POLARIS GPU: 20 shader: BOTH STORES RAN: the wave executes, "
++			    "the global store works and the descriptor path works\n");
++		} else if (good == 1) {
++			printf("POLARIS GPU: 20 shader: THE WAVE EXECUTES: a global store "
++			    "from the same wave reached the result page, so every earlier "
++			    "\"no store\" was the UAV store only\n");
 +		} else {
-+			printf("POLARIS GPU: 20 shader: NO STORE LANDED: the wave runs and "
-+			    "the result page is untouched\n");
++			printf("POLARIS GPU: 20 shader: NOTHING RAN: even a store with no "
++			    "descriptor and no UAV state leaves the page untouched\n");
 +		}
 +	} else {
 +		printf("POLARIS GPU: 20 shader: no fence after %u us; the CP is at RPTR %u WPTR %u\n",
@@ -1798,7 +1886,7 @@
 +			bool took = false, seen;
 +
 +			seq = polaris_gpu_fence_next();
-+			pg_cs_emit(iova, fence_iova, probe[k], seq, true);
++			pg_cs_emit(iova, fence_iova, probe[k], seq, true, iova);
 +			wptr = pg_cp_wptr;
 +			for (i = 0; i < 20000u; i++) {
 +				rp = pg_rd(pg_gpu3d + 4u * PG_CP_RB_RPTR) & (PG_RING_WORDS - 1u);
