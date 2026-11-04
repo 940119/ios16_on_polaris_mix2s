@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1714 @@
+@@ -5067,4 +5336,1729 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1460,8 +1460,22 @@
 +	desc[0] = 0x12c06880u;				/* fmt / swap / tile / swizzle */
 +	desc[1] = PG_CS_RESULT_WORDS;			/* width in elements */
 +	desc[2] = 0x80000010u;				/* A6XX_TEX_BUFFER */
-+	desc[4] = (uint32_t)(iova + 2u * PG_GMU_PAGE_SIZE);
-+	desc[5] = (uint32_t)((iova + 2u * PG_GMU_PAGE_SIZE) >> 32);
++	/*
++	 * 0227: the descriptor points at the descriptor page itself.
++	 *
++	 * Everything about the descriptor is now confirmed - the disassembly says the
++	 * store is the classic form with index 0, the block it reads from is
++	 * SP_CS_UAV_BASE, and the sixteen words are byte for byte what
++	 * fdl6_buffer_view_init() produces. So the question is no longer "does the
++	 * shader find its buffer" but "does a store reach memory at all".
++	 *
++	 * Pointing the buffer at the page the descriptor lives in answers that in one
++	 * look: a successful store overwrites descriptor[0] with 0x0209c0de, in a page
++	 * this test already reads back and scans. If that word is still 0x12c06880
++	 * afterwards, no store of any kind is landing, whatever the descriptor says.
++	 */
++	desc[4] = (uint32_t)(iova + PG_GMU_PAGE_SIZE);
++	desc[5] = (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32);
 +	for (i = 0; i < PG_CS_RESULT_WORDS; i++) {
 +		result[i] = 0;
 +	}
@@ -1590,7 +1604,8 @@
 +				hits++;
 +			}
 +			printf("POLARIS GPU: 20 shader: the sentinel appears %u times in the four "
-+			    "pages\n", hits);
++			    "pages; descriptor[0] now reads %08x, it started as 12c06880\n",
++			    hits, desc[0]);
 +			polaris_gpu_cp_report("after the dispatch");
 +			polaris_gpu_smmu_fault();
 +		}
