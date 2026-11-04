@@ -1,0 +1,32 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -245,6 +245,29 @@
+ 	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
++	/*
++	 * 0257 read-only probe: the two capabilities that decide whether the
++	 * two remaining USB theories are even testable.
++	 *
++	 * GHWPARAMS1 0xc144: bit 1 EN_PWROPT (clock gating), bit 24 64BIT_ACCESS
++	 *   (1 = the core has 64-bit register access - our DMA buffer sits at
++	 *    0x103b84000, above 4 GiB, so if this is 0 the event buffer address
++	 *    is silently wrong and no event can ever be delivered).
++	 * GHWPARAMS3 0xc14c: bit 0 64BIT_PHY (1 = 64-bit address capability).
++	 * GHWPARAMS6 0xc158: bit 1 SRPSUPPORT, bit 0 HNPSUPPORT - the OTG
++	 *   session-request path (GOTGCTL.SesReq) is only usable if SRP is
++	 *   supported; a pure-device core has neither and can never raise a
++	 *   B-session on its own, which is the deadlock we hit at 0256.
++	 * GUCTL1 0xc11c: DEV_IPGATE (bit 17), DEV_L1_EXIT_BY_HW (bit 24) etc.
++	 */
++	printf("SWEET USB: GHWPARAMS1 0x%08x (64bit_reg %d pwropt %d) GHWPARAMS3 0x%08x (64bit_phy %d) "
++	    "GHWPARAMS6 0x%08x (srp %d hnp %d) GUCTL1 0x%08x\n",
++	    usb_rd(dwc, 0xc144), !!(usb_rd(dwc, 0xc144) & (1u << 24)),
++	    !!(usb_rd(dwc, 0xc144) & (1u << 1)),
++	    usb_rd(dwc, 0xc14c), !!(usb_rd(dwc, 0xc14c) & 1u),
++	    usb_rd(dwc, 0xc158), !!(usb_rd(dwc, 0xc158) & (1u << 1)),
++	    !!(usb_rd(dwc, 0xc158) & 1u),
++	    usb_rd(dwc, 0xc11c));
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
