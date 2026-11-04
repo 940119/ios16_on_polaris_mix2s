@@ -1,0 +1,45 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -442,14 +442,35 @@
+ 	fPanelW = 1080;
+ 	fPanelH = 2400;
+ 	fScale = 0;
+-	if (!native && polaris) {
+-		/* Polaris 1080x2160: the logical display is scaled by height. */
++	if (polaris) {
++		/*
++		 * 0241: two framebuffer modes on this panel, so two mappings.
++		 *
++		 * With sweetfb_native=1 SweetFramebuffer presents the panel one to one
++		 * at 1080x2160 - no upscale, no letterbox, no stretch - and the
++		 * digitizer maps straight through: the frame is the panel, so there is
++		 * no offset and no scale.
++		 *
++		 * Without it the frame is still the 750x1624 logical display laid onto
++		 * the panel, and this mapping has to undo that layout, which is what
++		 * the arithmetic below has always done.
++		 */
+ 		fPanelH = 2160;
+-		fContentW = (fLogicalW * fPanelH + fLogicalH / 2) / fLogicalH;
+-		fContentH = fPanelH;
+-		fOffX = (fPanelW - fContentW) / 2;
+-		fOffY = 0;
+-		fScale = 1;
++		if (native) {
++			fLogicalW = 1080;
++			fLogicalH = 2160;
++			fContentW = 1080;
++			fContentH = 2160;
++			fOffX = 0;
++			fOffY = 0;
++			fScale = 0;
++		} else {
++			fContentW = (fLogicalW * fPanelH + fLogicalH / 2) / fLogicalH;
++			fContentH = fPanelH;
++			fOffX = (fPanelW - fContentW) / 2;
++			fOffY = 0;
++			fScale = 1;
++		}
+ 	} else {
+ 		fContentW = fPanelW;
+ 		fContentH = fPanelH;
