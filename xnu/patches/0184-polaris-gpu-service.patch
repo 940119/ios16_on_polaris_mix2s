@@ -343,7 +343,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1691 @@
+@@ -5067,4 +5336,1714 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1567,7 +1567,30 @@
 +		    pg_rd(pg_gpu3d + 4u * 0x0bb08), pg_rd(pg_gpu3d + 4u * 0x0a9bb),
 +		    pg_rd(pg_gpu3d + 4u * 0x0a9b0), pg_rd(pg_gpu3d + 4u * 0x0a9b1),
 +		    pg_rd(pg_gpu3d + 4u * 0x0b998), pg_rd(pg_gpu3d + 4u * 0x0b987));
++		/*
++		 * 0226: the store runs and no fault is reported, so it landed on an
++		 * address that is mapped - just not the one this test reads. Rather than
++		 * reason about which address that could be, look for the value in the
++		 * whole four-page block: shader, descriptor, result, fence. If the
++		 * sentinel is in a page it has no business being in, the offset says
++		 * exactly what the shader thought it was writing to.
++		 */
 +		if (good != PG_CS_RESULT_WORDS) {
++			volatile uint32_t *all = (volatile uint32_t *)view;
++			uint32_t hits = 0, words = PG_CS_PAGES * (PG_GMU_PAGE_SIZE / 4u);
++
++			for (i = 0; i < words; i++) {
++				if (all[i] != 0x0209c0deu) {
++					continue;
++				}
++				if (hits < 6u) {
++					printf("POLARIS GPU: 20 shader: the sentinel is at page %u word "
++					    "%u, byte %#x of the block\n", i / 1024u, i % 1024u, i * 4u);
++				}
++				hits++;
++			}
++			printf("POLARIS GPU: 20 shader: the sentinel appears %u times in the four "
++			    "pages\n", hits);
 +			polaris_gpu_cp_report("after the dispatch");
 +			polaris_gpu_smmu_fault();
 +		}
