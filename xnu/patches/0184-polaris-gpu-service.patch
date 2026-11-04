@@ -365,7 +365,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5351,1787 @@
+@@ -5067,4 +5351,1848 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1182,6 +1182,14 @@
 + */
 +#define PG_CS_DESC_SLOTS	64u
 +#define PG_CS_SLOT_BYTES	64u
++/*
++ * 0230: an address inside the program window that no page enters. The window is
++ * PG_USER_IOVA for 64 MB and the allocator hands out from its start, so the last
++ * page has never had a PTE - which is exactly what makes it useful: point a
++ * descriptor at it and the GPU's response says whether that descriptor is ever
++ * consulted. A fault means it is; silence means the store never uses it.
++ */
++#define PG_CS_MISSING_IOVA	(PG_USER_IOVA + PG_USER_SIZE - PG_GMU_PAGE_SIZE)
 +
 +/*
 + * 0225: back to the classic UAV block, and this is the correction that matters.
@@ -1297,6 +1305,7 @@
 +
 +/* Both are defined further down, after the submission helpers they belong with. */
 +static bool pg_fence_reached(volatile uint32_t *word, uint32_t seq, uint32_t tries);
++static uint64_t pg_smmu_far(uint32_t *fsr);
 +void polaris_gpu_cp_report(const char *why);
 +uint32_t polaris_gpu_fence_next(void);
 +void polaris_gpu_smmu_fault(void);
@@ -1456,10 +1465,18 @@
 +	volatile uint32_t * result;
 +	volatile uint32_t * fence;
 +	uint32_t seq, wptr, rptr = 0, good = 0, i, s, hit = PG_CS_DESC_SLOTS;
-+	uint64_t began, ns = 0;
++	uint32_t fsr0 = 0;
++	uint64_t began, ns = 0, far0 = 0;
 +	bool drained = false;
 +
 +	began = mach_absolute_time();
++	/*
++	 * The one line that says which build wrote this ring. It goes out before the
++	 * first register access, so "is it in the ring" answers "did this kernel run"
++	 * without needing a second source.
++	 */
++	printf("POLARIS GPU: 20 shader: ======== build 0230 alive: all sixty-four "
++	    "descriptors aimed at an unmapped page ========\n");
 +	if (pg_gpu3d == 0 || pg_ring_va[0] == 0) {
 +		printf("POLARIS GPU: 20 shader: the CP is not there\n");
 +		return;
@@ -1500,25 +1517,25 @@
 +		desc[i] = 0;
 +	}
 +	/*
-+	 * 0228: all sixty-four slots, each pointing somewhere different.
++	 * 0230: all sixty-four slots, each pointing at a page that has never been
++	 * mapped.
 +	 *
-+	 * 0227 pointed the one descriptor this test built at the page it lives in, so
-+	 * that any store at all would overwrite descriptor[0] in a page already being
-+	 * read back. It did not: that word was still 0x12c06880. So the shader is not
-+	 * writing to the address in our descriptor - either it reads a different slot,
-+	 * or it never consults this page.
++	 * 0227 aimed the one descriptor at the page it lives in, so that any store at
++	 * all would overwrite descriptor[0] in a page already being read back: nothing.
++	 * 0228 filled all sixty-four, each aimed at its own block of the result page:
++	 * nothing either, and USIZE read back 64. So the descriptor block is in place
++	 * and no store lands. The one question left is whether the shader's store uses
++	 * that block at all.
 +	 *
-+	 * Writing one descriptor leaves the other sixty-three as zeros, and a zero
-+	 * descriptor means a zero width, which the bounds check discards silently, with
-+	 * no fault and no write. That is indistinguishable from "nothing happened",
-+	 * which is exactly what the last three builds saw. So fill all of them, and
-+	 * give each a target of its own: slot k writes into block k of the result page.
-+	 * Whichever index the hardware uses, the block that changes names it.
++	 * An unmapped address answers it in one line. A descriptor that is read and
++	 * honoured sends the store into a page with no PTE, and the SMMU latches the
++	 * fault. A descriptor that is never read changes nothing, and the fault
++	 * registers stay exactly as they were before the dispatch. Either answer is
++	 * worth more than the last three builds, which could not tell the two apart.
 +	 */
 +	for (s = 0; s < PG_CS_DESC_SLOTS; s++) {
 +		volatile uint32_t * d = desc + s * 16u;
-+		uint64_t target = iova + 2u * PG_GMU_PAGE_SIZE +
-+		    (uint64_t)s * PG_CS_SLOT_BYTES;
++		uint64_t target = PG_CS_MISSING_IOVA;
 +
 +		/*
 +		 * The 64-byte buffer view, from fdl6_buffer_view_init(): R32_UINT,
@@ -1559,6 +1576,11 @@
 +	 * report at all and the last four builds were chasing uninitialised state.
 +	 */
 +	polaris_gpu_smmu_fault();
++	/*
++	 * 0230: and keep the numbers, so the read after the dispatch can say whether
++	 * anything changed. A fault already sitting there would not be ours.
++	 */
++	far0 = pg_smmu_far(&fsr0);
 +
 +	/*
 +	 * 0223: first, the same state with no dispatch at all. If this fence never
@@ -1609,6 +1631,29 @@
 +		printf("POLARIS GPU: 20 shader: the CP has not taken the ring: RPTR %u WPTR %u\n",
 +		    rptr, wptr);
 +	}
++	/*
++	 * 0230: did aiming the descriptors at a page with no PTE change the fault
++	 * registers? This is the one question the last three builds could not answer:
++	 * 0227 and 0228 both proved that no store lands on a mapped page, but not
++	 * whether the store ever looks at the descriptor it was given.
++	 *
++	 * Printed before the fence is waited on, because a store into an unmapped page
++	 * is exactly the case where the CP may stop answering.
++	 */
++	{
++		uint32_t fsr1 = 0;
++		uint64_t far1 = pg_smmu_far(&fsr1);
++
++		printf("POLARIS GPU: 20 shader: the descriptors point at %#llx; SMMU "
++		    "before FSR %#010x FAR %#010x%08x, after FSR %#010x FAR "
++		    "%#010x%08x\n", PG_CS_MISSING_IOVA, fsr0, (uint32_t)(far0 >> 32),
++		    (uint32_t)far0, fsr1, (uint32_t)(far1 >> 32), (uint32_t)far1);
++		printf("POLARIS GPU: 20 shader: %s\n",
++		    (far1 != far0 || fsr1 != fsr0) ?
++		    "THE STORE USES THE DESCRIPTOR: a target with no PTE raised a fault" :
++		    "THE STORE NEVER REACHES THE DESCRIPTOR BLOCK: an unmapped target changed nothing");
++	}
++
 +	if (pg_fence_reached(fence, seq, 20000u)) {
 +		/*
 +		 * 0228: which slot did it use? Each of the sixty-four descriptors points
@@ -1632,9 +1677,8 @@
 +			    "in block %u are 0x0209c0de\n", hit, good, PG_CS_RESULT_WORDS, hit);
 +		} else {
 +			good = 0;
-+			printf("POLARIS GPU: 20 shader: the fence reads %u; no slot took the "
-+			    "store, %u of %u descriptors pointed at their own block\n",
-+			    *fence, PG_CS_DESC_SLOTS, PG_CS_DESC_SLOTS);
++			printf("POLARIS GPU: 20 shader: the fence reads %u; no block of the "
++			    "result page took the store\n", *fence);
 +		}
 +		printf("POLARIS GPU: 20 shader: the words read %08x %08x %08x %08x %08x %08x "
 +		    "%08x %08x\n", result[0], result[1], result[2], result[3], result[4],
@@ -1690,9 +1734,8 @@
 +			printf("POLARIS GPU: 20 shader: THE STORE LANDED IN SLOT %u: the "
 +			    "descriptor, the index and the buffer all work\n", hit);
 +		} else {
-+			printf("POLARIS GPU: 20 shader: NO STORE LANDED: the wave runs, the "
-+			    "fault registers stay clean, and all %u descriptors were valid\n",
-+			    PG_CS_DESC_SLOTS);
++			printf("POLARIS GPU: 20 shader: NO STORE LANDED: the wave runs and "
++			    "the result page is untouched\n");
 +		}
 +	} else {
 +		printf("POLARIS GPU: 20 shader: no fence after %u us; the CP is at RPTR %u WPTR %u\n",
@@ -1829,6 +1872,24 @@
 +	    "%#010x%08x\n", pg_rd(pg_smmu + PG_SMMU_SGFSR),
 +	    pg_rd(pg_smmu + PG_SMMU_SGFSYNR0), pg_rd(cb + PG_CB_FSR),
 +	    pg_rd(cb + PG_CB_FAR + 4u), pg_rd(cb + PG_CB_FAR));
++}
++
++/*
++ * 0230: the bank's fault address and status, so a caller can compare before and
++ * after an operation instead of reading a value with no history.
++ */
++static uint64_t
++pg_smmu_far(uint32_t *fsr)
++{
++	vm_offset_t cb;
++
++	*fsr = 0;
++	if (pg_smmu == 0) {
++		return 0;
++	}
++	cb = pg_smmu_cb(PG_GMU_CTX);
++	*fsr = pg_rd(cb + PG_CB_FSR);
++	return ((uint64_t)pg_rd(cb + PG_CB_FAR + 4u) << 32) | pg_rd(cb + PG_CB_FAR);
 +}
 +
 +void
