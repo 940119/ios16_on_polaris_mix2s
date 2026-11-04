@@ -1,0 +1,52 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2119,19 +2119,44 @@
+ ud_utmi_clk_select(void)
+ {
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+-	uint32_t g0;
++	uint32_t g0, v;
+ 
+ 	if (qs == 0) {
+ 		printf("SWEET USB: QSCRATCH map failed (clksel)\n");
+ 		return;
+ 	}
++	/*
++	 * 0256: this was one write, (g & ~CLK_DIS) | CLK_SEL, and it left
++	 * GENERAL_CFG at 0x05 - bit 0 set, bit 3 (PIPE3_PHYSTATUS_SW) clear.
++	 * U-Boot's Caleb Connolly SDM845 patch and mainline's
++	 * dwc3_qcom_select_utmi_clk() do three steps, not one, for a
++	 * controller that has no superspeed PHY: set CLK_DIS first (stop the
++	 * PIPE clock), then set CLK_SEL | PIPE3_PHYSTATUS_SW, then clear
++	 * CLK_DIS. PIPE3_PHYSTATUS_SW is the switch that makes the PHY's
++	 * "ready" status come from software instead of a PIPE interface that
++	 * is not there; without it the core never sees the PHY ready, GSTS
++	 * stays at 0x7e800000 (no session) and the host never resets the bus.
++	 * 0255's pre_run_stop re-write of VBUS_VALID could not help because
++	 * this upstream bit was still clear.
++	 */
+ 	g0 = usb_rd(qs, QSCRATCH_GENERAL_CFG);
+-	*(volatile uint32_t *)(qs + QSCRATCH_GENERAL_CFG) =
+-	    (g0 & ~PIPE_UTMI_CLK_DIS) | PIPE_UTMI_CLK_SEL;
++	/* 1: stop the PIPE clock. */
++	usb_wr(qs, QSCRATCH_GENERAL_CFG, g0 | PIPE_UTMI_CLK_DIS);
++	delay(1000);
++	/* 2: select UTMI as the pipe clock, PHY status from software. */
++	v = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	usb_wr(qs, QSCRATCH_GENERAL_CFG, v | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
++	delay(1000);
++	/* 3: let the PIPE clock run again. */
++	v = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	usb_wr(qs, QSCRATCH_GENERAL_CFG, v & ~PIPE_UTMI_CLK_DIS);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	delay(500);
+-	printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (UTMI clock selected)\n",
+-	    g0, usb_rd(qs, QSCRATCH_GENERAL_CFG));
++	printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (sel %d phystatus_sw %d clk_dis %d)\n",
++	    g0, usb_rd(qs, QSCRATCH_GENERAL_CFG),
++	    !!(usb_rd(qs, QSCRATCH_GENERAL_CFG) & PIPE_UTMI_CLK_SEL),
++	    !!(usb_rd(qs, QSCRATCH_GENERAL_CFG) & PIPE3_PHYSTATUS_SW),
++	    !!(usb_rd(qs, QSCRATCH_GENERAL_CFG) & PIPE_UTMI_CLK_DIS));
+ }
+ 
+ /*
