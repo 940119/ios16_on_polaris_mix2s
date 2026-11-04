@@ -365,7 +365,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5351,1848 @@
+@@ -5067,4 +5351,1869 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1369,13 +1369,34 @@
 +	pg_ring_put(wptr++, (uint32_t)iova);
 +	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
 +	/*
-+	 * The descriptor block, sixty-four units, from the page the next bunch points
-+	 * at. NUM_UNIT is bits 31:22, so 64 is 0x40 << 22 = 0x10000000.
++	 * 0231: the descriptor goes into the packet instead of being pointed at.
++	 *
++	 * 0225 through 0230 loaded it with SS6_INDIRECT, which asks the SP to fetch it
++	 * from a GPU address. 0230 settled that path: aiming every descriptor at a page
++	 * with no PTE produced no fault at all, so nothing ever read that page. Rather
++	 * than guess where the SP looks instead, hand it the sixteen words directly -
++	 * SS6_DIRECT, num_unit 1, payload in the ring. Whatever lookup was broken is
++	 * now out of the picture.
++	 *
++	 * The address in this copy is the result page, so the same eight-word judgement
++	 * as before applies. The descriptor page stays as 0230 left it - all sixty-four
++	 * slots aimed at a page with no PTE - which makes this build a three-way test:
++	 * the result page changes if the inline descriptor is used, the fault registers
++	 * change if the page is fetched after all, and neither means neither.
 +	 */
-+	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the UAVs */
-+	pg_ring_put(wptr++, 0x1036c000u);		/* ST6_UAV / INDIRECT / CS_SHADER / 64 */
-+	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
-+	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++	pg_ring_put(wptr++, pg_pkt7(0x34u, 19u));	/* CP_LOAD_STATE6_FRAG: 3 + 16 */
++	pg_ring_put(wptr++, 0x0074c000u);		/* ST6_UAV / DIRECT / CS_SHADER / 1 */
++	pg_ring_put(wptr++, 0u);			/* EXT_SRC_ADDR, unused for DIRECT */
++	pg_ring_put(wptr++, 0u);
++	pg_ring_put(wptr++, 0x12c06880u);		/* R32_UINT, linear, identity swizzle */
++	pg_ring_put(wptr++, PG_CS_RESULT_WORDS);	/* width in elements */
++	pg_ring_put(wptr++, 0x80000010u);		/* A6XX_TEX_BUFFER */
++	pg_ring_put(wptr++, 0u);
++	pg_ring_put(wptr++, (uint32_t)(iova + 2u * PG_GMU_PAGE_SIZE));
++	pg_ring_put(wptr++, (uint32_t)((iova + 2u * PG_GMU_PAGE_SIZE) >> 32));
++	for (i = 0; i < 10u; i++) {
++		pg_ring_put(wptr++, 0u);
++	}
 +
 +	/* cs_uav_emit(): the pointer and the count, after the preload. */
 +	pg_ring_put(wptr++, pg_pkt7(0x5cu, 6u));
@@ -1384,7 +1405,7 @@
 +	pg_ring_put(wptr++, 0x0a9f3u);
 +	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
 +	pg_ring_put(wptr++, 0x0aa00u);			/* SP_CS_USIZE */
-+	pg_ring_put(wptr++, PG_CS_DESC_SLOTS);
++	pg_ring_put(wptr++, 1u);			/* one unit was loaded */
 +
 +	/*
 +	 * 0223: with launch false the state stops here - written, fenced, not
@@ -1475,8 +1496,8 @@
 +	 * first register access, so "is it in the ring" answers "did this kernel run"
 +	 * without needing a second source.
 +	 */
-+	printf("POLARIS GPU: 20 shader: ======== build 0230 alive: all sixty-four "
-+	    "descriptors aimed at an unmapped page ========\n");
++	printf("POLARIS GPU: 20 shader: ======== build 0231 alive: the descriptor rides "
++	    "in the packet (SS6_DIRECT), not at an address ========\n");
 +	if (pg_gpu3d == 0 || pg_ring_va[0] == 0) {
 +		printf("POLARIS GPU: 20 shader: the CP is not there\n");
 +		return;
