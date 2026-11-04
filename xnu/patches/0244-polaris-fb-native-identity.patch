@@ -1,0 +1,40 @@
+diff -Nur a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1039,7 +1039,26 @@
+ 			if (py1 > (int32_t)fHeight) {
+ 				py1 = (int32_t)fHeight;
+ 			}
+-			bool mapok = fWidth <= SWEET_FB_COLMAP_MAX;
++			/*
++			 * 0244: the column map only exists when one was built.
++			 *
++			 * fColMap is filled in one place, the polaris branch that
++			 * needs it - the stretch to 1080x2160 and the fit inside
++			 * it - and that branch is also the only one that sets
++			 * fScale. Everywhere else the map is still the zeroes the
++			 * allocation came with, so a test that only asks whether
++			 * the panel is narrow enough answers yes for the one mode
++			 * that has no map at all: sweetfb_native=1, where the
++			 * logical frame is the panel and the copy is the plain
++			 * one-to-one it was before 0233.
++			 *
++			 * With the map in play, a native frame gathers column
++			 * fColMap[x] = 0 for every x, i.e. one column smeared
++			 * across the panel. Requiring fScale sends that case down
++			 * the identity path below, which is the same memcpy the
++			 * driver did when the panel was wider than the map.
++			 */
++			bool mapok = fScale != 0 && fWidth <= SWEET_FB_COLMAP_MAX;
+ 			if (px1 > px0 && mapok) {
+ 				/*
+ 				 * fColMap is non-decreasing, so clamping lx to
+@@ -1133,7 +1152,7 @@
+ 					}
+ 				}
+ 			} else if (px1 > px0) {
+-				/* No column map (panel wider than the map): 1:1 as before. */
++				/* No column map: 1:1, as it was before 0233. */
+ 				int32_t sxc = sx + (px0 - dx);
+ 				for (int32_t y = py0; y < py1; y++) {
+ 					int32_t ly = (int32_t)(((int64_t)y * fLogicalH) / fHeight);
