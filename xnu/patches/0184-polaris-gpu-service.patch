@@ -315,7 +315,29 @@
  }
  
  /*
-@@ -4865,7 +5122,7 @@
+@@ -3222,6 +3479,21 @@
+ 	    ((opcode & 0x7fu) << 16) | (pg_pm4_parity(opcode) << 23);
+ }
+ 
++/*
++ * 0229: PM4 type-4, the channel for registers that live outside a context.
++ *
++ * a6xx has no CP_NON_CONTEXT_REG_BUNCH, so Mesa's fd_ncrb is fd_pkt4 on this
++ * generation: one register per packet, its address in the header. Everything this
++ * driver writes about SP, UCHE and the dev-info corrections used to go out as a
++ * context bunch, which is the wrong channel for the ones that are not per-context.
++ */
++static uint32_t
++pg_pkt4(uint32_t reg, uint32_t count)
++{
++	return 0x40000000u | (count & 0x7fu) | (pg_pm4_parity(count) << 7) |
++	    ((reg & 0x3ffffu) << 8) | (pg_pm4_parity(reg & 0x3ffffu) << 27);
++}
++
+ static bool
+ pg_map_phys(uint64_t iova, uint64_t pa, const char *name)
+ {
+@@ -4865,7 +5137,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
  	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
@@ -324,7 +346,7 @@
  	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
  	    "physical, stream 5 bypassed (polarisgpumap=0)");
  	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
-@@ -5049,6 +5306,18 @@
+@@ -5049,6 +5321,18 @@
  	if (upto > 0) {
  		polaris_gpu.state = POLARIS_GPU_STARTING;
  		polaris_gpu_up(upto);
@@ -343,7 +365,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5336,1772 @@
+@@ -5067,4 +5351,1787 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
@@ -1228,23 +1250,49 @@
 + * all; ir3 hands this register the *regid* of the local invocation sysval, which
 + * for r0.x is 0, so zero is the value that puts the invocation id in r0.x.
 + */
-+static const struct pg_cs_reg pg_cs_regs[] = {	/* a630's magic_raw[]: the dev-info corrections every a6xx driver writes. */
++/*
++ * 0229: two lists, because a6xx has two ways to write a register and the choice is
++ * not cosmetic.
++ *
++ * computerator puts the dev-info corrections and the two SP globals through
++ * fd_ncrb, and on A6XX fd_ncrb is fd_pkt4 - a type-4 packet, one register per
++ * packet, address in the header. Only the per-context state goes through
++ * fd_crb (CP_CONTEXT_REG_BUNCH). Through 0228 all of it went out as context
++ * bunches, which is the wrong channel for the first fourteen: those live in the
++ * GPU-wide register file, not in a context, so a context write to them has no
++ * defined effect.
++ */
++static const struct pg_cs_reg pg_cs_ncr[] = {	/* fd_ncrb: PKT4, non-context */
++	{ 0x0ae0f, 0x00000020 },	/* SP_PERFCTR_SHADER_MASK: .cs */
++	{ 0x0ae04, 0x00000000 },	/* SP_NC_MODE_CNTL_2 */
++	/* a630's magic_raw[]: the dev-info corrections every a6xx driver writes. */
 +	{ 0x09804, 0x0000001f }, { 0x09805, 0x00000001 }, { 0x0a0f8, 0x00000001 },
 +	{ 0x0b600, 0x00108000 }, { 0x08600, 0x00000880 }, { 0x0ae03, 0x00001430 },
 +	{ 0x0ae00, 0x00000000 }, { 0x0be04, 0x00080000 }, { 0x09600, 0x00000000 },
 +	{ 0x00e12, 0x10000001 }, { 0x08e01, 0x00000001 }, { 0x08e04, 0x04100000 },
-+	/* then the compute pipeline, in cs_program_emit()'s own order. */
-+	{ 0x0ae0f, 0x00000020 },	/* SP_PERFCTR_SHADER_MASK: .cs */
-+	{ 0x0ae04, 0x00000000 },	/* SP_NC_MODE_CNTL_2 */
++};
++
++/*
++ * cs_program_emit_regs(), in its own order. Two things here differ from 0228:
++ * SP_UPDATE_CNTL is the second register of the block rather than the last packet
++ * of the stream, and SP_CS_CONFIG now names sixty-four UAVs instead of one, so the
++ * count matches the block the descriptor page holds.
++ *
++ * The latch at the top is not a mistake: the whole block is one
++ * CP_CONTEXT_REG_BUNCH, which the CP applies as a unit, so position inside it
++ * carries no order. Writing it as its own packet at the end (0217 through 0228)
++ * gave it an order it was never meant to have.
++ */
++static const struct pg_cs_reg pg_cs_ctx[] = {
 +	{ 0x0ab00, 0x00000003 },	/* SP_MODE_CNTL: ISAMMODE_CL, constant demotion */
++	{ 0x0bb08, 0x000000bf },	/* SP_UPDATE_CNTL: stages + cs + gfx_uav */
 +	{ 0x0b987, 0x00000100 },	/* SP_CS_CONST_CONFIG: constlen 0, enabled */
-+	{ 0x0a9bb, 0x00400100 },	/* SP_CS_CONFIG: enabled, ntex 0, nsamp 0, nuav 1 */
-+	{ 0x0b998, 0x000002fc },	/* SP_CS_WGE_CNTL: THREAD128, no linear local id */
-+	{ 0x0b997, 0x00000000 },	/* SP_CS_CONST_CONFIG_0: local id into r0.x, no consts */
++	{ 0x0a9bb, 0x10400100 },	/* SP_CS_CONFIG: enabled, nuav 64 */
++	{ 0x0a9bc, 0x00000001 },	/* SP_CS_INSTR_SIZE: one 128-byte block */
 +	{ 0x0a9b0, 0x80100100 },	/* SP_CS_CNTL_0: merged regs, THREAD128, footprint 2 */
 +	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: 1 KB shared, const ram 128 */
-+	{ 0x0a9bc, 0x00000001 },	/* SP_CS_INSTR_SIZE: one 128-byte block */
-+	{ 0x0a9b3, 0x00000000 },	/* SP_CS_PROGRAM_COUNTER_OFFSET: instruction 0 */
++	{ 0x0b997, 0x00000000 },	/* SP_CS_CONST_CONFIG_0: local id into r0.x, no consts */
++	{ 0x0b998, 0x000002fc },	/* SP_CS_WGE_CNTL: THREAD128, no linear local id */
 +};
 +
 +/* Both are defined further down, after the submission helpers they belong with. */
@@ -1264,81 +1312,75 @@
 + * longer. Neither the shader nor the descriptor enters into that comparison,
 + * which is what makes it worth doing: both of them are still suspects.
 + */
++/*
++ * 0229: this is a6xx_emit_grid(), packet for packet.
++ *
++ * Eighteen builds guessed at this sequence. The one thing that was never done was
++ * to copy the implementation that Mesa ships for exactly this case - a shader
++ * assembled from text and launched without gallium (computerator's a6xx.cc). Its
++ * order is: non-context registers as type-4 writes, the CS block as one context
++ * bunch with the latch inside it, the shader preload, the descriptor preload, the
++ * UAV pointer and count, CP_SET_MARKER, the grid, CP_EXEC_CS. No CP_SET_MODE,
++ * and the marker goes in last, not first.
++ *
++ * The state values are unchanged from 0219-0228: those were derived from the same
++ * file and have been read back correct since. What changes is where each packet
++ * sits and which channel each register goes through.
++ */
 +static void
 +pg_cs_emit(uint64_t iova, uint64_t fence_iova, uint32_t groups, uint32_t seq,
 +    bool launch)
 +{
 +	uint32_t wptr = pg_cp_wptr;
-+	uint32_t i;
++	uint32_t i, n;
 +
-+	/*
-+	 * The marker goes first: an a6xx keeps more than one register context and
-+	 * CP_SET_MARKER says which one the packets that follow write into. Then
-+	 * CP_SET_MODE(1) so the state is applied now rather than deferred to the
-+	 * next draw. This is fd6_launch_grid()'s order.
-+	 */
-+	pg_ring_put(wptr++, pg_pkt7(0x65u, 1u));	/* CP_SET_MARKER */
-+	pg_ring_put(wptr++, 8u);			/* RM6_COMPUTE */
-+	pg_ring_put(wptr++, pg_pkt7(0x63u, 1u));	/* CP_SET_MODE */
-+	pg_ring_put(wptr++, 1u);			/* apply, do not defer */
-+	/*
-+	 * Addresses first, the program's state next, the latch last.
-+	 *
-+	 * SP_UPDATE_CNTL is not a configuration register, it is a strobe that says
-+	 * "these blocks have new state, take it now". Mesa can put it first because
-+	 * it lives inside a state group that the CP applies as a unit; flattened
-+	 * into a plain stream it would be written before the addresses it refers to.
-+	 * The 64-bit ones go in as <reg><lo><reg+1><hi>, which is what fd_crb::add()
-+	 * does for a reg64.
-+	 */
-+	{
-+		pg_ring_put(wptr++, pg_pkt7(0x5cu, 10u));	/* CP_CONTEXT_REG_BUNCH */
-+		pg_ring_put(wptr++, 0x0a9b4u);			/* SP_CS_BASE */
-+		pg_ring_put(wptr++, (uint32_t)iova);
-+		pg_ring_put(wptr++, 0x0a9b5u);
-+		pg_ring_put(wptr++, (uint32_t)(iova >> 32));
-+		/*
-+		 * The classic block: a pointer and a count. The descriptors live at
-+		 * SP_CS_UAV_BASE and there are SP_CS_USIZE of them, which is what
-+		 * cs_program_emit_regs() leaves for a text-assembled compute shader.
-+		 */
-+		pg_ring_put(wptr++, 0x0a9f2u);			/* SP_CS_UAV_BASE */
-+		pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
-+		pg_ring_put(wptr++, 0x0a9f3u);
-+		pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
-+		pg_ring_put(wptr++, 0x0aa00u);			/* SP_CS_USIZE */
-+		pg_ring_put(wptr++, PG_CS_DESC_SLOTS);		/* 0228: all 64 are valid */
++	/* fd_ncrb on a6xx: one type-4 packet per register. */
++	for (i = 0; i < sizeof(pg_cs_ncr) / sizeof(pg_cs_ncr[0]); i++) {
++		pg_ring_put(wptr++, pg_pkt4(pg_cs_ncr[i].reg, 1u));
++		pg_ring_put(wptr++, pg_cs_ncr[i].value);
 +	}
-+	{
-+		uint32_t n = (uint32_t)(sizeof(pg_cs_regs) / sizeof(pg_cs_regs[0]));
 +
-+		pg_ring_put(wptr++, pg_pkt7(0x5cu, 2u * n));	/* the program's state */
-+		for (i = 0; i < n; i++) {
-+			pg_ring_put(wptr++, pg_cs_regs[i].reg);
-+			pg_ring_put(wptr++, pg_cs_regs[i].value);
-+		}
++	/* fd_crb: the CS block, addresses inside it, latch inside it. */
++	n = (uint32_t)(sizeof(pg_cs_ctx) / sizeof(pg_cs_ctx[0]));
++	pg_ring_put(wptr++, pg_pkt7(0x5cu, 2u * (n + 3u)));	/* CP_CONTEXT_REG_BUNCH */
++	for (i = 0; i < n; i++) {
++		pg_ring_put(wptr++, pg_cs_ctx[i].reg);
++		pg_ring_put(wptr++, pg_cs_ctx[i].value);
 +	}
++	pg_ring_put(wptr++, 0x0a9b4u);			/* SP_CS_BASE */
++	pg_ring_put(wptr++, (uint32_t)iova);
++	pg_ring_put(wptr++, 0x0a9b5u);
++	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
++	pg_ring_put(wptr++, 0x0a9bcu);			/* SP_CS_INSTR_SIZE, as computerator
++							 * writes it a second time */
++	pg_ring_put(wptr++, 1u);
++
 +	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the shader */
 +	pg_ring_put(wptr++, 0x00760000u);		/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
 +	pg_ring_put(wptr++, (uint32_t)iova);
 +	pg_ring_put(wptr++, (uint32_t)(iova >> 32));
 +	/*
-+	 * 0225: and the descriptor itself, loaded indirectly from the block the
-+	 * pointer above names - ST6_UAV, SS6_INDIRECT, one unit, address 0x10c15000.
-+	 * This is the pair of packets cs_program_emit_regs() produces.
-+	 *
-+	 * 0228: sixty-four units, not one. NUM_UNIT is bits 31:22 of the first word,
-+	 * so 64 of them is 0x40 << 22 = 0x10000000 on top of the old 0x0036c000.
++	 * The descriptor block, sixty-four units, from the page the next bunch points
++	 * at. NUM_UNIT is bits 31:22, so 64 is 0x40 << 22 = 0x10000000.
 +	 */
-+	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG */
++	pg_ring_put(wptr++, pg_pkt7(0x34u, 3u));	/* CP_LOAD_STATE6_FRAG: the UAVs */
 +	pg_ring_put(wptr++, 0x1036c000u);		/* ST6_UAV / INDIRECT / CS_SHADER / 64 */
 +	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
 +	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++
++	/* cs_uav_emit(): the pointer and the count, after the preload. */
++	pg_ring_put(wptr++, pg_pkt7(0x5cu, 6u));
++	pg_ring_put(wptr++, 0x0a9f2u);			/* SP_CS_UAV_BASE */
++	pg_ring_put(wptr++, (uint32_t)(iova + PG_GMU_PAGE_SIZE));
++	pg_ring_put(wptr++, 0x0a9f3u);
++	pg_ring_put(wptr++, (uint32_t)((iova + PG_GMU_PAGE_SIZE) >> 32));
++	pg_ring_put(wptr++, 0x0aa00u);			/* SP_CS_USIZE */
++	pg_ring_put(wptr++, PG_CS_DESC_SLOTS);
++
 +	/*
-+	 * 0223: with launch false the state is written, the fence is armed, and no
-+	 * dispatch is ever issued. That separates "the CP/SP chokes on this state"
-+	 * from "the shader wedges while running", which is the one thing eleven
-+	 * builds of register archaeology could not decide.
++	 * 0223: with launch false the state stops here - written, fenced, not
++	 * dispatched. That is still the cheapest way to tell "this state chokes the
++	 * CP" from "the shader chokes while running".
 +	 */
 +	if (!launch) {
 +		pg_ring_put(wptr++, pg_pkt7(0x26u, 0u));	/* CP_WAIT_FOR_IDLE */
@@ -1354,9 +1396,15 @@
 +		pg_cp_wptr = wptr;
 +		return;
 +	}
++
++	/* and only now the render mode, immediately before the grid. */
++	pg_ring_put(wptr++, pg_pkt7(0x65u, 1u));	/* CP_SET_MARKER */
++	pg_ring_put(wptr++, 8u);			/* RM6_COMPUTE */
++
 +	/*
-+	 * The grid. NDRANGE_1 is the *global* size, i.e. local times groups, while
-+	 * CP_EXEC_CS and KERNEL_GROUP_X take the number of groups.
++	 * The grid. NDRANGE_1 is the *global* size, local times groups; the three
++	 * KERNEL_GROUP registers are 1, which is what computerator writes - the
++	 * Vulkan blob does not touch them at all.
 +	 */
 +	pg_ring_put(wptr++, pg_pkt7(0x5cu, 20u));	/* CP_CONTEXT_REG_BUNCH, ten pairs */
 +	pg_ring_put(wptr++, 0x0b990u);			/* SP_CS_NDRANGE_0 */
@@ -1374,23 +1422,12 @@
 +	pg_ring_put(wptr++, 0x0b996u);			/* SP_CS_NDRANGE_6 */
 +	pg_ring_put(wptr++, 0u);			/* offset z */
 +	pg_ring_put(wptr++, 0x0b999u);			/* SP_CS_KERNEL_GROUP_X */
-+	pg_ring_put(wptr++, groups);
++	pg_ring_put(wptr++, 1u);
 +	pg_ring_put(wptr++, 0x0b99au);			/* SP_CS_KERNEL_GROUP_Y */
 +	pg_ring_put(wptr++, 1u);
 +	pg_ring_put(wptr++, 0x0b99bu);			/* SP_CS_KERNEL_GROUP_Z */
 +	pg_ring_put(wptr++, 1u);
-+	/*
-+	 * CS_BINDLESS is a bitmap, one bit per descriptor set, not a count.
-+	 *
-+	 * 0218 learned that the hard way: it wrote 0x1f - "all five sets have a new
-+	 * base" - while only set 0's base had been written, so the SP went to address
-+	 * zero for the other four. 0222 makes the 0x1f honest instead: all five bases
-+	 * are now the same descriptor page, so whichever set the shader's store names
-+	 * it lands on a descriptor we built.
-+	 */
-+	pg_ring_put(wptr++, pg_pkt7(0x5cu, 2u));	/* the latch, now that the state is in */
-+	pg_ring_put(wptr++, 0x0bb08u);			/* SP_UPDATE_CNTL */
-+	pg_ring_put(wptr++, 0x000000ffu);		/* stages, cs, cs_uav, gfx_uav */
++
 +	pg_ring_put(wptr++, pg_pkt7(0x33u, 4u));	/* CP_EXEC_CS */
 +	pg_ring_put(wptr++, 0u);
 +	pg_ring_put(wptr++, groups);
