@@ -1,0 +1,40 @@
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -3876,6 +3876,37 @@
+ 			    tsb_size == 0 && tsb_mode == 1) ?
+ 			    "matches step 14" : "differs from step 14");
+ 		}
++
++		/*
++		 * 0253 write test (polarissecvid=2): the 0252 read-only probe showed
++		 * the TSB registers took the kernel's step-14 write and read back
++		 * exactly {0,0,0,0,1}, i.e. the SECVID block is not latched by the
++		 * boot loader. So now do what Linux does when it has no zap
++		 * (a6xx_gpu.c / adreno_a6xx.c "direct_switch"): write
++		 * RBBM_SECVID_TRUST_CNTL = 0 straight through, then read it back to
++		 * see whether the core actually left secure mode. This is the one
++		 * write the secvid-set-once quirk says is allowed, and the readback
++		 * self-proves whether it took or was blocked.
++		 *
++		 * polarissecvid is the value, not a boolean: 1 = read-only (0252),
++		 * 2 = write 0 and read back (0253). Both leave the zap path below
++		 * untouched, so the CP write test still runs either way.
++		 */
++		if (PE_parse_boot_argn("polarissecvid", &v, sizeof(v)) && v == 2) {
++			uint32_t before = pg_rd(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL);
++			uint32_t rbbm_before = pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS);
++
++			printf("POLARIS GPU: 16 secvid=2: writing TRUST_CNTL 0 "
++			    "(was %#010x, RBBM_STATUS %#010x)\n", before, rbbm_before);
++			pg_wr(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL, 0);
++			__asm__ volatile ("dsb sy" ::: "memory");
++			pg_sleep_us(100);
++			trust = pg_rd(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL);
++			printf("POLARIS GPU: 16 secvid=2: TRUST_CNTL after write %#010x "
++			    "(%s); RBBM_STATUS %#010x\n", trust,
++			    trust == 0 ? "NON-SECURE MODE" : "still secure",
++			    pg_rd(pg_gpu3d + 4u * PG_RBBM_STATUS));
++		}
+ 	}
+ 	/*
+ 	 * 0143 stopped here: TrustZone answered PAS_SUPPORTED(13) with 0, the zap
