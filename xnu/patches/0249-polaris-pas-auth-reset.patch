@@ -1,0 +1,95 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -470,6 +470,9 @@
+ #define MD_SCM_64		(1ull << 30)
+ #define MD_SCM_SIP		(2ull << 24)
+ #define MD_SCM_SUPPORTED	0x207ull
++#define MD_SCM_PAS_AUTH_AND_RESET	0x205ull	/* PAS service 2, command 5 */
++#define MD_SCM_ONE_VALUE	1u
++#define MD_PAS_MSS		5u		/* dt: qcom,mss@4080000 */
+ #define MD_PAS_FIRST		1u
+ #define MD_PAS_LAST		24u
+ 
+@@ -562,6 +565,55 @@
+ }
+ 
+ /*
++ * 0249, level 6: the one call the whole chain depends on.
++ *
++ * Level 5 asked PAS_SUPPORTED, and the modem answered not "no" but "the call
++ * failed" (rc -3145792) while adsp / zap / spss / cdsp came back as clean nos.
++ * That only proves the SMC path and the encoding are right; it says nothing
++ * about whether the modem can actually be started, because PAS_SUPPORTED is a
++ * different question from the bring-up call.
++ *
++ * This level sends the real entry point - PAS_AUTH_AND_RESET(5), the same call
++ * Linux's qcom_q6v5_pas() makes and the dipper port makes - with no image
++ * loaded and no memory handed over. That is deliberate: the point is not to
++ * start the modem, it is to hear how TrustZone answers an unloaded modem id.
++ * The three cases and what each means:
++ *
++ *   "no memory"/"no image" style error   the id is real, the monitor would
++ *                                        carry on once the image is there;
++ *                                        the dipper chain is worth porting
++ *   the same -3145792 as PAS_SUPPORTED   this TZ does not recognise id 5 as a
++ *                                        PAS image at all: the modem line ends
++ *                                        here, three thousand lines saved
++ *   "yes, started"                       the modem was already loaded (ABL) and
++ *                                        the work becomes QMI-over-SMEM, which
++ *                                        is the Wi-Fi line's GLINK
++ *
++ * Nothing is mapped and nothing is written; it is one SMC, exactly the shape
++ * dipper's scm() sends, with the same retry rule.
++ */
++static void
++md_pas_auth_probe(void)
++{
++	const uint64_t how = MD_SCM_64 | MD_SCM_SIP | MD_SCM_PAS_AUTH_AND_RESET;
++	uint64_t res[3] = { 0, 0, 0 };
++	int64_t rc;
++
++	MD_SAY("POLARIS MODEM: phase F: PAS_AUTH_AND_RESET(5) on the modem, no image "
++	    "loaded, no memory handed over\n");
++	rc = md_scm_call(how, MD_SCM_ONE_VALUE, MD_PAS_MSS, 0, 0, res);
++	MD_SAY("POLARIS MODEM:   rc %lld, answer %#llx %#llx %#llx\n", rc, res[0],
++	    res[1], res[2]);
++	if (rc == 0) {
++		MD_SAY("POLARIS MODEM:   the monitor accepted the modem id: the "
++		    "dipper chain can be ported\n");
++	} else {
++		MD_SAY("POLARIS MODEM:   the monitor refused: rc %lld "
++		    "(compare 0243's PAS_SUPPORTED rc -3145792)\n", rc);
++	}
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
+@@ -574,6 +626,9 @@
+  * secure monitor which subsystems it will boot and returns, so the answer to
+  * "can this phone's TrustZone start the modem" arrives without the risk that
+  * came with every other level.
++ *
++ * Level 6 asks the bring-up call itself, still with no image, so the answer is
++ * "does this TZ recognise the modem id" rather than "will it boot it".
+  */
+ void
+ polaris_modem_state_probe(void)
+@@ -582,6 +637,16 @@
+ 	int level = polaris_modem_level();
+ 
+ 	if (level < 2) {
++		return;
++	}
++	if (level >= 6) {
++		MD_SAY("POLARIS MODEM: ======== build 0249 alive: level %d, the "
++		    "bring-up call is sent with no image and no register is "
++		    "touched ========\n", level);
++		md_pas_scan();
++		md_pas_auth_probe();
++		MD_SAY("POLARIS MODEM: phase F done; nothing was written and no block "
++		    "was mapped\n");
+ 		return;
+ 	}
+ 	if (level >= 5) {
