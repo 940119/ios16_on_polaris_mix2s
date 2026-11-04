@@ -1,0 +1,170 @@
+diff -Nur a/bsd/dev/polaris_modem.c b/bsd/dev/polaris_modem.c
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -24,6 +24,11 @@
+  * later build, and it is the build that writes.
+  *
+  * Boot with polarismodem=1 to run it. Default: nothing at all.
++ *
++ * 0243 adds a level that reads no register at all: polarismodem=5 asks the
++ * secure monitor, id by id, which subsystems it is willing to boot. That list
++ * decides whether the rest of the modem line can be written at all, and asking
++ * costs one call per id.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -437,6 +442,126 @@
+ }
+ 
+ /*
++ * ---- asking TrustZone which subsystems it will boot -----------------------
++ *
++ * Every core that is not the application processor is started by a call into
++ * the secure monitor: PAS_AUTH_AND_RESET hands TrustZone the image, and the
++ * monitor takes the core out of reset. Which ids that call accepts is a
++ * property of the phone's signed TrustZone image and not of the kernel, so the
++ * first thing to establish on this phone is the list itself - and asking costs
++ * nothing.
++ *
++ * The transport is already known to work here. Step 16 of the GPU probe asks
++ * PAS_SUPPORTED(13) in every boot and gets a clean answer back (rc 0, result 0,
++ * "no zap on this phone"), which settles the encoding, the owner and the SMC
++ * path. What has never been asked is the same question about the other ids.
++ *
++ * PAS_SUPPORTED takes one value and returns one: 1 when the monitor will boot
++ * that subsystem, 0 when it will not. Nothing is reset, no memory changes
++ * hands, and a "no" leaves the machine exactly as it was - which is why this
++ * runs before a single line of the modem bring-up is written.
++ *
++ * 1, 14 and 18 are named from this phone's own device tree: the adsp, spss and
++ * cdsp nodes each carry qcom,pas-id. 5 and 13 are the numbers the other SDM845
++ * kernels use for the modem and for the GPU's zap, and 13 is the one the ring
++ * already reports as a "no". So the table is a hint printed beside the answer,
++ * not a claim about what the answer means.
++ */
++#define MD_SCM_64		(1ull << 30)
++#define MD_SCM_SIP		(2ull << 24)
++#define MD_SCM_SUPPORTED	0x207ull
++#define MD_PAS_FIRST		1u
++#define MD_PAS_LAST		24u
++
++static const struct {
++	uint32_t id;
++	const char *name;
++} md_pas_names[] = {
++	{ 1,  "adsp" },			/* dt: qcom,lpass@17300000 */
++	{ 5,  "the modem" },		/* dt: qcom,mss@4080000 */
++	{ 13, "the GPU's zap" },	/* the one this phone says no to */
++	{ 14, "spss" },			/* dt: qcom,spss@1880000 */
++	{ 18, "cdsp" },			/* dt: qcom,turing@8300000 */
++};
++
++static const char *
++md_pas_name(uint32_t id)
++{
++	for (unsigned i = 0; i < sizeof(md_pas_names) / sizeof(md_pas_names[0]); i++) {
++		if (md_pas_names[i].id == id) {
++			return md_pas_names[i].name;
++		}
++	}
++	return "no name this reader knows";
++}
++
++/*
++ * The same call the GPU probe makes, with the same retry rule: x0 comes back
++ * as 1 when the monitor was interrupted and wants the call again, and as the
++ * SCM return code otherwise.
++ */
++static int64_t
++md_scm_call(uint64_t function, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2,
++    uint64_t res[3])
++{
++	uint64_t session = 0;
++
++	for (unsigned i = 0; i < 100; i++) {
++		register uint64_t x0 __asm__("x0") = i ? 1 : function;
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = a0;
++		register uint64_t x3 __asm__("x3") = a1;
++		register uint64_t x4 __asm__("x4") = a2;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4),
++		    "+r" (x5), "+r" (x6), "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14",
++		    "x15", "x16", "x17", "memory", "cc");
++		session = x6;
++		if (x0 != 1) {
++			res[0] = x1;
++			res[1] = x2;
++			res[2] = x3;
++			return (int32_t)x0;
++		}
++	}
++	return -1000;
++}
++
++static void
++md_pas_scan(void)
++{
++	const uint64_t how = MD_SCM_64 | MD_SCM_SIP | MD_SCM_SUPPORTED;
++	uint32_t yes = 0, tried = 0, failed = 0;
++
++	MD_SAY("POLARIS MODEM: phase E: asking the monitor, id by id, which cores it "
++	    "will boot\n");
++	for (uint32_t id = MD_PAS_FIRST; id <= MD_PAS_LAST; id++) {
++		uint64_t res[3] = { 0, 0, 0 };
++		int64_t rc = md_scm_call(how, 1, id, 0, 0, res);
++
++		tried++;
++		if (rc != 0) {
++			failed++;
++			MD_SAY("POLARIS MODEM:   id %2u (%s): the call itself failed, "
++			    "rc %lld, result %#llx\n", id, md_pas_name(id), rc, res[0]);
++			continue;
++		}
++		if (res[0] == 1) {
++			yes++;
++			MD_SAY("POLARIS MODEM:   id %2u (%s): yes, this monitor will boot "
++			    "it\n", id, md_pas_name(id));
++		} else {
++			MD_SAY("POLARIS MODEM:   id %2u (%s): no, result %#llx\n", id,
++			    md_pas_name(id), res[0]);
++		}
++	}
++	MD_SAY("POLARIS MODEM: %u of %u ids answered yes, %u calls failed\n", yes,
++	    tried, failed);
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
+@@ -444,6 +569,11 @@
+  * Level 3 adds the two clock writes, the GPLL0 vote and the modem's own blocks.
+  * That is where a read can park the thread, which is exactly why it is a
+  * separate level and why this runs in its own thread.
++ *
++ * Level 5 is the odd one: it never maps a register block at all. It asks the
++ * secure monitor which subsystems it will boot and returns, so the answer to
++ * "can this phone's TrustZone start the modem" arrives without the risk that
++ * came with every other level.
+  */
+ void
+ polaris_modem_state_probe(void)
+@@ -452,6 +582,15 @@
+ 	int level = polaris_modem_level();
+ 
+ 	if (level < 2) {
++		return;
++	}
++	if (level >= 5) {
++		MD_SAY("POLARIS MODEM: ======== build 0243 alive: level %d, the "
++		    "secure monitor is asked which cores it will boot and no register "
++		    "is touched ========\n", level);
++		md_pas_scan();
++		MD_SAY("POLARIS MODEM: phase E done; nothing was written and no block "
++		    "was mapped\n");
+ 		return;
+ 	}
+ 	MD_SAY("POLARIS MODEM: ======== build 0177 alive: level %d, the boot ROM "
