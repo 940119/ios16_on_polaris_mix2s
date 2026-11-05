@@ -1,0 +1,155 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -45,6 +45,7 @@
+ extern int sweet_ufs_raw_read(uint8_t lun, uint64_t lba, uint32_t count, void *to);
+ extern void sweet_log_flush_now(void);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_vtophys(vm_offset_t);	/* 0291: kernel VA -> PA for the mdt */
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ 
+@@ -226,6 +227,7 @@
+  */
+ /* 0290: level 7 reads the firmware metadata; defined after MD_SAY below. */
+ static void md_firmware_metadata(uint32_t image_cluster);
++static void md_pas_image_only(uint32_t image_cluster);
+ 
+ static int
+ polaris_modem_level(void)
+@@ -295,6 +297,9 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
++	if (polaris_modem_level() >= 8) {
++		md_pas_image_only(md_image_cluster);
++	}
+ }
+ 
+ /*
+@@ -477,7 +482,13 @@
+ #define MD_SCM_SIP		(2ull << 24)
+ #define MD_SCM_SUPPORTED	0x207ull
+ #define MD_SCM_PAS_AUTH_AND_RESET	0x205ull	/* PAS service 2, command 5 */
++#define MD_SCM_PAS_INIT_IMAGE	0x201ull	/* 0291: PAS service 2, command 1 */
++#define MD_SCM_PAS_MEM_SETUP	0x202ull	/* 0291: PAS service 2, command 2 */
++#define MD_SCM_VALUE_AND_BUFFER	(2u | 2u << 6)	/* dipper's one value + one buffer */
++#define MD_SCM_THREE_VALUES	3u
+ #define MD_SCM_ONE_VALUE	1u
++#define MD_MODEM_BASE		0x8e400000ull	/* 0290: lowest PT_LOAD paddr */
++#define MD_MODEM_SIZE		0x07800000ull	/* 0290: 120 MiB window */
+ #define MD_PAS_MSS		5u		/* dt: qcom,mss@4080000 */
+ #define MD_PAS_FIRST		1u
+ #define MD_PAS_LAST		24u
+@@ -763,6 +774,101 @@
+ }
+ 
+ /*
++ * 0291, level 8: hand TrustZone the modem header and the place the image
++ * will go, and stop.
++ *
++ * 0290 measured both numbers from MODEM.MDT: 28 PT_LOAD segments spanning
++ * 0x8e400000 .. 0x95c00000, so PAS_MEM_SETUP(5) takes base 0x8e400000 and
++ * size 0x07800000 (120 MiB) - exactly the DT's modem_region base.
++ *
++ * PAS_INIT_IMAGE needs the whole 8412-byte .mdt physically contiguous. The
++ * current kernel is 4 KB pages and has no simple kmem_alloc_contig, so instead
++ * of three possibly-disjoint kmem_alloc pages we use a static, 4 KB-aligned
++ * 16 KB array: it is part of the continuously loaded kernel image, is wired,
++ * and costs no allocation at all (0288 showed what a 9.3 MB one does here).
++ * ml_vtophys() turns its address into the physical address TZ wants.
++ *
++ * Deliberately NOT done here: no .bXX segment is written into modem memory,
++ * and no PAS_AUTH_AND_RESET. XPU2 belongs to TrustZone (§48/§49); whether
++ * this TZ opens the 120 MiB window to the AP is exactly what 0292 must find
++ * out, one small mapping at a time. If TZ rejects either call we learn that
++ * from the rc without having touched a byte of the window.
++ */
++static uint8_t md_mdt_copy[16384] __attribute__((aligned(4096)));
++
++static void
++md_pas_image_only(uint32_t image_cluster)
++{
++	struct md_file_want mdt = { "MODEM.MDT", 0, 0, false };
++	uint32_t lba, blocks, b, size;
++	vm_offset_t phys;
++	uint64_t res[3];
++	int64_t rc;
++
++	MD_SAY("POLARIS MODEM: ======== build 0291 alive: PAS_INIT_IMAGE(5) + "
++	    "PAS_MEM_SETUP(5), no segment written ========\n");
++	md_walk(image_cluster, md_find_entry, &mdt);
++	if (!mdt.found || mdt.cluster < 2 || mdt.size == 0 ||
++	    mdt.size > sizeof(md_mdt_copy)) {
++		MD_SAY("POLARIS MODEM:   MODEM.MDT missing or does not fit (%u bytes)\n",
++		    mdt.size);
++		return;
++	}
++	size = mdt.size;
++	blocks = (size + MD_BLOCK - 1) / MD_BLOCK;
++	lba = md_geo.data_lba + (mdt.cluster - 2) * md_geo.spc;
++	MD_SAY("POLARIS MODEM:   reading %u blocks of the %u-byte mdt at +%u\n",
++	    blocks, size, lba);
++	for (b = 0; b < blocks; b++) {
++		if (!md_read(lba + b, md_mdt_copy + b * MD_BLOCK)) {
++			MD_SAY("POLARIS MODEM:   block +%u did not read\n", b);
++			return;
++		}
++	}
++	if (!(md_mdt_copy[0] == 0x7f && md_mdt_copy[1] == 'E' &&
++	    md_mdt_copy[2] == 'L' && md_mdt_copy[3] == 'F')) {
++		MD_SAY("POLARIS MODEM:   the copy is not an ELF\n");
++		return;
++	}
++	/* TZ reads the buffer through the physical address, not our caches. */
++	for (vm_offset_t line = (vm_offset_t)md_mdt_copy;
++	    line < (vm_offset_t)md_mdt_copy + sizeof(md_mdt_copy); line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	phys = ml_vtophys((vm_offset_t)md_mdt_copy);
++	MD_SAY("POLARIS MODEM:   mdt VA 0x%llx PA 0x%llx, %u bytes, page aligned %d\n",
++	    (unsigned long long)(vm_offset_t)md_mdt_copy,
++	    (unsigned long long)phys, size, (phys & 0xfff) == 0);
++	if (phys == 0) {
++		MD_SAY("POLARIS MODEM:   no physical address; no SMC sent\n");
++		return;
++	}
++
++	res[0] = res[1] = res[2] = ~0ull;
++	rc = md_scm_call(MD_SCM_64 | MD_SCM_SIP | MD_SCM_PAS_INIT_IMAGE,
++	    MD_SCM_VALUE_AND_BUFFER, MD_PAS_MSS, phys, 0, res);
++	MD_SAY("POLARIS MODEM:   PAS_INIT_IMAGE(5, mdt) rc %lld answer %#llx "
++	    "%#llx %#llx\n", rc, res[0], res[1], res[2]);
++	if (rc != 0 || res[0] != 0) {
++		MD_SAY("POLARIS MODEM:   the monitor did not take the header; "
++		    "MEM_SETUP not sent\n");
++		return;
++	}
++	MD_SAY("POLARIS MODEM:   TRUSTZONE ACCEPTED THE MODEM HEADER\n");
++
++	res[0] = res[1] = res[2] = ~0ull;
++	rc = md_scm_call(MD_SCM_64 | MD_SCM_SIP | MD_SCM_PAS_MEM_SETUP,
++	    MD_SCM_THREE_VALUES, MD_PAS_MSS, MD_MODEM_BASE, MD_MODEM_SIZE, res);
++	MD_SAY("POLARIS MODEM:   PAS_MEM_SETUP(5, 0x%llx, 0x%llx) rc %lld "
++	    "answer %#llx %#llx %#llx\n",
++	    (unsigned long long)MD_MODEM_BASE, (unsigned long long)MD_MODEM_SIZE,
++	    rc, res[0], res[1], res[2]);
++	MD_SAY("POLARIS MODEM: phase H done: no segment written, no register "
++	    "touched, no AUTH_AND_RESET\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
+@@ -794,8 +900,8 @@
+ 	 * level 5/6 questions and their answers would be mixed into this log.
+ 	 */
+ 	if (level >= 7) {
+-		MD_SAY("POLARIS MODEM: ======== build 0290 alive: level %d, firmware "
+-		    "metadata only; no SMC, no register, no write ========\n", level);
++		MD_SAY("POLARIS MODEM: ======== level %d: state probe skipped, the "
++		    "image probe runs in the mount path ========\n", level);
+ 		return;
+ 	}
+ 	if (level >= 6) {
