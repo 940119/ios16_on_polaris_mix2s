@@ -1,0 +1,88 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -41,6 +41,7 @@
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
++static void ud_attach_worker(void *arg, wait_result_t wr);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -337,6 +338,18 @@
+ #define DCFG            0xc700
+ #define DCTL            0xc704
+ #define DEVTEN          0xc708
++/*
++ * 0262: the endpoint event enable, which this driver had never written.
++ *
++ * DEVTEN (0xc708) carries the *device-level* events - disconnect, USB reset,
++ * connect-done. The events that matter for a control transfer are endpoint
++ * events: XferComplete, XferNotReady. Those are gated by DEPEVTENA (0xc718),
++ * one bit per endpoint, and with it zero the core queues nothing when the host
++ * sends GET_DESCRIPTOR - so ep0 never answers and Windows says "unknown USB
++ * device" on a link that is electrically fine.
++ */
++#define DEPEVTENA       0xc718
++#define DEPEVTENA_EP(n) (1u << (n))
+ #define DSTS            0xc70c
+ #define DALEPENA        0xc720
+ #define DEPCMDPAR2(n)   (0xc800 + 0x10 * (n))
+@@ -1756,6 +1769,12 @@
+ 	 */
+ 	ud_vbus_override_quiet();
+ 	/*
++	 * 0262: enable the endpoint events before the core is allowed to answer
++	 * anything. Two endpoints exist (ep0 in/out and ep1 in), and both need
++	 * their bit or their completions never reach the event ring.
++	 */
++	dwc_wr(DEPEVTENA, DEPEVTENA_EP(0) | DEPEVTENA_EP(1));
++	/*
+ 	 * 0258: and the controller's own override, immediately before the run.
+ 	 * Order matters for the same reason pre_run_stop does: the core latches
+ 	 * the session inputs when RUN_STOP goes to 1.
+@@ -2563,8 +2582,6 @@
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+-	thread_t thread;
+-
+ 	/*
+ 	 * Below 4 GiB, forced.
+ 	 *
+@@ -2703,6 +2720,36 @@
+ 	 * that configures ep0, and that one is the only one whose attach is
+ 	 * then awaited.
+ 	 */
++	/*
++	 * 0262: everything below runs in its own thread.
++	 *
++	 * It used to run here, inside the IOKit probe, and it is not quick: four
++	 * attach strategies, each one a core reset, a PHY sequence, an attach and
++	 * a four-second listen, plus an ifnet plumb that happens before the root
++	 * volume is mounted. With sweetusb=2 the kernel spent that whole window
++	 * holding the probe path, and the boot failed at vfs_rootvnode with
++	 * eleven retries, no launchd and never a single swap - measured against
++	 * sweetusb=1, which boots with one retry and 35 launchd lines.
++	 *
++	 * Nothing here is needed to mount the root volume, so it can all happen
++	 * after the system is up.
++	 */
++	{
++		thread_t worker;
++
++		if (kernel_thread_start(ud_attach_worker, NULL, &worker) == KERN_SUCCESS) {
++			thread_deallocate(worker);
++		} else {
++			printf("SWEET USB: the attach thread did not start\n");
++		}
++	}
++}
++
++static void
++ud_attach_worker(void *arg __unused, wait_result_t wr __unused)
++{
++	thread_t thread;
++
+ 	static const char *names[] = {
+ 		"resume+utmi", "table+utmi", "noreset", "runstop+table+utmi"
+ 	};
