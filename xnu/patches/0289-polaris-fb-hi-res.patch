@@ -1,0 +1,22 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -512,10 +512,16 @@
+  * saturated prints a hue letter instead of a brightness: R G B C M Y. White stays
+  * on the ramp. "G" in the bottom middle is a call button; "0" is not.
+  *
+- * 120 lines every two minutes, six dumps in twelve minutes.
++ * 0289: 18x18 was still too coarse to tell the lock screen from the home
++ * screen. 108x216 gives 10x10 pixels per cell, four times the linear detail.
++ * This is only a constant change: the buffer is fb->fPixels, already mapped by
++ * this driver. 0288 tried a second ml_io_map of the 9.3 MB scanout buffer and
++ * panicked with kmem_alloc KERN_NO_SPACE (vm_kern.c:170); do not repeat that.
++ *
++ * 216 lines every two minutes, six dumps in twelve minutes.
+  */
+-#define SWEET_FB_THUMB_COLS	60
+-#define SWEET_FB_THUMB_ROWS	120
++#define SWEET_FB_THUMB_COLS	108
++#define SWEET_FB_THUMB_ROWS	216
+ 
+ static char
+ sweet_fb_hue(uint32_t r, uint32_t g, uint32_t b)
