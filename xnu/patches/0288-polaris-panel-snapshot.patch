@@ -1,0 +1,154 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -302,6 +302,120 @@
+ 	    when, (unsigned)secs, (unsigned)usec);
+ }
+ 
++/*
++ * 0288: look at the panel from the outside.
++ *
++ * SweetFramebuffer already dumps a 60x120 character view of the screen every 7.2 s
++ * (sweet_fb_thumbnail, 0180), and 9 of those in one boot were enough to show that
++ * this machine draws a real iOS layout and even opens a white app window over the
++ * dock. 60x120 is 18x18 pixels per cell though, which is too coarse to say whether
++ * the settled screen is the home screen or the lock screen.
++ *
++ * The obvious fix - raise the driver's constants - needs the current text of
++ * SweetFramebuffer.cpp, which this session does not hold. The panel geometry is
++ * printed by that same driver on every boot, so we do not need it:
++ *
++ *   SWEET FB: AppleCLCD 1080x2160 stride 4320 at 0x9d400000, presented as 750x1624
++ *
++ * A linear 1080x2160 surface of 32-bit pixels at 0x9d400000. Mapping it and sampling
++ * it ourselves gives 108x216 cells (10x10 pixels each) - four times the linear
++ * resolution - without touching that file at all.
++ *
++ * Reading the scanout buffer is safe: the display controller is only reading it, and
++ * these are plain loads from memory that is already mapped uncached.
++ *
++ * sweetfbsnap=<seconds> arms it; 0 (the default) does nothing. One dump costs about
++ * 24 KB of ring, so it is on demand only.
++ */
++#define FB_PA		0x9d400000
++#define FB_W		1080
++#define FB_H		2160
++#define FB_STRIDE	4320		/* 1080 * 4, from the driver's own line */
++#define FB_COLS		108
++#define FB_ROWS		216
++
++static void ud_sleep_ms(unsigned ms);	/* defined further down */
++
++static void
++ud_fb_dump(const char *tag)
++{
++	static const char ramp[] = " .:-=+*#%@";
++	static char line[FB_COLS + 1];
++	const unsigned cw = FB_W / FB_COLS, ch = FB_H / FB_ROWS;
++	vm_offset_t fb = ml_io_map(FB_PA, (vm_size_t)FB_STRIDE * FB_H);
++
++	if (fb == 0) {
++		printf("SWEET USB: 0288 %s: panel map failed\n", tag);
++		ud_flush();
++		return;
++	}
++	printf("SWEET USB: 0288 %s: panel %ux%u stride %u, %ux%u cells of %ux%u px\n",
++	    tag, FB_W, FB_H, FB_STRIDE, FB_COLS, FB_ROWS, cw, ch);
++	ud_flush();
++
++	for (unsigned r = 0; r < FB_ROWS; r++) {
++		unsigned y0 = r * FB_H / FB_ROWS;
++
++		for (unsigned c = 0; c < FB_COLS; c++) {
++			unsigned x0 = c * FB_W / FB_COLS;
++			uint32_t sr = 0, sg = 0, sb = 0, n = 0;
++
++			/* every other pixel in both directions: a 5x5 sample of the cell */
++			for (unsigned y = y0; y < y0 + ch; y += 2) {
++				volatile uint32_t *p = (volatile uint32_t *)
++				    (fb + (vm_size_t)y * FB_STRIDE + x0 * 4);
++				for (unsigned x = 0; x < cw; x += 2) {
++					uint32_t v = p[x];
++					sb += v & 0xff;
++					sg += (v >> 8) & 0xff;
++					sr += (v >> 16) & 0xff;
++					n++;
++				}
++			}
++			if (n == 0) {
++				line[c] = ' ';
++				continue;
++			}
++			sr /= n; sg /= n; sb /= n;
++			uint32_t lum = (sr * 77 + sg * 151 + sb * 28) >> 8;
++			uint32_t mx = sr > sg ? sr : sg;
++			if (sb > mx) mx = sb;
++			uint32_t mn = sr < sg ? sr : sg;
++			if (sb < mn) mn = sb;
++			if (mx > 40 && (mx - mn) * 2 > mx) {
++				line[c] = (sr == mx) ? 'R' : (sg == mx ? 'G' : 'B');
++			} else {
++				line[c] = ramp[lum * 9 / 255];
++			}
++		}
++		line[FB_COLS] = 0;
++		printf("SWEET USB: 0288 |%s|\n", line);
++		if ((r & 31) == 31) {
++			ud_flush();
++		}
++	}
++	printf("SWEET USB: 0288 %s: done\n", tag);
++	ud_flush();
++}
++
++static void
++ud_fbsnap_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	int after = 0;
++
++	PE_parse_boot_argn("sweetfbsnap", &after, sizeof(after));
++	if (after <= 0) {
++		return;
++	}
++	if (after > 900) {
++		after = 900;
++	}
++	printf("SWEET USB: 0288 panel snapshot in %d s\n", after);
++	ud_flush();
++	ud_sleep_ms((unsigned)after * 1000);
++	ud_fb_dump("sweetfbsnap");
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -316,6 +430,21 @@
+ 	ud_seed_wall_clock();
+ 
+ 	/*
++	 * 0288: the panel snapshot runs on its own thread - the probe cannot block
++	 * for a minute, and with sweetusb=1 there is no gadget thread to ride on.
++	 */
++	{
++		int want = 0;
++		thread_t snap;
++
++		PE_parse_boot_argn("sweetfbsnap", &want, sizeof(want));
++		if (want > 0 &&
++		    kernel_thread_start(ud_fbsnap_thread, NULL, &snap) == KERN_SUCCESS) {
++			thread_deallocate(snap);
++		}
++	}
++
++	/*
+ 	 * sweetusb=0 (default) does nothing at all, 1 reports the controller's
+ 	 * state from registers that are always powered, 2 also touches the PHY
+ 	 * and starts the device.
+@@ -356,7 +485,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0287 alive: PHY on, wall clock seeded ========\n");
++	printf("SWEET USB: ======== build 0288 alive: PHY on, panel snapshot ========\n");
+ 	ud_flush();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
