@@ -1,0 +1,59 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -287,33 +287,7 @@
+ 	 * stops here, with the report above it complete, and only level 2 goes
+ 	 * on to the PHY.
+ 	 */
+-	if (enabled < 2) {
+-		return;
+-	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
+-	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
+-	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	/*
+-	 * These are byte registers behind an AHB slave that repeats the byte on
+-	 * every lane, so the 32-bit read has to be masked: 0151 printed
+-	 * "PLL_STATUS 0x17171717" for what is really 0x17, and 0x17171717 was
+-	 * briefly read as four different values.
+-	 *
+-	 * 0x1a0 is PLL_COMMON_STATUS_ONE on this PHY generation, not the
+-	 * msm8996-era PLL_STATUS, which is why the ready bit is bit 0 here.
+-	 */
+-	printf("SWEET USB: QUSB2 PLL_COMMON_STATUS_ONE 0x%02x PWR_CTRL1 0x%02x "
+-	    "PORT_TUNE1 0x%02x TEST1 0x%02x\n",
+-	    usb_rd(phy, 0x1a0) & 0xff, usb_rd(phy, 0x210) & 0xff,
+-	    usb_rd(phy, 0x240) & 0xff, usb_rd(phy, 0x254) & 0xff);
++
+ }
+ 
+ /*
+@@ -2623,6 +2597,21 @@
+ 	 */
+ 	vm_offset_t dwc = ud.dwc;
+ 	/*
++	 * 0266: the PHY read that used to sit in the probe, where mapping its
++	 * window before launchd cost the display. Same four registers, same
++	 * decode, just late enough not to matter.
++	 */
++	{
++		vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++
++		if (phy != 0) {
++			printf("SWEET USB: QUSB2 PLL_COMMON_STATUS_ONE 0x%02x PWR_CTRL1 0x%02x "
++			    "PORT_TUNE1 0x%02x TEST1 0x%02x\n",
++			    usb_rd(phy, 0x1a0) & 0xff, usb_rd(phy, 0x210) & 0xff,
++			    usb_rd(phy, 0x240) & 0xff, usb_rd(phy, 0x254) & 0xff);
++		}
++	}
++	/*
+ 	 * Below 4 GiB, forced.
+ 	 *
+ 	 * Every earlier build allocated this buffer wherever the allocator felt
