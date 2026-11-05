@@ -1,0 +1,121 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -158,16 +158,23 @@
+ static int ud_step = 3;
+ 
+ /*
+- * 0276: ep0-priming ladder. 0274 (no prime) runs 291 s / 839 swaps;
+- * 0275 (prime + run + event thread) is dead at 77 s with 0 swaps, one
+- * tick after "gadget armed". Everything between those two is one action,
+- * so split it by boot-arg instead of guessing:
+- *   0 = no prime                    (0274 behaviour)
+- *   1 = prime, core stays stopped   (no host connect, no TRB DMA)
+- *   2 = prime + RUN_STOP, but ud_thread NOT started (no event handling)
+- *   3 = full                        (0275 behaviour)
++ * 0277: when to issue STARTTRANSFER on ep0 OUT.
++ *
++ * 0274 (no prime) = 291 s / 839 swaps. 0275 (prime before RUN_STOP) =
++ * 77 s / 0 swaps. 0276-p1 (prime before RUN_STOP, core left stopped) died
++ * even earlier - the ring ends at "epcmd ep0 PAR written, firing DEPCMD",
++ * i.e. dwc_wr(DEPCMD(0), 0x406) itself wedged the bus. So the fatal
++ * action is the endpoint command issued while the core is HALTED.
++ *
++ * Linux __dwc3_gadget_start() has the controller running before ep0 is
++ * armed. Move the prime to after RUN_STOP and see whether the command
++ * engine accepts it.
++ *   0 = no prime                       (0274 behaviour, control)
++ *   1 = prime BEFORE RUN_STOP           (0275/0276 behaviour, known bad)
++ *   2 = prime AFTER RUN_STOP            (new default)
++ *   3 = prime AFTER RUN_STOP + 100 ms   (settle time)
+  */
+-static int ud_prime = 3;
++static int ud_prime = 2;
+ 
+ #define US_CHECK(what)	do { \
+ 	printf("SWEET USB: -- at %s\n", (what)); \
+@@ -277,7 +284,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0276 alive: PHY on, sweetusbstep ladder ========\n");
++	printf("SWEET USB: ======== build 0277 alive: PHY on, sweetusbstep ladder ========\n");
+ 	ud_flush();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -664,8 +671,16 @@
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	printf("SWEET USB: epcmd ep%u PAR written, firing DEPCMD\n", ep);
++	if ((cmd & 0xf) == DEPCMD_STARTTRANSFER) {
++		printf("SWEET USB: 0277 about to write DEPCMD 0x%08x (STARTTRANSFER)\n",
++		    cmd | DEPCMD_CMDACT);
++	}
+ 	ud_flush();
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
++	if ((cmd & 0xf) == DEPCMD_STARTTRANSFER) {
++		printf("SWEET USB: 0277 DEPCMD write returned, reading back\n");
++		ud_flush();
++	}
+ 	printf("SWEET USB: epcmd ep%u DEPCMD 0x%08x, polling\n", ep, dwc_rd(DEPCMD(ep)));
+ 	/*
+ 	 * Two phases: CMDACT latches almost immediately after the write and
+@@ -3227,16 +3242,17 @@
+ 	 * before it, STARTTRANSFER appeared ZERO times in the ring
+ 	 * (checked directly: grep -c STARTTRANSFER _r0274.txt == 0).
+ 	 */
+-	if (ud_prime >= 1) {
+-		printf("SWEET USB: 0276 prime=%d priming ep0 OUT SETUP TRB (saw_event=%d)\n",
+-		    ud_prime, saw_event);
++	if (ud_prime == 1) {
++		printf("SWEET USB: 0277 prime=1 priming ep0 OUT SETUP TRB BEFORE run (saw_event=%d)\n",
++		    saw_event);
+ 		ud_flush();
+ 		ud_start_setup();
+-		printf("SWEET USB: 0276 ep0 SETUP TRB armed, DALEPENA 0x%08x DEVTEN 0x%08x\n",
++		printf("SWEET USB: 0277 ep0 SETUP TRB armed (early), DALEPENA 0x%08x DEVTEN 0x%08x\n",
+ 		    dwc_rd(DALEPENA), dwc_rd(DEVTEN));
+ 		ud_flush();
+ 	} else {
+-		printf("SWEET USB: 0276 prime=0 - ep0 left unprimed (0274 behaviour)\n");
++		printf("SWEET USB: 0277 prime=%d - ep0 prime %s\n", ud_prime,
++		    ud_prime == 0 ? "skipped entirely" : "deferred until after RUN_STOP");
+ 		ud_flush();
+ 	}
+ 
+@@ -3251,22 +3267,25 @@
+ 	 * keeps the pull-up up.
+ 	 */
+ 	printf("SWEET USB: leaving the pull-up up, monitor thread starts below\n");
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	printf("SWEET USB: 0277 RUN_STOP set, DCTL 0x%08x DSTS 0x%08x\n",
++	    dwc_rd(DCTL), dwc_rd(DSTS));
++	ud_flush();
+ 	if (ud_prime >= 2) {
+-		dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+-	} else {
+-		printf("SWEET USB: 0276 prime=%d - core deliberately left STOPPED\n", ud_prime);
++		if (ud_prime >= 3) {
++			ud_sleep_ms(100);
++		}
++		printf("SWEET USB: 0277 prime=%d priming ep0 OUT SETUP TRB AFTER run\n", ud_prime);
++		ud_flush();
++		ud_start_setup();
++		printf("SWEET USB: 0277 ep0 SETUP TRB armed (late), DALEPENA 0x%08x DEVTEN 0x%08x\n",
++		    dwc_rd(DALEPENA), dwc_rd(DEVTEN));
+ 		ud_flush();
+ 	}
+ 
+ 	printf("SWEET USB: step 6/6 threads, DMA at 0x%llx\n", ud.dma_pa);
+-	if (ud_prime >= 3) {
+-		if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+-			thread_deallocate(thread);
+-		}
+-	} else {
+-		printf("SWEET USB: 0276 prime=%d - event thread deliberately NOT started\n",
+-		    ud_prime);
+-		ud_flush();
++	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
+ 	}
+ 	int livelog = 1;
+ 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
