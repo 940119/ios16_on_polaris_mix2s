@@ -1,0 +1,81 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -252,6 +252,56 @@
+ 	printf("\n");
+ }
+ 
++/*
++ * 0287: the wall clock, which has never been set on this machine.
++ *
++ * A crash report pulled off the data volume says it in one line:
++ *
++ *   "uptime" : 110,
++ *   "captureTime" : "1969-12-31 16:01:53.3950 -0800",
++ *
++ * calendar == 0 + uptime. Nothing sets it at boot because this port has no RTC
++ * driver, so PE_get_clock() has nothing to ask and XNU starts the calendar at
++ * the epoch. Everything downstream of a date is then wrong:
++ *
++ *   - certificate validity, i.e. TLS and anything that authenticates;
++ *   - file timestamps on the data volume, which the first-run migrations read;
++ *   - and the one process this machine is actually seen asserting:
++ *
++ *       -[PBFPosterExtensionDataStore _stateLock_setupSwitcherConfigurationForFirstTime]
++ *       EXC_BREAKPOINT, twice, identical stacks
++ *
++ * clock_set_calendar_microtime() is the same call settimeofday ends up making;
++ * after it the calendar advances with uptime as usual.
++ *
++ * sweetclock=<unix seconds> overrides the seed, sweetclock=0 leaves the clock
++ * alone. The default is a fixed date rather than "now" on purpose: a constant
++ * is reproducible boot to boot, and any date after 2015 satisfies the chains
++ * iOS ships.
++ *
++ * Where this lives is wrong on purpose. It belongs in the platform driver, but
++ * sweet_usb.c is the only file in this tree whose exact current text this
++ * session holds, so a patch against it is guaranteed to apply. Moving it later
++ * is a no-op refactor; the call site is one line at the top of the probe.
++ */
++static void
++ud_seed_wall_clock(void)
++{
++	uint64_t when = 1767225600ULL;	/* 2026-01-01T00:00:00Z */
++	clock_sec_t secs = 0;
++	clock_usec_t usec = 0;
++
++	PE_parse_boot_argn("sweetclock", &when, sizeof(when));
++	if (when == 0) {
++		printf("SWEET USB: 0287 sweetclock=0, calendar left at the epoch\n");
++		return;
++	}
++	clock_set_calendar_microtime((clock_sec_t)when, 0);
++	clock_get_calendar_microtime(&secs, &usec);
++	printf("SWEET USB: 0287 wall clock seeded to %llu, reads back %u.%06u\n",
++	    when, (unsigned)secs, (unsigned)usec);
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -260,6 +310,12 @@
+ 	bool clocks_on = true;
+ 
+ 	/*
++	 * 0287: before the sweetusb gate below, so the clock is seeded on every
++	 * boot including sweetusb=0.
++	 */
++	ud_seed_wall_clock();
++
++	/*
+ 	 * sweetusb=0 (default) does nothing at all, 1 reports the controller's
+ 	 * state from registers that are always powered, 2 also touches the PHY
+ 	 * and starts the device.
+@@ -300,7 +356,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0286 alive: PHY on, USB30_PRIM block reset ========\n");
++	printf("SWEET USB: ======== build 0287 alive: PHY on, wall clock seeded ========\n");
+ 	ud_flush();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
