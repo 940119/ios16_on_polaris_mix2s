@@ -1,0 +1,93 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -284,7 +284,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0277 alive: PHY on, sweetusbstep ladder ========\n");
++	printf("SWEET USB: ======== build 0278 alive: PHY on, sweetusbstep ladder ========\n");
+ 	ud_flush();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -396,6 +396,8 @@
+ 		    !!(g & (1u << 8)), !!(g & (1u << 9)), !!(g & (1u << 10)),
+ 		    !!(g & (1u << 5)), !!(g & (1u << 4)));
+ 	}
++	printf("SWEET USB: 0278 GBUSERRADDR 0x%08x%08x (at probe)\n",
++	    usb_rd(dwc, 0xc134), usb_rd(dwc, 0xc130));
+ 	ud_flush();
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+@@ -2855,11 +2857,40 @@
+ 	 * ordinary one. Kernel object memory is never paged out, so nothing is
+ 	 * lost by dropping the flag.
+ 	 */
++	/*
++	 * 0278: kmem_alloc_contig()'s fifth argument is max_pnum - the maximum
++	 * physical page number to allocate, 0 meaning no limit. The old loop
++	 * passed 0 and simply retried, hoping the allocator would hand back a
++	 * low page. With mkadt.py --highmem the whole kernel-managed bank
++	 * starts at 0x100000000, so all eight tries were >= 4 GiB and the
++	 * fallback knowingly used a high address anyway. Ask for a low page
++	 * directly instead.
++	 *
++	 * 0277-p2 showed GSTS 0x7e800010 after the ep0 prime; bit 4 is
++	 * DWC3_GSTS_BUS_ERR_ADDR_VLD, i.e. the core reported an AXI bus error
++	 * while fetching the SETUP TRB at 0x103b61000. The 64-bit AWIDTH only
++	 * describes the register width, not what the SDM845 AXI master can
++	 * actually reach. 0274 (no prime) never sets that bit.
++	 */
++	int lo = 1;
++	PE_parse_boot_argn("sweetusblo", &lo, sizeof(lo));
++	ppnum_t max_pnum = lo ? (ppnum_t)(atop_64(0x100000000ULL) - 1) : 0;
++	printf("SWEET USB: 0278 DMA max_pnum 0x%x (low=%d)\n", max_pnum, lo);
++	ud_flush();
+ 	for (; tries < 8; tries++) {
+-		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+-		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-			printf("SWEET USB: no DMA memory\n");
+-			return;
++		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK,
++		    max_pnum, 0, KMA_DATA | KMA_ZERO,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET USB: 0278 low-DMA alloc failed at try %d "
++			    "(max_pnum 0x%x)\n", tries, max_pnum);
++			ud_flush();
++			max_pnum = 0;           /* fall back, but say so */
++			if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK,
++			    0, 0, KMA_DATA | KMA_ZERO,
++			    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++				printf("SWEET USB: no DMA memory\n");
++				return;
++			}
+ 		}
+ 		pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+ 		if (!pn) {
+@@ -2882,7 +2913,7 @@
+ 		 * loop was trying to avoid - but the readback of GEVNTADR now
+ 		 * says whether the core can hold it.
+ 		 */
+-		printf("SWEET USB: no DMA memory below 4GiB, falling back\n");
++		printf("SWEET USB: 0278 no DMA below 4GiB, falling back\n");
+ 		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 			printf("SWEET USB: no DMA memory at all\n");
+@@ -3249,6 +3280,8 @@
+ 		ud_start_setup();
+ 		printf("SWEET USB: 0277 ep0 SETUP TRB armed (early), DALEPENA 0x%08x DEVTEN 0x%08x\n",
+ 		    dwc_rd(DALEPENA), dwc_rd(DEVTEN));
++		printf("SWEET USB: 0278 GBUSERRADDR 0x%08x%08x GSTS 0x%08x (after early prime)\n",
++		    usb_rd(ud.dwc, 0xc134), usb_rd(ud.dwc, 0xc130), usb_rd(ud.dwc, 0xc118));
+ 		ud_flush();
+ 	} else {
+ 		printf("SWEET USB: 0277 prime=%d - ep0 prime %s\n", ud_prime,
+@@ -3280,6 +3313,9 @@
+ 		ud_start_setup();
+ 		printf("SWEET USB: 0277 ep0 SETUP TRB armed (late), DALEPENA 0x%08x DEVTEN 0x%08x\n",
+ 		    dwc_rd(DALEPENA), dwc_rd(DEVTEN));
++		printf("SWEET USB: 0278 GBUSERRADDR 0x%08x%08x GSTS 0x%08x DMA 0x%llx\n",
++		    usb_rd(ud.dwc, 0xc134), usb_rd(ud.dwc, 0xc130),
++		    usb_rd(ud.dwc, 0xc118), ud.dma_pa);
+ 		ud_flush();
+ 	}
+ 
