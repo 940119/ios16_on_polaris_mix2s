@@ -1,0 +1,75 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -261,7 +261,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0273 alive: PHY on, sweetusbstep ladder ========\n");
++	printf("SWEET USB: ======== build 0274 alive: PHY on, sweetusbstep ladder ========\n");
+ 	ud_flush();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -332,6 +332,48 @@
+ 	    usb_rd(dwc, 0xc13c), !!(usb_rd(dwc, 0xc13c) & (1u << 1)),
+ 	    !!(usb_rd(dwc, 0xc13c) & 1u),
+ 	    usb_rd(dwc, 0xc11c));
++	/*
++	 * 0274: the register map above is wrong, and it has been driving the
++	 * diagnosis since 0258. Checked against Linux drivers/usb/dwc3/core.h
++	 * (DWC3 3.30a, GSNPSID 0x5533300a):
++	 *
++	 *   GGPIO 0xc124   GUID 0xc128   GUCTL 0xc12c
++	 *   GHWPARAMS0 0xc140 ... GHWPARAMS7 0xc15c
++	 *   DGCMDPAR 0xc710  DGCMD 0xc714   (0xc718 is NOT a register)
++	 *   OCFG 0xcc00  OCTL 0xcc04  OEVT 0xcc08  OEVTEN 0xcc0c  OSTS 0xcc10
++	 *
++	 * So "GHWPARAMS0 0xc124" was reading GGPIO (always 0), the value
++	 * 0x4020400a labelled GHWPARAMS7 was really GHWPARAMS0, and the
++	 * GOTGCTL 0xc000 override was writing a reserved address - its
++	 * [REFUSED] was never a hardware refusal. GSTS has no BSESSVLD /
++	 * BCABLE / BVALID bits either; Linux defines only bits 0..10
++	 * (CURMOD 1:0, BUS_ERR_ADDR_VLD 4, CSR_TIMEOUT 5, DEVICE_IP 6,
++	 * HOST_IP 7, ADP_IP 8, BC_IP 9, OTG_IP 10).
++	 *
++	 * This dump is deliberately raw. It is the first reading of the real
++	 * hardware capabilities this project has ever taken.
++	 */
++	printf("SWEET USB: 0274 REAL HWPARAMS 0:%08x 1:%08x 2:%08x 3:%08x "
++	    "4:%08x 5:%08x 6:%08x 7:%08x\n",
++	    usb_rd(dwc, 0xc140), usb_rd(dwc, 0xc144), usb_rd(dwc, 0xc148),
++	    usb_rd(dwc, 0xc14c), usb_rd(dwc, 0xc150), usb_rd(dwc, 0xc154),
++	    usb_rd(dwc, 0xc158), usb_rd(dwc, 0xc15c));
++	printf("SWEET USB: 0274 GGPIO %08x GUID %08x GUCTL %08x GUCTL1 %08x "
++	    "DGCMDPAR %08x DGCMD %08x\n",
++	    usb_rd(dwc, 0xc124), usb_rd(dwc, 0xc128), usb_rd(dwc, 0xc12c),
++	    usb_rd(dwc, 0xc11c), usb_rd(dwc, 0xc710), usb_rd(dwc, 0xc714));
++	printf("SWEET USB: 0274 OTG OCFG %08x OCTL %08x OEVT %08x OEVTEN %08x OSTS %08x\n",
++	    usb_rd(dwc, 0xcc00), usb_rd(dwc, 0xcc04), usb_rd(dwc, 0xcc08),
++	    usb_rd(dwc, 0xcc0c), usb_rd(dwc, 0xcc10));
++	{
++		uint32_t g = usb_rd(dwc, 0xc118);
++		printf("SWEET USB: 0274 GSTS %08x curmod %u dev_ip %d host_ip %d "
++		    "adp_ip %d bc_ip %d otg_ip %d csr_timeout %d buserr_vld %d\n",
++		    g, g & 3u, !!(g & (1u << 6)), !!(g & (1u << 7)),
++		    !!(g & (1u << 8)), !!(g & (1u << 9)), !!(g & (1u << 10)),
++		    !!(g & (1u << 5)), !!(g & (1u << 4)));
++	}
++	ud_flush();
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+@@ -1845,7 +1887,13 @@
+ 	 * anything. Two endpoints exist (ep0 in/out and ep1 in), and both need
+ 	 * their bit or their completions never reach the event ring.
+ 	 */
+-	dwc_wr(DEPEVTENA, DEPEVTENA_EP(0) | DEPEVTENA_EP(1));
++	/*
++	 * 0274: this used to be dwc_wr(DEPEVTENA, ...). 0xc718 is not a DWC3
++	 * register - Linux has DGCMDPAR 0xc710, DGCMD 0xc714, DALEPENA 0xc720
++	 * and nothing at 0xc718. Endpoint events are not gated by a separate
++	 * enable register in DWC3 at all; DALEPENA is what enables them.
++	 * Writing a reserved address was a no-op at best.
++	 */
+ 	/*
+ 	 * 0258: and the controller's own override, immediately before the run.
+ 	 * Order matters for the same reason pre_run_stop does: the core latches
