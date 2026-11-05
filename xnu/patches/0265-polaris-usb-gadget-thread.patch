@@ -1,0 +1,64 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -42,6 +42,7 @@
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ static void ud_attach_worker(void *arg, wait_result_t wr);
++static void ud_gadget_worker(void *arg, wait_result_t wr);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -2582,6 +2583,45 @@
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
++	thread_t worker;
++
++	ud.dwc = dwc;
++	/*
++	 * 0265: the probe starts a thread and returns; that is all it does now.
++	 *
++	 * 0263 moved the attach bisect and then the interface into their own
++	 * thread and the screen stayed black, because the probe path still did
++	 * the two things that had to happen outside it: eight kmem_alloc_contig
++	 * rounds for the event buffer, and ud_utmi_clk_select() writing
++	 * QSCRATCH GENERAL_CFG. Measured against sweetusb=1, which does neither:
++	 * SWEET SURF drops from sixteen lines to one, backboardd never reaches
++	 * create-750x1624, and the display presents no frame at all.
++	 *
++	 * So everything moves, not just the slow part. The boot does not need
++	 * any of it.
++	 */
++	if (kernel_thread_start(ud_gadget_worker, NULL, &worker) == KERN_SUCCESS) {
++		thread_deallocate(worker);
++	} else {
++		printf("SWEET USB: the gadget thread did not start\n");
++	}
++}
++
++static void
++ud_gadget_worker(void *arg __unused, wait_result_t wr __unused)
++{
++	/*
++	 * And nothing happens in it until the system has had time to come up.
++	 * The number is a placeholder for a real handshake, not a fix.
++	 */
++	ud_sleep_ms(20000);
++	printf("SWEET USB: the gadget thread starts now (20 s after the probe) ue0 left alone\n");
++
++	/*
++	 * The probe passed the mapping through ud.dwc; take it back as a local so
++	 * the body below - which was written against the parameter - is unchanged.
++	 */
++	vm_offset_t dwc = ud.dwc;
+ 	/*
+ 	 * Below 4 GiB, forced.
+ 	 *
+@@ -2595,7 +2635,6 @@
+ 	 * the address small and take the question away. Retry because the
+ 	 * allocator hands back whatever it finds first.
+ 	 */
+-	ud.dwc = dwc;
+ 	ppnum_t pn = 0;
+ 	uint64_t last_pa = 0;
+ 	int tries = 0;
