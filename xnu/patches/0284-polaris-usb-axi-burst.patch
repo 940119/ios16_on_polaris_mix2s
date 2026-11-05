@@ -1,0 +1,220 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -300,7 +300,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0283 alive: PHY on, SMMU CB scan + bypass ========\n");
++	printf("SWEET USB: ======== build 0284 alive: PHY on, AXI burst config ========\n");
+ 	ud_flush();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -2970,149 +2970,61 @@
+ }
+ 
+ /*
+- * 0283: the context banks, and the only way left to talk to the S2CRs.
++ * 0284: the last surface nothing in this project has ever read.
+  *
+- * 0282 settled half the question and left the other half open:
++ * Every transfer this controller has issued came back as a bus error at exactly
++ * the address it asked for - 0x1028ed000 in 0278, 0xc0001000 in 0280/0282 -
++ * and the two candidates that were worth testing are both gone:
+  *
+- *   0282 pre-prime  SMMU sGFSR 0x00000000 SYNR0 0 SYNR1 0
+- *   0282 post-prime SMMU sGFSR 0x00000000 SYNR0 0 SYNR1 0
+- *   0278 GBUSERRADDR 0x00000000c0001000 GSTS 0x7e800010
+- *
+- * sCR0 has USFCFG 1, GFRE 1 and GFIE 1, so an *unassigned* StreamID would have
+- * latched sGFSR.USF with the SID in sGFSYNR1. It did not. That rules out the
+- * "no matching SMR" branch of the hypothesis - but not the SMMU itself: a fault
+- * raised inside a context bank lands in that bank's FSR/FAR, not in sGFSR. So
+- * the SMMU is either translating SID 0x740 with a stale table and faulting, or
+- * it is not in the path at all and XPU/NoC refused the transfer.
+- *
+- * Those two are told apart by one register read, if the register can be
+- * reached. Where GR1 lives is not a guess: the downstream qsmmu-v500 driver
+- * (MiCode/Xiaomi_Kernel_OpenSource, polaris-o-oss, drivers/iommu/arm-smmu.c)
+- * derives it from the DT resource itself:
+- *
+- *   #define ARM_SMMU_CB_BASE(smmu)  ((smmu)->base + ((smmu)->size >> 1))
+- *   #define ARM_SMMU_CB(smmu, n)    ((n) * (1 << (smmu)->pgshift))
+- *   #define ARM_SMMU_CB_FSR         0x58
+- *   #define ARM_SMMU_CB_FAR         0x60
+- *   #define ARM_SMMU_CB_FSYNR0      0x68
+- *
+- * reg = <0x15000000 0x80000> so CB_BASE = 0x15040000, ID1.NUMCB = 45 and
+- * ID1.PAGESIZE = 0, i.e. pgshift 12: bank n sits at 0x15040000 + n * 0x1000.
+- * The same file also gives the encodings this build writes:
+- *
+- *   S2CR_TYPE_SHIFT 16, BYPASS = 1        S2CR_CBNDX_SHIFT 0
+- *   S2CR_SHCFG_SHIFT 8, NSH = 3           -> a Linux bypass entry is 0x00010300
+- *   FSR_FAULT = MULTI|SS|UUT|EF|PF|TF|AFF|ASF|TLBMCF|TLBLKF = 0xc00001fe
+- *
+- * Every bank index is printed *before* its FSR is read. If the ring ends on
+- * "0283 cb NN", that bank's read is what stopped the machine, which is how this
+- * build keeps a dead end informative instead of just dead.
+- *
+- * The bypass write is gated twice: it runs when a bank actually latched a fault,
+- * or when sweetusbsmmu=2 asks for it anyway. It has to write the *whole* S2CR
+- * array because the index that matters is the SMR group SID 0x740 matches, and
+- * reading the SMR array is the access that killed 0281. Writing every entry is
+- * the only move that does not need to know the index - and on a bring-up kernel
+- * with nothing else behind this SMMU it is also the state the hardware wants:
+- * qcom,smmu-s1-bypass.
+- */
+-#define APPS_SMMU_CB_PA		0x15040000
+-#define APPS_SMMU_CB_SIZE	0x2d000
+-#define SMMU_CB_STRIDE		0x1000
+-#define SMMU_CB_SCTLR		0x000
+-#define SMMU_CB_TTBR0		0x020
+-#define SMMU_CB_FSR		0x058
+-#define SMMU_CB_FAR		0x060
+-#define SMMU_CB_FSYNR0		0x068
+-#define SMMU_FSR_FAULT		0xc00001feu
+-#define SMMU_S2CR_BYPASS	0x00010300u
+-#define SMMU_NUM_SMR		76
+-#define SMMU_NUM_CB		45
+-
+-static void
+-ud_smmu_cb_probe(void)
+-{
+-	int mode = 1;
+-	PE_parse_boot_argn("sweetusbsmmu", &mode, sizeof(mode));
+-
+-	vm_offset_t cb = ml_io_map(APPS_SMMU_CB_PA, APPS_SMMU_CB_SIZE);
+-	if (cb == 0) {
+-		printf("SWEET USB: 0283 CB window map failed\n");
+-		ud_flush();
+-		return;
+-	}
+-	printf("SWEET USB: 0283 CB scan: base 0x%x %u banks stride 0x%x\n",
+-	    (unsigned)APPS_SMMU_CB_PA, SMMU_NUM_CB, SMMU_CB_STRIDE);
+-	ud_flush();
+-
+-	int guilty = -1;
+-	uint32_t guilty_fsr = 0;
++ *   SMMU    sGFSR stayed 0 across the prime with USFCFG/GFRE/GFIE all set
++ *           (0282), and none of the 45 context banks latched a fault whose FAR
++ *           was anywhere near ours (0283).
++ *   DDR     UFS reads this kernel's root filesystem. NOTES.md:207 records that
++ *           the UFS node has no iommus, so it never touches the SMMU: a
++ *           peripheral master reaching DDR works on this machine.
++ *
++ * What is left on the core's own side is how it drives AXI. GSBUSCFG0,
++ * GSBUSCFG1, GTXTHRCFG and GRXTHRCFG have never been read once in 283 builds.
++ * dwc3 treats the low nibble of GSBUSCFG0 as the INCR burst enables
++ * (INCR1/INCR4/INCR8/INCR16), and a port that bursts wider than the NoC in
++ * front of it expects is a textbook source of SLVERR at the burst address.
++ *
++ * So read them, print them, and unless the nibble is already zero, clear it -
++ * narrower bursts cannot be less safe than wider ones - then let the ordinary
++ * prime below be the test. sweetusbaxi=0 keeps the dump and skips the write.
++ */
++#define DWC3_GSBUSCFG0	0xc100
++#define DWC3_GSBUSCFG1	0xc104
++#define DWC3_GTXTHRCFG	0xc108
++#define DWC3_GRXTHRCFG	0xc10c
+ 
+-	for (unsigned n = 0; n < SMMU_NUM_CB; n++) {
+-		uint32_t off = n * SMMU_CB_STRIDE;
+-		uint32_t fsr;
++static void
++ud_axi_setup(void)
++{
++	int fix = 1;
++	uint32_t cfg0 = dwc_rd(DWC3_GSBUSCFG0);
+ 
+-		/* Before the read, on purpose: see the comment above. */
+-		printf("SWEET USB: 0283 cb %02u\n", n);
+-		ud_flush();
+-		fsr = usb_rd(cb, off + SMMU_CB_FSR);
+-		if (fsr == 0 || fsr == 0xffffffffu) {
+-			continue;
+-		}
+-		printf("SWEET USB: 0283 cb %02u fsr 0x%08x far 0x%08x "
+-		    "fsynr0 0x%08x sctlr 0x%08x ttbr0 0x%08x\n",
+-		    n, fsr, usb_rd(cb, off + SMMU_CB_FAR),
+-		    usb_rd(cb, off + SMMU_CB_FSYNR0),
+-		    usb_rd(cb, off + SMMU_CB_SCTLR),
+-		    usb_rd(cb, off + SMMU_CB_TTBR0));
+-		ud_flush();
+-		if ((fsr & SMMU_FSR_FAULT) != 0 && guilty < 0) {
+-			guilty = (int)n;
+-			guilty_fsr = fsr;
+-		}
+-	}
+-	printf("SWEET USB: 0283 CB scan done, first faulting bank %d\n", guilty);
++	PE_parse_boot_argn("sweetusbaxi", &fix, sizeof(fix));
++	printf("SWEET USB: 0284 AXI GSBUSCFG0 0x%08x GSBUSCFG1 0x%08x "
++	    "GTXTHRCFG 0x%08x GRXTHRCFG 0x%08x\n",
++	    cfg0, dwc_rd(DWC3_GSBUSCFG1), dwc_rd(DWC3_GTXTHRCFG),
++	    dwc_rd(DWC3_GRXTHRCFG));
+ 	ud_flush();
+ 
+-	if (guilty < 0 && mode != 2) {
+-		printf("SWEET USB: 0283 no bank latched a fault: the SMMU did not "
+-		    "terminate that transfer, XPU/NoC did\n");
++	if (!fix) {
++		printf("SWEET USB: 0284 sweetusbaxi=0, burst config left alone\n");
+ 		ud_flush();
+ 		return;
+ 	}
+-
+-	vm_offset_t gr0 = ml_io_map(APPS_SMMU_PA, APPS_SMMU_SIZE);
+-	if (gr0 == 0) {
+-		printf("SWEET USB: 0283 GR0 remap failed\n");
++	if ((cfg0 & 0xfu) == 0) {
++		printf("SWEET USB: 0284 no INCR burst enabled, so burst type "
++		    "cannot be the reason; register left alone\n");
+ 		ud_flush();
+ 		return;
+ 	}
+-	printf("SWEET USB: 0283 writing S2CR[0..%u] = 0x%08x\n",
+-	    (unsigned)(SMMU_NUM_SMR - 1), SMMU_S2CR_BYPASS);
+-	ud_flush();
+-	for (unsigned i = 0; i < SMMU_NUM_SMR; i++) {
+-		usb_wr(gr0, SMMU_GR0_S2CR(i), SMMU_S2CR_BYPASS);
+-	}
+-	printf("SWEET USB: 0283 S2CR readback %08x %08x %08x\n",
+-	    usb_rd(gr0, SMMU_GR0_S2CR(0)), usb_rd(gr0, SMMU_GR0_S2CR(1)),
+-	    usb_rd(gr0, SMMU_GR0_S2CR((unsigned)(SMMU_NUM_SMR - 1))));
+-	ud_flush();
+-
+-	if (guilty >= 0) {
+-		/* W1C, so a latched fault does not keep the combined interrupt
+-		 * line asserted for a handler that does not exist. */
+-		usb_wr(cb, guilty * SMMU_CB_STRIDE + SMMU_CB_FSR, guilty_fsr);
+-		printf("SWEET USB: 0283 cb %d fsr cleared, reads 0x%08x\n", guilty,
+-		    usb_rd(cb, guilty * SMMU_CB_STRIDE + SMMU_CB_FSR));
+-		ud_flush();
+-	}
+-
+-	printf("SWEET USB: 0283 re-priming ep0 with the SMMU bypassed\n");
+-	ud_flush();
+-	ud_start_setup();
+-	printf("SWEET USB: 0283 after re-prime GSTS 0x%08x GBUSERRADDR 0x%08x%08x "
+-	    "GEVNTCOUNT 0x%08x\n", dwc_rd(GSTS), usb_rd(ud.dwc, 0xc134),
+-	    usb_rd(ud.dwc, 0xc130), dwc_rd(GEVNTCOUNT));
++	dwc_wr(DWC3_GSBUSCFG0, cfg0 & ~0xfu);
++	printf("SWEET USB: 0284 GSBUSCFG0 0x%08x -> 0x%08x (INCR4/8/16 off)\n",
++	    cfg0, dwc_rd(DWC3_GSBUSCFG0));
+ 	ud_flush();
+ }
+ 
+@@ -3761,6 +3673,7 @@
+ 		}
+ 		printf("SWEET USB: 0277 prime=%d priming ep0 OUT SETUP TRB AFTER run\n", ud_prime);
+ 		ud_flush();
++		ud_axi_setup();
+ 		ud_smmu_fault("pre-prime");
+ 		ud_start_setup();
+ 		printf("SWEET USB: 0277 ep0 SETUP TRB armed (late), DALEPENA 0x%08x DEVTEN 0x%08x\n",
+@@ -3775,7 +3688,6 @@
+ 		    usb_rd(ud.dwc, 0xc134), usb_rd(ud.dwc, 0xc130),
+ 		    usb_rd(ud.dwc, 0xc118), ud.dma_pa);
+ 		ud_flush();
+-		ud_smmu_cb_probe();
+ 	}
+ 
+ 	printf("SWEET USB: step 6/6 threads, DMA at 0x%llx\n", ud.dma_pa);
