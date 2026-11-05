@@ -1,0 +1,36 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2652,7 +2652,19 @@
+ 	    "GUSB2PHYCFG 0x%08x DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
+ 	    dwc_rd(GHWPARAMS0), dwc_rd(GHWPARAMS7), dwc_rd(GCTL), dwc_rd(0xc200),
+ 	    dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS));
+-	ud_if_create();
++	/*
++	 * 0263: ud_if_create() used to be here, and it is what kept the screen
++	 * black when sweetusb=2 finally got past the root-volume problem.
++	 *
++	 * Measured: with it here the boot reaches launchd (35 lines) and exec
++	 * SpringBoard and exec backboardd, then never presents a frame - SWEET FB
++	 * shows swaps 0 for the whole run. With sweetusb=1, which never calls it,
++	 * the same kernel presents 357. `ue0 192.168.7.2/24 up` is the divider:/n/t * attach + plumb of PF_INET happen before the root volume is mounted, and
++	 * the display stack never comes up afterwards.
++	 *
++	 * The interface is only needed by the data path, which is started by the
++	 * thread below, so it moves there.
++	 */
+ 
+ 	ud_fifo_dump();
+ 	ud_ahb2phy_probe();
+@@ -2750,6 +2762,12 @@
+ {
+ 	thread_t thread;
+ 
++	/*
++	 * 0263: the interface, now that launchd is running and the root volume is
++	 * mounted. Building it earlier cost the whole display.
++	 */
++	ud_if_create();
++
+ 	static const char *names[] = {
+ 		"resume+utmi", "table+utmi", "noreset", "runstop+table+utmi"
+ 	};
