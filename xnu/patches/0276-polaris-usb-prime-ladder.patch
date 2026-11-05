@@ -1,0 +1,99 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -157,6 +157,18 @@
+  */
+ static int ud_step = 3;
+ 
++/*
++ * 0276: ep0-priming ladder. 0274 (no prime) runs 291 s / 839 swaps;
++ * 0275 (prime + run + event thread) is dead at 77 s with 0 swaps, one
++ * tick after "gadget armed". Everything between those two is one action,
++ * so split it by boot-arg instead of guessing:
++ *   0 = no prime                    (0274 behaviour)
++ *   1 = prime, core stays stopped   (no host connect, no TRB DMA)
++ *   2 = prime + RUN_STOP, but ud_thread NOT started (no event handling)
++ *   3 = full                        (0275 behaviour)
++ */
++static int ud_prime = 3;
++
+ #define US_CHECK(what)	do { \
+ 	printf("SWEET USB: -- at %s\n", (what)); \
+ 	ud_flush(); \
+@@ -246,11 +258,15 @@
+ 	PE_parse_boot_argn("sweetphytouch", &ud_phy_touch, sizeof(ud_phy_touch));
+ 	PE_parse_boot_argn("sweetusbstep", &ud_step, sizeof(ud_step));
+ 	PE_parse_boot_argn("sweetusbflush", &ud_flush_ok, sizeof(ud_flush_ok));
++	PE_parse_boot_argn("sweetusbprime", &ud_prime, sizeof(ud_prime));
++	if (ud_prime < 0 || ud_prime > 3) {
++		ud_prime = 3;
++	}
+ 	if (ud_step < 0 || ud_step > 3) {
+ 		ud_step = 3;
+ 	}
+-	printf("SWEET USB: 0273 phy_touch=%d step=%d flush=%d\n",
+-	    ud_phy_touch, ud_step, ud_flush_ok);
++	printf("SWEET USB: 0276 phy_touch=%d step=%d flush=%d prime=%d\n",
++	    ud_phy_touch, ud_step, ud_flush_ok, ud_prime);
+ 	/*
+ 	 * Say which build this is before anything that could stop the machine,
+ 	 * and put it on the disk.
+@@ -261,7 +277,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0275 alive: PHY on, sweetusbstep ladder ========\n");
++	printf("SWEET USB: ======== build 0276 alive: PHY on, sweetusbstep ladder ========\n");
+ 	ud_flush();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -3211,12 +3227,18 @@
+ 	 * before it, STARTTRANSFER appeared ZERO times in the ring
+ 	 * (checked directly: grep -c STARTTRANSFER _r0274.txt == 0).
+ 	 */
+-	printf("SWEET USB: 0275 priming ep0 OUT SETUP TRB (saw_event=%d)\n", saw_event);
+-	ud_flush();
+-	ud_start_setup();
+-	printf("SWEET USB: 0275 ep0 SETUP TRB armed, DALEPENA 0x%08x DEVTEN 0x%08x\n",
+-	    dwc_rd(DALEPENA), dwc_rd(DEVTEN));
+-	ud_flush();
++	if (ud_prime >= 1) {
++		printf("SWEET USB: 0276 prime=%d priming ep0 OUT SETUP TRB (saw_event=%d)\n",
++		    ud_prime, saw_event);
++		ud_flush();
++		ud_start_setup();
++		printf("SWEET USB: 0276 ep0 SETUP TRB armed, DALEPENA 0x%08x DEVTEN 0x%08x\n",
++		    dwc_rd(DALEPENA), dwc_rd(DEVTEN));
++		ud_flush();
++	} else {
++		printf("SWEET USB: 0276 prime=0 - ep0 left unprimed (0274 behaviour)\n");
++		ud_flush();
++	}
+ 
+ 	/*
+ 	 * Leave the core running (pull-up up) and watch the wire for 90 s.
+@@ -3229,11 +3251,22 @@
+ 	 * keeps the pull-up up.
+ 	 */
+ 	printf("SWEET USB: leaving the pull-up up, monitor thread starts below\n");
+-	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	if (ud_prime >= 2) {
++		dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	} else {
++		printf("SWEET USB: 0276 prime=%d - core deliberately left STOPPED\n", ud_prime);
++		ud_flush();
++	}
+ 
+ 	printf("SWEET USB: step 6/6 threads, DMA at 0x%llx\n", ud.dma_pa);
+-	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+-		thread_deallocate(thread);
++	if (ud_prime >= 3) {
++		if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	} else {
++		printf("SWEET USB: 0276 prime=%d - event thread deliberately NOT started\n",
++		    ud_prime);
++		ud_flush();
+ 	}
+ 	int livelog = 1;
+ 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
