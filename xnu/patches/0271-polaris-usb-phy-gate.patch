@@ -1,0 +1,179 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -113,6 +113,15 @@
+  */
+ extern void sweet_log_flush_now(void);
+ 
++/*
++ * 0271: whether anything in this file is allowed to touch the QUSB2 PHY at
++ * 0x088e2000 - read or write. Set from sweetphytouch= in sweet_usb_probe(),
++ * and zero unless the command line asks for it, because a read of that block
++ * stops this SoC and takes the boot with it. Declared up here because the
++ * probe sets it and the accessors that honour it live a thousand lines down.
++ */
++static int ud_phy_touch;
++
+ #define US_CHECK(what)	do { \
+ 	printf("SWEET USB: -- at %s\n", (what)); \
+ 	sweet_log_flush_now(); \
+@@ -196,6 +205,11 @@
+ 		return;
+ 	}
+ 	/*
++	 * 0271: the PHY gate is decided here, once, before any of the code that
++	 * could reach the block. sweetphytouch=1 is the only way in.
++	 */
++	PE_parse_boot_argn("sweetphytouch", &ud_phy_touch, sizeof(ud_phy_touch));
++	/*
+ 	 * Say which build this is before anything that could stop the machine,
+ 	 * and put it on the disk.
+ 	 *
+@@ -205,7 +219,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0270 alive: no QUSB2 PHY read, "
++	printf("SWEET USB: ======== build 0271 alive: no QUSB2 PHY read, "
+ 	    "flushed step markers ========\n");
+ 	sweet_log_flush_now();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+@@ -1358,12 +1372,35 @@
+ static uint32_t
+ qusb2_rd(vm_offset_t phy, uint32_t off)
+ {
++	/*
++	 * 0271: the one gate in front of every QUSB2 register read.
++	 *
++	 * There are eight places in this file that map 0x088e2000 and read
++	 * from it, and two of them have now killed the machine: 0112 on the
++	 * first read of the block, 0267 twenty seconds into the boot on the
++	 * same read. Guarding the call sites one at a time is what produced
++	 * ud_cfg_keep23() and its "this one is a write because a read killed
++	 * 0112" note, and it still left six other paths that read.
++	 *
++	 * So the guard goes here instead, at the only two functions that
++	 * actually touch the block. Off by default: no read reaches the PHY
++	 * unless sweetphytouch=1 is on the command line. Callers see zero,
++	 * which is a value they already have to tolerate, and each function
++	 * that gets a zero keeps going rather than aborting - this is a
++	 * bring-up, not a probe.
++	 */
++	if (!ud_phy_touch) {
++		return 0;
++	}
+ 	return usb_rd(phy, off) & 0xff;
+ }
+ 
+ static void
+ qusb2_wr(vm_offset_t phy, uint32_t off, uint32_t val)
+ {
++	if (!ud_phy_touch) {
++		return;
++	}
+ 	*(volatile uint32_t *)(phy + off) = val & 0xff;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+@@ -2579,7 +2616,7 @@
+ 	thread_t worker;
+ 
+ 	ud.dwc = dwc;
+-	printf("SWEET USB: gadget_start entered (0270)\n");
++	printf("SWEET USB: gadget_start entered (0271)\n");
+ 	sweet_log_flush_now();
+ 	/*
+ 	 * 0265: the probe starts a thread and returns; that is all it does now.
+@@ -2609,10 +2646,32 @@
+ 	 * And nothing happens in it until the system has had time to come up.
+ 	 * The number is a placeholder for a real handshake, not a fix.
+ 	 */
+-	printf("SWEET USB: the gadget thread is running (0270)\n");
++	printf("SWEET USB: the gadget thread is running (0271)\n");
++	sweet_log_flush_now();
++	/*
++	 * 0271: wait for the desktop, not for a made-up number.
++	 *
++	 * The first frame reaches the panel at tick 12780 - 213 s - on the one
++	 * boot that ever presented anything, so every window shorter than that
++	 * is a window in which "the screen is black" cannot be told apart from
++	 * "the screen is not due yet". Five seconds was worse than useless: it
++	 * only guaranteed the USB work and the boot were in the air together.
++	 *
++	 * 240 s puts the whole gadget sequence after the desktop is up. If it
++	 * then stops the machine, the desktop has already been seen and the
++	 * fault is provably in the USB path, not in the display.
++	 */
++	unsigned wait_s = 240;
++	PE_parse_boot_argn("sweetusbwait", &wait_s, sizeof(wait_s));
++	if (wait_s > 600) {
++		wait_s = 600;
++	}
++	printf("SWEET USB: gadget work waits %u s (sweetusbwait) so the desktop is up first\n",
++	    wait_s);
+ 	sweet_log_flush_now();
+-	ud_sleep_ms(5000);
+-	printf("SWEET USB: the gadget thread starts now (5 s after the probe) ue0 left alone\n");
++	ud_sleep_ms(wait_s * 1000);
++	printf("SWEET USB: the gadget thread starts now (%u s after the probe) ue0 left alone\n",
++	    wait_s);
+ 	/*
+ 	 * 0270: flushed on the spot. 0267 printed this line with no flush and
+ 	 * it never reached the disk, so the ring could not say whether the
+@@ -2646,7 +2705,7 @@
+ 	 * no matter when it is issued. Nothing below needs its four values -
+ 	 * they were printed, not used - so it is removed rather than deferred.
+ 	 */
+-	printf("SWEET USB: 0270 does not touch the QUSB2 PHY (0x%x); that read stops the SoC\n",
++	printf("SWEET USB: 0271 does not touch the QUSB2 PHY (0x%x); that read stops the SoC\n",
+ 	    (unsigned)QUSB2_PA);
+ 	sweet_log_flush_now();
+ 	/*
+@@ -2714,7 +2773,7 @@
+ 	ud.dma_pa = ptoa_64(pn);
+ 	printf("SWEET USB: DMA buffer pa 0x%llx (%s 4GiB) UD_SIZE 0x%x UD_EVT 0x%x\n",
+ 	    ud.dma_pa, ud.dma_pa >= 0x100000000ULL ? ">=" : "<", (unsigned)UD_SIZE, (unsigned)UD_EVT);
+-	printf("SWEET USB: 0270 step A done: event buffer allocated\n");
++	printf("SWEET USB: 0271 step A done: event buffer allocated\n");
+ 	sweet_log_flush_now();
+ 	printf("SWEET USB: pre-config GHWPARAMS0 0x%08x GHWPARAMS7 0x%08x GCTL 0x%08x "
+ 	    "GUSB2PHYCFG 0x%08x DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
+@@ -2735,10 +2794,10 @@
+ 	 */
+ 
+ 	ud_fifo_dump();
+-	printf("SWEET USB: 0270 step B done: fifo dump\n");
++	printf("SWEET USB: 0271 step B done: fifo dump\n");
+ 	sweet_log_flush_now();
+ 	ud_ahb2phy_probe();
+-	printf("SWEET USB: 0270 step C done: ahb2phy probe\n");
++	printf("SWEET USB: 0271 step C done: ahb2phy probe\n");
+ 	sweet_log_flush_now();
+ 	/*
+ 	 * 0112: the PHY is left alone here on purpose.
+@@ -2754,8 +2813,7 @@
+ 	 * only path that ever made the endpoint command engine report
+ 	 * "ok polls 0" and they may be needed again once the PHY survives.
+ 	 */
+-	int phy_touch = 0;
+-	PE_parse_boot_argn("sweetphytouch", &phy_touch, sizeof(phy_touch));
++	int phy_touch = ud_phy_touch;
+ 	if (phy_touch) {
+ 		ud_qusb2_sweep();
+ 		ud_utmi_clk_select();
+@@ -2771,7 +2829,7 @@
+ 		ud_utmi_clk_select();
+ 		printf("SWEET USB: sweep and mux bisect skipped (sweetphytouch=0)\n");
+ 	}
+-	printf("SWEET USB: 0270 step D done: QSCRATCH clock mux written\n");
++	printf("SWEET USB: 0271 step D done: QSCRATCH clock mux written\n");
+ 	sweet_log_flush_now();
+ 
+ 	/*
+@@ -2825,7 +2883,7 @@
+ 
+ 		if (kernel_thread_start(ud_attach_worker, NULL, &worker) == KERN_SUCCESS) {
+ 			thread_deallocate(worker);
+-			printf("SWEET USB: 0270 step E done: attach thread started, gadget worker returns\n");
++			printf("SWEET USB: 0271 step E done: attach thread started, gadget worker returns\n");
+ 		} else {
+ 			printf("SWEET USB: the attach thread did not start\n");
+ 		}
