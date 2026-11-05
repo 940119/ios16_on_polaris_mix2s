@@ -1,0 +1,122 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -284,7 +284,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0278 alive: PHY on, sweetusbstep ladder ========\n");
++	printf("SWEET USB: ======== build 0279 alive: PHY on, sweetusbstep ladder ========\n");
+ 	ud_flush();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -2849,6 +2849,85 @@
+ 	ppnum_t pn = 0;
+ 	uint64_t last_pa = 0;
+ 	int tries = 0;
++	int lo = 1;
++	ppnum_t max_pnum = 0;
++	/*
++	 * 0279: the low-bank DMA window.
++	 *
++	 * 0278 proved the failure with a register, not an inference:
++	 *   STARTTRANSFER ep0 trb 0x1028ed000
++	 *   0278 GBUSERRADDR 0x00000001028ed000  GSTS 0x7e800010
++	 * GBUSERRADDR is DWC3's own record of the AXI address it could not
++	 * reach, and it is byte-for-byte the TRB address. GSTS bit 4
++	 * (BUS_ERR_ADDR_VLD) is clear at probe and set after the prime.
++	 * AWIDTH=64 in GHWPARAMS0 only sizes the address register; the SDM845
++	 * USB AXI master cannot reach the upper DDR bank.
++	 *
++	 * kmem_alloc_contig's max_pnum cannot help: mkadt.py --highmem makes
++	 * the entire kernel-managed DRAM start at 0x100000000, so the low
++	 * bank has no allocatable pages (0278: "low-DMA alloc failed at
++	 * try 0", then eight >= 4GiB tries). But that is exactly why the low
++	 * bank is free: nothing in the kernel maps or writes it. NOTES.md:
++	 * "Only own image pages WB ... rest Device" - it is already mapped
++	 * non-cacheable, which is what a DMA buffer wants.
++	 *
++	 * Fixed carve-outs in the low bank (polaris_gpu_preflight.py):
++	 *   zap       0x8c415000 + 0x2000
++	 *   fb        0x9c000000 (1080x2400 x4)
++	 *   splash    0x9d400000 + 0x2400000
++	 *   ramdump_fb 0xaf000000 + 0x1000000
++	 *   rmtfs     ~0xfde01000
++	 * Candidate windows sit in the gap 0xb0000000..0xf0000000, 64 KiB
++	 * apart from every carve-out and from the top reservation.
++	 *
++	 * sweetusbdma=N picks one; 0 disables and keeps the old high-address
++	 * allocator, so a bad window can be ruled out with a boot-arg alone.
++	 */
++	static const uint64_t low_candidates[] = {
++		0,
++		0xc0000000ULL,   /* 1 */
++		0xc0010000ULL,   /* 2 */
++		0xd0000000ULL,   /* 3 */
++		0xe0000000ULL,   /* 4 */
++	};
++	int dma_sel = 1;
++	PE_parse_boot_argn("sweetusbdma", &dma_sel, sizeof(dma_sel));
++	if (dma_sel < 0 || dma_sel > 4) {
++		dma_sel = 1;
++	}
++	uint64_t low_pa = 0;
++	if (dma_sel != 0) {
++		uint64_t pa = low_candidates[dma_sel];
++		vm_offset_t v = ml_io_map(pa, UD_SIZE);
++
++		printf("SWEET USB: 0279 low-DMA candidate %d pa 0x%llx map 0x%llx\n",
++		    dma_sel, pa, (uint64_t)v);
++		ud_flush();
++		if (v != 0) {
++			volatile uint32_t *probe = (volatile uint32_t *)v;
++
++			probe[0] = 0x5a5a0279u;
++			if (probe[0] != 0x5a5a0279u) {
++				printf("SWEET USB: 0279 low-DMA self-test FAILED, "
++				    "falling back to the allocator\n");
++				ud_flush();
++			} else {
++				for (unsigned off = 0; off < UD_SIZE; off += 4) {
++					*((volatile uint32_t *)(v + off)) = 0;
++				}
++				ud.dma = v;
++				ud.dma_pa = pa;
++				low_pa = pa;
++				printf("SWEET USB: 0279 low-DMA ACTIVE pa 0x%llx "
++				    "va 0x%llx size 0x%x\n", pa, (uint64_t)v,
++				    (unsigned)UD_SIZE);
++				ud_flush();
++			}
++		}
++	}
++	if (low_pa) {
++		goto dma_ready;
++	}
+ 	/*
+ 	 * No KMA_PERMANENT here. The first version of this loop kept the flag
+ 	 * and then freed the rejected buffer, and vm_map_delete panicked on it:
+@@ -2872,9 +2951,8 @@
+ 	 * describes the register width, not what the SDM845 AXI master can
+ 	 * actually reach. 0274 (no prime) never sets that bit.
+ 	 */
+-	int lo = 1;
+ 	PE_parse_boot_argn("sweetusblo", &lo, sizeof(lo));
+-	ppnum_t max_pnum = lo ? (ppnum_t)(atop_64(0x100000000ULL) - 1) : 0;
++	max_pnum = lo ? (ppnum_t)(atop_64(0x100000000ULL) - 1) : 0;
+ 	printf("SWEET USB: 0278 DMA max_pnum 0x%x (low=%d)\n", max_pnum, lo);
+ 	ud_flush();
+ 	for (; tries < 8; tries++) {
+@@ -2924,7 +3002,12 @@
+ 			return;
+ 		}
+ 	}
+-	ud.dma_pa = ptoa_64(pn);
++dma_ready:
++	if (low_pa) {
++		ud.dma_pa = low_pa;
++	} else {
++		ud.dma_pa = ptoa_64(pn);
++	}
+ 	printf("SWEET USB: DMA buffer pa 0x%llx (%s 4GiB) UD_SIZE 0x%x UD_EVT 0x%x\n",
+ 	    ud.dma_pa, ud.dma_pa >= 0x100000000ULL ? ">=" : "<", (unsigned)UD_SIZE, (unsigned)UD_EVT);
+ 	printf("SWEET USB: 0273 step A done: event buffer allocated\n");
