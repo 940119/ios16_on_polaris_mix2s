@@ -1,0 +1,240 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -114,6 +114,29 @@
+ extern void sweet_log_flush_now(void);
+ 
+ /*
++ * 0273: one switch in front of every console flush this file issues.
++ *
++ * sweet_log_flush_now() is a synchronous, interrupt-masked, doorbell-polled
++ * UFS write. The attach bisect fires it at every step of four strategies,
++ * and the control experiment says sweetusb=1 (no gadget threads) reaches
++ * tick 13440 while sweetusb=2 (those threads) is dead by tick 2940. A
++ * plausible mechanism is that a polled write from the attach thread
++ * collides with the once-a-second log thread and wedges the UFS path,
++ * after which the PMIC watchdog resets the SoC. sweetusbflush=0 takes the
++ * USB threads out of that path entirely; the once-a-second log thread in
++ * the UFS driver still writes the console ring, so nothing is lost.
++ */
++static int ud_flush_ok = 1;
++
++static void
++ud_flush(void)
++{
++	if (ud_flush_ok) {
++		sweet_log_flush_now();
++	}
++}
++
++/*
+  * 0271: whether anything in this file is allowed to touch the QUSB2 PHY at
+  * 0x088e2000 - read or write. Set from sweetphytouch= in sweet_usb_probe(),
+  * and zero unless the command line asks for it, because a read of that block
+@@ -136,7 +159,7 @@
+ 
+ #define US_CHECK(what)	do { \
+ 	printf("SWEET USB: -- at %s\n", (what)); \
+-	sweet_log_flush_now(); \
++	ud_flush(); \
+ } while (0)
+ 
+ /*
+@@ -222,10 +245,12 @@
+ 	 */
+ 	PE_parse_boot_argn("sweetphytouch", &ud_phy_touch, sizeof(ud_phy_touch));
+ 	PE_parse_boot_argn("sweetusbstep", &ud_step, sizeof(ud_step));
++	PE_parse_boot_argn("sweetusbflush", &ud_flush_ok, sizeof(ud_flush_ok));
+ 	if (ud_step < 0 || ud_step > 3) {
+ 		ud_step = 3;
+ 	}
+-	printf("SWEET USB: 0272 phy_touch=%d step=%d\n", ud_phy_touch, ud_step);
++	printf("SWEET USB: 0273 phy_touch=%d step=%d flush=%d\n",
++	    ud_phy_touch, ud_step, ud_flush_ok);
+ 	/*
+ 	 * Say which build this is before anything that could stop the machine,
+ 	 * and put it on the disk.
+@@ -236,8 +261,8 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0272 alive: PHY on, sweetusbstep ladder ========\n");
+-	sweet_log_flush_now();
++	printf("SWEET USB: ======== build 0273 alive: PHY on, sweetusbstep ladder ========\n");
++	ud_flush();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
+@@ -581,7 +606,7 @@
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	printf("SWEET USB: epcmd ep%u PAR written, firing DEPCMD\n", ep);
+-	sweet_log_flush_now();
++	ud_flush();
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+ 	printf("SWEET USB: epcmd ep%u DEPCMD 0x%08x, polling\n", ep, dwc_rd(DEPCMD(ep)));
+ 	/*
+@@ -630,7 +655,7 @@
+ 		 * The whole point of the build: get this line on the disk even
+ 		 * if the next command is the one that stops the machine.
+ 		 */
+-		sweet_log_flush_now();
++		ud_flush();
+ 		if (!stuck && status == 0) {
+ 			return 0;
+ 		}
+@@ -2480,7 +2505,7 @@
+ ud_try(const char *tag, unsigned flags)
+ {
+ 	printf("SWEET USB: try %s (flags 0x%x)\n", tag, flags);
+-	sweet_log_flush_now();
++	ud_flush();
+ 	if (flags & UD_F_NORESET) {
+ 		/*
+ 		 * ABL hands over a controller that was working seconds ago,
+@@ -2572,7 +2597,7 @@
+ 	dwc_wr(DEVTEN, 0x7);
+ 	printf("  %s: pre-ep0 GUSB2PHYCFG 0x%08x GSTS 0x%08x DSTS 0x%08x\n",
+ 	    tag, dwc_rd(GUSB2PHYCFG), dwc_rd(GSTS), dwc_rd(DSTS));
+-	sweet_log_flush_now();
++	ud_flush();
+ 
+ 	if (flags & UD_F_RUNSTOP) {
+ 		/*
+@@ -2622,7 +2647,7 @@
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_fifo_dump();
+ 	printf("  %s: endpoint 0 configured OK\n", tag);
+-	sweet_log_flush_now();
++	ud_flush();
+ 	return 0;
+ }
+ 
+@@ -2632,8 +2657,8 @@
+ 	thread_t worker;
+ 
+ 	ud.dwc = dwc;
+-	printf("SWEET USB: gadget_start entered (0272)\n");
+-	sweet_log_flush_now();
++	printf("SWEET USB: gadget_start entered (0273)\n");
++	ud_flush();
+ 	/*
+ 	 * 0265: the probe starts a thread and returns; that is all it does now.
+ 	 *
+@@ -2662,11 +2687,11 @@
+ 	 * And nothing happens in it until the system has had time to come up.
+ 	 * The number is a placeholder for a real handshake, not a fix.
+ 	 */
+-	printf("SWEET USB: the gadget thread is running (0272) step=%d\n", ud_step);
+-	sweet_log_flush_now();
++	printf("SWEET USB: the gadget thread is running (0273) step=%d\n", ud_step);
++	ud_flush();
+ 	if (ud_step < 1) {
+-		printf("SWEET USB: 0272 step 0 - no gadget work this boot\n");
+-		sweet_log_flush_now();
++		printf("SWEET USB: 0273 step 0 - no gadget work this boot\n");
++		ud_flush();
+ 		return;
+ 	}
+ 	/*
+@@ -2687,7 +2712,7 @@
+ 	}
+ 	printf("SWEET USB: gadget work waits %u s (sweetusbwait) so the desktop is up first\n",
+ 	    wait_s);
+-	sweet_log_flush_now();
++	ud_flush();
+ 	ud_sleep_ms(wait_s * 1000);
+ 	printf("SWEET USB: the gadget thread starts now (%u s after the probe) ue0 left alone\n",
+ 	    wait_s);
+@@ -2698,7 +2723,7 @@
+ 	 * Every step below is flushed for the same reason: the machine is not
+ 	 * panicking when it goes, so the only record is whatever is on the UFS.
+ 	 */
+-	sweet_log_flush_now();
++	ud_flush();
+ 
+ 	/*
+ 	 * The probe passed the mapping through ud.dwc; take it back as a local so
+@@ -2724,9 +2749,9 @@
+ 	 * no matter when it is issued. Nothing below needs its four values -
+ 	 * they were printed, not used - so it is removed rather than deferred.
+ 	 */
+-	printf("SWEET USB: 0272 does not touch the QUSB2 PHY (0x%x); that read stops the SoC\n",
++	printf("SWEET USB: 0273 does not touch the QUSB2 PHY (0x%x); that read stops the SoC\n",
+ 	    (unsigned)QUSB2_PA);
+-	sweet_log_flush_now();
++	ud_flush();
+ 	/*
+ 	 * Below 4 GiB, forced.
+ 	 *
+@@ -2792,8 +2817,8 @@
+ 	ud.dma_pa = ptoa_64(pn);
+ 	printf("SWEET USB: DMA buffer pa 0x%llx (%s 4GiB) UD_SIZE 0x%x UD_EVT 0x%x\n",
+ 	    ud.dma_pa, ud.dma_pa >= 0x100000000ULL ? ">=" : "<", (unsigned)UD_SIZE, (unsigned)UD_EVT);
+-	printf("SWEET USB: 0272 step A done: event buffer allocated\n");
+-	sweet_log_flush_now();
++	printf("SWEET USB: 0273 step A done: event buffer allocated\n");
++	ud_flush();
+ 	printf("SWEET USB: pre-config GHWPARAMS0 0x%08x GHWPARAMS7 0x%08x GCTL 0x%08x "
+ 	    "GUSB2PHYCFG 0x%08x DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
+ 	    dwc_rd(GHWPARAMS0), dwc_rd(GHWPARAMS7), dwc_rd(GCTL), dwc_rd(0xc200),
+@@ -2813,11 +2838,11 @@
+ 	 */
+ 
+ 	ud_fifo_dump();
+-	printf("SWEET USB: 0272 step B done: fifo dump\n");
+-	sweet_log_flush_now();
++	printf("SWEET USB: 0273 step B done: fifo dump\n");
++	ud_flush();
+ 	ud_ahb2phy_probe();
+-	printf("SWEET USB: 0272 step C done: ahb2phy probe\n");
+-	sweet_log_flush_now();
++	printf("SWEET USB: 0273 step C done: ahb2phy probe\n");
++	ud_flush();
+ 	/*
+ 	 * 0112: the PHY is left alone here on purpose.
+ 	 *
+@@ -2848,8 +2873,8 @@
+ 		ud_utmi_clk_select();
+ 		printf("SWEET USB: sweep and mux bisect skipped (sweetphytouch=0)\n");
+ 	}
+-	printf("SWEET USB: 0272 step D done: QSCRATCH clock mux written\n");
+-	sweet_log_flush_now();
++	printf("SWEET USB: 0273 step D done: QSCRATCH clock mux written\n");
++	ud_flush();
+ 
+ 	/*
+ 	 * The order is no longer a guess. Build 0100 proved that GENERAL_CFG
+@@ -2901,18 +2926,18 @@
+ 		thread_t worker;
+ 
+ 		if (ud_step < 2) {
+-			printf("SWEET USB: 0272 step %d - attach thread deliberately NOT started\n",
++			printf("SWEET USB: 0273 step %d - attach thread deliberately NOT started\n",
+ 			    ud_step);
+-			sweet_log_flush_now();
++			ud_flush();
+ 			return;
+ 		}
+ 		if (kernel_thread_start(ud_attach_worker, NULL, &worker) == KERN_SUCCESS) {
+ 			thread_deallocate(worker);
+-			printf("SWEET USB: 0272 step E done: attach thread started, gadget worker returns\n");
++			printf("SWEET USB: 0273 step E done: attach thread started, gadget worker returns\n");
+ 		} else {
+ 			printf("SWEET USB: the attach thread did not start\n");
+ 		}
+-		sweet_log_flush_now();
++		ud_flush();
+ 	}
+ }
+ 
+@@ -2922,8 +2947,8 @@
+ 	thread_t thread;
+ 
+ 	if (ud_step < 3) {
+-		printf("SWEET USB: 0272 step %d - attach thread returns at once\n", ud_step);
+-		sweet_log_flush_now();
++		printf("SWEET USB: 0273 step %d - attach thread returns at once\n", ud_step);
++		ud_flush();
+ 		return;
+ 	}
+ 
