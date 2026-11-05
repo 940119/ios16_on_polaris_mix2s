@@ -88,12 +88,10 @@
  
  /* The GMU reads from memory, not from this processor's cache. */
  static void
-@@ -1405,6 +1442,226 @@
- 	printf("POLARIS GPU: 10 %s: %#llx -> %#llx, descriptor %#llx in slot %u\n", name, iova,
- 	    kvtophys(va), l3[((iova >> 12) & 0x1ff)], (uint32_t)((iova >> 12) & 0x1ff));
+@@ -1407,6 +1444,226 @@
  	return true;
-+}
-+
+ }
+ 
 +/* ---- the program's buffers: addresses in the user window, and their mappings ---------------------- */
 +
 +/*
@@ -312,10 +310,32 @@
 +			l3[(at >> 12) & 0x1ff] = 0;
 +		}
 +	}
- }
- 
++}
++
  /*
-@@ -2874,6 +3131,8 @@
+  * IMPL_DEF1 is at base + 6 pages, and its first word is the micro MMU's
+  * control word. The vendor driver halts the SMMU around the
+@@ -2011,6 +2268,19 @@
+ #define PG_SPTPRAC_STATUS	0x50d0u
+ #define PG_OOB_BOOT_SLUMBER_SET	22u		/* legacy out-of-band bits */
+ #define PG_OOB_BOOT_SLUMBER_ACK	30u
++/*
++ * 0261: the other out-of-band request, and the one Linux makes before the zap.
++ *
++ * BOOT_SLUMBER (22/30) asks the GMU to bring the GPU up out of slumber.
++ * GPU_SET (16/24) asks it to *keep* the GPU up while the host touches it -
++ * a6xx_gmu_set_oob(&a6xx_gpu->gmu, GMU_OOB_GPU_SET) sits at the top of
++ * a6xx_hw_init(), before the zap is loaded and long before
++ * CP_SET_SECURE_MODE. Without it the GMU is free to slumber the core between
++ * our writes, and CP_SET_SECURE_MODE moved SECVID_TRUST_CNTL from 1 to 3
++ * without clearing bit 0 - a switch that started and never finished.
++ */
++#define PG_OOB_GPU_SET		16u
++#define PG_OOB_GPU_SET_ACK	24u
+ 
+ #define PG_RSCC_OFFSET		0x23000u	/* the RSC block inside the GMU's window */
+ #define PG_RSCC_REQ		0x9307u		/* GMU_RSCC_CONTROL_REQ */
+@@ -2874,6 +3144,8 @@
  
  #define PG_RBBM_CLOCK_CNTL	0x00aeu
  #define PG_SECVID_TRUST_CNTL	0xf400u
@@ -324,7 +344,7 @@
  #define PG_GMU_AO_CGC_MODE	0x9309u
  #define PG_GMU_AO_CGC_DELAY	0x930au
  #define PG_GMU_AO_CGC_HYST	0x930bu
-@@ -3222,6 +3481,21 @@
+@@ -3222,6 +3494,21 @@
  	    ((opcode & 0x7fu) << 16) | (pg_pm4_parity(opcode) << 23);
  }
  
@@ -346,7 +366,7 @@
  static bool
  pg_map_phys(uint64_t iova, uint64_t pa, const char *name)
  {
-@@ -3466,9 +3740,31 @@
+@@ -3466,9 +3753,31 @@
  	PG_CHECK("16: asking TrustZone whether PAS 13 is supported");
  	rc = pg_scm_call(how | PG_SCM_SUPPORTED, 1, PG_ZAP_PAS_ID, 0, 0, res);
  	printf("POLARIS GPU: 16 PAS_SUPPORTED(13): rc %lld result %#llx\n", rc, res[0]);
@@ -380,7 +400,46 @@
  	}
  	/*
  	 * Physically contiguous and 4 KB aligned, the way dma_alloc_coherent gives
-@@ -3539,7 +3835,7 @@
+@@ -3533,13 +3842,46 @@
+ 	return done;
+ }
+ 
++/*
++ * a6xx_gmu_set_oob(GMU_OOB_GPU_SET), legacy bits: ring bit 16, wait for the
++ * firmware to answer on bit 24, then clear the answer. Returns whether the
++ * firmware answered; the caller keeps going either way, because a GMU that
++ * ignores this is itself the finding.
++ */
++static bool
++pg_oob_gpu_set(void)
++{
++	uint32_t info = 0;
++	bool ack = false;
++
++	if (pg_gmu == 0) {
++		return false;
++	}
++	pg_wr(pg_gmu + PG_GMU_WORD(PG_H2G_INTR_SET), 1u << PG_OOB_GPU_SET);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (unsigned i = 0; i < 20 && !ack; i++) {
++		info = pg_rd(pg_gmu + PG_GMU_WORD(PG_G2H_INTR_INFO));
++		ack = (info & (1u << PG_OOB_GPU_SET_ACK)) != 0;
++		if (!ack) {
++			pg_sleep_us(10000);
++		}
++	}
++	info = pg_rd(pg_gmu + PG_GMU_WORD(PG_G2H_INTR_INFO));
++	printf("POLARIS GPU: 16 OOB GPU_SET: GMU2HOST %#010x (ack bit %u %s; fault %d)\n",
++	    info, PG_OOB_GPU_SET_ACK, ack ? "set" : "NOT set within 200 ms",
++	    !!(info & PG_CM3_FAULT));
++	pg_wr(pg_gmu + PG_GMU_WORD(PG_G2H_INTR_CLR), 1u << PG_OOB_GPU_SET_ACK);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return ack;
++}
++
+ static bool
+ pg_step_zap(void)
+ {
  	uint32_t *ring = (uint32_t *)pg_ring_va[0];
  	uint32_t wptr = 9, rptr = 0;
  	uint32_t trust;
@@ -389,55 +448,27 @@
  
  	if (pg_gpu3d == 0 || pg_ring_va[0] == 0) {
  		printf("POLARIS GPU: 16 the CP is not running: no zap\n");
-@@ -3573,7 +3869,10 @@
+@@ -3573,7 +3915,18 @@
  	 * what would make that write legal - and the write test below runs anyway.
  	 * It answers the only question that matters: may the CP write memory.
  	 */
 -	if (trust != 0 && pg_zap_load()) {
 +	if (trust != 0) {
++		/*
++		 * 0261: Linux holds the GPU on through the GMU across the whole of
++		 * this sequence; this is that request. It goes before the zap because
++		 * the zap load itself resets the core.
++		 */
++		PG_CHECK("16: asking the GMU to hold the GPU on (OOB GPU_SET)");
++		printf("POLARIS GPU: 16 OOB GPU_SET answered: %s\n",
++		    pg_oob_gpu_set() ? "yes" : "no");
 +		zap_ok = pg_zap_load();
 +	}
 +	if (zap_ok) {
  		ring[wptr++] = pg_pkt7(PG_CP_SET_SECURE_MODE, 1);
  		ring[wptr++] = 0;
  		pg_to_memory(pg_ring_va[0], PG_GMU_PAGE_SIZE);
-@@ -3593,6 +3892,35 @@
- 	} else if (trust != 0) {
- 		printf("POLARIS GPU: 16 no zap on this phone: SECVID_TRUST_CNTL is left untouched "
- 		    "(set-once) and the CP's write test runs anyway\n");
-+	}
-+	/*
-+	 * 0260: the write 0253 could not make, now that the zap is authenticated.
-+	 *
-+	 * 0253 set this register to zero on a core whose zap had never loaded, and
-+	 * every GPU register access after that line stopped - the permission
-+	 * violation the kernel comment warns about. The condition now is different
-+	 * in exactly the way that matters: PAS_AUTH_AND_RESET(13) returned
-+	 * rc 0 / result 0, so this core has an authenticated zap in its secure
-+	 * world, and this write is the one the zap exists to license.
-+	 *
-+	 * CP_SET_SECURE_MODE(0) moved the register from 1 to 3 but left bit 0 set,
-+	 * so the core still calls itself secure. If bit 1 is a latched "transition
-+	 * happened" flag and bit 0 is the state, a direct write clears the state.
-+	 * If the write is refused, the line printed next is the last thing this
-+	 * boot produces, and that answers the question just as well.
-+	 */
-+	if (zap_ok && trust != 0) {
-+		PG_CHECK("16: writing TRUST_CNTL 0 with the zap authenticated");
-+		printf("POLARIS GPU: 16 CP_PROTECT_STATUS %#010x CP_PROTECT_CNTL %#010x "
-+		    "before the write\n", pg_rd(pg_gpu3d + 4u * PG_CP_PROTECT_STATUS),
-+		    pg_rd(pg_gpu3d + 4u * PG_CP_PROTECT_CNTL));
-+		printf("POLARIS GPU: 16 writing SECVID_TRUST_CNTL 0 (was %#010x)\n", trust);
-+		sweet_log_flush_now();
-+		pg_wr(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL, 0);
-+		__asm__ volatile ("dsb sy" ::: "memory");
-+		trust = pg_rd(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL);
-+		printf("POLARIS GPU: 16 SECVID_TRUST_CNTL after the write: %#010x (%s)\n",
-+		    trust, trust == 0 ? "NON-SECURE MODE" : "refused, still secure");
- 	}
- 	nonsecure = pg_rd(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL) == 0;
- 	printf("POLARIS GPU: 16 the core is %s; the write below is the real question\n",
-@@ -4865,7 +5193,7 @@
+@@ -4865,7 +5218,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
  	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
@@ -446,7 +477,7 @@
  	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
  	    "physical, stream 5 bypassed (polarisgpumap=0)");
  	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
-@@ -5049,6 +5377,18 @@
+@@ -5049,6 +5402,18 @@
  	if (upto > 0) {
  		polaris_gpu.state = POLARIS_GPU_STARTING;
  		polaris_gpu_up(upto);
@@ -465,7 +496,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5407,1993 @@
+@@ -5067,4 +5432,1993 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
