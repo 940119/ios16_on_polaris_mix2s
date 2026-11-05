@@ -1,0 +1,54 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -425,9 +425,9 @@
+  * Linux's core.h; 0258 also reads CurMod in bit 0.
+  *
+  * This comment used to claim that 0154 "read GSTS 0x7e800000, all three
+- * clear". It did not: 0xc118 is GUCTL, and GSTS is 0xc114. The three bits that
+- * looked dead were GUCTL's bits 12-14, which have nothing to do with the
+- * cable. The real GSTS is read for the first time in this build.
++ * clear". (0258 briefly claimed 0xc118 was GUCTL and moved the read to
++ * 0xc114; Linux's core.h says 0xc114 is GEVTEN and GSTS really is 0xc118, so
++ * 0269 moved it back. The three bits really are clear either way.)
+  */
+ #define GSTS_BSESSVLD   (1u << 12)
+ #define GSTS_BCABLE     (1u << 13)
+@@ -1263,7 +1263,7 @@
+  * 0258: GSTS is 0xc114, not 0xc118.
+  *
+  * The DWC3 global block is a fixed run: GCTL 0xc110, GSTS 0xc114,
+- * GUCTL 0xc118, GUCTL1 0xc11c, GSNPSID 0xc120, GHWPARAMS0 0xc124. The three
++ * GEVTEN 0xc114, GSTS 0xc118, GUCTL1 0xc11c, GSNPSID 0xc120. The three
+  * reads this build trusts prove the run is where it should be - GUCTL1 reads
+  * 0x000c0002, GSNPSID 0x5533300a, GHWPARAMS0 0x4020400a - so 0xc114 has to be
+  * GSTS and 0xc118 has to be GUCTL.
+@@ -1274,8 +1274,27 @@
+  * 13 and 14 happen to be zero, which is exactly why the three "session" bits
+  * looked dead. Nobody has ever read the real GSTS on this machine.
+  */
+-#define GSTS                0xc114
+-#define GUCTL               0xc118
++/*
++ * 0269: GSTS is 0xc118. 0258 moved it to 0xc114 and that was wrong.
++ *
++ * Linux's drivers/usb/dwc3/core.h:
++ *
++ *   #define DWC3_GCTL    0xc110
++ *   #define DWC3_GEVTEN  0xc114     <- what 0258 was reading and calling GSTS
++ *   #define DWC3_GSTS    0xc118     <- the real one
++ *   #define DWC3_GUCTL1  0xc11c
++ *   #define DWC3_GSNPSID 0xc120
++ *   #define DWC3_GUCTL   0xc12c     <- not adjacent at all
++ *
++ * GEVTEN is the global event enable and resets to zero, which is exactly what
++ * every build since 0258 printed as "GSTS 0x00000000". The conclusion those
++ * builds drew - cable/session/bvalid all clear - happens to survive, because
++ * the real GSTS (0x7e800000) has bits 12, 13 and 14 clear too, but the
++ * instrument has to say the right thing.
++ */
++#define GSTS                0xc118
++#define GEVTEN              0xc114
++#define GUCTL               0xc12c
+ /*
+  * The OTG control block, never touched by this driver. GHWPARAMS0 reads
+  * 0x4020400a, whose low bits decode to op_mode 2 = OTG (a value the earlier
