@@ -1,0 +1,69 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -261,7 +261,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0274 alive: PHY on, sweetusbstep ladder ========\n");
++	printf("SWEET USB: ======== build 0275 alive: PHY on, sweetusbstep ladder ========\n");
+ 	ud_flush();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -353,21 +353,21 @@
+ 	 * This dump is deliberately raw. It is the first reading of the real
+ 	 * hardware capabilities this project has ever taken.
+ 	 */
+-	printf("SWEET USB: 0274 REAL HWPARAMS 0:%08x 1:%08x 2:%08x 3:%08x "
++	printf("SWEET USB: 0275 REAL HWPARAMS 0:%08x 1:%08x 2:%08x 3:%08x "
+ 	    "4:%08x 5:%08x 6:%08x 7:%08x\n",
+ 	    usb_rd(dwc, 0xc140), usb_rd(dwc, 0xc144), usb_rd(dwc, 0xc148),
+ 	    usb_rd(dwc, 0xc14c), usb_rd(dwc, 0xc150), usb_rd(dwc, 0xc154),
+ 	    usb_rd(dwc, 0xc158), usb_rd(dwc, 0xc15c));
+-	printf("SWEET USB: 0274 GGPIO %08x GUID %08x GUCTL %08x GUCTL1 %08x "
++	printf("SWEET USB: 0275 GGPIO %08x GUID %08x GUCTL %08x GUCTL1 %08x "
+ 	    "DGCMDPAR %08x DGCMD %08x\n",
+ 	    usb_rd(dwc, 0xc124), usb_rd(dwc, 0xc128), usb_rd(dwc, 0xc12c),
+ 	    usb_rd(dwc, 0xc11c), usb_rd(dwc, 0xc710), usb_rd(dwc, 0xc714));
+-	printf("SWEET USB: 0274 OTG OCFG %08x OCTL %08x OEVT %08x OEVTEN %08x OSTS %08x\n",
++	printf("SWEET USB: 0275 OTG OCFG %08x OCTL %08x OEVT %08x OEVTEN %08x OSTS %08x\n",
+ 	    usb_rd(dwc, 0xcc00), usb_rd(dwc, 0xcc04), usb_rd(dwc, 0xcc08),
+ 	    usb_rd(dwc, 0xcc0c), usb_rd(dwc, 0xcc10));
+ 	{
+ 		uint32_t g = usb_rd(dwc, 0xc118);
+-		printf("SWEET USB: 0274 GSTS %08x curmod %u dev_ip %d host_ip %d "
++		printf("SWEET USB: 0275 GSTS %08x curmod %u dev_ip %d host_ip %d "
+ 		    "adp_ip %d bc_ip %d otg_ip %d csr_timeout %d buserr_vld %d\n",
+ 		    g, g & 3u, !!(g & (1u << 6)), !!(g & (1u << 7)),
+ 		    !!(g & (1u << 8)), !!(g & (1u << 9)), !!(g & (1u << 10)),
+@@ -3195,9 +3195,28 @@
+ 	printf("SWEET USB: step 5/6 %s (DSTS 0x%08x GSTS 0x%08x)\n",
+ 	    saw_event ? "bus reset seen, arming ep0 SETUP" : "host never reset the bus",
+ 	    dwc_rd(DSTS), dwc_rd(GSTS));
+-	if (saw_event) {
+-		ud_start_setup();
+-	}
++	/*
++	 * 0275: prime ep0 OUT unconditionally, BEFORE DCTL.RUN_STOP.
++	 *
++	 * This is the bug. Linux __dwc3_gadget_start() calls
++	 * dwc3_ep0_out_start() - an 8-byte SETUP TRB via STARTTRANSFER on
++	 * ep0 OUT - before it starts the controller. Without that TRB the
++	 * core has nowhere to put the host's SETUP packet, so no amount of
++	 * pulling D+ up can ever enumerate.
++	 *
++	 * ud_start_setup() used to sit behind "if (saw_event)", i.e. it only
++	 * ran after a bus reset had already been observed. The other two
++	 * callers are ud_stall() and the EP0_STATUS event branch - both
++	 * unreachable before the first SETUP. So across 0274 and every build
++	 * before it, STARTTRANSFER appeared ZERO times in the ring
++	 * (checked directly: grep -c STARTTRANSFER _r0274.txt == 0).
++	 */
++	printf("SWEET USB: 0275 priming ep0 OUT SETUP TRB (saw_event=%d)\n", saw_event);
++	ud_flush();
++	ud_start_setup();
++	printf("SWEET USB: 0275 ep0 SETUP TRB armed, DALEPENA 0x%08x DEVTEN 0x%08x\n",
++	    dwc_rd(DALEPENA), dwc_rd(DEVTEN));
++	ud_flush();
+ 
+ 	/*
+ 	 * Leave the core running (pull-up up) and watch the wire for 90 s.
