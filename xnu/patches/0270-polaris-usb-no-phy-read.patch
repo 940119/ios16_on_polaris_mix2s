@@ -1,0 +1,125 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -205,8 +205,8 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0156 alive: PORT_POWERDOWN sweep, every monitor "
+-	    "sample printed ========\n");
++	printf("SWEET USB: ======== build 0270 alive: no QUSB2 PHY read, "
++	    "flushed step markers ========\n");
+ 	sweet_log_flush_now();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -2579,7 +2579,7 @@
+ 	thread_t worker;
+ 
+ 	ud.dwc = dwc;
+-	printf("SWEET USB: gadget_start entered (0268)\n");
++	printf("SWEET USB: gadget_start entered (0270)\n");
+ 	sweet_log_flush_now();
+ 	/*
+ 	 * 0265: the probe starts a thread and returns; that is all it does now.
+@@ -2609,10 +2609,18 @@
+ 	 * And nothing happens in it until the system has had time to come up.
+ 	 * The number is a placeholder for a real handshake, not a fix.
+ 	 */
+-	printf("SWEET USB: the gadget thread is running (0268)\n");
++	printf("SWEET USB: the gadget thread is running (0270)\n");
+ 	sweet_log_flush_now();
+ 	ud_sleep_ms(5000);
+ 	printf("SWEET USB: the gadget thread starts now (5 s after the probe) ue0 left alone\n");
++	/*
++	 * 0270: flushed on the spot. 0267 printed this line with no flush and
++	 * it never reached the disk, so the ring could not say whether the
++	 * thread woke at all or woke and died on its first register access.
++	 * Every step below is flushed for the same reason: the machine is not
++	 * panicking when it goes, so the only record is whatever is on the UFS.
++	 */
++	sweet_log_flush_now();
+ 
+ 	/*
+ 	 * The probe passed the mapping through ud.dwc; take it back as a local so
+@@ -2620,20 +2628,27 @@
+ 	 */
+ 	vm_offset_t dwc = ud.dwc;
+ 	/*
+-	 * 0266: the PHY read that used to sit in the probe, where mapping its
+-	 * window before launchd cost the display. Same four registers, same
+-	 * decode, just late enough not to matter.
++	 * 0270: the QUSB2 PHY is no longer read anywhere, at any time.
++	 *
++	 * 0266 moved this read out of the probe into this thread on the theory
++	 * that it only hurt because it ran before launchd. 0267 put it twenty
++	 * seconds in and the ring still stops at tick 2160: the thread wakes,
++	 * touches 0x88e2000 once, and the SoC is gone. The reboot sixteen
++	 * seconds later is the PMIC watchdog, not a panic.
++	 *
++	 * Tick 2160 is 36 s. On the boot that does present frames the first
++	 * swap is at tick 12780 - 213 s - so 0267 was never a display failure
++	 * at all: it died three minutes before the display was due. The same
++	 * reading applies to 0112, whose first PHY access was a read and whose
++	 * core stopped there instead of faulting.
++	 *
++	 * A read of this block is therefore not survivable on this machine yet,
++	 * no matter when it is issued. Nothing below needs its four values -
++	 * they were printed, not used - so it is removed rather than deferred.
+ 	 */
+-	{
+-		vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-
+-		if (phy != 0) {
+-			printf("SWEET USB: QUSB2 PLL_COMMON_STATUS_ONE 0x%02x PWR_CTRL1 0x%02x "
+-			    "PORT_TUNE1 0x%02x TEST1 0x%02x\n",
+-			    usb_rd(phy, 0x1a0) & 0xff, usb_rd(phy, 0x210) & 0xff,
+-			    usb_rd(phy, 0x240) & 0xff, usb_rd(phy, 0x254) & 0xff);
+-		}
+-	}
++	printf("SWEET USB: 0270 does not touch the QUSB2 PHY (0x%x); that read stops the SoC\n",
++	    (unsigned)QUSB2_PA);
++	sweet_log_flush_now();
+ 	/*
+ 	 * Below 4 GiB, forced.
+ 	 *
+@@ -2699,6 +2714,8 @@
+ 	ud.dma_pa = ptoa_64(pn);
+ 	printf("SWEET USB: DMA buffer pa 0x%llx (%s 4GiB) UD_SIZE 0x%x UD_EVT 0x%x\n",
+ 	    ud.dma_pa, ud.dma_pa >= 0x100000000ULL ? ">=" : "<", (unsigned)UD_SIZE, (unsigned)UD_EVT);
++	printf("SWEET USB: 0270 step A done: event buffer allocated\n");
++	sweet_log_flush_now();
+ 	printf("SWEET USB: pre-config GHWPARAMS0 0x%08x GHWPARAMS7 0x%08x GCTL 0x%08x "
+ 	    "GUSB2PHYCFG 0x%08x DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
+ 	    dwc_rd(GHWPARAMS0), dwc_rd(GHWPARAMS7), dwc_rd(GCTL), dwc_rd(0xc200),
+@@ -2718,7 +2735,11 @@
+ 	 */
+ 
+ 	ud_fifo_dump();
++	printf("SWEET USB: 0270 step B done: fifo dump\n");
++	sweet_log_flush_now();
+ 	ud_ahb2phy_probe();
++	printf("SWEET USB: 0270 step C done: ahb2phy probe\n");
++	sweet_log_flush_now();
+ 	/*
+ 	 * 0112: the PHY is left alone here on purpose.
+ 	 *
+@@ -2750,6 +2771,8 @@
+ 		ud_utmi_clk_select();
+ 		printf("SWEET USB: sweep and mux bisect skipped (sweetphytouch=0)\n");
+ 	}
++	printf("SWEET USB: 0270 step D done: QSCRATCH clock mux written\n");
++	sweet_log_flush_now();
+ 
+ 	/*
+ 	 * The order is no longer a guess. Build 0100 proved that GENERAL_CFG
+@@ -2802,9 +2825,11 @@
+ 
+ 		if (kernel_thread_start(ud_attach_worker, NULL, &worker) == KERN_SUCCESS) {
+ 			thread_deallocate(worker);
++			printf("SWEET USB: 0270 step E done: attach thread started, gadget worker returns\n");
+ 		} else {
+ 			printf("SWEET USB: the attach thread did not start\n");
+ 		}
++		sweet_log_flush_now();
+ 	}
+ }
+ 
