@@ -1,0 +1,162 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -120,7 +120,19 @@
+  * stops this SoC and takes the boot with it. Declared up here because the
+  * probe sets it and the accessors that honour it live a thousand lines down.
+  */
+-static int ud_phy_touch;
++static int ud_phy_touch = 1;
++
++/*
++ * 0272: the bring-up ladder. Parsed once in sweet_usb_probe(), honoured in the
++ * two threads. 0 = no gadget work at all (the sweetusb=1 behaviour), 1 = the
++ * event buffer and the wrapper registers but no attach thread, 2 = the attach
++ * thread exists but returns at once, 3 = the full attach bisect. Measured on
++ * 0270: sweetusb=1 with polarisgpuup=18 reaches tick 13440 and swaps 323;
++ * the same kernel with sweetusb=2 dies at tick 2940 with swaps 0. Only the
++ * gadget/attach threads differ, so one of them is what reboots the machine.
++ * The level is a boot-arg, so the whole bisect costs one build.
++ */
++static int ud_step = 3;
+ 
+ #define US_CHECK(what)	do { \
+ 	printf("SWEET USB: -- at %s\n", (what)); \
+@@ -209,6 +221,11 @@
+ 	 * could reach the block. sweetphytouch=1 is the only way in.
+ 	 */
+ 	PE_parse_boot_argn("sweetphytouch", &ud_phy_touch, sizeof(ud_phy_touch));
++	PE_parse_boot_argn("sweetusbstep", &ud_step, sizeof(ud_step));
++	if (ud_step < 0 || ud_step > 3) {
++		ud_step = 3;
++	}
++	printf("SWEET USB: 0272 phy_touch=%d step=%d\n", ud_phy_touch, ud_step);
+ 	/*
+ 	 * Say which build this is before anything that could stop the machine,
+ 	 * and put it on the disk.
+@@ -219,8 +236,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0271 alive: no QUSB2 PHY read, "
+-	    "flushed step markers ========\n");
++	printf("SWEET USB: ======== build 0272 alive: PHY on, sweetusbstep ladder ========\n");
+ 	sweet_log_flush_now();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -2616,7 +2632,7 @@
+ 	thread_t worker;
+ 
+ 	ud.dwc = dwc;
+-	printf("SWEET USB: gadget_start entered (0271)\n");
++	printf("SWEET USB: gadget_start entered (0272)\n");
+ 	sweet_log_flush_now();
+ 	/*
+ 	 * 0265: the probe starts a thread and returns; that is all it does now.
+@@ -2646,22 +2662,25 @@
+ 	 * And nothing happens in it until the system has had time to come up.
+ 	 * The number is a placeholder for a real handshake, not a fix.
+ 	 */
+-	printf("SWEET USB: the gadget thread is running (0271)\n");
++	printf("SWEET USB: the gadget thread is running (0272) step=%d\n", ud_step);
+ 	sweet_log_flush_now();
++	if (ud_step < 1) {
++		printf("SWEET USB: 0272 step 0 - no gadget work this boot\n");
++		sweet_log_flush_now();
++		return;
++	}
+ 	/*
+-	 * 0271: wait for the desktop, not for a made-up number.
++	 * 0272: five seconds by default, overridable with sweetusbwait.
+ 	 *
+-	 * The first frame reaches the panel at tick 12780 - 213 s - on the one
+-	 * boot that ever presented anything, so every window shorter than that
+-	 * is a window in which "the screen is black" cannot be told apart from
+-	 * "the screen is not due yet". Five seconds was worse than useless: it
+-	 * only guaranteed the USB work and the boot were in the air together.
+-	 *
+-	 * 240 s puts the whole gadget sequence after the desktop is up. If it
+-	 * then stops the machine, the desktop has already been seen and the
+-	 * fault is provably in the USB path, not in the display.
++	 * 0271 used 240 s to "wait for the desktop"; that premise was wrong -
++	 * this machine has never reached a usable desktop, and the control
++	 * (sweetusb=1, polarisgpuup=18) only reaches tick 13440 with 323
++	 * swaps after 224 s. What is actually being tested here is timing:
++	 * whether the gadget/attach work kills the boot because it runs in
++	 * the first minute, or kills it regardless of when it runs.
++	 * sweetusbwait=240 asks the second question without a rebuild.
+ 	 */
+-	unsigned wait_s = 240;
++	unsigned wait_s = 5;
+ 	PE_parse_boot_argn("sweetusbwait", &wait_s, sizeof(wait_s));
+ 	if (wait_s > 600) {
+ 		wait_s = 600;
+@@ -2705,7 +2724,7 @@
+ 	 * no matter when it is issued. Nothing below needs its four values -
+ 	 * they were printed, not used - so it is removed rather than deferred.
+ 	 */
+-	printf("SWEET USB: 0271 does not touch the QUSB2 PHY (0x%x); that read stops the SoC\n",
++	printf("SWEET USB: 0272 does not touch the QUSB2 PHY (0x%x); that read stops the SoC\n",
+ 	    (unsigned)QUSB2_PA);
+ 	sweet_log_flush_now();
+ 	/*
+@@ -2773,7 +2792,7 @@
+ 	ud.dma_pa = ptoa_64(pn);
+ 	printf("SWEET USB: DMA buffer pa 0x%llx (%s 4GiB) UD_SIZE 0x%x UD_EVT 0x%x\n",
+ 	    ud.dma_pa, ud.dma_pa >= 0x100000000ULL ? ">=" : "<", (unsigned)UD_SIZE, (unsigned)UD_EVT);
+-	printf("SWEET USB: 0271 step A done: event buffer allocated\n");
++	printf("SWEET USB: 0272 step A done: event buffer allocated\n");
+ 	sweet_log_flush_now();
+ 	printf("SWEET USB: pre-config GHWPARAMS0 0x%08x GHWPARAMS7 0x%08x GCTL 0x%08x "
+ 	    "GUSB2PHYCFG 0x%08x DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
+@@ -2794,10 +2813,10 @@
+ 	 */
+ 
+ 	ud_fifo_dump();
+-	printf("SWEET USB: 0271 step B done: fifo dump\n");
++	printf("SWEET USB: 0272 step B done: fifo dump\n");
+ 	sweet_log_flush_now();
+ 	ud_ahb2phy_probe();
+-	printf("SWEET USB: 0271 step C done: ahb2phy probe\n");
++	printf("SWEET USB: 0272 step C done: ahb2phy probe\n");
+ 	sweet_log_flush_now();
+ 	/*
+ 	 * 0112: the PHY is left alone here on purpose.
+@@ -2829,7 +2848,7 @@
+ 		ud_utmi_clk_select();
+ 		printf("SWEET USB: sweep and mux bisect skipped (sweetphytouch=0)\n");
+ 	}
+-	printf("SWEET USB: 0271 step D done: QSCRATCH clock mux written\n");
++	printf("SWEET USB: 0272 step D done: QSCRATCH clock mux written\n");
+ 	sweet_log_flush_now();
+ 
+ 	/*
+@@ -2881,9 +2900,15 @@
+ 	{
+ 		thread_t worker;
+ 
++		if (ud_step < 2) {
++			printf("SWEET USB: 0272 step %d - attach thread deliberately NOT started\n",
++			    ud_step);
++			sweet_log_flush_now();
++			return;
++		}
+ 		if (kernel_thread_start(ud_attach_worker, NULL, &worker) == KERN_SUCCESS) {
+ 			thread_deallocate(worker);
+-			printf("SWEET USB: 0271 step E done: attach thread started, gadget worker returns\n");
++			printf("SWEET USB: 0272 step E done: attach thread started, gadget worker returns\n");
+ 		} else {
+ 			printf("SWEET USB: the attach thread did not start\n");
+ 		}
+@@ -2896,6 +2921,12 @@
+ {
+ 	thread_t thread;
+ 
++	if (ud_step < 3) {
++		printf("SWEET USB: 0272 step %d - attach thread returns at once\n", ud_step);
++		sweet_log_flush_now();
++		return;
++	}
++
+ 	/*
+ 	 * 0267: the interface is optional, and off by default.
+ 	 *
