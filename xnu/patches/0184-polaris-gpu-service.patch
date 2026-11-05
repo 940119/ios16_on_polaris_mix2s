@@ -315,7 +315,16 @@
  }
  
  /*
-@@ -3222,6 +3479,21 @@
+@@ -2874,6 +3131,8 @@
+ 
+ #define PG_RBBM_CLOCK_CNTL	0x00aeu
+ #define PG_SECVID_TRUST_CNTL	0xf400u
++#define PG_CP_PROTECT_STATUS	0x0824u
++#define PG_CP_PROTECT_CNTL	0x084fu
+ #define PG_GMU_AO_CGC_MODE	0x9309u
+ #define PG_GMU_AO_CGC_DELAY	0x930au
+ #define PG_GMU_AO_CGC_HYST	0x930bu
+@@ -3222,6 +3481,21 @@
  	    ((opcode & 0x7fu) << 16) | (pg_pm4_parity(opcode) << 23);
  }
  
@@ -337,7 +346,7 @@
  static bool
  pg_map_phys(uint64_t iova, uint64_t pa, const char *name)
  {
-@@ -3466,9 +3738,31 @@
+@@ -3466,9 +3740,31 @@
  	PG_CHECK("16: asking TrustZone whether PAS 13 is supported");
  	rc = pg_scm_call(how | PG_SCM_SUPPORTED, 1, PG_ZAP_PAS_ID, 0, 0, res);
  	printf("POLARIS GPU: 16 PAS_SUPPORTED(13): rc %lld result %#llx\n", rc, res[0]);
@@ -371,7 +380,64 @@
  	}
  	/*
  	 * Physically contiguous and 4 KB aligned, the way dma_alloc_coherent gives
-@@ -4865,7 +5159,7 @@
+@@ -3539,7 +3835,7 @@
+ 	uint32_t *ring = (uint32_t *)pg_ring_va[0];
+ 	uint32_t wptr = 9, rptr = 0;
+ 	uint32_t trust;
+-	bool nonsecure = false, ok = false;
++	bool nonsecure = false, ok = false, zap_ok = false;
+ 
+ 	if (pg_gpu3d == 0 || pg_ring_va[0] == 0) {
+ 		printf("POLARIS GPU: 16 the CP is not running: no zap\n");
+@@ -3573,7 +3869,10 @@
+ 	 * what would make that write legal - and the write test below runs anyway.
+ 	 * It answers the only question that matters: may the CP write memory.
+ 	 */
+-	if (trust != 0 && pg_zap_load()) {
++	if (trust != 0) {
++		zap_ok = pg_zap_load();
++	}
++	if (zap_ok) {
+ 		ring[wptr++] = pg_pkt7(PG_CP_SET_SECURE_MODE, 1);
+ 		ring[wptr++] = 0;
+ 		pg_to_memory(pg_ring_va[0], PG_GMU_PAGE_SIZE);
+@@ -3593,6 +3892,35 @@
+ 	} else if (trust != 0) {
+ 		printf("POLARIS GPU: 16 no zap on this phone: SECVID_TRUST_CNTL is left untouched "
+ 		    "(set-once) and the CP's write test runs anyway\n");
++	}
++	/*
++	 * 0260: the write 0253 could not make, now that the zap is authenticated.
++	 *
++	 * 0253 set this register to zero on a core whose zap had never loaded, and
++	 * every GPU register access after that line stopped - the permission
++	 * violation the kernel comment warns about. The condition now is different
++	 * in exactly the way that matters: PAS_AUTH_AND_RESET(13) returned
++	 * rc 0 / result 0, so this core has an authenticated zap in its secure
++	 * world, and this write is the one the zap exists to license.
++	 *
++	 * CP_SET_SECURE_MODE(0) moved the register from 1 to 3 but left bit 0 set,
++	 * so the core still calls itself secure. If bit 1 is a latched "transition
++	 * happened" flag and bit 0 is the state, a direct write clears the state.
++	 * If the write is refused, the line printed next is the last thing this
++	 * boot produces, and that answers the question just as well.
++	 */
++	if (zap_ok && trust != 0) {
++		PG_CHECK("16: writing TRUST_CNTL 0 with the zap authenticated");
++		printf("POLARIS GPU: 16 CP_PROTECT_STATUS %#010x CP_PROTECT_CNTL %#010x "
++		    "before the write\n", pg_rd(pg_gpu3d + 4u * PG_CP_PROTECT_STATUS),
++		    pg_rd(pg_gpu3d + 4u * PG_CP_PROTECT_CNTL));
++		printf("POLARIS GPU: 16 writing SECVID_TRUST_CNTL 0 (was %#010x)\n", trust);
++		sweet_log_flush_now();
++		pg_wr(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL, 0);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		trust = pg_rd(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL);
++		printf("POLARIS GPU: 16 SECVID_TRUST_CNTL after the write: %#010x (%s)\n",
++		    trust, trust == 0 ? "NON-SECURE MODE" : "refused, still secure");
+ 	}
+ 	nonsecure = pg_rd(pg_gpu3d + 4u * PG_SECVID_TRUST_CNTL) == 0;
+ 	printf("POLARIS GPU: 16 the core is %s; the write below is the real question\n",
+@@ -4865,7 +5193,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
  	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
@@ -380,7 +446,7 @@
  	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
  	    "physical, stream 5 bypassed (polarisgpumap=0)");
  	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
-@@ -5049,6 +5343,18 @@
+@@ -5049,6 +5377,18 @@
  	if (upto > 0) {
  		polaris_gpu.state = POLARIS_GPU_STARTING;
  		polaris_gpu_up(upto);
@@ -399,7 +465,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5373,1993 @@
+@@ -5067,4 +5407,1993 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
