@@ -337,7 +337,41 @@
  static bool
  pg_map_phys(uint64_t iova, uint64_t pa, const char *name)
  {
-@@ -4865,7 +5137,7 @@
+@@ -3466,9 +3738,31 @@
+ 	PG_CHECK("16: asking TrustZone whether PAS 13 is supported");
+ 	rc = pg_scm_call(how | PG_SCM_SUPPORTED, 1, PG_ZAP_PAS_ID, 0, 0, res);
+ 	printf("POLARIS GPU: 16 PAS_SUPPORTED(13): rc %lld result %#llx\n", rc, res[0]);
+-	if (rc != 0 || res[0] != 1) {
+-		printf("POLARIS GPU: 16 TrustZone does not support PAS 13: no zap\n");
++	/*
++	 * 0259: this gate is what stopped the entire zap path, and it was ours.
++	 *
++	 * The call is the same one dipper's zap_load() makes, at the same service
++	 * (0x207), and on this phone it answers rc 0 / result 0. dipper prints
++	 * that answer and then calls PAS_INIT_IMAGE anyway; its preflight treats
++	 * only an answer above 1 as a refusal (mi8_adreno.c: `if (answer > 1)
++	 * return false;`). This file required == 1, so a zero returned early -
++	 * which means PAS_INIT_IMAGE, PAS_MEM_SETUP and PAS_AUTH_AND_RESET have
++	 * never run on this machine, not once.
++	 *
++	 * A zero is not obviously a refusal either. It says the query does not
++	 * report support; the only way to learn what the loader does is to hand
++	 * it the image. Everything below this gate already exists and is the same
++	 * sequence dipper runs, with the same 6684-byte mdt and the same
++	 * 0x8c415000 region.
++	 */
++	if (rc != 0 || res[0] > 1) {
++		printf("POLARIS GPU: 16 TrustZone refuses PAS 13 outright "
++		    "(rc %lld result %#llx): no zap\n", rc, res[0]);
+ 		return false;
++	}
++	if (res[0] == 0) {
++		printf("POLARIS GPU: 16 PAS_SUPPORTED answered 0, which is not a refusal; "
++		    "calling the loader anyway\n");
+ 	}
+ 	/*
+ 	 * Physically contiguous and 4 KB aligned, the way dma_alloc_coherent gives
+@@ -4865,7 +5159,7 @@
  	pg_smmu_mode = (map == 1);
  	(void)PE_parse_boot_argn("polarisgpummu", &pg_mmu_way, sizeof(pg_mmu_way));
  	(void)PE_parse_boot_argn("polarisgpumem", &pg_mem_way, sizeof(pg_mem_way));
@@ -346,7 +380,7 @@
  	    pg_mem_way, pg_smmu_mode ? "behind SMMU translation (polarisgpumap=1)" :
  	    "physical, stream 5 bypassed (polarisgpumap=0)");
  	printf("POLARIS GPU: ladder 1..%d, addressing from the Mi 8 port (same SDM845 nodes)\n", upto);
-@@ -5049,6 +5321,18 @@
+@@ -5049,6 +5343,18 @@
  	if (upto > 0) {
  		polaris_gpu.state = POLARIS_GPU_STARTING;
  		polaris_gpu_up(upto);
@@ -365,7 +399,7 @@
  		polaris_gpu.state = POLARIS_GPU_QUARANTINED;
  		printf("POLARIS GPU: quarantined on purpose; CPU display unchanged\n");
  		return;
-@@ -5067,4 +5351,1993 @@
+@@ -5067,4 +5373,1993 @@
  	polaris_gpu_unwind(&polaris_gpu, true);
  	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
  }
