@@ -1,0 +1,24 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2560,6 +2560,8 @@
+ 	thread_t worker;
+ 
+ 	ud.dwc = dwc;
++	printf("SWEET USB: gadget_start entered (0268)\n");
++	sweet_log_flush_now();
+ 	/*
+ 	 * 0265: the probe starts a thread and returns; that is all it does now.
+ 	 *
+@@ -2588,8 +2590,10 @@
+ 	 * And nothing happens in it until the system has had time to come up.
+ 	 * The number is a placeholder for a real handshake, not a fix.
+ 	 */
+-	ud_sleep_ms(20000);
+-	printf("SWEET USB: the gadget thread starts now (20 s after the probe) ue0 left alone\n");
++	printf("SWEET USB: the gadget thread is running (0268)\n");
++	sweet_log_flush_now();
++	ud_sleep_ms(5000);
++	printf("SWEET USB: the gadget thread starts now (5 s after the probe) ue0 left alone\n");
+ 
+ 	/*
+ 	 * The probe passed the mapping through ud.dwc; take it back as a local so
