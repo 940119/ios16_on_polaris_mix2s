@@ -1,0 +1,254 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -300,7 +300,7 @@
+ 	 * first register access and flushed immediately, so either it is in the
+ 	 * ring or the kernel that wrote the ring was not this one.
+ 	 */
+-	printf("SWEET USB: ======== build 0281 alive: PHY on, apps-SMMU 0x740 bypass ========\n");
++	printf("SWEET USB: ======== build 0282 alive: PHY on, SMMU read-only ========\n");
+ 	ud_flush();
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+@@ -2845,6 +2845,48 @@
+  *      sCR0.CLIENTPD if it is set (default)
+  *   2  1, and put every S2CR in the array into bypass as well
+  */
++/*
++ * 0282: 0281 died on the first SMR read, so the SMMU is read-only from here.
++ *
++ * The global block of the apps SMMU reads fine and says a lot:
++ *
++ *   0281 SMMU in: sCR0 0x00200406 ID0 0x4c017e4c ID1 0x5000002d
++ *                 sGFSR 0x0 SYNR0 0x0 SYNR1 0x0
++ *
++ *   sCR0  CLIENTPD 0 (clients enabled), GFRE 1, GFIE 1, USFCFG 1
++ *         - fault reporting is on AND unassigned StreamIDs are made to fault,
++ *           so if the SMMU were refusing our DMA it would latch a global fault
++ *           with the SID in sGFSYNR1. That is a measurement, not a theory.
++ *   ID0   NUMSMRG 76, NUMSIDB 15 (mask 0x7fff, matches Linux), CTTW 1
++ *         (matches dmesg's "IDR0.CTTW overridden by dma-coherent"), S1TS 1,
++ *         S2TS 0 - this instance is stage-1 only, which is what
++ *         qcom,smmu-s1-bypass is about.
++ *   ID1   NUMCB 45 (matches dmesg's "45 context banks"), NUMS2CB 0.
++ *
++ * Those six numbers agreed with the Linux log line for line, so the block is
++ * clocked, the mapping is right and the reads are real. The next statement was
++ * the first SMR read at 0x15000800 - same 4 KiB page as sCR0 at 0x15000000 -
++ * and the ring ends there, mid-thread, with the machine still needing a hand to
++ * get back into recovery:
++ *
++ *   1141  SWEET USB: 0273 does not touch the QUSB2 PHY (0x88e2000) ...
++ *   1142  SWEET USB: 0281 SMMU in: sCR0 0x00200406 ...
++ *   <end of boot>
++ *
++ * 0280-d1 reached the same point and then printed the low-DMA window, so the
++ * wedge is the SMR access itself and not the moment. Until someone reads the
++ * downstream qsmmu-v500 driver, treat 0x15000800 like 0x088e2000: an address
++ * this kernel may not touch. The stream-matching tables are also very likely
++ * not where arm-smmu.h puts them - qcom,qsmmu-v500 is not a plain MMU-500, its
++ * TBUs have their own 4 KiB windows at 0x150c5000/0x150c9000/0x150cd000.
++ *
++ * So 0282 removes every write and every SMR access. What is left is the
++ * question 0281 could not answer: is the SMMU the thing that refuses the DMA?
++ * sGFSR.USF (bit 1) plus sGFSYNR1 == 0x740 after the prime says yes; a still
++ * zero sGFSR says the refusal comes from somewhere else and the two remaining
++ * suspects in section 38.3 (XPU/TZ, GDSC/clock) take over.
++ */
++
+ #define APPS_SMMU_PA		0x15000000
+ #define APPS_SMMU_SIZE		0x4000
+ #define SMMU_GR0_sCR0		0x0000
+@@ -2865,133 +2907,37 @@
+ static void
+ ud_smmu_setup(void)
+ {
+-	int mode = 1;
+-	PE_parse_boot_argn("sweetusbsmmu", &mode, sizeof(mode));
+-
+ 	vm_offset_t s = ml_io_map(APPS_SMMU_PA, APPS_SMMU_SIZE);
+-	if (s == 0) {
+-		printf("SWEET USB: 0281 apps-SMMU map failed\n");
+-		ud_flush();
+-		return;
+-	}
+-	uint32_t cr0  = usb_rd(s, SMMU_GR0_sCR0);
+-	uint32_t id0  = usb_rd(s, SMMU_GR0_ID0);
+-	uint32_t id1  = usb_rd(s, SMMU_GR0_ID1);
+-	uint32_t gfsr = usb_rd(s, SMMU_GR0_sGFSR);
+-	printf("SWEET USB: 0281 SMMU in: sCR0 0x%08x ID0 0x%08x ID1 0x%08x "
+-	    "sGFSR 0x%08x SYNR0 0x%08x SYNR1 0x%08x\n",
+-	    cr0, id0, id1, gfsr, usb_rd(s, SMMU_GR0_sGFSYNR0),
+-	    usb_rd(s, SMMU_GR0_sGFSYNR1));
+-	ud_flush();
+ 
+-	if (id0 == 0 || id0 == 0xffffffffu) {
+-		printf("SWEET USB: 0281 SMMU ID0 0x%08x - nothing mapped there, "
+-		    "giving up\n", id0);
+-		ud_flush();
+-		return;
+-	}
+-	unsigned groups = (id0 & 0xffu) + 1u;
+-	if (groups > SMMU_MAX_GROUPS) {
+-		groups = SMMU_MAX_GROUPS;
+-	}
+-
+-	int found = -1;
+-	int free_idx = -1;
+-	for (unsigned i = 0; i < groups; i++) {
+-		uint32_t smr = usb_rd(s, SMMU_GR0_SMR(i));
+-
+-		if (!(smr & SMMU_SMR_VALID)) {
+-			if (free_idx < 0) {
+-				free_idx = (int)i;
+-			}
+-			continue;
+-		}
+-		if ((smr & SMMU_SMR_ID) == SMMU_USB_SID) {
+-			found = (int)i;
+-		}
+-	}
+-	printf("SWEET USB: 0281 SMMU %u groups: SID 0x%x %s, first free %d\n",
+-	    groups, SMMU_USB_SID,
+-	    (found >= 0) ? "already mapped" : "NOT mapped", free_idx);
+-	ud_flush();
+-
+-	if (mode <= 0) {
+-		printf("SWEET USB: 0281 sweetusbsmmu=0 - dump only, no writes\n");
++	if (s == 0) {
++		printf("SWEET USB: 0282 apps-SMMU map failed\n");
+ 		ud_flush();
+ 		return;
+ 	}
+-
+-	int idx = found;
+-	if (idx < 0) {
+-		if (free_idx < 0) {
+-			printf("SWEET USB: 0281 no free SMR for SID 0x%x\n",
+-			    SMMU_USB_SID);
+-			ud_flush();
+-			return;
+-		}
+-		usb_wr(s, SMMU_GR0_SMR(free_idx), SMMU_SMR_VALID | SMMU_USB_SID);
+-		printf("SWEET USB: 0281 SMR[%d] <- 0x%08x, reads 0x%08x\n",
+-		    free_idx, SMMU_SMR_VALID | SMMU_USB_SID,
+-		    usb_rd(s, SMMU_GR0_SMR(free_idx)));
+-		idx = free_idx;
+-		ud_flush();
+-	}
+-
+-	uint32_t s2cr_old = usb_rd(s, SMMU_GR0_S2CR(idx));
+-	usb_wr(s, SMMU_GR0_S2CR(idx), SMMU_S2CR_TYPE_BYPASS);
+-	uint32_t s2cr_new = usb_rd(s, SMMU_GR0_S2CR(idx));
+-	printf("SWEET USB: 0281 S2CR[%d] 0x%08x -> 0x%08x (type %u, want 1)\n",
+-	    idx, s2cr_old, s2cr_new, (s2cr_new >> 16) & 3u);
+-	ud_flush();
+-	if (((s2cr_new >> 16) & 3u) != 1u) {
+-		/*
+-		 * Qualcomm firmware on this generation can refuse a bare
+-		 * bypass and only accept it with CBNDX pointed at the last
+-		 * context bank - arm-smmu-qcom carries the same workaround as
+-		 * qsmmu->bypass_cbndx. Try it once before believing the
+-		 * read-back.
+-		 */
+-		unsigned ncb = (id1 & 0xffu) + 1u;
+-		uint32_t alt = SMMU_S2CR_TYPE_BYPASS |
+-		    ((ncb - 1u) & SMMU_S2CR_CBNDX);
+-
+-		usb_wr(s, SMMU_GR0_S2CR(idx), alt);
+-		printf("SWEET USB: 0281 S2CR[%d] CBNDX %u retry -> 0x%08x\n",
+-		    idx, ncb - 1u, usb_rd(s, SMMU_GR0_S2CR(idx)));
+-		ud_flush();
+-	}
+-
+ 	/*
+-	 * CLIENTPD is 0 = clients enabled. If the bootloader left the SMMU
+-	 * globally parked, no S2CR means anything until this bit is cleared.
+-	 * Only clear it when it is set, so the other masters that ABL may
+-	 * have configured keep the state they were given.
+-	 */
+-	if (cr0 & 1u) {
+-		usb_wr(s, SMMU_GR0_sCR0, cr0 & ~1u);
+-		printf("SWEET USB: 0281 sCR0 0x%08x -> 0x%08x (client port on)\n",
+-		    cr0, usb_rd(s, SMMU_GR0_sCR0));
+-		ud_flush();
+-	}
+-
+-	if (mode >= 2) {
+-		for (unsigned i = 0; i < groups; i++) {
+-			usb_wr(s, SMMU_GR0_S2CR(i), SMMU_S2CR_TYPE_BYPASS);
+-		}
+-		printf("SWEET USB: 0281 all %u S2CR set to bypass\n", groups);
+-		ud_flush();
+-	}
++	 * Global block only: 0x00..0x54. Everything from 0x800 up is off
++	 * limits (see the comment on APPS_SMMU_PA), which also means this
++	 * function must not be extended into a scan again.
++	 */
++	uint32_t cr0 = usb_rd(s, SMMU_GR0_sCR0);
++	uint32_t id0 = usb_rd(s, SMMU_GR0_ID0);
++	uint32_t id1 = usb_rd(s, SMMU_GR0_ID1);
+ 
+-	/* Acknowledge whatever fault was already latched, so a later read
+-	 * means something new rather than the same stuck bit. */
+-	if (gfsr != 0 && gfsr != 0xffffffffu) {
+-		usb_wr(s, SMMU_GR0_sGFSR, gfsr);
+-	}
+-	printf("SWEET USB: 0281 SMMU out: sCR0 0x%08x SMR[%d] 0x%08x "
+-	    "S2CR[%d] 0x%08x sGFSR 0x%08x SYNR1 0x%08x\n",
+-	    usb_rd(s, SMMU_GR0_sCR0), idx, usb_rd(s, SMMU_GR0_SMR(idx)),
+-	    idx, usb_rd(s, SMMU_GR0_S2CR(idx)), usb_rd(s, SMMU_GR0_sGFSR),
+-	    usb_rd(s, SMMU_GR0_sGFSYNR1));
++	printf("SWEET USB: 0282 SMMU sCR0 0x%08x ID0 0x%08x ID1 0x%08x "
++	    "sGFSR 0x%08x SYNR0 0x%08x SYNR1 0x%08x\n",
++	    cr0, id0, id1, usb_rd(s, SMMU_GR0_sGFSR),
++	    usb_rd(s, SMMU_GR0_sGFSYNR0), usb_rd(s, SMMU_GR0_sGFSYNR1));
++	/*
++	 * Decode the raw ID fields without inventing "+1"s: the header gives
++	 * NUMSMRG as 76 here and Linux printed 76 register groups, so the
++	 * field is printed raw and compared to what Linux said, not to a
++	 * formula guessed from it.
++	 */
++	printf("SWEET USB: 0282 SMMU ID: S1TS %d S2TS %d NUMSMRG %u NUMSIDB %u "
++	    "NUMCB %u | sCR0: CLIENTPD %d USFCFG %d GFRE %d GFIE %d\n",
++	    !!(id0 & (1u << 30)), !!(id0 & (1u << 29)), id0 & 0xffu,
++	    (id0 >> 9) & 0xfu, id1 & 0xffu, cr0 & 1u, !!(cr0 & (1u << 10)),
++	    !!(cr0 & 2u), !!(cr0 & 4u));
+ 	ud_flush();
+ }
+ 
+@@ -3012,11 +2958,11 @@
+ 	vm_offset_t s = ml_io_map(APPS_SMMU_PA, APPS_SMMU_SIZE);
+ 
+ 	if (s == 0) {
+-		printf("SWEET USB: 0281 %s SMMU map failed\n", tag);
++		printf("SWEET USB: 0282 %s SMMU map failed\n", tag);
+ 		ud_flush();
+ 		return;
+ 	}
+-	printf("SWEET USB: 0281 %s SMMU sGFSR 0x%08x SYNR0 0x%08x SYNR1 0x%08x "
++	printf("SWEET USB: 0282 %s SMMU sGFSR 0x%08x SYNR0 0x%08x SYNR1 0x%08x "
+ 	    "sCR0 0x%08x\n", tag, usb_rd(s, SMMU_GR0_sGFSR),
+ 	    usb_rd(s, SMMU_GR0_sGFSYNR0), usb_rd(s, SMMU_GR0_sGFSYNR1),
+ 	    usb_rd(s, SMMU_GR0_sCR0));
+@@ -3668,14 +3614,20 @@
+ 		}
+ 		printf("SWEET USB: 0277 prime=%d priming ep0 OUT SETUP TRB AFTER run\n", ud_prime);
+ 		ud_flush();
++		ud_smmu_fault("pre-prime");
+ 		ud_start_setup();
+ 		printf("SWEET USB: 0277 ep0 SETUP TRB armed (late), DALEPENA 0x%08x DEVTEN 0x%08x\n",
+ 		    dwc_rd(DALEPENA), dwc_rd(DEVTEN));
++		/*
++		 * Before the GBUSERRADDR line, not after it: in 0280-d1 the log
++		 * ended on that line, so anything printed after it is a coin
++		 * toss. sGFSR is the whole point of this build.
++		 */
++		ud_smmu_fault("post-prime");
+ 		printf("SWEET USB: 0278 GBUSERRADDR 0x%08x%08x GSTS 0x%08x DMA 0x%llx\n",
+ 		    usb_rd(ud.dwc, 0xc134), usb_rd(ud.dwc, 0xc130),
+ 		    usb_rd(ud.dwc, 0xc118), ud.dma_pa);
+ 		ud_flush();
+-		ud_smmu_fault("post-prime");
+ 	}
+ 
+ 	printf("SWEET USB: step 6/6 threads, DMA at 0x%llx\n", ud.dma_pa);
