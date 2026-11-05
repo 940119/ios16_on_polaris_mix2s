@@ -1,0 +1,33 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2791,10 +2791,27 @@
+ 	thread_t thread;
+ 
+ 	/*
+-	 * 0263: the interface, now that launchd is running and the root volume is
+-	 * mounted. Building it earlier cost the whole display.
++	 * 0267: the interface is optional, and off by default.
++	 *
++	 * 0263 moved it here, 0266 moved everything else out of the probe, and the
++	 * screen stayed black through both - SWEET SURF one line against sixteen,
++	 * swaps zero. The one thing that still happens in this kernel and not in a
++	 * sweetusb=1 boot is ifnet_attach of ue0 plus a PF_INET plumb, and a
++	 * half-built interface appearing while configd and backboardd are
++	 * enumerating is a far better candidate for "no frames ever" than any
++	 * register write.
++	 *
++	 * Enumeration itself does not need it: ep0 answers descriptors, which is
++	 * what "unknown USB device" is about. The data path does, so it stays
++	 * behind sweetusbnet=1 until the display question is settled.
+ 	 */
+-	ud_if_create();
++	int make_if = 0;
++	PE_parse_boot_argn("sweetusbnet", &make_if, sizeof(make_if));
++	if (make_if) {
++		ud_if_create();
++	} else {
++		printf("SWEET USB: no interface this boot (sweetusbnet=0); enumeration only\n");
++	}
+ 
+ 	static const char *names[] = {
+ 		"resume+utmi", "table+utmi", "noreset", "runstop+table+utmi"
