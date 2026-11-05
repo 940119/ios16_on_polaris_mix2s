@@ -1,0 +1,189 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -224,6 +224,9 @@
+  * own state (step 2). The level is the boot-arg's value, so one argument covers
+  * both steps and a boot can ask for either.
+  */
++/* 0290: level 7 reads the firmware metadata; defined after MD_SAY below. */
++static void md_firmware_metadata(uint32_t image_cluster);
++
+ static int
+ polaris_modem_level(void)
+ {
+@@ -289,6 +292,9 @@
+ 	printf("POLARIS MODEM: image/ holds:\n");
+ 	md_walk(md_image_cluster, md_image_entry, NULL);
+ 	printf("POLARIS MODEM: read only; nothing was written\n");
++	if (polaris_modem_level() >= 7) {
++		md_firmware_metadata(md_image_cluster);
++	}
+ }
+ 
+ /*
+@@ -614,6 +620,149 @@
+ }
+ 
+ /*
++ * 0290, level 7: measure the modem firmware before handing anything to the
++ * secure monitor.
++ *
++ * §14 established that TrustZone recognises PAS id 5 - PAS_AUTH_AND_RESET(5)
++ * on an empty image returns -3145799, not a clean "no" - so the next step is
++ * the full PIL chain. That chain needs three numbers this file has never read:
++ * the physical load address, the total span of the loadable segments, and
++ * which .mdt / .mbn carry them. PAS_MEM_SETUP(5, base, size) takes the first
++ * two; PAS_INIT_IMAGE(5, mdt) takes the third.
++ *
++ * This reads only the first 8 KiB of MODEM.MDT (the ELF header and its program
++ * header table live at the front) plus the first block of MBA.MBN. No SMC, no
++ * ml_io_map, no register, no write. If a read parks the thread, the ring ends
++ * at the line that said what was about to be read.
++ */
++struct md_file_want {
++	const char *name;
++	uint32_t cluster, size;
++	bool found;
++};
++
++static void
++md_find_entry(const uint8_t *entry, void *ctx)
++{
++	struct md_file_want *w = (struct md_file_want *)ctx;
++	char name[16];
++
++	if ((entry[11] & MD_ATTR_DIR) != 0) {
++		return;
++	}
++	md_name(entry, name, sizeof(name));
++	if (strcmp(name, w->name) == 0) {
++		w->cluster = md_first_cluster(entry);
++		w->size = md_file_size(entry);
++		w->found = true;
++	}
++}
++
++static uint32_t
++md_rd32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
++	    (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static void
++md_firmware_metadata(uint32_t image_cluster)
++{
++	struct md_file_want mdt = { "MODEM.MDT", 0, 0, false };
++	struct md_file_want mba = { "MBA.MBN", 0, 0, false };
++	struct md_file_want wlan = { "WLANMDSP.MBN", 0, 0, false };
++	uint32_t count, lowest = ~0u, highest = 0, loads = 0, i;
++	uint32_t lba;
++
++	MD_SAY("POLARIS MODEM: ======== build 0290 alive: modem firmware "
++	    "metadata, read only ========\n");
++	md_walk(image_cluster, md_find_entry, &mdt);
++	md_walk(image_cluster, md_find_entry, &mba);
++	md_walk(image_cluster, md_find_entry, &wlan);
++
++	MD_SAY("POLARIS MODEM:   MODEM.MDT %s, %u bytes at cluster %u\n",
++	    mdt.found ? "found" : "MISSING", mdt.size, mdt.cluster);
++	MD_SAY("POLARIS MODEM:   MBA.MBN %s, %u bytes at cluster %u\n",
++	    mba.found ? "found" : "MISSING", mba.size, mba.cluster);
++	MD_SAY("POLARIS MODEM:   WLANMDSP.MBN %s, %u bytes at cluster %u\n",
++	    wlan.found ? "found" : "MISSING", wlan.size, wlan.cluster);
++	if (!mdt.found || mdt.cluster < 2) {
++		return;
++	}
++
++	lba = md_geo.data_lba + (mdt.cluster - 2) * md_geo.spc;
++	MD_SAY("POLARIS MODEM:   reading MODEM.MDT at partition block +%u\n", lba);
++	if (!md_read(lba, md_cluster) ||
++	    !md_read(lba + 1, md_cluster + MD_BLOCK)) {
++		MD_SAY("POLARIS MODEM:   the mdt did not read\n");
++		return;
++	}
++	if (!(md_cluster[0] == 0x7f && md_cluster[1] == 'E' &&
++	    md_cluster[2] == 'L' && md_cluster[3] == 'F')) {
++		MD_SAY("POLARIS MODEM:   %02x %02x %02x %02x is not an ELF\n",
++		    md_cluster[0], md_cluster[1], md_cluster[2], md_cluster[3]);
++		return;
++	}
++	count = (uint32_t)md_cluster[44] | (uint32_t)md_cluster[45] << 8;
++	MD_SAY("POLARIS MODEM:   ELF32 class %u, e_phoff %u, e_phnum %u, "
++	    "machine %u\n", md_cluster[4], md_rd32(md_cluster + 28), count,
++	    (uint32_t)md_cluster[18] | (uint32_t)md_cluster[19] << 8);
++	if (count > 64) {
++		count = 64;
++	}
++	for (i = 0; i < count; i++) {
++		const uint8_t *p = md_cluster + 52 + 32 * i;
++		uint32_t type, paddr, filesz, memsz, flags;
++		bool hash;
++
++		if (52 + 32 * (i + 1) > 2 * MD_BLOCK) {
++			break;
++		}
++		type = md_rd32(p);
++		paddr = md_rd32(p + 12);
++		filesz = md_rd32(p + 16);
++		memsz = md_rd32(p + 20);
++		flags = md_rd32(p + 24);
++		hash = ((flags >> 24) & 7) == 2;
++		MD_SAY("POLARIS MODEM:   ph%2u type %u paddr 0x%08x filesz %8u "
++		    "memsz %8u flags 0x%08x%s\n", i, type, paddr, filesz,
++		    memsz, flags, hash ? " HASH" : "");
++		if (type == 1 && !hash && memsz != 0) {
++			loads++;
++			if (paddr < lowest) {
++				lowest = paddr;
++			}
++			if (paddr + memsz > highest) {
++				highest = paddr + memsz;
++			}
++		}
++	}
++	if (loads == 0) {
++		MD_SAY("POLARIS MODEM:   no loadable segments\n");
++		return;
++	}
++	MD_SAY("POLARIS MODEM:   %u loadable segments, window 0x%08x .. 0x%08x\n",
++	    loads, lowest, highest);
++	MD_SAY("POLARIS MODEM:   PAS_MEM_SETUP(5) would take base 0x%08x size "
++	    "0x%08x (%u MiB); DT says modem_region 0x8e400000, mba_region "
++	    "0x96900000\n", lowest,
++	    ((highest + 0xfffu) & ~0xfffu) - lowest,
++	    (((highest + 0xfffu) & ~0xfffu) - lowest) >> 20);
++	if (mba.found && mba.cluster >= 2) {
++		lba = md_geo.data_lba + (mba.cluster - 2) * md_geo.spc;
++		MD_SAY("POLARIS MODEM:   reading MBA.MBN at partition block +%u\n", lba);
++		if (md_read(lba, md_cluster)) {
++			MD_SAY("POLARIS MODEM:   MBA.MBN starts %02x %02x %02x %02x "
++			    "%02x %02x %02x %02x\n", md_cluster[0], md_cluster[1],
++			    md_cluster[2], md_cluster[3], md_cluster[4],
++			    md_cluster[5], md_cluster[6], md_cluster[7]);
++		}
++	}
++	MD_SAY("POLARIS MODEM: phase G done: no SMC, no register, no memory "
++	    "written\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
+@@ -639,6 +788,16 @@
+ 	if (level < 2) {
+ 		return;
+ 	}
++	/*
++	 * 0290: level 7 measures the firmware before anything is handed to the
++	 * monitor. It must not run the PAS scan or the auth probe: those are
++	 * level 5/6 questions and their answers would be mixed into this log.
++	 */
++	if (level >= 7) {
++		MD_SAY("POLARIS MODEM: ======== build 0290 alive: level %d, firmware "
++		    "metadata only; no SMC, no register, no write ========\n", level);
++		return;
++	}
+ 	if (level >= 6) {
+ 		MD_SAY("POLARIS MODEM: ======== build 0249 alive: level %d, the "
+ 		    "bring-up call is sent with no image and no register is "
