@@ -1,0 +1,229 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -45,6 +45,9 @@
+ extern int sweet_ufs_raw_read(uint8_t lun, uint64_t lba, uint32_t count, void *to);
+ extern void sweet_log_flush_now(void);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++					/* 0296: dipper maps MBA_MEMORY with VM_WIMG_WCOMB */
++static bool md_content_risky;	/* 0296: the dispatch sets it before the thread runs */
+ extern vm_offset_t ml_vtophys(vm_offset_t);	/* 0291: kernel VA -> PA for the mdt */
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+@@ -244,6 +247,8 @@
+ static void md_mba_probe_thread(void *, wait_result_t);	/* 0294 */
+ static void md_mp_assign_probe(void);			/* 0295 */
+ static void md_mp_assign_thread(void *, wait_result_t);	/* 0295 */
++static void md_content_probe(void);			/* 0296 */
++static void md_content_thread(void *, wait_result_t);	/* 0296 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -313,7 +318,19 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 12) {
++	if (polaris_modem_level() == 13 || polaris_modem_level() == 14) {
++		/* 0296: level 14 is the deliberately risky variant; same kernel. */
++		thread_t thread;
++
++		md_content_risky = polaris_modem_level() == 14;
++		if (kernel_thread_start(md_content_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			MD_SAY("POLARIS MODEM: 0296: content probe thread started (%s)\n",
++			    md_content_risky ? "risky 14" : "safe 13");
++		} else {
++			MD_SAY("POLARIS MODEM: 0296: could not start the content thread\n");
++		}
++	} else if (polaris_modem_level() == 12) {
+ 		/* 0295: an SMC can park its thread, so never do it on the mount path. */
+ 		thread_t thread;
+ 
+@@ -1379,6 +1396,186 @@
+ }
+ 
+ /*
++ * 0296, levels 13/14: 0295 got "MP_ASSIGN ACCEPTED" - every SMC returned 0 -
++ * but the marker written into mba_region before the handoff read back as 0
++ * afterwards.  ml_io_map() is VM_WIMG_IO (VM_MEM_NOT_CACHEABLE | GUARDED), so
++ * a dirty cache line is not the explanation.  Two possibilities remain:
++ *
++ *   (a) TrustZone scrubs the region when it moves from VMID_HLOS to
++ *       VMID_MSS_MSA.  Then dipper's W2e - which memcpy's mba.mbn into the
++ *       region BEFORE assign_mem() - cannot work on polaris at all, and the
++ *       modem line has to be re-thought (Linux on sdm845 uses PAS for this,
++ *       and PAS id 5 is exactly what 0291/0293 found shut).
++ *   (b) The AP's reads/writes are flattened while the XPU has the region in
++ *       the MSS's name, and the "give it back" SMC is not restoring the AP's
++ *       access even though it returns 0.
++ *
++ * This build writes distinctive patterns on two kinds of mapping (the
++ * VM_WIMG_IO one 0294/0295 used, and dipper's VM_WIMG_WCOMB), does the
++ * HLOS->MSS->HLOS round trip, and compares checksums.  It also writes a
++ * fresh pattern AFTER the round trip (is the region usable again?), and tries
++ * the shared HLOS+MSS owner state that dipper's W2d uses for mpss.
++ *
++ * Level 14 is the same kernel with one extra, deliberately risky step: write
++ * while the MSS is the sole owner.  If that works, W2e can be reordered to
++ * assign first and load mba.mbn afterwards.  It is a separate boot-arg so it
++ * can be run by repacking boot-args without another build; a fault there
++ * costs only the tail of this probe, all earlier lines are already flushed.
++ */
++#define MD_WIMG_WCOMB		0x6u	/* VM_MEM_NOT_CACHEABLE | VM_MEM_COHERENT */
++#define MD_CONTENT_WORDS	16u
++#define MD_META_PAGE_OFFSET	0x00100000u	/* dipper's MBA_META_OFFSET */
++
++static uint32_t
++md_content_seed_sum(uint32_t seed)
++{
++	uint32_t sum = 0;
++
++	for (unsigned i = 0; i < MD_CONTENT_WORDS; i++) {
++		sum = sum * 31u + (seed + i * 0x11111111u);
++	}
++	return sum;
++}
++
++static uint32_t
++md_content_sum(volatile uint32_t *p)
++{
++	uint32_t sum = 0;
++
++	for (unsigned i = 0; i < MD_CONTENT_WORDS; i++) {
++		sum = sum * 31u + p[i];
++	}
++	return sum;
++}
++
++static void
++md_content_fill(volatile uint32_t *p, uint32_t seed)
++{
++	for (unsigned i = 0; i < MD_CONTENT_WORDS; i++) {
++		p[i] = seed + i * 0x11111111u;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++md_content_probe(void)
++{
++	vm_offset_t va_io, va_wc;
++	volatile uint32_t *io, *wc;
++	uint64_t owners = 1ull << MD_VMID_HLOS;
++	uint32_t sum_io, sum_wc, expect_io, expect_wc;
++	bool survived_io, survived_wc, writable_again = false, shared_survived = false;
++
++	MD_SAY("POLARIS MODEM: ======== build 0296 alive: does MBA content "
++	    "survive MP_ASSIGN? (%s) ========\n",
++	    md_content_risky ? "level 14, RISKY" : "level 13, safe");
++	va_io = ml_io_map((vm_offset_t)MD_MBA_REGION, 4096);
++	va_wc = ml_io_map_unmappable(
++	    (vm_offset_t)(MD_MBA_REGION + MD_META_PAGE_OFFSET), 4096, MD_WIMG_WCOMB);
++	MD_SAY("POLARIS MODEM:   mappings: IO %s, WCOMB(+0x100000) %s\n",
++	    va_io ? "ok" : "FAILED", va_wc ? "ok" : "FAILED");
++	if (va_io == 0 || va_wc == 0) {
++		MD_SAY("POLARIS MODEM:   a mapping failed; no SMC sent\n");
++		return;
++	}
++	io = (volatile uint32_t *)(void *)va_io;
++	wc = (volatile uint32_t *)(void *)va_wc;
++	expect_io = md_content_seed_sum(0xa2960000u);
++	expect_wc = md_content_seed_sum(0xb2960000u);
++
++	md_content_fill(io, 0xa2960000u);
++	md_content_fill(wc, 0xb2960000u);
++	MD_SAY("POLARIS MODEM:   before the handoff: IO %#x, WCOMB %#x "
++	    "(want %#x / %#x)\n", md_content_sum(io), md_content_sum(wc),
++	    expect_io, expect_wc);
++
++	if (md_content_risky) {
++		MD_SAY("POLARIS MODEM:   level 14: giving the MBA region to the MSS\n");
++		if (!md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, false, true)) {
++			MD_SAY("POLARIS MODEM:   the first assign failed; stopping\n");
++			return;
++		}
++		MD_SAY("POLARIS MODEM:   reading while the MSS owns it: IO %#x (was "
++		    "%#x), WCOMB %#x (was %#x)\n", md_content_sum(io), expect_io,
++		    md_content_sum(wc), expect_wc);
++		MD_SAY("POLARIS MODEM:   about to write while the MSS is the sole owner\n");
++		md_content_fill(io, 0xc2960000u);
++		MD_SAY("POLARIS MODEM:   AP CAN WRITE WHILE THE MSS OWNS IT: %#x "
++	    "(want %#x)\n", md_content_sum(io), md_content_seed_sum(0xc2960000u));
++		(void)md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, true, false);
++		MD_SAY("POLARIS MODEM:   back with HLOS: %#x, final owners %#llx\n",
++		    md_content_sum(io), owners);
++		MD_SAY("POLARIS MODEM: phase M done (level 14 risky variant)\n");
++		return;
++	}
++
++	/* T1: the plain round trip, exactly what 0295 did. */
++	MD_SAY("POLARIS MODEM:   T1: HLOS -> MSS -> HLOS\n");
++	if (!md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, false, true) ||
++	    !md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, true, false)) {
++		MD_SAY("POLARIS MODEM:   T1 assign FAILED, owners %#llx\n", owners);
++		return;
++	}
++	sum_io = md_content_sum(io);
++	sum_wc = md_content_sum(wc);
++	survived_io = sum_io == expect_io;
++	survived_wc = sum_wc == expect_wc;
++	MD_SAY("POLARIS MODEM:   T1 after: IO %#x (%s), WCOMB %#x (%s)\n",
++	    sum_io, survived_io ? "SURVIVED" : "LOST",
++	    sum_wc, survived_wc ? "SURVIVED" : "LOST");
++
++	/* T2: is the region usable at all after the handoff? */
++	md_content_fill(io, 0xd2960000u);
++	writable_again = md_content_sum(io) == md_content_seed_sum(0xd2960000u);
++	MD_SAY("POLARIS MODEM:   T2 fresh write reads %#x: %s\n",
++	    md_content_sum(io),
++	    writable_again ? "THE REGION IS WRITABLE AGAIN"
++	    : "THE REGION NO LONGER ACCEPTS AP WRITES");
++
++	/* T3: write while both HLOS and MSS own it (dipper W2d's mpss state). */
++	owners = 1ull << MD_VMID_HLOS;
++	MD_SAY("POLARIS MODEM:   T3: HLOS -> HLOS+MSS -> MSS -> HLOS\n");
++	if (md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, true, true)) {
++		md_content_fill(io, 0xe2960000u);
++		MD_SAY("POLARIS MODEM:   T3 while shared: %#x (want %#x)\n",
++		    md_content_sum(io), md_content_seed_sum(0xe2960000u));
++		if (md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, false, true) &&
++		    md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, true, false)) {
++			shared_survived = md_content_sum(io) ==
++			    md_content_seed_sum(0xe2960000u);
++			MD_SAY("POLARIS MODEM:   T3 after MSS-only and back: %#x (%s)\n",
++			    md_content_sum(io), shared_survived ? "SURVIVED" : "LOST");
++		} else {
++			MD_SAY("POLARIS MODEM:   T3 assign sequence FAILED, owners %#llx\n",
++			    owners);
++		}
++	} else {
++		MD_SAY("POLARIS MODEM:   T3 shared assign FAILED, owners %#llx\n", owners);
++	}
++
++	md_content_fill(io, 0);
++	md_content_fill(wc, 0);
++	MD_SAY("POLARIS MODEM:   final owners %#llx\n", owners);
++	MD_SAY("POLARIS MODEM: phase M done: no MBA.MBN, no QMP, no clock, "
++	    "no reset, no Q6 start\n");
++	MD_SAY("POLARIS MODEM: 0296 VERDICT: %s\n",
++	    (survived_io || survived_wc) ?
++	    "CONTENT SURVIVES MP_ASSIGN: W2e step 1 can precede step 4"
++	    : writable_again ?
++	    "TZ ERASES CONTENT ON HANDOFF: W2e as dipper does it cannot work here"
++	    : "AP LOST ACCESS AFTER HANDOFF: the give-back SMC did not restore it");
++}
++
++static void
++md_content_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	md_content_probe();
++	MD_SAY("POLARIS MODEM: the content thread returned\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
