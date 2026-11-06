@@ -1,0 +1,287 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -261,6 +261,8 @@
+ static void md_w2c_reset_thread(void *, wait_result_t);	/* 0301 */
+ static void md_qmp_message_probe(void);		/* 0302 */
+ static void md_qmp_message_thread(void *, wait_result_t);	/* 0302 */
++static void md_rail_survey_probe(void);		/* 0303 */
++static void md_rail_survey_thread(void *, wait_result_t);	/* 0303 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -330,7 +332,17 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 20) {
++	if (polaris_modem_level() == 21) {
++		/* 0303: length-word readback, CMD_DB survey, RSC survey, modem on. */
++		thread_t thread;
++
++		if (kernel_thread_start(md_rail_survey_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			MD_SAY("POLARIS MODEM: 0303: rail survey thread started\n");
++		} else {
++			MD_SAY("POLARIS MODEM: 0303: could not start the rail survey thread\n");
++		}
++	} else if (polaris_modem_level() == 20) {
+ 		/* 0302: one QMP message to the AOP; no modem register is touched. */
+ 		thread_t thread;
+ 
+@@ -2607,6 +2619,256 @@
+ }
+ 
+ /*
++ * 0303, level 21: the length word read back at once, the RPMh command
++ * database read, the RSC's TCS state read, and one QMP "modem on".
++ *
++ * The two addresses are SoC-level device tree entries, not dipper's:
++ *
++ *   /soc/aop-cmd-db-mem@85fe0000  compatible qcom,cmd-db
++ *                                 reg 0x85fe0000 0x20000
++ *   /soc/apps_rsc: rsc@179c0000   reg-names drv-0 drv-1 drv-2
++ *                                 drv-2 = 0x179e0000 0x10000
++ *                                 qcom,tcs-offset 0xd00, qcom,drv-id 2
++ *
++ * Layout of the database and of a TCS follows Linux's cmd-db.c and
++ * rpmh-rsc.c; dipper's mi8_rproc.c uses the same ones on the same SoC.
++ * Nothing in the database or the RSC is written here.
++ */
++#define MD_CMD_DB_PHYS		0x85fe0000ull
++#define MD_CMD_DB_SIZE		0x00020000ull
++#define MD_RSC_PHYS		0x179e0000ull
++#define MD_RSC_SIZE		0x00010000ull
++#define MD_RSC_TCS_BASE		0xd00u
++#define MD_RSC_TCS(n)		(MD_RSC_TCS_BASE + 672u * (n))
++
++struct md_cmd_db_slave {
++	uint16_t id, header_offset, data_offset, count, version, reserved[3];
++};
++
++struct md_cmd_db_header {
++	uint32_t version;
++	uint8_t magic[4];
++	struct md_cmd_db_slave slave[8];
++	uint32_t checksum, reserved;
++	uint8_t data[];
++};
++
++struct md_cmd_db_entry {
++	char id[8];
++	uint32_t priority[2];
++	uint32_t address;
++	uint16_t length, offset;
++};
++
++static const char md_qmp_on[] =
++    "{class: image, res: load_state, name: modem, val: on}";
++
++/*
++ * Hand the AOP one message, and say what the length word reads the instant
++ * after the store. That single number is what 0302 could not report.
++ */
++static bool
++md_qmp_send(vm_offset_t qmp, vm_offset_t apcs, uint32_t box, const char *text)
++{
++	uint8_t raw[MD_QMP_MESSAGE];
++	uint32_t words[MD_QMP_MESSAGE / 4];
++	uint32_t i, now;
++
++	if (md_rd(qmp, box) != 0) {
++		MD_SAY("POLARIS MODEM:   the box still holds a message of %u "
++		    "bytes: not sent\n", md_rd(qmp, box));
++		return false;
++	}
++	for (i = 0; i < MD_QMP_MESSAGE; i++) {
++		raw[i] = 0;
++	}
++	for (i = 0; i < MD_QMP_MESSAGE - 1 && text[i] != 0; i++) {
++		raw[i] = (uint8_t)text[i];
++	}
++	for (i = 0; i < MD_QMP_MESSAGE / 4; i++) {
++		words[i] = (uint32_t)raw[4 * i] |
++		    ((uint32_t)raw[4 * i + 1] << 8) |
++		    ((uint32_t)raw[4 * i + 2] << 16) |
++		    ((uint32_t)raw[4 * i + 3] << 24);
++	}
++	MD_SAY("POLARIS MODEM:   === telling the AOP \"%s\" ===\n", text);
++	for (i = 0; i < MD_QMP_MESSAGE / 4; i++) {
++		md_wr(qmp, box + 4 + 4 * i, words[i]);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	MD_SAY("POLARIS MODEM:   about to WRITE the length %u at +%#x\n",
++	    MD_QMP_MESSAGE, box);
++	md_wr(qmp, box, MD_QMP_MESSAGE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	now = md_rd(qmp, box);
++	MD_SAY("POLARIS MODEM:   IMMEDIATELY after the store the length reads "
++	    "%#x: %s\n", now,
++	    now == MD_QMP_MESSAGE ? "THE STORE LANDED" :
++	    "THE STORE DID NOT LAND (a 0 here is not the AOP being fast)");
++	md_qmp_ring(apcs);
++	if (md_qmp_wait(qmp, box, 0, MD_QMP_POLL_MS)) {
++		MD_SAY("POLARIS MODEM:   THE AOP TOOK THE MESSAGE\n");
++		return now == MD_QMP_MESSAGE;
++	}
++	MD_SAY("POLARIS MODEM:   THE AOP DID NOT TAKE IT; the length is put "
++	    "back to 0\n");
++	md_wr(qmp, box, 0);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return false;
++}
++
++/* One rail: its RPMh address and the levels the boot loader listed. */
++static uint32_t
++md_rail_lookup(vm_offset_t db, const char *name)
++{
++	const struct md_cmd_db_header *hdr = (const struct md_cmd_db_header *)db;
++	char id[8] = { 0 };
++	unsigned sl, i, l;
++
++	for (i = 0; i < 7 && name[i] != 0; i++) {
++		id[i] = name[i];
++	}
++	for (sl = 0; sl < 8; sl++) {
++		const struct md_cmd_db_slave *slave = &hdr->slave[sl];
++		const struct md_cmd_db_entry *entry;
++
++		if (slave->id == 0 || slave->header_offset >= MD_CMD_DB_SIZE - 0x1000 ||
++		    slave->count > 512) {
++			continue;
++		}
++		entry = (const struct md_cmd_db_entry *)(hdr->data +
++		    slave->header_offset);
++		for (i = 0; i < slave->count; i++) {
++			const uint8_t *data;
++			char levels[192];
++			int at;
++
++			if (memcmp(entry[i].id, id, sizeof(id)) != 0) {
++				continue;
++			}
++			if ((unsigned)slave->data_offset + entry[i].offset +
++			    entry[i].length > MD_CMD_DB_SIZE - 0x1000) {
++				MD_SAY("POLARIS MODEM:   %s: its level list is "
++				    "outside the database\n", name);
++				return 0;
++			}
++			data = hdr->data + slave->data_offset + entry[i].offset;
++			at = snprintf(levels, sizeof(levels),
++			    "%s at %#x, levels:", name, entry[i].address);
++			for (l = 0; l < entry[i].length / 2u && l < 16; l++) {
++				unsigned value = data[2 * l] |
++				    (unsigned)data[2 * l + 1] << 8;
++
++				if (l > 0 && value == 0) {
++					break;
++				}
++				at += snprintf(levels + at,
++				    sizeof(levels) - (size_t)at, " %u", value);
++			}
++			MD_SAY("POLARIS MODEM:   %s\n", levels);
++			return entry[i].address;
++		}
++	}
++	MD_SAY("POLARIS MODEM:   no \"%s\" in the command database\n", name);
++	return 0;
++}
++
++static void
++md_rail_survey_probe(void)
++{
++	vm_offset_t qmp, apcs, db, rsc, tcs;
++	uint32_t box, size, i, cx, mx, mss;
++	bool magic_ok;
++
++	MD_SAY("POLARIS MODEM: ======== build 0303 alive: length-word "
++	    "readback, CMD_DB and RSC survey, one QMP 'modem on' "
++	    "(level 21) ========\n");
++	MD_SAY("POLARIS MODEM:   no modem register, no rail, no TCS is written; "
++	    "the only write is the AOSS mailbox\n");
++	qmp = ml_io_map((vm_offset_t)MD_AOSS_QMP_PHYS, MD_MAP_SIZE);
++	apcs = ml_io_map((vm_offset_t)MD_APCS_PHYS, MD_MAP_SIZE);
++	db = ml_io_map((vm_offset_t)MD_CMD_DB_PHYS, MD_CMD_DB_SIZE);
++	rsc = ml_io_map((vm_offset_t)MD_RSC_PHYS, MD_RSC_SIZE);
++	MD_SAY("POLARIS MODEM:   maps: qmp %s apcs %s cmd_db %s rsc %s\n",
++	    qmp ? "ok" : "FAILED", apcs ? "ok" : "FAILED",
++	    db ? "ok" : "FAILED", rsc ? "ok" : "FAILED");
++	if (qmp == 0 || apcs == 0 || db == 0 || rsc == 0) {
++		MD_SAY("POLARIS MODEM:   a map failed; nothing was written\n");
++		return;
++	}
++
++	/* ---- A: the command database, read only ---- */
++	MD_SAY("POLARIS MODEM:   === A: the command database at %#llx ===\n",
++	    (unsigned long long)MD_CMD_DB_PHYS);
++	magic_ok = md_rd(db, 0) != 0 &&
++	    (md_rd(db, 4) & 0xffu) == 0xdb &&
++	    ((md_rd(db, 4) >> 8) & 0xffu) == 0x30 &&
++	    ((md_rd(db, 4) >> 16) & 0xffu) == 0x03 &&
++	    ((md_rd(db, 4) >> 24) & 0xffu) == 0x0c;
++	MD_SAY("POLARIS MODEM:   version %#x, magic %#x (want 0x0c0330db), %s\n",
++	    md_rd(db, 0), md_rd(db, 4),
++	    magic_ok ? "the database is there" : "NOT a command database");
++	cx = mx = mss = 0;
++	if (magic_ok) {
++		cx = md_rail_lookup(db, "cx.lvl");
++		mx = md_rail_lookup(db, "mx.lvl");
++		mss = md_rail_lookup(db, "mss.lvl");
++	}
++
++	/* ---- B: the RSC's TCAs, read only ---- */
++	MD_SAY("POLARIS MODEM:   === B: apps_rsc drv-2 at %#llx, tcs offset "
++	    "%#x ===\n", (unsigned long long)MD_RSC_PHYS, MD_RSC_TCS_BASE);
++	MD_SAY("POLARIS MODEM:   IRQ status %#x, IRQ clear %#x\n",
++	    md_rd(rsc, MD_RSC_TCS_BASE + 0x04), md_rd(rsc, MD_RSC_TCS_BASE + 0x08));
++	for (i = 0; i < 4; i++) {
++		tcs = rsc + MD_RSC_TCS(i);
++		MD_SAY("POLARIS MODEM:   TCS %u: control %#x, enable %#x, "
++		    "cmd %#x, status %#x\n", i, md_rd(tcs, 0x14),
++		    md_rd(tcs, 0x1c), md_rd(tcs, 0x30), md_rd(tcs, 0x3c));
++	}
++
++	/* ---- C: one QMP message, with the store read back at once ---- */
++	MD_SAY("POLARIS MODEM:   === C: the mailbox ===\n");
++	box = md_rd(qmp, MD_QMP_OUR_BOX);
++	size = md_rd(qmp, MD_QMP_OUR_BOX_SIZE);
++	MD_SAY("POLARIS MODEM:   magic %#x, box +%#x, %u bytes, first word %#x\n",
++	    md_rd(qmp, MD_QMP_MAGIC), box, size, md_rd(qmp, box));
++	if (md_rd(qmp, MD_QMP_MAGIC) != MD_QMP_MAGIC_VALUE) {
++		MD_SAY("POLARIS MODEM: 0303 VERDICT: the mailbox is not the one "
++		    "0299 read; nothing was written\n");
++		return;
++	}
++	if (!(size >= MD_QMP_MESSAGE + 4 && box >= 0x3c &&
++	    box + size <= MD_MAP_SIZE && (box & 3) == 0)) {
++		MD_SAY("POLARIS MODEM: 0303 VERDICT: the box is not where a "
++		    "message fits; nothing was written\n");
++		return;
++	}
++	if (!md_qmp_open(qmp, apcs)) {
++		MD_SAY("POLARIS MODEM: 0303 VERDICT: THE HANDSHAKE FAILED\n");
++		return;
++	}
++	(void)md_qmp_send(qmp, apcs, box, md_qmp_on);
++
++	MD_SAY("POLARIS MODEM: 0303 VERDICT: %s\n",
++	    (magic_ok && cx != 0 && mx != 0 && mss != 0)
++	    ? "THE RPMH DATABASE IS READABLE: cx/mx/mss addresses are known "
++	    "and 0304 may write the rails"
++	    : "THE RPMH DATABASE IS NOT USABLE: rails are not attempted");
++	MD_SAY("POLARIS MODEM: phase T done: no modem register, no rail and no "
++	    "TCS was written; only the AOSS mailbox and the APCS doorbell\n");
++}
++
++static void
++md_rail_survey_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	md_rail_survey_probe();
++	MD_SAY("POLARIS MODEM: the rail survey thread returned\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
