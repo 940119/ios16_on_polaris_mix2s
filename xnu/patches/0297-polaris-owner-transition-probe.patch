@@ -1,0 +1,220 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -249,6 +249,8 @@
+ static void md_mp_assign_thread(void *, wait_result_t);	/* 0295 */
+ static void md_content_probe(void);			/* 0296 */
+ static void md_content_thread(void *, wait_result_t);	/* 0296 */
++static void md_owner_probe(void);			/* 0297 */
++static void md_owner_thread(void *, wait_result_t);	/* 0297 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -318,7 +320,17 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 13 || polaris_modem_level() == 14) {
++	if (polaris_modem_level() == 15) {
++		/* 0297: only reads while HLOS is still an owner. */
++		thread_t thread;
++
++		if (kernel_thread_start(md_owner_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			MD_SAY("POLARIS MODEM: 0297: owner transition probe thread started\n");
++		} else {
++			MD_SAY("POLARIS MODEM: 0297: could not start the owner probe thread\n");
++		}
++	} else if (polaris_modem_level() == 13 || polaris_modem_level() == 14) {
+ 		/* 0296: level 14 is the deliberately risky variant; same kernel. */
+ 		thread_t thread;
+ 
+@@ -1576,6 +1588,189 @@
+ }
+ 
+ /*
++ * 0297, level 15: find out WHICH ownership transition erases mba_region.
++ *
++ * 0296 lost the content across HLOS->MSS->HLOS on both mapping types, but
++ * AP access was restored afterwards (T2) and shared HLOS+MSS was writable
++ * (T3).  0296 level 14 then showed that reading the region while the MSS is
++ * the SOLE owner parks the AP thread - the kernel kept ticking, no panic -
++ * so "assign first, then write MBA.MBN from the AP" is not an option and we
++ * cannot inspect the MSS-only state directly.
++ *
++ * Every read below happens with HLOS still in the owner set.  The 64-bit
++ * hash and the 0x9e3779b9 step avoid 0296's collision (all five seeds there
++ * hashed to 0xcf47f888).
++ */
++#define MD_OWNER_STEP	0x9e3779b9u
++
++static uint64_t
++md_owner_sum(volatile uint32_t *p)
++{
++	uint64_t sum = 0xcbf29ce484222325ull;
++
++	for (unsigned i = 0; i < MD_CONTENT_WORDS; i++) {
++		sum = (sum ^ p[i]) * 0x100000001b3ull;
++	}
++	return sum;
++}
++
++static uint64_t
++md_owner_seed_sum(uint32_t seed)
++{
++	uint64_t sum = 0xcbf29ce484222325ull;
++
++	for (unsigned i = 0; i < MD_CONTENT_WORDS; i++) {
++		sum = (sum ^ (uint32_t)(seed + i * MD_OWNER_STEP)) * 0x100000001b3ull;
++	}
++	return sum;
++}
++
++/* The hash of an all-zero region, as a reference for "TZ wiped it". */
++static uint64_t
++md_owner_zero_sum(void)
++{
++	uint64_t sum = 0xcbf29ce484222325ull;
++
++	for (unsigned i = 0; i < MD_CONTENT_WORDS; i++) {
++		sum = sum * 0x100000001b3ull;
++	}
++	return sum;
++}
++
++static void
++md_owner_fill(volatile uint32_t *p, uint32_t seed)
++{
++	for (unsigned i = 0; i < MD_CONTENT_WORDS; i++) {
++		p[i] = (uint32_t)(seed + i * MD_OWNER_STEP);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++md_owner_probe(void)
++{
++	vm_offset_t va;
++	volatile uint32_t *io;
++	uint64_t owners = 1ull << MD_VMID_HLOS;
++	uint64_t want1, want2, zero, s0, a, b, c, d;
++
++	MD_SAY("POLARIS MODEM: ======== build 0297 alive: which owner "
++	    "transition erases the MBA region? (level 15) ========\n");
++	va = ml_io_map((vm_offset_t)MD_MBA_REGION, 4096);
++	if (va == 0) {
++		MD_SAY("POLARIS MODEM:   mba_region did not map; no SMC sent\n");
++		return;
++	}
++	io = (volatile uint32_t *)(void *)va;
++	want1 = md_owner_seed_sum(0x15300001u);
++	want2 = md_owner_seed_sum(0x15300002u);
++	zero = md_owner_zero_sum();
++	MD_SAY("POLARIS MODEM:   want(P1) %#llx, want(P2) %#llx, "
++	    "all-zero %#llx, as mapped %#llx\n",
++	    (unsigned long long)want1, (unsigned long long)want2,
++	    (unsigned long long)zero,
++	    (unsigned long long)md_owner_sum(io));
++
++	md_owner_fill(io, 0x15300001u);
++	s0 = md_owner_sum(io);
++	MD_SAY("POLARIS MODEM:   S0 wrote P1: %#llx (%s)\n",
++	    (unsigned long long)s0, s0 == want1 ? "LANDED" : "DID NOT LAND");
++	if (s0 != want1) {
++		MD_SAY("POLARIS MODEM:   S0 DID NOT LAND: no pattern to trace, "
++		    "no SMC sent, stopping here\n");
++		return;
++	}
++
++	/* S1: add MSS as a co-owner.  HLOS is still an owner, so reading is safe. */
++	MD_SAY("POLARIS MODEM:   S1: HLOS -> HLOS+MSS\n");
++	if (!md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, true, true)) {
++		MD_SAY("POLARIS MODEM:   S1 FAILED, owners %#llx\n",
++		    (unsigned long long)owners);
++		return;
++	}
++	a = md_owner_sum(io);
++	MD_SAY("POLARIS MODEM:   S1 shared read A = %#llx (%s)\n",
++	    (unsigned long long)a,
++	    a == want1 ? "CONTENT KEPT" : "CONTENT LOST");
++
++	/* S2: drop MSS again while HLOS never left. */
++	MD_SAY("POLARIS MODEM:   S2: HLOS+MSS -> HLOS\n");
++	if (!md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, true, false)) {
++		MD_SAY("POLARIS MODEM:   S2 FAILED, owners %#llx\n",
++		    (unsigned long long)owners);
++		return;
++	}
++	b = md_owner_sum(io);
++	MD_SAY("POLARIS MODEM:   S2 back read B = %#llx (%s)\n",
++	    (unsigned long long)b,
++	    b == want1 ? "CONTENT KEPT" : "CONTENT LOST");
++
++	/* S3: an MSS-only excursion, but come back to SHARED before reading.
++	 * Never touch the region while the MSS is the sole owner: 0296 level 14
++	 * showed that read parks the thread. */
++	md_owner_fill(io, 0x15300002u);
++	MD_SAY("POLARIS MODEM:   S3 wrote P2: %#llx\n",
++	    (unsigned long long)md_owner_sum(io));
++	MD_SAY("POLARIS MODEM:   S3: HLOS -> MSS-only (no AP access, no read)\n");
++	if (!md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, false, true)) {
++		MD_SAY("POLARIS MODEM:   S3 outbound FAILED, owners %#llx\n",
++		    (unsigned long long)owners);
++		return;
++	}
++	MD_SAY("POLARIS MODEM:   S3: MSS-only -> HLOS+MSS (shared again)\n");
++	if (!md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, true, true)) {
++		MD_SAY("POLARIS MODEM:   S3 return FAILED, owners %#llx: "
++		    "RESET THE PHONE BEFORE THE NEXT FLASH\n",
++		    (unsigned long long)owners);
++		return;
++	}
++	c = md_owner_sum(io);
++	MD_SAY("POLARIS MODEM:   S3 shared read C = %#llx (%s)\n",
++	    (unsigned long long)c,
++	    c == want2 ? "CONTENT KEPT" : "CONTENT LOST");
++
++	/* S4: finally back to HLOS-only. */
++	MD_SAY("POLARIS MODEM:   S4: HLOS+MSS -> HLOS\n");
++	if (!md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, true, false)) {
++		MD_SAY("POLARIS MODEM:   S4 FAILED, owners %#llx\n",
++		    (unsigned long long)owners);
++		return;
++	}
++	d = md_owner_sum(io);
++	MD_SAY("POLARIS MODEM:   S4 final read D = %#llx (%s), owners %#llx\n",
++	    (unsigned long long)d,
++	    d == want2 ? "CONTENT KEPT" : "CONTENT LOST",
++	    (unsigned long long)owners);
++
++	md_owner_fill(io, 0);
++	MD_SAY("POLARIS MODEM: phase N done: no MBA.MBN, no QMP, no clock, "
++	    "no reset, no Q6 start\n");
++	MD_SAY("POLARIS MODEM: 0297 SCORES: A=%s B=%s C=%s D=%s; "
++	    "all-zero reference %#llx\n",
++	    a == want1 ? "KEPT" : "LOST", b == want1 ? "KEPT" : "LOST",
++	    c == want2 ? "KEPT" : "LOST", d == want2 ? "KEPT" : "LOST",
++	    (unsigned long long)zero);
++	MD_SAY("POLARIS MODEM:   note: C=LOST alone cannot separate an erase on "
++	    "HLOS->MSS-only from one on MSS-only->shared; A and D break that tie\n");
++	MD_SAY("POLARIS MODEM: 0297 TENTATIVE VERDICT: %s\n",
++	    c == want2 ? "the MSS-only excursion kept the content: the 0296 wipe "
++	        "is on the MSS->HLOS-ONLY handback, dipper's W2e order may work"
++	    : a == want1 ? "adding the MSS as a co-owner keeps content: "
++	        "a shared-owner (HLOS+MSS) W2e is the surviving path"
++	    : "even adding the MSS erases content: no AP-side W2e ordering works here");
++	MD_SAY("POLARIS MODEM:   final call is deferred to the ring read\n");
++}
++
++static void
++md_owner_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	md_owner_probe();
++	MD_SAY("POLARIS MODEM: the owner transition thread returned\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
