@@ -1,0 +1,355 @@
+diff -Nur a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -29,7 +29,8 @@
+  *
+  * One more thing this file learned from the Mi 8: every ml_io_map() takes I/O
+  * window for good, and three drivers mapping the same arbiter ran the window
+- * out at boot. The three maps are taken once, here, and kept.
++ * out at boot. 0294 (yinliang): the three maps are now taken once by
++ * bsd/dev/sweet_spmi.c and borrowed by both drivers, whoever starts first.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -41,7 +42,12 @@
+ #include <pexpert/pexpert.h>
+ extern bool sweet_touch_board(void);
+ 
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* 0294 (yinliang): the three arbiter windows are owned once by
++ * bsd/dev/sweet_spmi.c.  Do NOT ml_io_map() them again here: on this phone
++ * SweetBattery starts first (IOKit registration), sweet_keys_init() runs only
++ * after the UFS root mounts, so mapping again would consume a second set of
++ * I/O windows for good. */
++extern bool sweet_spmi_windows(vm_offset_t *, vm_offset_t *, vm_offset_t *);
+ extern void sweet_hid_key(int key, int down);
+ extern void sweet_log_flush_now(void);
+ void sweet_keys_init(void);
+@@ -211,11 +217,8 @@
+ 	if (keys_polaris) {
+ 		keys_gpio_rt = KEYS_POLARIS_GPIO_RT;
+ 	}
+-	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+-	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+-	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+-	if (!keys_core || !keys_cnfg || !keys_obs) {
+-		printf("SWEET KEYS: MMIO mapping failed\n");
++	if (!sweet_spmi_windows(&keys_core, &keys_cnfg, &keys_obs)) {
++		printf("SWEET KEYS: SPMI windows unavailable\n");
+ 		return;
+ 	}
+ 	keys_version = keys_rd(keys_core, 0);
+diff -Nur a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -3,7 +3,28 @@
+  * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+  * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+  * Init is serialized by the single built-in SweetBattery personality.
+- * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
++ *
++ * 0294 (yinliang): this phone is SDM845 + PM8998 (slave 0) + PMI8998 (slave 2).
++ * The 0062 whitelist only admitted the PM6150/SM7150 battery blocks on slave 0,
++ * so sweetbattery=1 could never read the PMI8998 fuel gauge and fell straight
++ * back to the static 100% / 4200 mV.  Admit slave 2's four blocks:
++ *
++ *   PPID 0x240  FG batt-soc   absolute 0x4000  (BATT_MONOTONIC_SOC at 0x09)
++ *   PPID 0x241  FG batt-info  absolute 0x4100  (VOLTAGE 0xa0, CURRENT 0xa2,
++ *                                              BATT_TEMP 0x50)
++ *   PPID 0x210  SMB2 chgr     absolute 0x1000  (BATTERY_CHARGER_STATUS_1 0x06)
++ *   PPID 0x213  USB chgpth    absolute 0x1300  (INT_RT_STS 0x10)
++ *
++ * Provenance: the Mi 8 / dipper port (redwood_buttons.c, EXP-0135) measured
++ * 98%, 4.34 V, 35 C and a cable-following USB bit on this exact PMIC pair;
++ * offsets come from Linux's pmi8998_fg / qcom_smbx.  sid is now real: PPID is
++ * (sid << 8) | peripheral, which is what spmi-pmic-arb's mapping table holds.
++ *
++ * The three arbiter windows are owned exactly once, here, by
++ * sweet_spmi_windows(); both this driver and sweet_keys borrow them.  Every
++ * ml_io_map() consumes I/O window for good (Mi 8 EXP-0145: three drivers
++ * mapping one arbiter panicked at boot), and on this phone the battery starts
++ * BEFORE the keys do, so "borrow the keys' maps" would have been backwards.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -22,10 +43,40 @@
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+-static bool sp_attempted, sp_ready;
++static bool sp_attempted, sp_ready, sp_map_attempted;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+ static bool sp_poisoned[512];
+ 
++/*
++ * 0294 (yinliang): ONE owner for the three arbiter windows, whichever driver
++ * gets there first.  On this phone SweetBattery::start() runs during IOKit
++ * registration (boot-0298-shared.txt line 33) but sweet_keys_init() only runs
++ * after the UFS root is mounted (line 115).  Borrowing "the keys' windows"
++ * from the battery is therefore backwards: the battery would map its own
++ * three, then keys would map three more, and every ml_io_map() consumes I/O
++ * window for good (Mi 8 EXP-0145 panicked at boot with three drivers).
++ * Both drivers call here instead; the first caller maps exactly once, every
++ * later caller reuses the same three addresses.  A failed attempt is latched
++ * so we never burn a second set of windows on a retry.
++ */
++bool
++sweet_spmi_windows(vm_offset_t *core, vm_offset_t *cnfg, vm_offset_t *observer)
++{
++	if (!sp_map_attempted) {
++		sp_map_attempted = true;
++		sp_core = ml_io_map(SP_CORE_PA, 0x2000);
++		sp_cfg  = ml_io_map(SP_CFG_PA, 0x1000);
++		sp_obs  = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
++	}
++	if (!sp_core || !sp_cfg || !sp_obs) {
++		return false;
++	}
++	*core = sp_core;
++	*cnfg = sp_cfg;
++	*observer = sp_obs;
++	return true;
++}
++
+ static uint32_t
+ sp_rd(vm_offset_t base, unsigned off)
+ {
+@@ -62,10 +113,7 @@
+ 	if (!sp_lock) {
+ 		return -1;
+ 	}
+-	sp_core = ml_io_map(SP_CORE_PA, 0x2000);
+-	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
+-	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
+-	if (!sp_core || !sp_cfg || !sp_obs) {
++	if (!sweet_spmi_windows(&sp_core, &sp_cfg, &sp_obs)) {
+ 		printf("SWEET BATTERY: SPMI mapping failed\n");
+ 		return -1;
+ 	}
+@@ -78,7 +126,7 @@
+ 		return -1;
+ 	}
+ 	sp_ready = true;
+-	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
++	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads only, one shared window\n",
+ 	    arb_version, sp_count);
+ 	return 0;
+ }
+@@ -88,9 +136,15 @@
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	/* 0062 keeps its PM6150 blocks on slave 0 untouched. */
++	bool pm6150 = sid == 0 &&
++	    (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++	     peripheral == 0x13 || peripheral == 0x48);
++	/* 0294: the PMI8998 is slave 2, its FG and SMB2 are four other blocks. */
++	bool pmi8998 = sid == 2 &&
++	    (peripheral == 0x10 || peripheral == 0x13 ||
++	     peripheral == 0x40 || peripheral == 0x41);
++	if (!sp_ready || !out || addr > 0xffffu || !(pm6150 || pmi8998)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff -Nur a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -3,6 +3,16 @@
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
++ *
++ * 0294 (yinliang): sweetbattery=2 selects this phone's real PMIC. polaris is
++ * SDM845 + PM8998 + PMI8998 (slave 2); the 0062 path reads PM6150/SM7150
++ * registers on slave 0 that simply are not there, so every poll fell back to
++ * the static 100% / 4200 mV.  The new path reads the PMI8998 fuel gauge's
++ * monotonic SOC (so no voltage curve is needed), voltage, current, temperature
++ * and the SMB2 charger/USB status.  Registers, scaling and the 3400 mAh design
++ * capacity come from the Mi 8 / dipper port (redwood_buttons.c EXP-0135, which
++ * measured 98%, 4.34 V, 35 C on this same PMIC pair).  Read only, still no
++ * PMIC writes.  =1 is left exactly as it was for the other board.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -27,12 +37,16 @@
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
++	/* 0294: which PMIC, and the last measured temperature (centidegrees C). */
++	bool fPolaris, fTempMeasured;
++	UInt32 fTemp;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	void pollPMI8998(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -52,6 +66,8 @@
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+ 	fTimerAdded = fRunning = fReal = false;
++	fPolaris = fTempMeasured = false;
++	fTemp = 2500; /* 25.00 C until a real sample replaces it. */
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -101,11 +117,13 @@
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* 0294: polaris is 3400 mAh (Xiaomi's specification, same cell as Mi 8);
++	 * the other board keeps its DT nominal of 5020. powerd computes C*100/M. */
++	const unsigned design = fPolaris ? 3400u : 5020u;
++	const unsigned capacity = (design * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(design);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,15 +137,18 @@
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", design);
++	putNumber("DesignCapacity", design);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C. 0294 uses the FG's real sample
++	 * on polaris; the other board keeps the fixed 25 C placeholder. */
++	putNumber("Temperature", fTemp);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+-	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	/* 0294: the polaris SOC comes from the FG's monotonic SOC register, it is
++	 * NOT a voltage-curve estimate, so do not advertise it as one. */
++	putBool("SweetBatterySOCEstimated", measured && !fPolaris);
++	putBool("SweetBatteryTemperatureEstimated", !fTempMeasured);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -154,7 +175,8 @@
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    !measured ? "static fallback" :
++		    (fPolaris ? "PMI8998 FG / measured SOC" : "PM6150 / estimated SOC"),
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -206,6 +228,12 @@
+ void
+ SweetBattery::poll(void)
+ {
++	/* 0294: polaris has a PMI8998 on slave 2, not the PM6150 the 0062 path
++	 * expects. Keep that path untouched for the board it was measured on. */
++	if (fPolaris) {
++		pollPMI8998();
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -246,6 +274,76 @@
+ 	    charging, full, true, currentValid);
+ }
+ 
++/* 0294: PMI8998 (slave 2) fuel gauge + SMB2, read only, no PMIC writes.
++ * Offsets and scaling are the ones the Mi 8 port verified on this same PMIC
++ * pair (redwood_buttons.c / EXP-0135: 98%, 4.34 V, 35 C, USB bit follows the
++ * cable): BATT_MONOTONIC_SOC 0x09, BATT_TEMP 0x50, VOLTAGE 0xa0, CURRENT
++ * 0xa2, BATTERY_CHARGER_STATUS_1 0x06, USBIN INT_RT_STS 0x10. Absolute
++ * addresses are (peripheral << 8) | offset; sid 2 makes the PPIDs 0x240,
++ * 0x241, 0x210 and 0x213. */
++void
++SweetBattery::pollPMI8998(void)
++{
++	/* All zeroed: the && chain short-circuits on the first failed read, and
++	 * the raw values must never be used uninitialised on that path. */
++	uint8_t soc0 = 0, soc1 = 0, vlo = 0, vhi = 0, clo = 0, chi = 0;
++	uint8_t tlo = 0, thi = 0, st0 = 0, st1 = 0, usb = 0;
++	bool ok =
++	    !sweet_spmi_read(2, 0x4009, &soc0) &&	/* FG batt-soc: MONOTONIC_SOC */
++	    !sweet_spmi_read(2, 0x400a, &soc1) &&	/* its shadow copy */
++	    !sweet_spmi_read(2, 0x41a0, &vlo) &&	/* FG batt-info: VOLTAGE */
++	    !sweet_spmi_read(2, 0x41a1, &vhi) &&
++	    !sweet_spmi_read(2, 0x41a2, &clo) &&	/* CURRENT */
++	    !sweet_spmi_read(2, 0x41a3, &chi) &&
++	    !sweet_spmi_read(2, 0x4150, &tlo) &&	/* BATT_TEMP */
++	    !sweet_spmi_read(2, 0x4151, &thi) &&
++	    !sweet_spmi_read(2, 0x1006, &st0) &&	/* SMB2 charger status 1 */
++	    !sweet_spmi_read(2, 0x1007, &st1) &&
++	    !sweet_spmi_read(2, 0x1310, &usb);	/* USB input RT status */
++	static bool logged = false;
++
++	if (!ok) {
++		fTemp = 2500;
++		fTempMeasured = false;
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	uint8_t low = soc0 < soc1 ? soc0 : soc1;
++	/* The FG's monotonic SOC, NOT a voltage curve: dipper's own conversion. */
++	unsigned percent = low ? ((unsigned)(low - 1) * 98u + 126u) / 253u + 1u : 0u;
++	uint16_t volt = (uint16_t)((unsigned)vlo | ((unsigned)vhi << 8));
++	uint16_t cur = (uint16_t)((unsigned)clo | ((unsigned)chi << 8));
++	uint16_t temp = (uint16_t)((unsigned)tlo | ((unsigned)thi << 8));
++	unsigned mv = (unsigned)(((uint64_t)volt * 122070u) / 1000000u);
++	int ma = (int)(-((int64_t)(int16_t)cur * 488281) / 1000000);
++	int t10 = (int)((((unsigned)temp & 0x7ffu) * 10u + 2u) / 4u) - 2730;
++	bool external = (usb & 0x10u) != 0;
++	unsigned state = st0 & 7u;
++	bool charging = external && state >= 1 && state <= 4 && ma > 0;
++	bool full = external && (state == 5 || percent >= 100);
++	if (!low || mv < 2800 || mv > 4600 || percent > 100) {
++		fTemp = 2500;
++		fTempMeasured = false;
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	if (t10 < -200 || t10 > 800) {
++		t10 = 250;
++		fTempMeasured = false;
++	} else {
++		fTempMeasured = true;
++	}
++	fTemp = (UInt32)(t10 * 10);
++	if (!logged) {
++		logged = true;
++		IOLog("SWEET BATTERY: PMI8998 raw soc=%#x/%#x volt=%#x cur=%#x "
++		    "temp=%#x chg=%#x/%#x usb=%#x -> %u%% %umV %dmA %d.%dC\n",
++		    soc0, soc1, volt, cur, temp, st0, st1, usb, percent, mv, ma,
++		    t10 / 10, (t10 < 0 ? -t10 : t10) % 10);
++	}
++	publish(percent, mv, ma, external, external, charging, full, true, true);
++}
++
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -264,7 +362,9 @@
+ 	}
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	/* 0294: 1 = the original PM6150 board, 2 = polaris / PMI8998. */
++	fPolaris = real >= 2;
++	fReal = (real == 1 || real == 2) && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
