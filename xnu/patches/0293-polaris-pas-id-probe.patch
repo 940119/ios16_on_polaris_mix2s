@@ -1,0 +1,122 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -229,6 +229,7 @@
+ static void md_firmware_metadata(uint32_t image_cluster);
+ static void md_pas_image_only(uint32_t image_cluster);
+ static void md_pas_adsp_probe(uint32_t image_cluster);	/* 0292 */
++static void md_pas_id_probe(uint32_t image_cluster);	/* 0293 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -298,7 +299,10 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 9) {
++	if (polaris_modem_level() == 10) {
++		/* 0293: same mdt, two ids - id 5 locked, or MODEM.MDT bad? */
++		md_pas_id_probe(md_image_cluster);
++	} else if (polaris_modem_level() == 9) {
+ 		/* 0292: one SMC on PAS_ADSP, not the modem PAS chain. */
+ 		md_pas_adsp_probe(md_image_cluster);
+ 	} else if (polaris_modem_level() >= 8) {
+@@ -953,6 +957,99 @@
+ 	    "no register touched, no AUTH_AND_RESET\n");
+ }
+ 
++/*
++ * 0293, level 10: two PAS_INIT_IMAGE calls on the very same ADSP.MDT bytes.
++ *
++ * 0291 offered MODEM.MDT for id 5 and got rc -3145797. 0292 offered
++ * ADSP.MDT for id 1 on the same static buffer, same physical address
++ * 0x101ebd000, same cache clean, same SMC encoding - and got rc 0. That
++ * leaves exactly two readings: TZ has locked AP access to modem id 5, or
++ * TZ rejected MODEM.MDT's own ELF layout (its ph1 HASH paddr 0x95c00000
++ * sits exactly at the end of the 120 MiB window).
++ *
++ * Here the mdt is held constant at the one TZ already accepted, and only
++ * the id changes: (1, phys) is an in-run sanity check, (5, phys) is the
++ * answer. PAS_SUPPORTED(5) and AUTH_AND_RESET(5) failed without any mdt,
++ * which argues for the policy reading, but that is inference - this is
++ * the measurement.
++ *
++ * Deliberately NOT done: no PAS_MEM_SETUP, no .bXX written, no
++ * AUTH_AND_RESET, no register touched. Two INIT_IMAGE SMCs and nothing else.
++ */
++static void
++md_pas_id_probe(uint32_t image_cluster)
++{
++	struct md_file_want adsp = { "ADSP.MDT", 0, 0, false };
++	uint32_t lba, blocks, b, size;
++	vm_offset_t phys;
++	uint64_t res[3];
++	int64_t rc1, rc5;
++
++	MD_SAY("POLARIS MODEM: ======== build 0293 alive: same ADSP.MDT, "
++	    "ids 1 then 5 ========\n");
++	md_walk(image_cluster, md_find_entry, &adsp);
++	if (!adsp.found || adsp.cluster < 2 || adsp.size == 0 ||
++	    adsp.size > sizeof(md_mdt_copy)) {
++		MD_SAY("POLARIS MODEM:   ADSP.MDT missing or does not fit "
++		    "(%u bytes)\n", adsp.size);
++		return;
++	}
++	size = adsp.size;
++	blocks = (size + MD_BLOCK - 1) / MD_BLOCK;
++	lba = md_geo.data_lba + (adsp.cluster - 2) * md_geo.spc;
++	MD_SAY("POLARIS MODEM:   reading %u blocks of the %u-byte ADSP.MDT "
++	    "at +%u\n", blocks, size, lba);
++	for (b = 0; b < blocks; b++) {
++		if (!md_read(lba + b, md_mdt_copy + b * MD_BLOCK)) {
++			MD_SAY("POLARIS MODEM:   block +%u did not read\n", b);
++			return;
++		}
++	}
++	if (!(md_mdt_copy[0] == 0x7f && md_mdt_copy[1] == 'E' &&
++	    md_mdt_copy[2] == 'L' && md_mdt_copy[3] == 'F')) {
++		MD_SAY("POLARIS MODEM:   ADSP.MDT is not an ELF\n");
++		return;
++	}
++	/* TZ reads this through the physical address, not our caches. */
++	for (vm_offset_t line = (vm_offset_t)md_mdt_copy;
++	    line < (vm_offset_t)md_mdt_copy + sizeof(md_mdt_copy); line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	phys = ml_vtophys((vm_offset_t)md_mdt_copy);
++	MD_SAY("POLARIS MODEM:   ADSP.MDT PA 0x%llx, %u bytes, page aligned "
++	    "%d\n", (unsigned long long)phys, size, (phys & 0xfff) == 0);
++	if (phys == 0) {
++		MD_SAY("POLARIS MODEM:   no physical address; no SMC sent\n");
++		return;
++	}
++
++	res[0] = res[1] = res[2] = ~0ull;
++	rc1 = md_scm_call(MD_SCM_64 | MD_SCM_SIP | MD_SCM_PAS_INIT_IMAGE,
++	    MD_SCM_VALUE_AND_BUFFER, MD_PAS_ADSP, phys, 0, res);
++	MD_SAY("POLARIS MODEM:   PAS_INIT_IMAGE(1, ADSP.MDT) rc %lld answer "
++	    "%#llx %#llx %#llx\n", rc1, res[0], res[1], res[2]);
++
++	res[0] = res[1] = res[2] = ~0ull;
++	rc5 = md_scm_call(MD_SCM_64 | MD_SCM_SIP | MD_SCM_PAS_INIT_IMAGE,
++	    MD_SCM_VALUE_AND_BUFFER, MD_PAS_MSS, phys, 0, res);
++	MD_SAY("POLARIS MODEM:   PAS_INIT_IMAGE(5, ADSP.MDT) rc %lld answer "
++	    "%#llx %#llx %#llx\n", rc5, res[0], res[1], res[2]);
++
++	if (rc1 == 0 && rc5 == 0) {
++		MD_SAY("POLARIS MODEM:   BOTH IDS ACCEPTED: 0291 failed on "
++		    "MODEM.MDT's own ELF layout, not on id 5\n");
++	} else if (rc1 == 0) {
++		MD_SAY("POLARIS MODEM:   ONLY ID 1 ACCEPTED: modem id 5 is "
++		    "locked by TZ policy, the mdt is irrelevant\n");
++	} else {
++		MD_SAY("POLARIS MODEM:   the sanity call failed too: this run "
++		    "cannot discriminate\n");
++	}
++	MD_SAY("POLARIS MODEM: phase J done: no MEM_SETUP, no segment written, "
++	    "no register touched, no AUTH_AND_RESET\n");
++}
++
+ /*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
