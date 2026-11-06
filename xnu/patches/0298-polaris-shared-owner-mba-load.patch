@@ -1,0 +1,166 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -251,6 +251,8 @@
+ static void md_content_thread(void *, wait_result_t);	/* 0296 */
+ static void md_owner_probe(void);			/* 0297 */
+ static void md_owner_thread(void *, wait_result_t);	/* 0297 */
++static void md_mba_load_probe(void);			/* 0298 */
++static void md_mba_load_thread(void *, wait_result_t);	/* 0298 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -320,7 +322,17 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 15) {
++	if (polaris_modem_level() == 16) {
++		/* 0298: shared-owner MBA.MBN load, never enters MSS-only. */
++		thread_t thread;
++
++		if (kernel_thread_start(md_mba_load_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			MD_SAY("POLARIS MODEM: 0298: shared-owner MBA load thread started\n");
++		} else {
++			MD_SAY("POLARIS MODEM: 0298: could not start the MBA load thread\n");
++		}
++	} else if (polaris_modem_level() == 15) {
+ 		/* 0297: only reads while HLOS is still an owner. */
+ 		thread_t thread;
+ 
+@@ -1771,6 +1783,135 @@
+ }
+ 
+ /*
++ * 0298, level 16: shared-owner MBA.MBN load.
++ *
++ * 0296's "TZ erases on handoff" was too broad: 0297 measured 0x8 -> 0x8008
++ * and 0x8008 -> 0x8 and both kept a 16-word pattern.  It also found that
++ * 0x8000 -> 0x8008 is refused (rc -2 / 0x55), which left that build with a
++ * dirty MSS-only owner and stalled the boot.  So we stay away from MSS-only
++ * entirely: stage the real MBA.MBN, add the MSS as a CO-owner, compare, and
++ * come back.  No Q6, no QMP, no clocks, no reset - just ownership and bytes.
++ *
++ * MBA.MBN: 238304 B, first FAT16 cluster 9030, data_lba 19, 4 sectors/cluster
++ *   -> partition block +36131 (absolute LBA 65536 + 36131 = 101667),
++ *      59 blocks of 4096 B.  Confirmed by 0290 phase G.
++ */
++#define MD_MBA_FILE_LBA		36131u
++#define MD_MBA_FILE_BYTES	238304u
++#define MD_MBA_FILE_BLOCKS	59u
++#define MD_LOAD_MAP_SIZE	0x00040000u	/* 256 KiB, > 238304 B */
++
++static uint8_t md_mba_image[MD_MBA_FILE_BLOCKS * MD_BLOCK]
++    __attribute__((aligned(4096)));
++
++static uint32_t
++md_load_diff(volatile uint8_t *region)
++{
++	uint32_t diff = 0;
++
++	for (uint32_t i = 0; i < MD_MBA_FILE_BYTES; i++) {
++		if (region[i] != md_mba_image[i]) {
++			diff++;
++		}
++	}
++	return diff;
++}
++
++static void
++md_load_copy(volatile uint8_t *region, bool zero)
++{
++	for (uint32_t i = 0; i < MD_MBA_FILE_BYTES; i++) {
++		region[i] = zero ? 0 : md_mba_image[i];
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++md_mba_load_probe(void)
++{
++	vm_offset_t va;
++	volatile uint8_t *region;
++	uint64_t owners = 1ull << MD_VMID_HLOS;
++	uint32_t d0, da, db;
++	bool recovered;
++
++	MD_SAY("POLARIS MODEM: ======== build 0298 alive: can a real MBA.MBN "
++	    "sit in the MBA region under a SHARED owner? (level 16) ========\n");
++	MD_SAY("POLARIS MODEM:   staging %u blocks of MBA.MBN from partition "
++	    "block +%u (abs LBA %u)\n", MD_MBA_FILE_BLOCKS, MD_MBA_FILE_LBA,
++	    MD_PART_LBA + MD_MBA_FILE_LBA);
++	for (uint32_t i = 0; i < MD_MBA_FILE_BLOCKS; i++) {
++		if (!md_read(MD_MBA_FILE_LBA + i, md_mba_image + i * MD_BLOCK)) {
++			MD_SAY("POLARIS MODEM:   block %u of MBA.MBN did not read; "
++			    "no SMC sent\n", i);
++			return;
++		}
++	}
++	if (!(md_mba_image[0] == 0x7f && md_mba_image[1] == 'E' &&
++	    md_mba_image[2] == 'L' && md_mba_image[3] == 'F')) {
++		MD_SAY("POLARIS MODEM:   no ELF magic at the MBA.MBN start; "
++		    "no SMC sent\n");
++		return;
++	}
++	MD_SAY("POLARIS MODEM:   MBA.MBN ELF header ok, %u bytes staged\n",
++	    MD_MBA_FILE_BYTES);
++
++	va = ml_io_map((vm_offset_t)MD_MBA_REGION, MD_LOAD_MAP_SIZE);
++	if (va == 0) {
++		MD_SAY("POLARIS MODEM:   the 256 KiB MBA map failed; no SMC sent\n");
++		return;
++	}
++	region = (volatile uint8_t *)(void *)va;
++	md_load_copy(region, true);
++	md_load_copy(region, false);
++	d0 = md_load_diff(region);
++	MD_SAY("POLARIS MODEM:   S0 after load: %u differing bytes (want 0)\n", d0);
++	if (d0 != 0) {
++		MD_SAY("POLARIS MODEM:   the load did not land; no SMC sent\n");
++		return;
++	}
++
++	/* S1: HLOS -> HLOS+MSS.  Never MSS-only, never a Q6 start. */
++	MD_SAY("POLARIS MODEM:   S1: HLOS -> HLOS+MSS\n");
++	if (!md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE, &owners, true, true)) {
++		MD_SAY("POLARIS MODEM:   S1 FAILED, owners %#llx, no verdict\n",
++		    (unsigned long long)owners);
++		return;
++	}
++	da = md_load_diff(region);
++	MD_SAY("POLARIS MODEM:   S1 shared: %u differing bytes (%s)\n", da,
++	    da == 0 ? "MBA.MBN INTACT" : "MBA.MBN DAMAGED");
++
++	/* S2: back to HLOS-only, which 0297 measured as rc 0 / content kept. */
++	MD_SAY("POLARIS MODEM:   S2: HLOS+MSS -> HLOS\n");
++	recovered = md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE,
++	    &owners, true, false);
++	db = recovered ? md_load_diff(region) : 0xffffffffu;
++	MD_SAY("POLARIS MODEM:   S2 back: %u differing bytes (%s), owners %#llx\n",
++	    db, db == 0 ? "MBA.MBN INTACT" : "MBA.MBN DAMAGED",
++	    (unsigned long long)owners);
++	MD_SAY("POLARIS MODEM: 0298 SCORES: load=%u shared=%u back=%u\n",
++	    d0, da, db);
++	MD_SAY("POLARIS MODEM: 0298 VERDICT: %s\n",
++	    !recovered ? "THE GIVE-BACK FAILED: owners may be shared, they are still AP-safe"
++	    : da == 0 && db == 0 ? "SHARED OWNER HOLDS A REAL MBA.MBN: W2e can start the Q6 in 0x8008"
++	    : da == 0 ? "SHARED KEEPS MBA.MBN BUT THE GIVE-BACK WIPES IT: stay shared for the Q6"
++	    : "ADDING THE MSS DAMAGES MBA.MBN: shared-owner W2e is dead");
++	md_load_copy(region, true);
++	MD_SAY("POLARIS MODEM: phase O done: no QMP, no clock, no reset, "
++	    "no Q6 start, region cleared, never MSS-only\n");
++}
++
++static void
++md_mba_load_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	md_mba_load_probe();
++	MD_SAY("POLARIS MODEM: the MBA load thread returned\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
