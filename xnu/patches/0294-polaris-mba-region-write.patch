@@ -1,6 +1,23 @@
 --- a/bsd/dev/polaris_modem.c
 +++ b/bsd/dev/polaris_modem.c
-@@ -230,6 +230,8 @@
+@@ -49,6 +49,16 @@
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ 
++/*
++ * Every line goes to the flash copy of the ring the moment it is printed.
++ * Build 0175 printed a dozen lines between two flushes and then stopped, which
++ * left no way to tell which one of them did it.
++ */
++#define MD_SAY(...) do {			\
++	printf(__VA_ARGS__);			\
++	sweet_log_flush_now();			\
++} while (0)
++
+ #define MD_LUN			4
+ #define MD_PART_LBA		65536u		/* 0x10000000 bytes / 4096 */
+ #define MD_BLOCK		4096u
+@@ -230,6 +240,8 @@
  static void md_pas_image_only(uint32_t image_cluster);
  static void md_pas_adsp_probe(uint32_t image_cluster);	/* 0292 */
  static void md_pas_id_probe(uint32_t image_cluster);	/* 0293 */
@@ -9,7 +26,7 @@
  
  static int
  polaris_modem_level(void)
-@@ -299,7 +301,17 @@
+@@ -299,7 +311,17 @@
  	if (polaris_modem_level() >= 7) {
  		md_firmware_metadata(md_image_cluster);
  	}
@@ -28,7 +45,23 @@
  		/* 0293: same mdt, two ids - id 5 locked, or MODEM.MDT bad? */
  		md_pas_id_probe(md_image_cluster);
  	} else if (polaris_modem_level() == 9) {
-@@ -1051,6 +1063,76 @@
+@@ -407,15 +429,6 @@
+ {
+ 	*(volatile uint32_t *)(void *)(base + off) = v;
+ }
+-/*
+- * Every line goes to the flash copy of the ring the moment it is printed.
+- * Build 0175 printed a dozen lines between two flushes and then stopped, which
+- * left no way to tell which one of them did it.
+- */
+-#define MD_SAY(...) do {			\
+-	printf(__VA_ARGS__);			\
+-	sweet_log_flush_now();			\
+-} while (0)
+ 
+ /*
+  * The four values the MBA reports as it goes, in the order it reports them.
+@@ -1051,6 +1064,76 @@
  }
  
  /*
