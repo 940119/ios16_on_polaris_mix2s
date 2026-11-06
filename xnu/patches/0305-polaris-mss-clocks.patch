@@ -1,0 +1,234 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -265,6 +265,8 @@
+ static void md_rail_survey_thread(void *, wait_result_t);	/* 0303 */
+ static void md_rail_write_probe(void);		/* 0304 */
+ static void md_rail_write_thread(void *, wait_result_t);	/* 0304 */
++static void md_clock_complete_probe(void);	/* 0305 */
++static void md_clock_complete_thread(void *, wait_result_t);	/* 0305 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -334,7 +336,17 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 22) {
++	if (polaris_modem_level() == 23) {
++		/* 0305: all seven mss clocks and the Q6's sleep clock, on and back. */
++		thread_t thread;
++
++		if (kernel_thread_start(md_clock_complete_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			MD_SAY("POLARIS MODEM: 0305: clock thread started\n");
++		} else {
++			MD_SAY("POLARIS MODEM: 0305: could not start the clock thread\n");
++		}
++	} else if (polaris_modem_level() == 22) {
+ 		/* 0304: the three ARC rails, one at a time, through TCS 1. */
+ 		thread_t thread;
+ 
+@@ -3071,6 +3083,203 @@
+ }
+ 
+ /*
++ * 0305, level 23: every clock W2e needs, turned on, read back, put back.
++ *
++ * The table is mi8_rproc.c's mss_clocks[] (1885-1893), same order, because
++ * that order is Linux's: proxy (prng), reset (iface, snoc_axi), then the four
++ * active ones (mnoc_axi, boot_rom, gpll0_mss, mfab).
++ *
++ * Two kinds of entry live in one table, exactly as dipper has it:
++ *
++ *   - a branch with its own CBCR (0x8a000, 0x8a150, 0x8a154, 0x8a004): bit 0
++ *     is CLK_ENABLE and the same word's bit 31 is CLK_OFF;
++ *   - a bit in the application processor's shared vote word (GCC_VOTE 0x52004):
++ *     prng_ahb is bit 13, boot_rom_ahb is bit 10, mss_gpll0_div is bit 17.
++ *     Here the halt word is a different register, which is why each entry
++ *     carries its own.
++ *
++ * mss_gpll0_div has no halt word at all (Linux just waits a moment), so
++ * halt_reg 0 means "nothing to poll".
++ *
++ * The vote word is shared, so it is snapshotted once and restored once rather
++ * than restored per entry: restoring per entry would undo the previous vote
++ * because they overlap.
++ */
++struct md_mss_clock {
++	const char	*name;
++	uint32_t	enable_reg;	/* GCC_VOTE, or the branch's own CBCR */
++	uint32_t	enable_bit;	/* 0 for a CBCR: CLK_ENABLE */
++	uint32_t	halt_reg;	/* the CLK_OFF word, bit 31; 0: none */
++};
++
++#define MD_MSS_CLOCKS	(sizeof(md_mss_clocks) / sizeof(md_mss_clocks[0]))
++
++static const struct md_mss_clock md_mss_clocks[] = {
++	{ "prng_ahb",          MD_GCC_APPS_VOTE, 13, 0x34004 },
++	{ "mss_cfg_ahb",       0x8a000,           0, 0x8a000 },
++	{ "mss_snoc_axi",      0x8a150,           0, 0x8a150 },
++	{ "mss_q6_memnoc_axi", 0x8a154,           0, 0x8a154 },
++	{ "boot_rom_ahb",      MD_GCC_APPS_VOTE, 10, 0x38004 },
++	{ "mss_gpll0_div",     MD_GCC_APPS_VOTE, 17, 0 },
++	{ "mss_mfab_axis",     0x8a004,           0, 0x8a004 },
++};
++
++#define MD_Q6_SLEEP		0x03cu
++#define MD_Q6_BOOT_CORE_START	0x400u
++#define MD_Q6_BOOT_CMD		0x404u
++#define MD_Q6_CBCR_CLKEN	(1u << 0)
++
++static void
++md_clock_complete_probe(void)
++{
++	vm_offset_t gcc, q6, rmb;
++	uint32_t vote_before, before, after, t, sleep;
++	unsigned i;
++	unsigned on = 0, could = 0;
++
++	MD_SAY("POLARIS MODEM: ======== build 0305 alive: all seven mss clocks "
++	    "and the Q6's own sleep clock, each on, read back, put back "
++	    "(level 23) ========\n");
++	MD_SAY("POLARIS MODEM:   no QMP, no rail, no reset, no SMC, no owner "
++	    "change, no MBA copy; BOOT_CORE_START is not written, and 0x38004 "
++	    "and 0x400/0x404 are only ever read\n");
++	gcc = ml_io_map((vm_offset_t)MD_GCC_PHYS, MD_GCC_SIZE);
++	q6 = ml_io_map((vm_offset_t)MD_Q6_PHYS, MD_MAP_SIZE);
++	rmb = ml_io_map((vm_offset_t)MD_RMB_PHYS, MD_MAP_SIZE);
++	MD_SAY("POLARIS MODEM:   maps: gcc %s q6 %s rmb %s\n",
++	    gcc ? "ok" : "FAILED", q6 ? "ok" : "FAILED",
++	    rmb ? "ok" : "FAILED");
++	if (gcc == 0 || q6 == 0 || rmb == 0) {
++		MD_SAY("POLARIS MODEM:   a map failed; nothing was written\n");
++		return;
++	}
++
++	/* ---- A: where the seven stand now, without touching them ---- */
++	MD_SAY("POLARIS MODEM:   === A: the seven clocks as they are ===\n");
++	vote_before = md_rd(gcc, MD_GCC_APPS_VOTE);
++	for (i = 0; i < MD_MSS_CLOCKS; i++) {
++		const struct md_mss_clock *c = &md_mss_clocks[i];
++		uint32_t enabled = (md_rd(gcc, c->enable_reg) >>
++		    c->enable_bit) & 1u;
++		bool halted = c->halt_reg != 0 &&
++		    (md_rd(gcc, c->halt_reg) & MD_CBCR_OFF) != 0;
++
++		if (enabled && !halted) {
++			on++;
++		}
++		MD_SAY("POLARIS MODEM:   %-18s +0x%05x bit %2u = %u, halt word "
++		    "+0x%05x %s (%s)\n", c->name, c->enable_reg, c->enable_bit,
++		    enabled, c->halt_reg, halted ? "HALTED" : "clear",
++		    (enabled && !halted) ? "on" : "off");
++	}
++	MD_SAY("POLARIS MODEM:   the vote word +0x%05x reads %#x\n",
++	    MD_GCC_APPS_VOTE, vote_before);
++
++	/* ---- B: each turned on, read back, then the vote put back ---- */
++	MD_SAY("POLARIS MODEM:   === B: each clock turned on and read back ===\n");
++	for (i = 0; i < MD_MSS_CLOCKS; i++) {
++		const struct md_mss_clock *c = &md_mss_clocks[i];
++		bool running = FALSE;
++
++		before = md_rd(gcc, c->enable_reg);
++		MD_SAY("POLARIS MODEM:   about to ENABLE %-18s +0x%05x bit %2u "
++		    "(was %#x)\n", c->name, c->enable_reg, c->enable_bit, before);
++		md_wr(gcc, c->enable_reg, before | (1u << c->enable_bit));
++		__asm__ volatile ("dsb sy" ::: "memory");
++
++		after = md_rd(gcc, c->enable_reg);
++		for (t = 0; t < MD_CLOCK_POLLS; t++) {
++			if ((after & (1u << c->enable_bit)) == 0) {
++				break;		/* the store did not stick */
++			}
++			if (c->halt_reg == 0) {
++				running = TRUE;	/* Linux waits a moment instead */
++				break;
++			}
++			if ((md_rd(gcc, c->halt_reg) & MD_CBCR_OFF) == 0) {
++				running = TRUE;	/* CLK_OFF cleared: it runs */
++				break;
++			}
++			after = md_rd(gcc, c->enable_reg);
++		}
++		if (running) {
++			could++;
++		}
++		MD_SAY("POLARIS MODEM:   %-18s reads %#x after %u polls (%s)%s\n",
++		    c->name, after, t, running ? "RUNNING" : "STILL HALTED",
++		    c->halt_reg == 0 ? ", no halt word to poll" : "");
++
++		/* put it back exactly as it was found */
++		md_wr(gcc, c->enable_reg, before);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		MD_SAY("POLARIS MODEM:   %-18s put back: +0x%05x reads %#x\n",
++		    c->name, c->enable_reg, md_rd(gcc, c->enable_reg));
++	}
++	md_wr(gcc, MD_GCC_APPS_VOTE, vote_before);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	MD_SAY("POLARIS MODEM:   the vote word put back: %#x (was %#x)\n",
++	    md_rd(gcc, MD_GCC_APPS_VOTE), vote_before);
++
++	/* ---- C: the Q6's own sleep clock ---- */
++	MD_SAY("POLARIS MODEM:   === C: the Q6's own sleep clock, +0x%03x ===\n",
++	    MD_Q6_SLEEP);
++	sleep = md_rd(q6, MD_Q6_SLEEP);
++	MD_SAY("POLARIS MODEM:   sleep word before %#x (enable %u, halt %u)\n",
++	    sleep, sleep & MD_Q6_CBCR_CLKEN,
++	    (sleep & MD_CBCR_OFF) != 0);
++	md_wr(q6, MD_Q6_SLEEP, sleep | MD_Q6_CBCR_CLKEN);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (t = 0; t < MD_CLOCK_POLLS &&
++	    (md_rd(q6, MD_Q6_SLEEP) & MD_CBCR_OFF); t++) {
++		__asm__ volatile ("nop");
++	}
++	after = md_rd(q6, MD_Q6_SLEEP);
++	MD_SAY("POLARIS MODEM:   sleep word after %#x after %u polls (%s)\n",
++	    after, t, (after & MD_CBCR_OFF) ? "STILL OFF" : "on");
++	if ((after & MD_CBCR_OFF) == 0) {
++		could++;
++	}
++	md_wr(q6, MD_Q6_SLEEP, sleep);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	MD_SAY("POLARIS MODEM:   sleep word put back: %#x\n",
++	    md_rd(q6, MD_Q6_SLEEP));
++
++	/* ---- D: the RMB and the two boot words, read only ---- */
++	MD_SAY("POLARIS MODEM:   === D: RMB and boot words, read only ===\n");
++	MD_SAY("POLARIS MODEM:   MBA base  rmb+0x00 %#x, PBL_STATUS  rmb+0x04 "
++	    "%#x\n", md_rd(rmb, 0x00), md_rd(rmb, 0x04));
++	MD_SAY("POLARIS MODEM:   MBA_STATUS rmb+0x0c %#x, MSS_STATUS  rmb+0x40 "
++	    "%#x, ALT_RESET rmb+0x44 %#x\n",
++	    md_rd(rmb, 0x0c), md_rd(rmb, 0x40), md_rd(rmb, 0x44));
++	MD_SAY("POLARIS MODEM:   BOOT_CORE_START q6+0x400 %#x, BOOT_CMD q6+0x404 "
++	    "%#x (neither written)\n",
++	    md_rd(q6, MD_Q6_BOOT_CORE_START), md_rd(q6, MD_Q6_BOOT_CMD));
++
++	MD_SAY("POLARIS MODEM: 0305 VERDICT: %s\n",
++	    (could == (unsigned)MD_MSS_CLOCKS + 1u)
++	    ? "EVERY CLOCK W2E NEEDS RUNS: all seven branches and the Q6's own "
++	    "sleep clock came on and were seen running, so 0306 may deassert the "
++	    "reset, hand over the MBA and start the core"
++	    : "NOT EVERY CLOCK CAME ON: the ones above that stayed halted are "
++	    "what W2e would fail on, and the core is not started");
++	if (on > 0) {
++		MD_SAY("POLARIS MODEM:   %u of the seven were already on before "
++		    "this build touched anything\n", on);
++	}
++	MD_SAY("POLARIS MODEM: phase V done: every clock put back, nothing "
++	    "started\n");
++}
++
++static void
++md_clock_complete_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	md_clock_complete_probe();
++	MD_SAY("POLARIS MODEM: the clock thread returned\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
