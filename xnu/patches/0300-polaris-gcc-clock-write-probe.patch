@@ -1,0 +1,128 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -255,6 +255,8 @@
+ static void md_mba_load_thread(void *, wait_result_t);	/* 0298 */
+ static void md_w2e_survey(void);			/* 0299 */
+ static void md_w2e_survey_thread(void *, wait_result_t);	/* 0299 */
++static void md_clock_write_probe(void);		/* 0300 */
++static void md_clock_write_thread(void *, wait_result_t);	/* 0300 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -324,7 +326,17 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 17) {
++	if (polaris_modem_level() == 18) {
++		/* 0300: GCC clock branch writes, one at a time, all restored. */
++		thread_t thread;
++
++		if (kernel_thread_start(md_clock_write_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			MD_SAY("POLARIS MODEM: 0300: GCC clock write thread started\n");
++		} else {
++			MD_SAY("POLARIS MODEM: 0300: could not start the clock thread\n");
++		}
++	} else if (polaris_modem_level() == 17) {
+ 		/* 0299: W2e preflight, read only. */
+ 		thread_t thread;
+ 
+@@ -2055,6 +2067,97 @@
+ }
+ 
+ /*
++ * 0300, level 18: the first WRITES on the W2e path.
++ *
++ * 0299 read PDC/AOSS_CC/TCSR/QMP without a single park, but build 0176
++ * writing CBCR 0x38004 stopped the SoC outright.  So this build touches
++ * only the two branches dipper's mss_w2bc(3) has to bring up, plus the
++ * GPLL0 vote that 0177's level 3 already proved harmless.  It never
++ * writes 0x38004, never deasserts reset, never starts the Q6.
++ */
++#define MD_CLOCK_POLLS		200000u
++
++static void
++md_clock_write_probe(void)
++{
++	vm_offset_t gcc;
++	uint32_t before, after, vote, t, running = 0;
++	static const uint32_t branches[] = { 0x8a150u, 0x8a154u };
++	static const char *const names[] = {
++		"mss_snoc_axi", "mss_q6_memnoc_axi"
++	};
++	unsigned i;
++
++	MD_SAY("POLARIS MODEM: ======== build 0300 alive: can the AP write "
++	    "the modem GCC clock branches? (level 18) ========\n");
++	MD_SAY("POLARIS MODEM:   no QMP, no rails, no reset, no Q6 start, "
++	    "no MBA copy, no SMC, no owner change\n");
++	gcc = ml_io_map((vm_offset_t)MD_GCC_PHYS, MD_GCC_SIZE);
++	if (gcc == 0) {
++		MD_SAY("POLARIS MODEM:   GCC did not map; nothing written\n");
++		return;
++	}
++	MD_SAY("POLARIS MODEM:   GCC mapped ok\n");
++	for (i = 0; i < sizeof(md_clocks) / sizeof(md_clocks[0]); i++) {
++		MD_SAY("POLARIS MODEM:   before %-22s +0x%05x = %#x (%s)\n",
++		    md_clocks[i].name, md_clocks[i].off,
++		    md_rd(gcc, md_clocks[i].off),
++		    md_rd(gcc, md_clocks[i].off) & MD_CBCR_OFF ? "OFF" : "on");
++	}
++
++	/* 0177 level 3 voted this bit and survived; still, announce first. */
++	vote = md_rd(gcc, MD_GCC_APPS_VOTE);
++	MD_SAY("POLARIS MODEM:   about to vote GPLL0: +0x52004 = %#x\n", vote);
++	md_wr(gcc, MD_GCC_APPS_VOTE, vote | (1u << 17));
++	__asm__ volatile ("dsb sy" ::: "memory");
++	MD_SAY("POLARIS MODEM:   GPLL0 voted: %#x -> %#x\n", vote,
++	    md_rd(gcc, MD_GCC_APPS_VOTE));
++
++	for (i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
++		before = md_rd(gcc, branches[i]);
++		MD_SAY("POLARIS MODEM:   about to ENABLE %s +0x%05x (was %#x)\n",
++		    names[i], branches[i], before);
++		md_wr(gcc, branches[i], 1u);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (t = 0; t < MD_CLOCK_POLLS &&
++		    (md_rd(gcc, branches[i]) & MD_CBCR_OFF); t++) {
++			__asm__ volatile ("nop");
++		}
++		after = md_rd(gcc, branches[i]);
++		if ((after & MD_CBCR_OFF) == 0) {
++			running |= 1u << i;
++		}
++		MD_SAY("POLARIS MODEM:   %s enabled: %#x after %u polls (%s)\n",
++		    names[i], after, t,
++		    after & MD_CBCR_OFF ? "STILL HALTED" : "RUNNING");
++		MD_SAY("POLARIS MODEM:   about to DISABLE %s again\n", names[i]);
++		md_wr(gcc, branches[i], 0u);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		MD_SAY("POLARIS MODEM:   %s restored to %#x (was %#x)\n",
++		    names[i], md_rd(gcc, branches[i]), before);
++	}
++	md_wr(gcc, MD_GCC_APPS_VOTE, vote);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	MD_SAY("POLARIS MODEM:   GPLL0 vote restored to %#x (was %#x)\n",
++	    md_rd(gcc, MD_GCC_APPS_VOTE), vote);
++	MD_SAY("POLARIS MODEM: 0300 VERDICT: %s\n",
++	    running == 3u ? "BOTH MODEM CLOCK BRANCHES CAME UP: W2c clock phase is writable"
++	    : running == 0u ? "NEITHER BRANCH CAME UP: the GCC writes do not enable the clocks"
++	    : "ONLY ONE BRANCH CAME UP: check the other before W2c");
++	MD_SAY("POLARIS MODEM: phase Q done: no QMP, no rails, no reset, "
++	    "no Q6 start, both branches back off\n");
++}
++
++static void
++md_clock_write_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	md_clock_write_probe();
++	MD_SAY("POLARIS MODEM: the GCC clock write thread returned\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
