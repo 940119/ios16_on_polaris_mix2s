@@ -1,0 +1,305 @@
+yinliang: measure the power press, and replay the power-off chord
+
+PRIVATE YINLIANG BRANCH PATCH - no numeric prefix, same rule as the
+WLED backlight patch: mainline numbers belong to the WiFi/GPU AI.
+
+Evidence (boot-01-keys-0299.txt): a short press locks and wakes, so the
+HID path is complete; a long press is measured and launches Siri
+(exec Siri, L4682), which is what a real iPhone does with Siri on; and
+the real iPhone X chord - power + volume held together for ~2 s
+(L4688-L4973) - produced no slider. The events are therefore correct
+and the missing piece is on the SpringBoard side, not in this driver.
+
+So this patch stops adding events and starts measuring them:
+  SWEET KEYS: power held <n> ms (<r> repeat(s), <c> chord(s))
+  SWEET KEYS: chord power+volume<k> down
+
+Plus one knob to replay the chord with exact timing, BOTH DEFAULT OFF:
+  sweetkeys_off=<ms>       hold a synthetic volume key for 2.5 s
+  sweetkeys_offkey=1|2     1 = volume up, 2 = volume down (default 2)
+  sweetkeys_hold=<ms>      negative control, expected to do nothing
+
+Also fixed: a failed SPMI read used to report volume-up as pressed and
+leave it stuck down (uint8_t 0 + !(0 & 1u) == 1); the previous state is
+carried instead.
+
+Apply AFTER 0062 -> 0245 -> 0294 v2 -> WLED backlight.
+Touches only sweet_keys.c and SweetHID.cpp. Zero WiFi files.
+
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -49,6 +49,8 @@
+  * I/O windows for good. */
+ extern bool sweet_spmi_windows(vm_offset_t *, vm_offset_t *, vm_offset_t *);
+ extern void sweet_hid_key(int key, int down);
++/* 0302: the same event with kIOHIDEventOptionIsRepeat set. */
++extern void sweet_hid_key_repeat(int key, int down);
+ extern void sweet_log_flush_now(void);
+ void sweet_keys_init(void);
+ 
+@@ -78,6 +80,61 @@
+ static bool keys_polaris;			/* 0245: which wiring this boot uses */
+ static uint16_t keys_gpio_rt = KEYS_GPIO_RT;	/* and where its volume-up status is */
+ static int keys_sleep_chan;
++
++/*
++ * 0302 (yinliang): what the power key does after the press is over.
++ *
++ * Read this with the ring in hand (boot-01-keys-0299.txt): a short press locks
++ * and wakes, a long press is measured and launches Siri, and the real iPhone X
++ * chord - power + volume held together for about two seconds - produced no
++ * slider. So the events are already right and the useful work here is
++ * *measurement*, plus one knob to replay the chord with exact timing:
++ *
++ *   sweetkeys_off=<ms>   hold a synthetic volume key for 2.5 s once the power
++ *                        key has been down that long. Side effect: the volume
++ *                        really does change while it is held.
++ *   sweetkeys_offkey=<1|2>  which volume key, 1 = up, 2 = down (default 2).
++ *                        The user tried volume up by hand, so this is the knob
++ *                        that says whether SpringBoard arms on only one.
++ *   sweetkeys_hold=<ms>  negative control: repeat the power down event every
++ *                        100 ms with kIOHIDEventOptionIsRepeat. Expected to
++ *                        change nothing - iOS measures a long press from the
++ *                        down/up timestamps, not from a repeat stream.
++ *
++ * Every window defaults to 0 = off, so a boot without these boot-args behaves
++ * exactly like 0294 v2 apart from the two measurement lines below.
++ */
++#define KEYS_REPEAT_MS		100u
++#define KEYS_OFF_CHORD_MS	2500u
++
++static uint32_t keys_hold_ms;		/* sweetkeys_hold, 0 = off */
++static uint32_t keys_off_ms;		/* sweetkeys_off,  0 = off */
++static int keys_off_key = 2;		/* sweetkeys_offkey: 1 up, 2 down */
++static uint64_t keys_power_since;	/* ns, 0 = power not held */
++static uint64_t keys_repeat_last;	/* ns of the last repeat */
++static uint64_t keys_off_release;	/* ns to let the synthetic volume go */
++static bool keys_off_sent;		/* synthetic press already fired */
++static bool keys_off_vol_down;		/* synthetic volume key is held */
++static bool keys_chord_seen;		/* power + volume down, logged once */
++static uint32_t keys_repeats;		/* repeats since the last release */
++static uint32_t keys_off_fired;		/* synthetic chords since boot */
++static uint32_t keys_chords;		/* physical chords since boot */
++
++static uint64_t
++keys_now_ns(void)
++{
++	uint64_t t, ns;
++
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns;
++}
++
++static uint32_t
++keys_ms_between(uint64_t now, uint64_t then)
++{
++	return (uint32_t)((now - then) / 1000000ull);
++}
+ 
+ static uint32_t
+ keys_rd(vm_offset_t base, uint32_t off)
+@@ -151,7 +208,22 @@
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 		bool gok = keys_read(keys_gpio_apid, keys_gpio_rt, &gpio);
+-		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
++		/*
++		 * 0302: a failed read must not fabricate a press. The old initialiser
++		 * defaulted both bytes to 0, and !(0 & 1u) is 1, so a single dropped
++		 * SPMI read reported volume-up as *pressed* - and because the level
++		 * then never changes, it stayed stuck down until the next successful
++		 * edge. Carry the previous state instead; an unread key simply keeps
++		 * whatever it had.
++		 */
++		int now[3] = {state[0], state[1], state[2]};
++		if (pok) {
++			now[0] = !!(pon & 1u);
++			now[2] = !!(pon & 2u);
++		}
++		if (gok) {
++			now[1] = !(gpio & 1u);
++		}
+ 		if (!pok || !gok) {
+ 			if ((errors++ % 250u) == 0) {
+ 				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+@@ -184,6 +256,78 @@
+ 				sweet_hid_key(k, state[k]);
+ 			}
+ 		}
++		/*
++		 * 0302: measurement first, then the optional chord.
++		 *
++		 * Two lines, one per press at most, are what makes the next ring
++		 * decisive instead of another round of guessing:
++		 *
++		 *   power held <n> ms   the duration SpringBoard will compute for itself.
++		 *                       Under ~500 ms it never had a long press to see;
++		 *                       over 2000 ms with no slider puts the fault past
++		 *                       this driver entirely.
++		 *   chord power+volume<k> down
++		 *                       both keys were down at once, which is the whole
++		 *                       input the shutdown gesture needs.
++		 *
++		 * Everything below the measurements is a no-op unless sweetkeys_hold or
++		 * sweetkeys_off was given, so a plain boot matches 0294 v2.
++		 */
++		{
++			uint64_t t = keys_now_ns();
++
++			if (state[0] && (state[1] || state[2])) {
++				if (!keys_chord_seen) {
++					keys_chord_seen = true;
++					keys_chords++;
++					printf("SWEET KEYS: chord power+volume%d down\n",
++					    state[1] ? 1 : 2);
++				}
++			} else {
++				keys_chord_seen = false;
++			}
++			if (state[0]) {
++				if (keys_power_since == 0) {
++					keys_power_since = t;
++					keys_repeat_last = t;
++					keys_off_sent = false;
++				} else if (keys_hold_ms &&
++				    keys_ms_between(t, keys_power_since) >= keys_hold_ms &&
++				    keys_ms_between(t, keys_repeat_last) >= KEYS_REPEAT_MS) {
++					keys_repeat_last = t;
++					keys_repeats++;
++					sweet_hid_key_repeat(0, 1);
++				}
++				if (keys_off_ms && !keys_off_sent &&
++				    keys_ms_between(t, keys_power_since) >= keys_off_ms) {
++					keys_off_sent = true;
++					keys_off_fired++;
++					keys_off_vol_down = true;
++					keys_off_release = t +
++					    (uint64_t)KEYS_OFF_CHORD_MS * 1000000ull;
++					printf("SWEET KEYS: power held %u ms, synthesising the "
++					    "power-off chord on volume-%s\n", keys_off_ms,
++					    keys_off_key == 1 ? "up" : "down");
++					sweet_hid_key(keys_off_key, 1);
++				}
++			} else {
++				if (keys_power_since) {
++					printf("SWEET KEYS: power held %u ms (%u repeat(s), "
++					    "%u chord(s) so far)\n",
++					    keys_ms_between(t, keys_power_since), keys_repeats,
++					    keys_chords);
++				}
++				keys_repeats = 0;
++				keys_power_since = 0;
++				keys_off_sent = false;
++			}
++			if (keys_off_vol_down && t >= keys_off_release) {
++				keys_off_vol_down = false;
++				printf("SWEET KEYS: releasing the synthetic volume-%s\n",
++				    keys_off_key == 1 ? "up" : "down");
++				sweet_hid_key(keys_off_key, 0);
++			}
++		}
+ 		keys_wait();
+ 	}
+ }
+@@ -210,6 +354,21 @@
+ 	 * port's own PPIDs for the same PM8998.
+ 	 */
+ 	keys_polaris = (enabled >= 2);
++	/*
++	 * 0302: the hold experiments, all off unless asked for. Parsed into int
++	 * because PE_parse_boot_argn() has no unsigned form, then clamped so a
++	 * typo cannot turn the power key into a machine gun.
++	 */
++	{
++		int hold = 0, off = 0, offkey = 0;
++
++		(void)PE_parse_boot_argn("sweetkeys_hold", &hold, sizeof(hold));
++		(void)PE_parse_boot_argn("sweetkeys_off", &off, sizeof(off));
++		(void)PE_parse_boot_argn("sweetkeys_offkey", &offkey, sizeof(offkey));
++		keys_hold_ms = (hold > 0 && hold <= 5000) ? (uint32_t)hold : 0u;
++		keys_off_ms = (off > 0 && off <= 10000) ? (uint32_t)off : 0u;
++		keys_off_key = (offkey == 1 || offkey == 2) ? offkey : 2;
++	}
+ 	if (!keys_polaris && !sweet_touch_board()) {
+ 		printf("SWEET KEYS: SM7150 not confirmed; PMIC driver prohibited\n");
+ 		return;
+@@ -301,6 +460,13 @@
+ 	if (!pok && !gok) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}
++	if (keys_hold_ms || keys_off_ms) {
++		printf("SWEET KEYS: hold=%u ms (repeat every %u ms), off-chord=%u ms on volume-%s\n",
++		    keys_hold_ms, KEYS_REPEAT_MS, keys_off_ms,
++		    keys_off_key == 1 ? "up" : "down");
++	} else {
++		printf("SWEET KEYS: hold experiments off (sweetkeys_hold / sweetkeys_off)\n");
++	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -330,6 +330,8 @@
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void key(UInt32 usage, bool down);
++	/* 0302: the same event, marked as an auto-repeat of a held key. */
++	void keyRepeat(UInt32 usage, bool down);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
+@@ -405,6 +407,32 @@
+ 	if (event) {
+ 		IOLog("SWEET HID: key 0x%x %s (%u clients)\n", (unsigned)usage, down ? "down" : "up",
+ 		    _clients ? _clients->getCount() : 0);
++		dispatchEvent(event);
++		event->release();
++	}
++}
++
++/*
++ * 0302: the held-key stream, kept as a negative control.
++ *
++ * iOS measures a long press from the down/up timestamps it already receives,
++ * so a real PMU does not need to repeat anything for that, and this variant is
++ * NOT expected to fix the power-off slider. It exists so one CI build can rule
++ * the hypothesis out on the phone instead of on paper: boot with
++ * sweetkeys_hold=800 and the ring will show the repeats being posted.
++ *
++ * kIOHIDEventOptionIsRepeat is 0x00010000, defined in IOHIDEvent.h.
++ *
++ * Deliberately silent: this runs every 100 ms while a key is held and would
++ * otherwise flood the persistent ring.
++ */
++void
++SweetHIDButtons::keyRepeat(UInt32 usage, bool down)
++{
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(),
++	    kHIDPage_Consumer, usage, down, kIOHIDEventOptionIsRepeat);
++
++	if (event) {
+ 		dispatchEvent(event);
+ 		event->release();
+ 	}
+@@ -601,6 +629,20 @@
+ 	}
+ }
+ 
++/* 0302: same table, repeat flavour. Called only by the keys poll thread. */
++extern "C" void
++sweet_hid_key_repeat(int key, int down)
++{
++	static const UInt32 usages[] = {
++		kHIDUsage_Csmr_Power, kHIDUsage_Csmr_VolumeIncrement,
++		kHIDUsage_Csmr_VolumeDecrement, kHIDUsage_Csmr_Menu,
++	};
++
++	if (gSweetButtons && key >= 0 && key < (int)(sizeof(usages) / sizeof(usages[0]))) {
++		gSweetButtons->keyRepeat(usages[key], down != 0);
++	}
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
