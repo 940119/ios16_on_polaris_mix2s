@@ -1,0 +1,295 @@
+yinliang: switch the PMI8998 WLED off on RequestPowerChange(0)
+
+PRIVATE YINLIANG BRANCH PATCH - deliberately NO numeric prefix.
+Mainline 0301 already belongs to the WiFi AI's
+0301-polaris-w2c-reset-sequence.patch; do not confuse the two.
+If this ever lands in the shared patch repo it must be renamed to
+that repo's next sequence number (e.g. 0097-...), never 0301.
+
+Apply AFTER 0062 -> 0245 -> 0294 v2 (see yinliang/README.md).
+Touches only sweet_spmi.c / sweet_spmi.h / SweetFramebuffer.cpp.
+Zero WiFi files, zero CI dispatched by this patch.
+
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -31,6 +31,7 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <pexpert/pexpert.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -144,7 +145,11 @@
+ 	bool pmi8998 = sid == 2 &&
+ 	    (peripheral == 0x10 || peripheral == 0x13 ||
+ 	     peripheral == 0x40 || peripheral == 0x41);
+-	if (!sp_ready || !out || addr > 0xffffu || !(pm6150 || pmi8998)) {
++	/* 0301: the PMI8998 WLED lives on slave 3, ctrl 0xd800 / sink 0xd900.
++	 * Observer reads only; the single write in this file is below. */
++	bool wled = sid == 3 &&
++	    (peripheral == 0xd8 || peripheral == 0xd9);
++	if (!sp_ready || !out || addr > 0xffffu || !(pm6150 || pmi8998 || wled)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -177,4 +182,219 @@
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++/* -------------------------------------------------------------------------
++ * 0301 (yinliang): "the screen does not go fully dark; there is a faint glow"
++ *
++ * 0079-sweet-display-power.patch only fades the framebuffer pixels to black:
++ *
++ *   Off fades the panel out over a few vsyncs (halving each pixel) and keeps
++ *   it black until on again; the panel itself stays powered (AMOLED black
++ *   pixels are off).
++ *
++ * That is an AMOLED assumption.  A Mi MIX 2S is an LCD: black pixels still
++ * have the WLED backlight shining through them, hence the faint glow.  The
++ * real hardware switch is the PMI8998 WLED module enable, and this file is
++ * the only place in this build that owns the SPMI arbiter windows.
++ *
++ * Hardware evidence, all from this project's own dumps, not guesswork:
++ *
++ *   _dtb_all.txt:3743  /soc/qcom,spmi@c440000
++ *       qcom,spmi-pmic-arb; reg-names "core | chnls | obsrvr | intr | cnfg"
++ *       core 0xc440000 / chnls 0xc600000 / obsrvr 0xe600000 / cnfg 0xc40a000
++ *       qcom,ee = 0, qcom,channel = 0
++ *   _dtb_all.txt:4741  /soc/qcom,spmi@c440000/qcom,pmi8998@3/qcom,leds@d800
++ *       qcom,qpnp-wled; reg 0xd800/0x100 (ctrl), 0xd900/0x100 (sink)
++ *       reg-names "qpnp-wled-ctrl-base | qpnp-wled-sink-base"
++ *   _dtb_all.txt:20937 qcom,mdss_dsi_jdi_fhd_r63452_cmd: bl_ctrl_wled,
++ *       bl-max-level 4095 (the LCD panel variant, unlike the AMOLED ones
++ *       that use bl_ctrl_dcs -- those are the Mi 8 / Mi 8 Pro panels).
++ *   _sagit_disp.md:806 PMI8998WLED: same SID 3 / 0xd800 / 0xd900, strings
++ *       0 and 1, firmware retains SYNC 0xd947 = 0x03.  Its blanking keeps
++ *       the LCD/DPU/DSI scan alive and only switches the WLED off.
++ *   Linux v6.12 drivers/video/backlight/qcom-wled.c:
++ *       WLED3_CTRL_REG_MOD_EN = 0x46 -> 0xd846, BIT(7) = 0x80 is the
++ *       GLOBAL module enable; disable writes 0x00, enable writes 0x80.
++ *       SYNC (0xd947) is a *brightness shadow* latch, not a module switch,
++ *       and the Mi 6 port learned that touching firmware's 0x03 breaks
++ *       takeover.  So this patch never writes SYNC or any brightness
++ *       register: switching 0xd846 BIT(7) is enough and leaves the saved
++ *       brightness byte-for-byte intact.
++ *   Linux v6.12 drivers/spmi/spmi-pmic-arb.c:
++ *       fmt_cmd_v2 = (opc << 27) | ((addr & 0xff) << 4) | (bc & 7);
++ *       PMIC_ARB_OP_EXT_READL = 1 (what sweet_spmi_read() already uses),
++ *       PMIC_ARB_OP_EXT_WRITEL = 0 (the proven Mi 8 haptic write path),
++ *       CMD 0x00 / STATUS 0x08 / WDATA0 0x10 / RDATA0 0x18,
++ *       DONE = 0x1, FAILURE|DENIED|DROPPED = 0x0e.
++ *   _dipper/bsd__dev__redwood_haptic.c:70,323,719: the same SDM845 +
++ *       PMI8998 pair writes one byte with COMMAND_WRITE (0u << 27), WDATA0
++ *       first, then CMD, and maps the write channel at
++ *       0x0c600000 + 0x10000 * apid (0x1000 bytes).  That driver is proven
++ *       on real hardware; this is the same sequence, not a new invention.
++ *
++ * SAFETY, deliberately stricter than the reference port:
++ *   - sweetbl=0 by default: absolutely nothing is mapped, read or written.
++ *   - sweetbl=1 is READ-ONLY: survey and log, never a single PMIC store.
++ *   - sweetbl=2 arms one write register only, 0xd846, and only bit 7 of it;
++ *     the other seven bits are preserved from the byte we read at boot.
++ *   - The arming gate requires a real WLED APID, a nonzero peripheral type,
++ *     and MOD_EN BIT(7) already set by the firmware.  If this phone's
++ *     backlight is DCS instead of WLED, the gate fails and we stay read-only.
++ *   - Every write is read back through the observer channel.  A timeout,
++ *     a status error or a mismatched readback latches bl_broken: no further
++ *     PMIC writes for the rest of this boot.
++ *   - The write channel is mapped exactly once, here, by the same single
++ *     owner as core/cnfg/observer (0294 v2).  No second ml_io_map().
++ */
++
++#define SP_CHNLS_PA      0x0c600000u   /* "chnls" of spmi-pmic-arb */
++#define SP_WLED_SID      3u
++#define SP_WLED_CTRL_PID 0xd8u         /* PPID 0x3d8 */
++#define SP_WLED_SINK_PID 0xd9u         /* PPID 0x3d9 */
++#define WLED_MOD_EN      0xd846u       /* ctrl + 0x46, BIT(7) = module on */
++#define WLED_MOD_BIT     0x80u
++#define WLED_TYPE        0xd804u       /* PERPH_TYPE */
++#define WLED_SUBTYPE     0xd805u       /* PERPH_SUBTYPE */
++#define WLED_SYNC        0xd947u       /* sink + 0x47, READ ONLY here */
++#define WLED_BRIGHT0     0xd957u       /* sink + 0x57, WLED4 string 0 LSB */
++#define WLED_CURR_SINK   0xd946u       /* sink + 0x46 */
++
++#define SP_CMD_WRITE     (0u << 27)    /* PMIC_ARB_OP_EXT_WRITEL, BC=0 */
++#define SP_CH_CMD        0x00u
++#define SP_CH_STATUS     0x08u
++#define SP_CH_WDATA0     0x10u
++#define SP_ST_DONE       0x1u
++#define SP_ST_ERR        0x0eu
++
++static int        bl_level;            /* sweetbl: 0 off, 1 survey, 2 control */
++static bool       bl_surveyed, bl_usable, bl_broken, bl_off;
++static uint16_t   bl_apid;
++static vm_offset_t bl_chnls;           /* the ONE write channel, mapped once */
++static uint8_t    bl_mod_en;           /* firmware's 0xd846, kept verbatim */
++
++/* The only PMIC store in this build.  One byte, one register, one bit. */
++static int
++bl_write_mod_en(uint8_t value)
++{
++	uint32_t cmd = SP_CMD_WRITE | ((WLED_MOD_EN & 0xffu) << 4);
++
++	if (bl_broken || !bl_chnls || bl_apid == SP_NO_APID || !sp_ready) {
++		return -1;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(bl_chnls + SP_CH_WDATA0) = value;
++	*(volatile uint32_t *)(bl_chnls + SP_CH_CMD) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t st = sp_rd(bl_chnls, SP_CH_STATUS);
++		if (st & SP_ST_DONE) {
++			return (st & SP_ST_ERR) ? -1 : 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++/* Called once from AppleCLCD::start().  sweetbl=1 is a pure survey. */
++void
++sweet_backlight_init(void)
++{
++	int level = 0;
++	uint8_t type = 0, subtype = 0, mod = 0, sync = 0;
++	uint8_t b0 = 0, b1 = 0, currsink = 0;
++	bool read_ok;
++	uint16_t sink_apid;
++
++	(void)PE_parse_boot_argn("sweetbl", &level, sizeof(level));
++	bl_level = (level < 0 || level > 2) ? 0 : level;
++	if (bl_level == 0) {
++		printf("SWEET BL: disabled (sweetbl=0), 0079 fade-to-black only\n");
++		return;
++	}
++	if (sweet_spmi_init() != 0) {
++		printf("SWEET BL: no SPMI arbiter, backlight left untouched\n");
++		return;
++	}
++	IOLockLock(sp_lock);
++	bl_apid = sp_find_apid((SP_WLED_SID << 8) | SP_WLED_CTRL_PID);
++	sink_apid = sp_find_apid((SP_WLED_SID << 8) | SP_WLED_SINK_PID);
++	IOLockUnlock(sp_lock);
++	printf("SWEET BL: sweetbl=%d WLED ctrl PPID=%#x APID=%u sink PPID=%#x APID=%u\n",
++	    bl_level, (SP_WLED_SID << 8) | SP_WLED_CTRL_PID, bl_apid,
++	    (SP_WLED_SID << 8) | SP_WLED_SINK_PID, sink_apid);
++	if (bl_apid == SP_NO_APID) {
++		printf("SWEET BL: NO WLED APID; this panel is not WLED-backed, "
++		    "NOT writing any PMIC register\n");
++		return;
++	}
++	read_ok = !sweet_spmi_read(SP_WLED_SID, WLED_TYPE, &type) &&
++	    !sweet_spmi_read(SP_WLED_SID, WLED_SUBTYPE, &subtype) &&
++	    !sweet_spmi_read(SP_WLED_SID, WLED_MOD_EN, &mod) &&
++	    !sweet_spmi_read(SP_WLED_SID, WLED_SYNC, &sync) &&
++	    !sweet_spmi_read(SP_WLED_SID, WLED_BRIGHT0, &b0) &&
++	    !sweet_spmi_read(SP_WLED_SID, WLED_BRIGHT0 + 1, &b1) &&
++	    !sweet_spmi_read(SP_WLED_SID, WLED_CURR_SINK, &currsink);
++	bl_surveyed = true;
++	printf("SWEET BL: survey %s type=%#x subtype=%#x MOD_EN=%#x SYNC=%#x "
++	    "bright0=%#x%02x CURR_SINK=%#x\n", read_ok ? "ok" : "INCOMPLETE",
++	    type, subtype, mod, sync, b0, b1, currsink);
++	if (bl_level == 1) {
++		printf("SWEET BL: survey only (sweetbl=1); ZERO PMIC writes this boot\n");
++		return;
++	}
++	/* Arming gate: the firmware must already be driving the WLED module.
++	 * A DCS-backlit panel would leave BIT(7) clear and we stay read-only. */
++	if (!read_ok || !(mod & WLED_MOD_BIT) || type == 0) {
++		printf("SWEET BL: NOT armed (read_ok=%d mod=%#x type=%#x); "
++		    "no WLED takeover, nothing written\n", read_ok, mod, type);
++		return;
++	}
++	bl_mod_en = mod;
++	bl_chnls = ml_io_map(SP_CHNLS_PA + 0x10000u * bl_apid, 0x1000);
++	if (!bl_chnls) {
++		printf("SWEET BL: write channel map failed; nothing written\n");
++		return;
++	}
++	bl_usable = true;
++	printf("SWEET BL: armed APID=%u chnls=%#lx MOD_EN=%#x; "
++	    "only 0xd846 BIT(7) may change\n", bl_apid,
++	    (unsigned long)(SP_CHNLS_PA + 0x10000u * bl_apid), mod);
++}
++
++/* Called from kSweetFBRequestPowerChange in SweetFramebuffer.cpp.
++ * on=1 restores exactly the byte firmware had; on=0 clears only BIT(7). */
++void
++sweet_backlight_power(int on)
++{
++	uint8_t want, back = 0;
++	int rc;
++
++	if (bl_level < 2 || !bl_usable || bl_broken) {
++		return;
++	}
++	if (on == (bl_off ? 0 : 1)) {
++		return;                 /* repeated off / repeated on: no store */
++	}
++	want = on ? (uint8_t)(bl_mod_en | WLED_MOD_BIT) :
++	    (uint8_t)(bl_mod_en & ~WLED_MOD_BIT);
++	IOLockLock(sp_lock);
++	rc = bl_write_mod_en(want);
++	IOLockUnlock(sp_lock);
++	if (rc != 0) {
++		bl_broken = true;
++		printf("SWEET BL: write 0xd846 <- %#x FAILED; "
++		    "PMIC writes disabled for this boot\n", want);
++		return;
++	}
++	if (sweet_spmi_read(SP_WLED_SID, WLED_MOD_EN, &back) != 0 ||
++	    (back & WLED_MOD_BIT) != (want & WLED_MOD_BIT)) {
++		bl_broken = true;
++		printf("SWEET BL: readback 0xd846=%#x (wanted %#x) MISMATCH; "
++		    "PMIC writes disabled for this boot\n", back, want);
++		return;
++	}
++	bl_off = !on;
++	printf("SWEET BL: backlight %s, 0xd846 %#x -> %#x "
++	    "(readback %#x, brightness untouched)\n",
++	    on ? "ON" : "OFF", bl_mod_en, want, back);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,9 @@
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* 0301: PMI8998 WLED backlight. See bsd/dev/sweet_spmi.c. */
++void sweet_backlight_init(void);
++void sweet_backlight_power(int on);
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,9 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++/* 0301: the real WLED backlight switch lives in bsd/dev/sweet_spmi.c. */
++extern "C" void sweet_backlight_init(void);
++extern "C" void sweet_backlight_power(int on);
+ 
+ /*
+  * Frame accounting, read once a second by the vsync timer.
+@@ -479,6 +482,7 @@
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	sweet_backlight_init();   /* 0301: survey, sweetbl=0 does nothing */
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -1445,6 +1449,7 @@
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			sweet_backlight_power(!off);  /* 0301: switch the WLED, not just pixels */
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
