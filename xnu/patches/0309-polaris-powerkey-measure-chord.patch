@@ -32,7 +32,7 @@ Touches only sweet_keys.c and SweetHID.cpp. Zero WiFi files.
   * I/O windows for good. */
  extern bool sweet_spmi_windows(vm_offset_t *, vm_offset_t *, vm_offset_t *);
  extern void sweet_hid_key(int key, int down);
-+/* 0302: the same event with kIOHIDEventOptionIsRepeat set. */
++/* 0302: the held-key repeat stream, negative control only. */
 +extern void sweet_hid_key_repeat(int key, int down);
  extern void sweet_log_flush_now(void);
  void sweet_keys_init(void);
@@ -58,9 +58,9 @@ Touches only sweet_keys.c and SweetHID.cpp. Zero WiFi files.
 + *                        The user tried volume up by hand, so this is the knob
 + *                        that says whether SpringBoard arms on only one.
 + *   sweetkeys_hold=<ms>  negative control: repeat the power down event every
-+ *                        100 ms with kIOHIDEventOptionIsRepeat. Expected to
-+ *                        change nothing - iOS measures a long press from the
-+ *                        down/up timestamps, not from a repeat stream.
++ *                        100 ms. Expected to change nothing - iOS measures a
++ *                        long press from the down/up timestamps, not from a
++ *                        repeat stream.
 + *
 + * Every window defaults to 0 = off, so a boot without these boot-args behaves
 + * exactly like 0294 v2 apart from the two measurement lines below.
@@ -249,7 +249,7 @@ Touches only sweet_keys.c and SweetHID.cpp. Zero WiFi files.
  protected:
  	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
  	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
-@@ -405,6 +407,32 @@
+@@ -405,6 +407,37 @@
  	if (event) {
  		IOLog("SWEET HID: key 0x%x %s (%u clients)\n", (unsigned)usage, down ? "down" : "up",
  		    _clients ? _clients->getCount() : 0);
@@ -267,7 +267,12 @@ Touches only sweet_keys.c and SweetHID.cpp. Zero WiFi files.
 + * the hypothesis out on the phone instead of on paper: boot with
 + * sweetkeys_hold=800 and the ring will show the repeats being posted.
 + *
-+ * kIOHIDEventOptionIsRepeat is 0x00010000, defined in IOHIDEvent.h.
++ * There is no kIOHIDEventOptionIsRepeat in this tree: IOHIDEventTypes.h only
++ * has ...IsAbsolute / ...IsCollection / ...Injected, and there is no
++ * 5-argument keyboardEvent() overload either.  0309 failed to compile on
++ * exactly that ("use of undeclared identifier").  So the repeat goes through
++ * the same 4-argument call key() already uses.  What the negative control
++ * needs is a stream of downs, not an option flag.
 + *
 + * Deliberately silent: this runs every 100 ms while a key is held and would
 + * otherwise flood the persistent ring.
@@ -276,13 +281,13 @@ Touches only sweet_keys.c and SweetHID.cpp. Zero WiFi files.
 +SweetHIDButtons::keyRepeat(UInt32 usage, bool down)
 +{
 +	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(),
-+	    kHIDPage_Consumer, usage, down, kIOHIDEventOptionIsRepeat);
++	    kHIDPage_Consumer, usage, down);
 +
 +	if (event) {
  		dispatchEvent(event);
  		event->release();
  	}
-@@ -601,6 +629,20 @@
+@@ -601,6 +634,20 @@
  	}
  }
  
