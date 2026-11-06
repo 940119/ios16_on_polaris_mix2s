@@ -1,0 +1,261 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -263,6 +263,8 @@
+ static void md_qmp_message_thread(void *, wait_result_t);	/* 0302 */
+ static void md_rail_survey_probe(void);		/* 0303 */
+ static void md_rail_survey_thread(void *, wait_result_t);	/* 0303 */
++static void md_rail_write_probe(void);		/* 0304 */
++static void md_rail_write_thread(void *, wait_result_t);	/* 0304 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -332,7 +334,17 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 21) {
++	if (polaris_modem_level() == 22) {
++		/* 0304: the three ARC rails, one at a time, through TCS 1. */
++		thread_t thread;
++
++		if (kernel_thread_start(md_rail_write_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			MD_SAY("POLARIS MODEM: 0304: rail write thread started\n");
++		} else {
++			MD_SAY("POLARIS MODEM: 0304: could not start the rail write thread\n");
++		}
++	} else if (polaris_modem_level() == 21) {
+ 		/* 0303: length-word readback, CMD_DB survey, RSC survey, modem on. */
+ 		thread_t thread;
+ 
+@@ -2717,9 +2729,14 @@
+ 	return false;
+ }
+ 
+-/* One rail: its RPMh address and the levels the boot loader listed. */
++/*
++ * One rail: its RPMh address, and through `top` the index of the highest
++ * level the boot loader listed.  The index is what RPMh is asked for, not the
++ * level value -- rail_position()/rpmh_write() in mi8_rproc.c make the same
++ * split, and `top` is how the caller learns the list's length.
++ */
+ static uint32_t
+-md_rail_lookup(vm_offset_t db, const char *name)
++md_rail_lookup(vm_offset_t db, const char *name, uint32_t *top)
+ {
+ 	const struct md_cmd_db_header *hdr = (const struct md_cmd_db_header *)db;
+ 	char id[8] = { 0 };
+@@ -2765,7 +2782,11 @@
+ 				at += snprintf(levels + at,
+ 				    sizeof(levels) - (size_t)at, " %u", value);
+ 			}
+-			MD_SAY("POLARIS MODEM:   %s\n", levels);
++			MD_SAY("POLARIS MODEM:   %s (%u levels, %u bytes, top %u)\n",
++			    levels, l, (unsigned)entry[i].length, l > 0 ? l - 1 : 0);
++			if (top != NULL) {
++				*top = l > 0 ? l - 1 : 0;
++			}
+ 			return entry[i].address;
+ 		}
+ 	}
+@@ -2810,9 +2831,9 @@
+ 	    magic_ok ? "the database is there" : "NOT a command database");
+ 	cx = mx = mss = 0;
+ 	if (magic_ok) {
+-		cx = md_rail_lookup(db, "cx.lvl");
+-		mx = md_rail_lookup(db, "mx.lvl");
+-		mss = md_rail_lookup(db, "mss.lvl");
++		cx = md_rail_lookup(db, "cx.lvl", NULL);
++		mx = md_rail_lookup(db, "mx.lvl", NULL);
++		mss = md_rail_lookup(db, "mss.lvl", NULL);
+ 	}
+ 
+ 	/* ---- B: the RSC's TCAs, read only ---- */
+@@ -2869,6 +2890,187 @@
+ }
+ 
+ /*
++ * 0304, level 22: mss.lvl, cx.lvl and mx.lvl, each voted at the top of its own
++ * list, through TCS 1 of apps_rsc drv-2.
++ *
++ * This is mi8_rproc.c's rpmh_write() line for line (1287-1324 there), because
++ * that code already runs on this SoC family and 0303 showed our RSC is the same
++ * block: TCS 0 still holds the boot loader's own command word 0x10108, which is
++ * dipper's (1 << 16) | (1 << 8) | 8 in every bit that matters.
++ *
++ * TCS 1, not TCS 0: TCS 0 is the one the boot loader left a command in.
++ * Linux's tcs-config for this RSC is <2 3 3 1> -- two active, three sleep,
++ * three wake, one control -- so TCS 1 is the second active TCS and dipper picks
++ * the same one.
++ *
++ * The rail is asked for by POSITION in the level list, not by level value.
++ * rpmh_write() takes `data` and rail_position() hands it the index, so cx and
++ * mss get 7 and mx gets 4 (5 levels listed).  Every index is printed with the
++ * list it came from, so a surprise here is visible rather than inferred.
++ *
++ * Nothing else is written: no modem register, no clock, no reset, no
++ * BOOT_CORE_START, no QMP message.  If the phone stops here, the last line says
++ * which rail was being asked for.
++ */
++#define MD_RPMH_TCS		1u
++#define MD_RSC_IRQ_STATUS	0x04u
++#define MD_RSC_IRQ_CLEAR	0x08u
++#define MD_RSC_TCS_CONTROL	0x14u
++#define MD_RSC_TCS_CMD_ENABLE	0x1cu
++#define MD_RSC_TCS_WAIT		0x10u
++#define MD_RSC_TCS_MSG		0x30u
++#define MD_RSC_TCS_ADDR		0x34u
++#define MD_RSC_TCS_DATA		0x38u
++#define MD_RSC_TCS_STATUS	0x3cu
++#define MD_RSC_TRIGGER		(1u << 24)
++#define MD_RSC_ACTIVE_ONLY	(1u << 16)
++#define MD_RSC_DONE		(1u << 16)	/* the command's COMPL bit */
++#define MD_RSC_POLL		200u		/* ~200 ms, as dipper's 20000 x 10 us */
++
++static bool
++md_rpmh_write(vm_offset_t rsc, uint32_t address, uint32_t data,
++    const char *what)
++{
++	uint32_t tcs = MD_RSC_TCS(MD_RPMH_TCS);
++	uint32_t control, enable, irq = 0, status = 0, t;
++	bool done = FALSE;
++
++	control = md_rd(rsc, tcs + MD_RSC_TCS_CONTROL);
++	enable = md_rd(rsc, tcs + MD_RSC_TCS_CMD_ENABLE);
++	if (enable != 0 || (control & MD_RSC_TRIGGER) != 0) {
++		MD_SAY("POLARIS MODEM:   TCS %u is in use (control %#x, enable "
++		    "%#x): %s is not asked for\n", MD_RPMH_TCS, control, enable,
++		    what);
++		return FALSE;
++	}
++
++	MD_SAY("POLARIS MODEM:   asking, through TCS %u, for %s (%#x) = %u\n",
++	    MD_RPMH_TCS, what, address, data);
++	MD_SAY("POLARIS MODEM:     before: control %#x, enable %#x, irq status "
++	    "%#x, command status %#x\n", control, enable,
++	    md_rd(rsc, MD_RSC_TCS_BASE + MD_RSC_IRQ_STATUS),
++	    md_rd(rsc, tcs + MD_RSC_TCS_STATUS));
++
++	md_wr(rsc, MD_RSC_TCS_BASE + MD_RSC_IRQ_CLEAR, 1u << MD_RPMH_TCS);
++	/* write, an answer wanted, eight bytes: the descriptor dipper uses */
++	md_wr(rsc, tcs + MD_RSC_TCS_MSG, (1u << 16) | (1u << 8) | 8u);
++	md_wr(rsc, tcs + MD_RSC_TCS_ADDR, address);
++	md_wr(rsc, tcs + MD_RSC_TCS_DATA, data);
++	md_wr(rsc, tcs + MD_RSC_TCS_WAIT, 1u);
++	md_wr(rsc, tcs + MD_RSC_TCS_CMD_ENABLE, 1u);
++	md_w2c_settle();
++
++	md_wr(rsc, tcs + MD_RSC_TCS_CONTROL,
++	    md_rd(rsc, tcs + MD_RSC_TCS_CONTROL) & ~MD_RSC_TRIGGER);
++	md_wr(rsc, tcs + MD_RSC_TCS_CONTROL,
++	    md_rd(rsc, tcs + MD_RSC_TCS_CONTROL) | MD_RSC_ACTIVE_ONLY);
++	md_wr(rsc, tcs + MD_RSC_TCS_CONTROL,
++	    md_rd(rsc, tcs + MD_RSC_TCS_CONTROL) | MD_RSC_TRIGGER);
++
++	for (t = 0; t < MD_RSC_POLL; t++) {
++		irq = md_rd(rsc, MD_RSC_TCS_BASE + MD_RSC_IRQ_STATUS);
++		status = md_rd(rsc, tcs + MD_RSC_TCS_STATUS);
++		if ((irq & (1u << MD_RPMH_TCS)) != 0 ||
++		    (status & MD_RSC_DONE) != 0) {
++			done = TRUE;
++			break;
++		}
++		md_qmp_ms();
++	}
++	MD_SAY("POLARIS MODEM:     %s after ~%u ms: irq status %#x, command "
++	    "status %#x\n", done ? "DONE" : "NOT SAID DONE", t, irq, status);
++
++	md_wr(rsc, MD_RSC_TCS_BASE + MD_RSC_IRQ_CLEAR, 1u << MD_RPMH_TCS);
++	md_wr(rsc, tcs + MD_RSC_TCS_CONTROL, 0u);
++	md_wr(rsc, tcs + MD_RSC_TCS_CMD_ENABLE, 0u);
++	md_w2c_settle();
++	MD_SAY("POLARIS MODEM:     after: control %#x, enable %#x, irq status "
++	    "%#x\n", md_rd(rsc, tcs + MD_RSC_TCS_CONTROL),
++	    md_rd(rsc, tcs + MD_RSC_TCS_CMD_ENABLE),
++	    md_rd(rsc, MD_RSC_TCS_BASE + MD_RSC_IRQ_STATUS));
++	return done;
++}
++
++static void
++md_rail_write_probe(void)
++{
++	vm_offset_t db, rsc;
++	uint32_t cx = 0, mx = 0, mss = 0, i;
++	uint32_t cx_top = 0, mx_top = 0, mss_top = 0;
++	bool cx_ok, mx_ok, mss_ok;
++
++	MD_SAY("POLARIS MODEM: ======== build 0304 alive: the three ARC rails "
++	    "through apps_rsc TCS 1, one at a time ========\n");
++	MD_SAY("POLARIS MODEM:   no modem register, no clock, no reset, no "
++	    "BOOT_CORE_START, no mailbox; the only writes are the RSC's\n");
++	db = ml_io_map((vm_offset_t)MD_CMD_DB_PHYS, MD_CMD_DB_SIZE);
++	rsc = ml_io_map((vm_offset_t)MD_RSC_PHYS, MD_RSC_SIZE);
++	MD_SAY("POLARIS MODEM:   maps: cmd_db %s rsc %s\n",
++	    db ? "ok" : "FAILED", rsc ? "ok" : "FAILED");
++	if (db == 0 || rsc == 0) {
++		MD_SAY("POLARIS MODEM:   a map failed; nothing was written\n");
++		return;
++	}
++
++	MD_SAY("POLARIS MODEM:   === the three rails, from the database ===\n");
++	mss = md_rail_lookup(db, "mss.lvl", &mss_top);
++	cx = md_rail_lookup(db, "cx.lvl", &cx_top);
++	mx = md_rail_lookup(db, "mx.lvl", &mx_top);
++	if (mss == 0 || cx == 0 || mx == 0) {
++		MD_SAY("POLARIS MODEM: 0304 VERDICT: A RAIL IS NOT IN THE "
++		    "DATABASE: nothing was written\n");
++		return;
++	}
++
++	MD_SAY("POLARIS MODEM:   === writing TCS %u ===\n", MD_RPMH_TCS);
++	MD_SAY("POLARIS MODEM:   TCS %u starts at control %#x, enable %#x, cmd "
++	    "%#x, status %#x\n", MD_RPMH_TCS,
++	    md_rd(rsc, MD_RSC_TCS(MD_RPMH_TCS) + MD_RSC_TCS_CONTROL),
++	    md_rd(rsc, MD_RSC_TCS(MD_RPMH_TCS) + MD_RSC_TCS_CMD_ENABLE),
++	    md_rd(rsc, MD_RSC_TCS(MD_RPMH_TCS) + MD_RSC_TCS_MSG),
++	    md_rd(rsc, MD_RSC_TCS(MD_RPMH_TCS) + MD_RSC_TCS_STATUS));
++
++	/* mss first: it is the modem's own rail, so it is the one W2e needs and
++	 * the one whose failure would be least ambiguous. */
++	mss_ok = md_rpmh_write(rsc, mss, mss_top, "mss.lvl");
++	cx_ok = md_rpmh_write(rsc, cx, cx_top, "cx.lvl");
++	mx_ok = md_rpmh_write(rsc, mx, mx_top, "mx.lvl");
++
++	MD_SAY("POLARIS MODEM:   === the TCS block afterwards ===\n");
++	for (i = 0; i < 4; i++) {
++		uint32_t tcs = MD_RSC_TCS(i);
++
++		MD_SAY("POLARIS MODEM:   TCS %u: control %#x, enable %#x, "
++		    "cmd %#x, status %#x\n", i,
++		    md_rd(rsc, tcs + MD_RSC_TCS_CONTROL),
++		    md_rd(rsc, tcs + MD_RSC_TCS_CMD_ENABLE),
++		    md_rd(rsc, tcs + MD_RSC_TCS_MSG),
++		    md_rd(rsc, tcs + MD_RSC_TCS_STATUS));
++	}
++
++	MD_SAY("POLARIS MODEM: 0304 VERDICT: %s\n",
++	    (mss_ok && cx_ok && mx_ok)
++	    ? "ALL THREE RAILS ANSWERED: mss, cx and mx are voted and W2e may "
++	    "go on to start the core"
++	    : mss_ok
++	    ? "MSS IS VOTED, CX OR MX DID NOT ANSWER: the modem's own rail is "
++	    "up but the fabric is not voted, so the core stays stopped"
++	    : "THE MSS RAIL DID NOT ANSWER: the TCS path itself is the problem "
++	    "and no modem register should be touched until it is fixed");
++	MD_SAY("POLARIS MODEM: phase U done: three rails asked for, nothing "
++	    "else written\n");
++}
++
++static void
++md_rail_write_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	md_rail_write_probe();
++	MD_SAY("POLARIS MODEM: the rail write thread returned\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
