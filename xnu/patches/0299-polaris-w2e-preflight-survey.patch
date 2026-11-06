@@ -1,0 +1,168 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -253,6 +253,8 @@
+ static void md_owner_thread(void *, wait_result_t);	/* 0297 */
+ static void md_mba_load_probe(void);			/* 0298 */
+ static void md_mba_load_thread(void *, wait_result_t);	/* 0298 */
++static void md_w2e_survey(void);			/* 0299 */
++static void md_w2e_survey_thread(void *, wait_result_t);	/* 0299 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -322,7 +324,17 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 16) {
++	if (polaris_modem_level() == 17) {
++		/* 0299: W2e preflight, read only. */
++		thread_t thread;
++
++		if (kernel_thread_start(md_w2e_survey_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			MD_SAY("POLARIS MODEM: 0299: W2e preflight survey thread started\n");
++		} else {
++			MD_SAY("POLARIS MODEM: 0299: could not start the survey thread\n");
++		}
++	} else if (polaris_modem_level() == 16) {
+ 		/* 0298: shared-owner MBA.MBN load, never enters MSS-only. */
+ 		thread_t thread;
+ 
+@@ -1912,6 +1924,137 @@
+ }
+ 
+ /*
++ * 0299, level 17: W2e preflight register survey.  READ ONLY.
++ *
++ * dipper mss_w2bc(3) / mss_w2e() (mi8_rproc.c:1981-1989, 1874-1877,
++ * 1047-1064) need these blocks.  0291-md4 already proved RMB, QDSP6SS
++ * and GCC are AP-readable on polaris; PDC, AOSS_CC, TCSR and the AOP
++ * QMP mailbox have never been touched here.  An XPU stall on any of
++ * them would park a thread (0296 level 14), so each one is announced
++ * before the read and the line is flushed immediately.
++ *
++ * Addresses from dipper / polaris DT:
++ *   PDC        0x0b2e0000  PDC_SYNC_RESET +0x100, modem is bit 9
++ *   AOSS_CC    0x0c2b0000  MSS_RESTART +0x00 (1 = held in reset)
++ *   TCSR_HALT  0x01f60000  q6 +0x3000, nc +0x4000, modem +0x5000
++ *   AOSS QMP   0x0c300000  magic +0x00, version +0x04,
++ *                          their link +0x0c, our link +0x24
++ */
++#define MD_PDC_PHYS		0x0b2e0000ull
++#define MD_AOSS_CC_PHYS		0x0c2b0000ull
++#define MD_TCSR_PHYS		0x01f60000ull
++#define MD_AOSS_QMP_PHYS	0x0c300000ull
++#define MD_PDC_SYNC_RESET	0x100u
++#define MD_PDC_MODEM_BIT	(1u << 9)
++#define MD_QMP_MAGIC		0x00u
++#define MD_QMP_VERSION		0x04u
++#define MD_QMP_THEIR_LINK	0x0cu
++#define MD_QMP_OUR_LINK		0x24u
++
++static void
++md_w2e_survey(void)
++{
++	vm_offset_t rmb, q6, gcc, pdc, aoss, tcsr, qmp;
++	unsigned i;
++	uint32_t v;
++
++	MD_SAY("POLARIS MODEM: ======== build 0299 alive: W2e preflight "
++	    "register survey (level 17, READ ONLY) ========\n");
++	MD_SAY("POLARIS MODEM:   nothing is written: no register, no SMC, "
++	    "no QMP message, no clock, no reset, no Q6 start\n");
++
++	/* The three blocks 0291-md4 already proved safe. */
++	rmb = ml_io_map((vm_offset_t)MD_RMB_PHYS, MD_MAP_SIZE);
++	q6 = ml_io_map((vm_offset_t)MD_Q6_PHYS, MD_MAP_SIZE);
++	gcc = ml_io_map((vm_offset_t)MD_GCC_PHYS, MD_GCC_SIZE);
++	MD_SAY("POLARIS MODEM:   maps: rmb %s, q6 %s, gcc %s\n",
++	    rmb ? "ok" : "FAILED", q6 ? "ok" : "FAILED", gcc ? "ok" : "FAILED");
++	if (rmb == 0 || q6 == 0 || gcc == 0) {
++		MD_SAY("POLARIS MODEM:   a known-good map failed; stopping\n");
++		return;
++	}
++	for (i = 0; i < sizeof(md_rmb) / sizeof(md_rmb[0]); i++) {
++		MD_SAY("POLARIS MODEM:   RMB   %-22s +0x%03x = %#x\n",
++		    md_rmb[i].name, md_rmb[i].off, md_rd(rmb, md_rmb[i].off));
++	}
++	for (i = 0; i < sizeof(md_q6) / sizeof(md_q6[0]); i++) {
++		MD_SAY("POLARIS MODEM:   Q6    %-22s +0x%03x = %#x\n",
++		    md_q6[i].name, md_q6[i].off, md_rd(q6, md_q6[i].off));
++	}
++	for (i = 0; i < sizeof(md_clocks) / sizeof(md_clocks[0]); i++) {
++		MD_SAY("POLARIS MODEM:   GCC   %-22s +0x%05x = %#x (%s)\n",
++		    md_clocks[i].name, md_clocks[i].off,
++		    md_rd(gcc, md_clocks[i].off),
++		    md_rd(gcc, md_clocks[i].off) & MD_CBCR_OFF ? "OFF" : "on");
++	}
++
++	/* New ground: announce, map, read, one block at a time. */
++	MD_SAY("POLARIS MODEM:   about to map PDC %#llx\n",
++	    (unsigned long long)MD_PDC_PHYS);
++	pdc = ml_io_map((vm_offset_t)MD_PDC_PHYS, MD_MAP_SIZE);
++	MD_SAY("POLARIS MODEM:   PDC mapped %s\n", pdc ? "ok" : "FAILED");
++	if (pdc != 0) {
++		v = md_rd(pdc, MD_PDC_SYNC_RESET);
++		MD_SAY("POLARIS MODEM:   PDC_SYNC_RESET +0x100 = %#x "
++		    "(modem bit9 %s)\n", v,
++		    v & MD_PDC_MODEM_BIT ? "SET / in reset" : "clear");
++	}
++
++	MD_SAY("POLARIS MODEM:   about to map AOSS_CC %#llx\n",
++	    (unsigned long long)MD_AOSS_CC_PHYS);
++	aoss = ml_io_map((vm_offset_t)MD_AOSS_CC_PHYS, MD_MAP_SIZE);
++	MD_SAY("POLARIS MODEM:   AOSS_CC mapped %s\n", aoss ? "ok" : "FAILED");
++	if (aoss != 0) {
++		MD_SAY("POLARIS MODEM:   AOSS_CC_MSS_RESTART +0x00 = %#x "
++		    "(%s)\n", md_rd(aoss, 0),
++		    md_rd(aoss, 0) & 1 ? "held in reset" : "released");
++	}
++
++	MD_SAY("POLARIS MODEM:   about to map TCSR halt %#llx\n",
++	    (unsigned long long)MD_TCSR_PHYS);
++	tcsr = ml_io_map((vm_offset_t)MD_TCSR_PHYS, 0x10000u);
++	MD_SAY("POLARIS MODEM:   TCSR mapped %s\n", tcsr ? "ok" : "FAILED");
++	if (tcsr != 0) {
++		static const struct md_reg ports[] = {
++			{ 0x3000, "q6" }, { 0x4000, "nc" }, { 0x5000, "modem" },
++		};
++		for (i = 0; i < sizeof(ports) / sizeof(ports[0]); i++) {
++			MD_SAY("POLARIS MODEM:   TCSR  %-22s +0x%04x: "
++			    "req %#x ack %#x idle %#x\n", ports[i].name,
++			    ports[i].off, md_rd(tcsr, ports[i].off),
++			    md_rd(tcsr, ports[i].off + 4),
++			    md_rd(tcsr, ports[i].off + 8));
++		}
++	}
++
++	MD_SAY("POLARIS MODEM:   about to map AOP QMP %#llx\n",
++	    (unsigned long long)MD_AOSS_QMP_PHYS);
++	qmp = ml_io_map((vm_offset_t)MD_AOSS_QMP_PHYS, MD_MAP_SIZE);
++	MD_SAY("POLARIS MODEM:   AOP QMP mapped %s\n", qmp ? "ok" : "FAILED");
++	if (qmp != 0) {
++		MD_SAY("POLARIS MODEM:   QMP magic %#x (want 0x4d41494c), "
++		    "version %#x, their link %#x, our link %#x\n",
++		    md_rd(qmp, MD_QMP_MAGIC), md_rd(qmp, MD_QMP_VERSION),
++		    md_rd(qmp, MD_QMP_THEIR_LINK), md_rd(qmp, MD_QMP_OUR_LINK));
++	}
++
++	MD_SAY("POLARIS MODEM: 0299 VERDICT: every W2e preflight block is "
++	    "AP-readable%s\n",
++	    (pdc && aoss && tcsr && qmp) ? "" : " (SOME BLOCKS FAILED)");
++	MD_SAY("POLARIS MODEM: phase P done: read only, all four new blocks "
++	    "surveyed, no state changed\n");
++}
++
++static void
++md_w2e_survey_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	md_w2e_survey();
++	MD_SAY("POLARIS MODEM: the W2e survey thread returned\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
