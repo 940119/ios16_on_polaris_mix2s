@@ -1,0 +1,107 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -230,6 +230,8 @@
+ static void md_pas_image_only(uint32_t image_cluster);
+ static void md_pas_adsp_probe(uint32_t image_cluster);	/* 0292 */
+ static void md_pas_id_probe(uint32_t image_cluster);	/* 0293 */
++static void md_mba_write_probe(void);			/* 0294 */
++static void md_mba_probe_thread(void *, wait_result_t);	/* 0294 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -299,7 +301,17 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 10) {
++	if (polaris_modem_level() == 11) {
++		/* 0294: a write can park its thread, so never do it on the mount path. */
++		thread_t thread;
++
++		if (kernel_thread_start(md_mba_probe_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			MD_SAY("POLARIS MODEM: 0294: mba write probe thread started\n");
++		} else {
++			MD_SAY("POLARIS MODEM: 0294: could not start the mba write thread\n");
++		}
++	} else if (polaris_modem_level() == 10) {
+ 		/* 0293: same mdt, two ids - id 5 locked, or MODEM.MDT bad? */
+ 		md_pas_id_probe(md_image_cluster);
+ 	} else if (polaris_modem_level() == 9) {
+@@ -1051,6 +1063,76 @@
+ }
+ 
+ /*
++ * 0294, level 11: dipper's W2e, step one, and nothing past it.
++ *
++ * _dipper/bsd/dev/mi8_rproc.c:mss_w2e() does not use PAS_INIT_IMAGE(5) to
++ * start the modem at all. It maps MBA_MEMORY (0x96900000), copies mba.mbn
++ * there and checks the readback BEFORE any memory is handed to the MSS;
++ * only then does SCM_MP_ASSIGN give the mba/mpss regions to VMID_MSS_MSA,
++ * QDSP6SS_BOOT_CORE_START releases the Q6, and the MBA itself reports
++ * "XPU unlocked" in MBA_STATUS. That is how the Mi 8 gets a live modem
++ * without TrustZone ever accepting a PAS image for id 5 - exactly the door
++ * 0291/0293 found shut on this phone.
++ *
++ * Whether polaris can take that path has one cheap gate: is the MBA region
++ * writable from the AP at all? 0291-md4 read RMB (0x4180000) and QDSP6SS
++ * (0x4080000) without trouble, the AOP's QMP mailbox is open, MBA.MBN is
++ * 238304 bytes in image/, and mba_region@0x96900000 is in the device tree.
++ * Here we map one 4 KB page of it and put one word through a write/readback.
++ *
++ * Deliberately NOT done: no MBA.MBN copy, no SCM_MP_ASSIGN, no clock or
++ * rail vote, no Q6 reset, no SMC of any kind. A refusal parks at most this
++ * thread; MD_SAY flushes each line before the next one is attempted.
++ */
++#define MD_MBA_REGION		0x96900000ull
++#define MD_MBA_PROBE_SIZE	4096u
++
++static void
++md_mba_write_probe(void)
++{
++	vm_offset_t va;
++	volatile uint32_t *p;
++	uint32_t before, after, restored;
++
++	MD_SAY("POLARIS MODEM: ======== build 0294 alive: can the AP write "
++	    "mba_region (dipper W2e step one)? ========\n");
++	va = ml_io_map((vm_offset_t)MD_MBA_REGION, MD_MBA_PROBE_SIZE);
++	if (va == 0) {
++		MD_SAY("POLARIS MODEM:   mba_region did not map; no write "
++		    "attempted\n");
++		return;
++	}
++	p = (volatile uint32_t *)(void *)va;
++	before = *p;
++	MD_SAY("POLARIS MODEM:   mba_region VA 0x%llx, first word 0x%08x, "
++	    "second 0x%08x\n", (unsigned long long)va, before, p[1]);
++	MD_SAY("POLARIS MODEM:   about to write 0xc0ffee21 into the first "
++	    "word\n");
++	*p = 0xc0ffee21u;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	after = *p;
++	MD_SAY("POLARIS MODEM:   read back 0x%08x: %s\n", after,
++	    after == 0xc0ffee21u ? "THE AP CAN WRITE THE MBA REGION"
++	    : "THE WRITE DID NOT LAND (XPU / read-only?)");
++	*p = before;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	restored = *p;
++	MD_SAY("POLARIS MODEM:   restored 0x%08x (%s)\n", restored,
++	    restored == before ? "ok" : "NOT RESTORED");
++	MD_SAY("POLARIS MODEM: phase K done: no MBA copy, no MP_ASSIGN, no "
++	    "SMC, no Q6 reset, no clock touched\n");
++}
++
++static void
++md_mba_probe_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	md_mba_write_probe();
++	MD_SAY("POLARIS MODEM: the mba write thread returned\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
