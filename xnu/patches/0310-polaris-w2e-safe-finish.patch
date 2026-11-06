@@ -1,0 +1,145 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -29,6 +29,15 @@
+  * secure monitor, id by id, which subsystems it is willing to boot. That list
+  * decides whether the rest of the modem line can be written at all, and asking
+  * costs one call per id.
++ *
++ * 0310 fixes the only thing 0306 got wrong.  0306 proved W2e works on
++ * polaris (MSS_STATUS 0xb COMPLETE, PBL 1, MBA_STATUS 1 XPU unlocked),
++ * then panicked in its own verdict: out: called md_w2e_state(), which
++ * re-read q6+0x3c (QDSP6SS_SLEEP) AFTER the Q6 had taken the XPU.
++ * ESR 0x96000010 Synchronous External Abort, far = q6 + 0x3c, x12
++ * still holding 0x96900000.  0310 unmaps the MBA image before QMP (as
++ * dipper does) and never reads QDSP6SS again once the BOOT words are
++ * written.  Level 25.  W2e itself is unchanged and stays successful.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -47,6 +56,8 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ 					/* 0296: dipper maps MBA_MEMORY with VM_WIMG_WCOMB */
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++					/* 0310: dipper mi8_rproc.c:74 */
+ static bool md_content_risky;	/* 0296: the dispatch sets it before the thread runs */
+ extern vm_offset_t ml_vtophys(vm_offset_t);	/* 0291: kernel VA -> PA for the mdt */
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -338,15 +349,15 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 24) {
+-		/* 0306: W2e, the first build that starts the modem's Q6. */
++	if (polaris_modem_level() == 25) {
++		/* 0310: W2e with the safe finish.  0306 worked; its verdict panicked. */
+ 		thread_t thread;
+ 
+ 		if (kernel_thread_start(md_w2e_thread, NULL, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+-			MD_SAY("POLARIS MODEM: 0306: W2e thread started\n");
++			MD_SAY("POLARIS MODEM: 0310: W2e thread started\n");
+ 		} else {
+-			MD_SAY("POLARIS MODEM: 0306: could not start the W2e thread\n");
++			MD_SAY("POLARIS MODEM: 0310: could not start the W2e thread\n");
+ 		}
+ 	} else if (polaris_modem_level() == 23) {
+ 		/* 0305: all seven mss clocks and the Q6's sleep clock, on and back. */
+@@ -3409,8 +3420,14 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-	MD_SAY("POLARIS MODEM: ======== build 0306 alive: W2e -- start the "
+-	    "modem's Q6 (level 24) ========\n");
++	MD_SAY("POLARIS MODEM: ======== build 0310 alive: W2e with a SAFE "
++	    "finish (level 25) ========\n");
++	MD_SAY("POLARIS MODEM:   0306 already proved W2e works: MSS_STATUS "
++	    "0xb COMPLETE, PBL 1, MBA_STATUS 1 XPU unlocked, stable 1s later\n");
++	MD_SAY("POLARIS MODEM:   0306 then panicked reading q6+0x3c in its "
++	    "verdict: ESR 0x96000010, far = q6 + 0x3c (Synchronous External Abort)\n");
++	MD_SAY("POLARIS MODEM:   0310 unmap the AP's MBA image before QMP, "
++	    "and NEVER read QDSP6SS again after the two BOOT writes\n");
+ 	MD_SAY("POLARIS MODEM:   MBA.MBN + QMP on + three rails + seven clocks "
+ 	    "+ reset pulse + shared owners + two BOOT writes\n");
+ 	MD_SAY("POLARIS MODEM:   0x38004 stays read-only; 0x8 -> 0x8008 shared, "
+@@ -3496,6 +3513,19 @@
+ 		goto out;
+ 	}
+ 
++	/* ---- 0310: drop the AP's mapping of the MBA image BEFORE anything
++	 * else touches the modem.  dipper does exactly this at
++	 * mi8_rproc.c:3643, before QMP: "the region goes to the MSS: nothing
++	 * of ours may touch it".  0306 kept a 256 KiB mapping of 0x96900000
++	 * alive for the whole run.  From here down the probe reads RMB /
++	 * QDSP6SS registers only; no path below dereferences region again.
++	 * ---- */
++	ml_io_unmap(region, MD_LOAD_MAP_SIZE);
++	region = 0;
++	MD_SAY("POLARIS MODEM:   0310: AP mapping of %#llx UNMAPPED while "
++	    "the Q6 is still in reset (dipper mi8_rproc.c:3643)\n",
++	    (unsigned long long)MD_MBA_REGION);
++
+ 	/* ---- step 5: QMP, modem on ---- */
+ 	MD_SAY("POLARIS MODEM:   W2e step 5/12: QMP modem on\n");
+ 	box = md_rd(qmp, MD_QMP_OUR_BOX);
+@@ -3650,18 +3680,51 @@
+ 	}
+ 
+ out:
+-	if (mapped) {
++	/* ---- 0310.  This is the exact spot where 0306 died.
++	 *
++	 * md_w2e_state() reads q6+0x3c (MD_Q6_SLEEP).  Before the two BOOT
++	 * writes that is an ordinary QDSP6SS register and answers 0x1 -- the
++	 * 0306 "[at the gate]" line proves it.  Once BOOT_CORE_START and
++	 * BOOT_CMD have started the Q6, the XPU gives that block to the modem
++	 * and the SAME read is refused on the bus:
++	 *
++	 *   panic(cpu 3 ...): Kernel data abort
++	 *   esr 0x96000010   EC 0x25 current-EL data abort, WnR=0 read,
++	 *                    DFSC 0x10 Synchronous External Abort
++	 *   far 0xffffffe4df938c03c = x15 0xffffffe4df938c000 + 0x3c
++	 *   x12 0x96900000 (MD_MBA_REGION), still live in the probe
++	 *
++	 * The 0306 ring ends at "a second later MBA_STATUS 1, PBL 0x1,
++	 * MSS_STATUS 0xb": W2e had ALREADY SUCCEEDED.  No [at the verdict],
++	 * no 0306 VERDICT, no phase W done -- all three sit after this read.
++	 *
++	 * dipper's mi8rp_hold success path just returns and touches nothing
++	 * again (mi8_rproc.c:3714).  Do the same:
++	 *   success              -> cached words, read NOTHING, return;
++	 *   failure before BOOT  -> QDSP6SS still ours, full dump is safe;
++	 *   failure after BOOT   -> cached words only, never touch QDSP6SS.
++	 * ---- */
++	if (region != 0) {
++		/* a step bailed before step 4's unmap: drop the AP mapping here */
++		ml_io_unmap(region, MD_LOAD_MAP_SIZE);
++		region = 0;
++	}
++	if (mapped && !boot_written) {
+ 		md_w2e_state(rmb, q6, "at the verdict");
+ 	}
+-	MD_SAY("POLARIS MODEM: 0306 VERDICT: %s\n", ok
+-	    ? "THE MBA RUNS ON THE MODEM'S Q6 AND SAYS IT UNLOCKED THE XPU: "
+-	    "W2e works on polaris, the modem side of WiFi can now be brought up"
+-	    : "W2e DID NOT START THE MBA");
+-	MD_SAY("POLARIS MODEM:   reason: %s; BOOT writes %s\n", why,
+-	    boot_written ? "WERE MADE" : "WERE NOT MADE");
+-	MD_SAY("POLARIS MODEM:   on success the modem is LEFT RUNNING; reboot "
+-	    "to stop it\n");
++	MD_SAY("POLARIS MODEM: 0310 VERDICT: %s\n", (ok && boot_written)
++	    ? "W2e WORKS ON POLARIS: the MBA runs on the modem's Q6 and "
++	      "unlocked the XPU, and the AP never touched QDSP6SS again"
++	    : "W2e did not reach a stable running MBA");
++	MD_SAY("POLARIS MODEM:   reason: %s; BOOT writes %s; cached FSM %#x, "
++	    "PBL %#x, MBA %u\n", why,
++	    boot_written ? "WERE MADE" : "WERE NOT MADE", fsm, pbl, mba);
++	MD_SAY("POLARIS MODEM:   the AP's MBA mapping is UNMAPPED; on success "
++	    "the modem is LEFT RUNNING, reboot to stop it\n");
+ 	MD_SAY("POLARIS MODEM: phase W done\n");
++	if (ok && boot_written) {
++		return;	/* mi8rp_hold: the Q6 owns the XPU now; touch nothing */
++	}
+ }
+ 
+ static void
