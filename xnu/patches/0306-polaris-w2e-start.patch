@@ -1,0 +1,419 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -267,6 +267,8 @@
+ static void md_rail_write_thread(void *, wait_result_t);	/* 0304 */
+ static void md_clock_complete_probe(void);	/* 0305 */
+ static void md_clock_complete_thread(void *, wait_result_t);	/* 0305 */
++static void md_w2e_probe(void);			/* 0306 */
++static void md_w2e_thread(void *, wait_result_t);	/* 0306 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -336,7 +338,17 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 23) {
++	if (polaris_modem_level() == 24) {
++		/* 0306: W2e, the first build that starts the modem's Q6. */
++		thread_t thread;
++
++		if (kernel_thread_start(md_w2e_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			MD_SAY("POLARIS MODEM: 0306: W2e thread started\n");
++		} else {
++			MD_SAY("POLARIS MODEM: 0306: could not start the W2e thread\n");
++		}
++	} else if (polaris_modem_level() == 23) {
+ 		/* 0305: all seven mss clocks and the Q6's sleep clock, on and back. */
+ 		thread_t thread;
+ 
+@@ -3280,6 +3292,388 @@
+ }
+ 
+ /*
++ * 0306, level 24: W2e.  The first build that actually starts the Q6.
++ *
++ * The sequence is dipper's mss_w2e(load=false), mi8_rproc.c:3592-3700:
++ *
++ *   MBA.MBN -> MBA region -> QMP modem on -> rails at top -> clocks 0..2
++ *   -> reset deassert -> clocks 3..6 -> hand the memory to the MSS
++ *   -> rmb+0x00 = MBA base -> Q6 sleep clock -> BOOT_CORE_START / BOOT_CMD
++ *   -> MSS_STATUS bit0 -> PBL_STATUS 1 -> MBA_STATUS 1 or 2 (XPU unlocked)
++ *
++ * Two places where polaris deliberately does NOT copy dipper:
++ *
++ *   1. OWNER.  dipper assigns mba and mpss as MSS-only (false, true).  On
++ *      polaris 0297 measured that MSS-only parks the AP's reads, and 0298
++ *      measured that a real 238304-byte MBA.MBN stays byte-for-byte intact
++ *      under the SHARED owner 0x8008.  Its verdict was "W2e can start the Q6
++ *      in 0x8008".  So both regions are handed over with (true, true).
++ *
++ *   2. ORDER OF THE ASSIGN.  dipper assigns after the reset is released.
++ *      Here it is done while the Q6 is still held in reset, so the MBA bytes
++ *      can be verified a second time after the owner change without any
++ *      chance that the Q6 is already reading them.
++ *
++ * No modem.mdt is staged: dipper only does that when load=true.  The MBA
++ * unlocks the XPU on its own.
++ *
++ * Nothing is reclaimed on success.  dipper's mi8rp_hold leaves the modem
++ * running and so do we; that is the state worth observing, and a reboot
++ * clears everything.
++ */
++#define MD_RMB_MBA_BASE		0x00u
++#define MD_RMB_PBL_STATUS	0x04u
++#define MD_RMB_MBA_STATUS	0x0cu
++#define MD_RMB_MSS_STATUS	0x40u
++#define MD_RMB_FSM_DONE		(1u << 0)
++#define MD_W2E_FSM_POLLS	50u		/* ~50 ms */
++#define MD_W2E_PBL_POLLS	1000u		/* ~1 s */
++#define MD_W2E_MBA_POLLS	2000u		/* ~2 s */
++
++static bool
++md_clock_on(vm_offset_t gcc, unsigned i)
++{
++	const struct md_mss_clock *c = &md_mss_clocks[i];
++	uint32_t v = md_rd(gcc, c->enable_reg);
++	uint32_t t;
++	bool ok = FALSE;
++
++	md_wr(gcc, c->enable_reg, v | (1u << c->enable_bit));
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (t = 0; t < MD_CLOCK_POLLS; t++) {
++		v = md_rd(gcc, c->enable_reg);
++		if ((v & (1u << c->enable_bit)) == 0) {
++			break;		/* the store did not stick */
++		}
++		if (c->halt_reg == 0 ||
++		    (md_rd(gcc, c->halt_reg) & MD_CBCR_OFF) == 0) {
++			ok = TRUE;
++			break;
++		}
++	}
++	MD_SAY("POLARIS MODEM:   clock %-18s reads %#x after %u polls (%s)\n",
++	    c->name, v, t, ok ? "RUNNING" : "STILL HALTED");
++	return ok;
++}
++
++/* dipper's mss_reset_deassert(): a pulse, not a level, and leave it released. */
++static void
++md_reset_deassert(vm_offset_t rmb, vm_offset_t pdc, vm_offset_t aoss)
++{
++	uint32_t v = md_rd(pdc, MD_PDC_SYNC_RESET);
++
++	MD_SAY("POLARIS MODEM:   reset pulse: PDC +0x%03x %#x -> %#x, "
++	    "ALT_RESET %#x, AOSS_MSS_RESTART 0 -> 1 -> 0\n",
++	    MD_PDC_SYNC_RESET, v, v | MD_PDC_MODEM_BIT,
++	    md_rd(rmb, MD_RMB_ALT_RESET));
++	md_wr(pdc, MD_PDC_SYNC_RESET, v | MD_PDC_MODEM_BIT);
++	md_w2c_settle();
++	md_wr(rmb, MD_RMB_ALT_RESET, 1u);
++	md_w2c_settle();
++	md_wr(aoss, 0, 1u);
++	md_w2c_settle();
++	md_qmp_ms();
++	md_wr(aoss, 0, 0u);
++	md_w2c_settle();
++	md_qmp_ms();
++	md_wr(rmb, MD_RMB_ALT_RESET, 0u);
++	md_w2c_settle();
++	md_wr(pdc, MD_PDC_SYNC_RESET, v & ~MD_PDC_MODEM_BIT);
++	md_w2c_settle();
++	MD_SAY("POLARIS MODEM:   reset pulse done: PDC %#x, ALT_RESET %#x, "
++	    "AOSS %#x\n", md_rd(pdc, MD_PDC_SYNC_RESET),
++	    md_rd(rmb, MD_RMB_ALT_RESET), md_rd(aoss, 0));
++}
++
++static void
++md_w2e_state(vm_offset_t rmb, vm_offset_t q6, const char *when)
++{
++	MD_SAY("POLARIS MODEM:   [%s] PBL %#x, MBA_STATUS %#x, MSS_STATUS %#x, "
++	    "ALT_RESET %#x, MBA_BASE %#x, Q6 sleep %#x, BOOT_CORE_START %#x, "
++	    "BOOT_CMD %#x\n", when,
++	    md_rd(rmb, MD_RMB_PBL_STATUS), md_rd(rmb, MD_RMB_MBA_STATUS),
++	    md_rd(rmb, MD_RMB_MSS_STATUS), md_rd(rmb, MD_RMB_ALT_RESET),
++	    md_rd(rmb, MD_RMB_MBA_BASE), md_rd(q6, MD_Q6_SLEEP),
++	    md_rd(q6, MD_Q6_BOOT_CORE_START), md_rd(q6, MD_Q6_BOOT_CMD));
++}
++
++static void
++md_w2e_probe(void)
++{
++	vm_offset_t gcc = 0, rmb = 0, q6 = 0, pdc = 0, aoss = 0, db = 0;
++	vm_offset_t rsc = 0, qmp = 0, apcs = 0, region = 0;
++	uint32_t box, size, cx, mx, mss, cx_top = 0, mx_top = 0, mss_top = 0;
++	uint32_t t, diff, fsm = 0, pbl = 0, mba = 0, i;
++	uint64_t mba_owners = 1ull << MD_VMID_HLOS;
++	uint64_t mpss_owners = 1ull << MD_VMID_HLOS;
++	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
++	const char *why = "nothing went wrong";
++
++	MD_SAY("POLARIS MODEM: ======== build 0306 alive: W2e -- start the "
++	    "modem's Q6 (level 24) ========\n");
++	MD_SAY("POLARIS MODEM:   MBA.MBN + QMP on + three rails + seven clocks "
++	    "+ reset pulse + shared owners + two BOOT writes\n");
++	MD_SAY("POLARIS MODEM:   0x38004 stays read-only; 0x8 -> 0x8008 shared, "
++	    "never MSS-only (0297/0298)\n");
++
++	/* ---- step 1: stage MBA.MBN from the FAT partition ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 1/12: stage MBA.MBN from partition "
++	    "block +%u (%u blocks)\n", MD_MBA_FILE_LBA, MD_MBA_FILE_BLOCKS);
++	for (i = 0; i < MD_MBA_FILE_BLOCKS; i++) {
++		if (!md_read(MD_MBA_FILE_LBA + i,
++		    md_mba_image + i * MD_BLOCK)) {
++			why = "MBA.MBN could not be read from the partition";
++			goto out;
++		}
++	}
++	if (!(md_mba_image[0] == 0x7f && md_mba_image[1] == 'E' &&
++	    md_mba_image[2] == 'L' && md_mba_image[3] == 'F')) {
++		why = "no ELF magic at the start of MBA.MBN";
++		goto out;
++	}
++	MD_SAY("POLARIS MODEM:   MBA.MBN ELF header ok, %u bytes staged\n",
++	    MD_MBA_FILE_BYTES);
++
++	/* ---- step 2: map every block ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 2/12: map the blocks\n");
++	gcc = ml_io_map((vm_offset_t)MD_GCC_PHYS, MD_GCC_SIZE);
++	rmb = ml_io_map((vm_offset_t)MD_RMB_PHYS, MD_MAP_SIZE);
++	q6 = ml_io_map((vm_offset_t)MD_Q6_PHYS, MD_MAP_SIZE);
++	pdc = ml_io_map((vm_offset_t)MD_PDC_PHYS, MD_MAP_SIZE);
++	aoss = ml_io_map((vm_offset_t)MD_AOSS_CC_PHYS, MD_MAP_SIZE);
++	db = ml_io_map((vm_offset_t)MD_CMD_DB_PHYS, MD_CMD_DB_SIZE);
++	rsc = ml_io_map((vm_offset_t)MD_RSC_PHYS, MD_RSC_SIZE);
++	qmp = ml_io_map((vm_offset_t)MD_AOSS_QMP_PHYS, MD_MAP_SIZE);
++	apcs = ml_io_map((vm_offset_t)MD_APCS_PHYS, MD_MAP_SIZE);
++	region = ml_io_map((vm_offset_t)MD_MBA_REGION, MD_LOAD_MAP_SIZE);
++	MD_SAY("POLARIS MODEM:   maps: gcc %s rmb %s q6 %s pdc %s aoss %s "
++	    "db %s rsc %s qmp %s apcs %s mba %s\n",
++	    gcc ? "ok" : "FAILED", rmb ? "ok" : "FAILED",
++	    q6 ? "ok" : "FAILED", pdc ? "ok" : "FAILED",
++	    aoss ? "ok" : "FAILED", db ? "ok" : "FAILED",
++	    rsc ? "ok" : "FAILED", qmp ? "ok" : "FAILED",
++	    apcs ? "ok" : "FAILED", region ? "ok" : "FAILED");
++	if (gcc == 0 || rmb == 0 || q6 == 0 || pdc == 0 || aoss == 0 ||
++	    db == 0 || rsc == 0 || qmp == 0 || apcs == 0 || region == 0) {
++		why = "a block did not map";
++		goto out;
++	}
++	mapped = TRUE;
++	md_w2e_state(rmb, q6, "before anything");
++
++	/* ---- step 3: put MBA.MBN in the region and read it back ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 3/12: copy MBA.MBN into "
++	    "%#llx and compare\n", (unsigned long long)MD_MBA_REGION);
++	md_load_copy((volatile uint8_t *)(void *)region, FALSE);
++	diff = md_load_diff((volatile uint8_t *)(void *)region);
++	MD_SAY("POLARIS MODEM:   MBA.MBN in place: %u differing bytes (want 0)\n",
++	    diff);
++	if (diff != 0) {
++		why = "MBA.MBN did not land in the region";
++		goto out;
++	}
++
++	/* ---- step 4: hand mba and mpss to shared owners, EARLY ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 4/12: owners 0x8 -> 0x8008 (shared) "
++	    "while the Q6 is still held in reset\n");
++	if (!md_assign_mem("mba", MD_MBA_REGION, MD_MBA_SIZE,
++	    &mba_owners, TRUE, TRUE)) {
++		why = "the mba owner change was refused";
++		goto out;
++	}
++	if (!md_assign_mem("mpss", MD_MPSS_REGION, MD_MPSS_SIZE,
++	    &mpss_owners, TRUE, TRUE)) {
++		why = "the mpss owner change was refused";
++		goto out;
++	}
++	diff = md_load_diff((volatile uint8_t *)(void *)region);
++	MD_SAY("POLARIS MODEM:   after the owner change: mba %#llx, mpss %#llx, "
++	    "%u differing bytes (%s)\n", (unsigned long long)mba_owners,
++	    (unsigned long long)mpss_owners, diff,
++	    diff == 0 ? "MBA.MBN INTACT" : "MBA.MBN DAMAGED");
++	if (diff != 0) {
++		why = "the shared owner did not keep MBA.MBN";
++		goto out;
++	}
++
++	/* ---- step 5: QMP, modem on ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 5/12: QMP modem on\n");
++	box = md_rd(qmp, MD_QMP_OUR_BOX);
++	size = md_rd(qmp, MD_QMP_OUR_BOX_SIZE);
++	if (md_rd(qmp, MD_QMP_MAGIC) != MD_QMP_MAGIC_VALUE ||
++	    !(size >= MD_QMP_MESSAGE + 4 && box >= 0x3c &&
++	    box + size <= MD_MAP_SIZE && (box & 3) == 0)) {
++		why = "the AOSS mailbox is not usable";
++		goto out;
++	}
++	if (!md_qmp_open(qmp, apcs)) {
++		why = "the QMP handshake failed";
++		goto out;
++	}
++	if (!md_qmp_send(qmp, apcs, box, md_qmp_on)) {
++		why = "the AOP did not take the modem-on message";
++		goto out;
++	}
++
++	/* ---- step 6: the three rails ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 6/12: rails at the top level\n");
++	cx = md_rail_lookup(db, "cx.lvl", &cx_top);
++	mx = md_rail_lookup(db, "mx.lvl", &mx_top);
++	mss = md_rail_lookup(db, "mss.lvl", &mss_top);
++	if (cx == 0 || mx == 0 || mss == 0) {
++		why = "a rail is missing from the command database";
++		goto out;
++	}
++	if (!md_rpmh_write(rsc, cx, cx_top, "cx.lvl") ||
++	    !md_rpmh_write(rsc, mx, mx_top, "mx.lvl") ||
++	    !md_rpmh_write(rsc, mss, mss_top, "mss.lvl")) {
++		why = "a rail did not answer";
++		goto out;
++	}
++
++	/* ---- step 7: the three proxy/reset clocks ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 7/12: clocks 0..2 (proxy/reset)\n");
++	for (i = 0; i < 3; i++) {
++		if (!md_clock_on(gcc, i)) {
++			why = "a proxy/reset clock did not come on";
++			goto out;
++		}
++	}
++
++	/* ---- step 8: release the reset ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 8/12: reset deassert\n");
++	md_reset_deassert(rmb, pdc, aoss);
++	md_w2e_state(rmb, q6, "reset released");
++
++	/* ---- step 9: the four active clocks ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 9/12: clocks 3..6 (active)\n");
++	for (i = 3; i < MD_MSS_CLOCKS; i++) {
++		if (!md_clock_on(gcc, i)) {
++			why = "an active clock did not come on";
++			goto out;
++		}
++	}
++
++	/* ---- step 10: MBA base, then the Q6's own sleep clock ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 10/12: rmb+0x00 = %#llx, then the "
++	    "Q6 sleep clock\n", (unsigned long long)MD_MBA_REGION);
++	md_wr(rmb, MD_RMB_MBA_BASE, (uint32_t)MD_MBA_REGION);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	md_wr(q6, MD_Q6_SLEEP,
++	    md_rd(q6, MD_Q6_SLEEP) | MD_Q6_CBCR_CLKEN);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (t = 0; t < MD_CLOCK_POLLS &&
++	    (md_rd(q6, MD_Q6_SLEEP) & MD_CBCR_OFF); t++) {
++		__asm__ volatile ("nop");
++	}
++	MD_SAY("POLARIS MODEM:   Q6 sleep clock %#x after %u polls (%s); "
++	    "MBA base reads %#x\n", md_rd(q6, MD_Q6_SLEEP), t,
++	    (md_rd(q6, MD_Q6_SLEEP) & MD_CBCR_OFF) ? "STILL OFF" : "on",
++	    md_rd(rmb, MD_RMB_MBA_BASE));
++	if ((md_rd(q6, MD_Q6_SLEEP) & MD_CBCR_OFF) != 0 ||
++	    md_rd(rmb, MD_RMB_MBA_BASE) != (uint32_t)MD_MBA_REGION) {
++		why = "the sleep clock or the MBA base is not ready";
++		goto out;
++	}
++
++	/* ---- step 11: the gate.  Nothing below is allowed to start the Q6
++	 * unless every one of these still says "not started yet". ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 11/12: GATE before the two BOOT "
++	    "writes\n");
++	md_w2e_state(rmb, q6, "at the gate");
++	if ((md_rd(rmb, MD_RMB_MSS_STATUS) & MD_RMB_FSM_DONE) != 0 ||
++	    md_rd(q6, MD_Q6_BOOT_CORE_START) != 0 ||
++	    md_rd(q6, MD_Q6_BOOT_CMD) != 0) {
++		why = "the GATE says the Q6 has already been started";
++		goto out;
++	}
++
++	/* ---- step 12: the two writes that actually start the core ---- */
++	MD_SAY("POLARIS MODEM:   W2e step 12/12: WRITING BOOT_CORE_START=1 "
++	    "and BOOT_CMD=1 NOW; the next line is the boot FSM\n");
++	md_wr(q6, MD_Q6_BOOT_CORE_START, 1u);
++	md_wr(q6, MD_Q6_BOOT_CMD, 1u);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	boot_written = TRUE;
++
++	for (t = 0; t < MD_W2E_FSM_POLLS; t++) {
++		fsm = md_rd(rmb, MD_RMB_MSS_STATUS);
++		if ((fsm & MD_RMB_FSM_DONE) != 0) {
++			break;
++		}
++		md_qmp_ms();
++	}
++	MD_SAY("POLARIS MODEM:   boot FSM after ~%u ms: MSS_STATUS %#x (%s)\n",
++	    t, fsm, (fsm & MD_RMB_FSM_DONE) ? "COMPLETE" : "NOT COMPLETE");
++	if ((fsm & MD_RMB_FSM_DONE) == 0) {
++		why = "the boot FSM did not complete";
++		goto out;
++	}
++
++	for (t = 0; t < MD_W2E_PBL_POLLS; t++) {
++		pbl = md_rd(rmb, MD_RMB_PBL_STATUS);
++		if (pbl != 0) {
++			break;
++		}
++		md_qmp_ms();
++	}
++	MD_SAY("POLARIS MODEM:   PBL_STATUS %#x after ~%u ms (1 is success)\n",
++	    pbl, t);
++	if (pbl != 1) {
++		why = "the PBL did not report success";
++		goto out;
++	}
++
++	for (t = 0; t < MD_W2E_MBA_POLLS; t++) {
++		mba = md_rd(rmb, MD_RMB_MBA_STATUS);
++		if (mba != 0) {
++			break;
++		}
++		md_qmp_ms();
++	}
++	MD_SAY("POLARIS MODEM:   MBA_STATUS %u after ~%u ms (1 or 2: XPU "
++	    "unlocked)\n", mba, t);
++	ok = mba == 1 || mba == 2;
++	if (ok) {
++		why = "the MBA unlocked the XPU";
++		/* dipper waits a second and reads it again: a status that sticks
++		 * is a core that is actually running, not a transient word. */
++		for (t = 0; t < 1000u; t++) {
++			md_qmp_ms();
++		}
++		MD_SAY("POLARIS MODEM:   a second later MBA_STATUS %u, PBL %#x, "
++		    "MSS_STATUS %#x\n", md_rd(rmb, MD_RMB_MBA_STATUS),
++		    md_rd(rmb, MD_RMB_PBL_STATUS),
++		    md_rd(rmb, MD_RMB_MSS_STATUS));
++	} else {
++		why = "the MBA did not report that it unlocked the XPU";
++	}
++
++out:
++	if (mapped) {
++		md_w2e_state(rmb, q6, "at the verdict");
++	}
++	MD_SAY("POLARIS MODEM: 0306 VERDICT: %s\n", ok
++	    ? "THE MBA RUNS ON THE MODEM'S Q6 AND SAYS IT UNLOCKED THE XPU: "
++	    "W2e works on polaris, the modem side of WiFi can now be brought up"
++	    : "W2e DID NOT START THE MBA");
++	MD_SAY("POLARIS MODEM:   reason: %s; BOOT writes %s\n", why,
++	    boot_written ? "WERE MADE" : "WERE NOT MADE");
++	MD_SAY("POLARIS MODEM:   on success the modem is LEFT RUNNING; reboot "
++	    "to stop it\n");
++	MD_SAY("POLARIS MODEM: phase W done\n");
++}
++
++static void
++md_w2e_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	md_w2e_probe();
++	MD_SAY("POLARIS MODEM: the W2e thread returned\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
