@@ -1,0 +1,189 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -257,6 +257,8 @@
+ static void md_w2e_survey_thread(void *, wait_result_t);	/* 0299 */
+ static void md_clock_write_probe(void);		/* 0300 */
+ static void md_clock_write_thread(void *, wait_result_t);	/* 0300 */
++static void md_w2c_reset_probe(void);		/* 0301 */
++static void md_w2c_reset_thread(void *, wait_result_t);	/* 0301 */
+ 
+ static int
+ polaris_modem_level(void)
+@@ -326,7 +328,17 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 18) {
++	if (polaris_modem_level() == 19) {
++		/* 0301: W2c reset sequence with a full reclaim, no Q6 start. */
++		thread_t thread;
++
++		if (kernel_thread_start(md_w2c_reset_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			MD_SAY("POLARIS MODEM: 0301: W2c reset thread started\n");
++		} else {
++			MD_SAY("POLARIS MODEM: 0301: could not start the reset thread\n");
++		}
++	} else if (polaris_modem_level() == 18) {
+ 		/* 0300: GCC clock branch writes, one at a time, all restored. */
+ 		thread_t thread;
+ 
+@@ -2158,6 +2170,158 @@
+ }
+ 
+ /*
++ * 0301, level 19: dipper mss_w2bc(3) on polaris, minus QMP and rails.
++ *
++ * Reuses the addresses and helpers already in this file:
++ *   MD_GCC_PHYS / MD_GCC_APPS_VOTE / md_clocks[]  (0177, 0300)
++ *   MD_RMB_PHYS / md_rmb[] / MD_Q6_PHYS / md_q6[]
++ *   MD_PDC_PHYS / MD_PDC_SYNC_RESET / MD_PDC_MODEM_BIT  (0299)
++ *   MD_AOSS_CC_PHYS                                    (0299)
++ *
++ * Linux q6v5_reset_deassert / q6v5_reset_assert, alt-reset path
++ * (qcom_q6v5_mss.c).  The Q6 stays in its boot ROM because
++ * QDSP6SS_BOOT_CORE_START is never written.
++ */
++#define MD_RMB_ALT_RESET	0x44u
++
++static const struct md_reg md_w2c_clocks[] = {
++	{ 0x8a150, "mss_snoc_axi" },
++	{ 0x8a154, "mss_q6_memnoc_axi" },
++};
++
++static void
++md_w2c_delay(void)
++{
++	for (volatile uint32_t i = 0; i < 300000u; i++) {
++		__asm__ volatile ("nop");
++	}
++}
++
++static void
++md_w2c_settle(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	md_w2c_delay();
++}
++
++/* Every store on this path goes through here: announce, write, read back. */
++static uint32_t
++md_w2c_wr(vm_offset_t base, uint32_t off, uint32_t v, const char *name)
++{
++	uint32_t before = md_rd(base, off);
++
++	MD_SAY("POLARIS MODEM:   about to WRITE %-24s +0x%05x: %#x -> %#x\n",
++	    name, off, before, v);
++	md_wr(base, off, v);
++	md_w2c_settle();
++	MD_SAY("POLARIS MODEM:   %-24s reads back %#x\n", name,
++	    md_rd(base, off));
++	return before;
++}
++
++static void
++md_w2c_status(vm_offset_t rmb, vm_offset_t q6, const char *when)
++{
++	MD_SAY("POLARIS MODEM:   [%s] PBL %#x, MBA_STATUS %#x, "
++	    "MSS_STATUS %#x, ALT_RESET %#x, Q6 GFMUX %#x, "
++	    "BOOT_CORE_START %#x\n", when,
++	    md_rd(rmb, 0x04), md_rd(rmb, 0x0c), md_rd(rmb, 0x40),
++	    md_rd(rmb, MD_RMB_ALT_RESET), md_rd(q6, 0x020),
++	    md_rd(q6, 0x400));
++}
++
++static void
++md_w2c_reset_probe(void)
++{
++	vm_offset_t gcc, rmb, q6, pdc, aoss;
++	uint32_t vote, i, v;
++
++	MD_SAY("POLARIS MODEM: ======== build 0301 alive: W2c reset sequence "
++	    "with a full reclaim (level 19, NO Q6 start) ========\n");
++	MD_SAY("POLARIS MODEM:   no QMP message, no RPMh rails, no MBA copy, "
++	    "no MP_ASSIGN, no BOOT_CORE_START / BOOT_CMD\n");
++	gcc = ml_io_map((vm_offset_t)MD_GCC_PHYS, MD_GCC_SIZE);
++	rmb = ml_io_map((vm_offset_t)MD_RMB_PHYS, MD_MAP_SIZE);
++	q6 = ml_io_map((vm_offset_t)MD_Q6_PHYS, MD_MAP_SIZE);
++	pdc = ml_io_map((vm_offset_t)MD_PDC_PHYS, MD_MAP_SIZE);
++	aoss = ml_io_map((vm_offset_t)MD_AOSS_CC_PHYS, MD_MAP_SIZE);
++	MD_SAY("POLARIS MODEM:   maps: gcc %s rmb %s q6 %s pdc %s aoss %s\n",
++	    gcc ? "ok" : "FAILED", rmb ? "ok" : "FAILED", q6 ? "ok" : "FAILED",
++	    pdc ? "ok" : "FAILED", aoss ? "ok" : "FAILED");
++	if (!gcc || !rmb || !q6 || !pdc || !aoss) {
++		MD_SAY("POLARIS MODEM:   a map failed; nothing was written\n");
++		return;
++	}
++	md_w2c_status(rmb, q6, "before");
++	MD_SAY("POLARIS MODEM:   PDC_SYNC_RESET %#x, AOSS_MSS_RESTART %#x\n",
++	    md_rd(pdc, MD_PDC_SYNC_RESET), md_rd(aoss, 0));
++
++	/* ---- clocks on (0300 proved these two and the vote are safe) ---- */
++	vote = md_rd(gcc, MD_GCC_APPS_VOTE);
++	md_w2c_wr(gcc, MD_GCC_APPS_VOTE, vote | (1u << 17), "GPLL0 apps vote");
++	for (i = 0; i < sizeof(md_w2c_clocks) / sizeof(md_w2c_clocks[0]); i++) {
++		md_w2c_wr(gcc, md_w2c_clocks[i].off, 1u, md_w2c_clocks[i].name);
++	}
++
++	/* ---- q6v5_reset_deassert, alt-reset path ---- */
++	MD_SAY("POLARIS MODEM:   === deassert: PDC bit9, ALT_RESET 1, "
++	    "MSS_RESTART 1 -> 0, ALT_RESET 0, PDC bit9 clear ===\n");
++	v = md_rd(pdc, MD_PDC_SYNC_RESET);
++	md_w2c_wr(pdc, MD_PDC_SYNC_RESET, v | MD_PDC_MODEM_BIT,
++	    "PDC_SYNC_RESET");
++	md_w2c_wr(rmb, MD_RMB_ALT_RESET, 1u, "RMB_ALT_RESET");
++	md_w2c_wr(aoss, 0, 1u, "AOSS_MSS_RESTART");
++	md_w2c_delay();
++	md_w2c_wr(aoss, 0, 0u, "AOSS_MSS_RESTART");
++	md_w2c_delay();
++	md_w2c_wr(rmb, MD_RMB_ALT_RESET, 0u, "RMB_ALT_RESET");
++	md_w2c_wr(pdc, MD_PDC_SYNC_RESET, v & ~MD_PDC_MODEM_BIT,
++	    "PDC_SYNC_RESET");
++
++	/* ---- READ ONLY while out of reset; the Q6 is not started ---- */
++	md_w2c_status(rmb, q6, "out of reset");
++	MD_SAY("POLARIS MODEM:   PDC_SYNC_RESET %#x, AOSS_MSS_RESTART %#x\n",
++	    md_rd(pdc, MD_PDC_SYNC_RESET), md_rd(aoss, 0));
++
++	/* ---- q6v5_reset_assert: put it all back ---- */
++	MD_SAY("POLARIS MODEM:   === assert: PDC bit9, MSS_RESTART 1 -> 0, "
++	    "PDC bit9 clear ===\n");
++	v = md_rd(pdc, MD_PDC_SYNC_RESET);
++	md_w2c_wr(pdc, MD_PDC_SYNC_RESET, v | MD_PDC_MODEM_BIT,
++	    "PDC_SYNC_RESET");
++	md_w2c_wr(aoss, 0, 1u, "AOSS_MSS_RESTART");
++	md_w2c_delay();
++	md_w2c_wr(aoss, 0, 0u, "AOSS_MSS_RESTART");
++	md_w2c_delay();
++	md_w2c_wr(pdc, MD_PDC_SYNC_RESET, v & ~MD_PDC_MODEM_BIT,
++	    "PDC_SYNC_RESET");
++
++	/* ---- clocks off, vote restored ---- */
++	for (i = 0; i < sizeof(md_w2c_clocks) / sizeof(md_w2c_clocks[0]); i++) {
++		md_w2c_wr(gcc, md_w2c_clocks[i].off, 0u, md_w2c_clocks[i].name);
++	}
++	md_w2c_wr(gcc, MD_GCC_APPS_VOTE, vote, "GPLL0 apps vote");
++
++	md_w2c_status(rmb, q6, "after reclaim");
++	MD_SAY("POLARIS MODEM:   PDC_SYNC_RESET %#x, AOSS_MSS_RESTART %#x, "
++	    "vote %#x (want %#x)\n", md_rd(pdc, MD_PDC_SYNC_RESET),
++	    md_rd(aoss, 0), md_rd(gcc, MD_GCC_APPS_VOTE), vote);
++	MD_SAY("POLARIS MODEM: 0301 VERDICT: THE W2c RESET SEQUENCE RAN AND "
++	    "WAS TAKEN BACK: the Q6 was never started\n");
++	MD_SAY("POLARIS MODEM: phase R done: no QMP, no rails, no MBA, "
++	    "no MP_ASSIGN, no Q6 start, all registers restored\n");
++}
++
++static void
++md_w2c_reset_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	md_w2c_reset_probe();
++	MD_SAY("POLARIS MODEM: the W2c reset thread returned\n");
++}
++
++/*
+  * Level 2 stops after the GCC block: every register there belongs to a
+  * controller that is never powered down, and the GPU probe already read five of
+  * them in this same boot, so that phase is the one that cannot hurt.
