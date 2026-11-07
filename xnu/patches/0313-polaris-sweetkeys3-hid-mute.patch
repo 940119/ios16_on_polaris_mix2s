@@ -1,0 +1,50 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -620,10 +620,36 @@
+ 	collection->release();
+ }
+ 
++/*
++ * 0313: sweetkeys=3 keeps all kernel-side effects of the polaris key driver
++ * (SPMI windows, 20 ms poll, raw PON/GPIO reads) but posts ZERO HID events.
++ * This isolates event dispatch from mapping/polling as the cause of the
++ * 2-for-2 "every app unopenable" regression.
++ *
++ * BOTH key bridges must be muted.  0302/0309 added sweet_hid_key_repeat(),
++ * which dispatches through keyRepeat() and bypasses sweet_hid_key() entirely;
++ * leaving it live would make the survey result ambiguous on a long press.
++ */
++static int
++sweet_keys_survey_muted(void)
++{
++	static int hid_muted = -1;
++	if (hid_muted < 0) {
++		int sk = 0;
++
++		(void)PE_parse_boot_argn("sweetkeys", &sk, sizeof(sk));
++		hid_muted = (sk == 3) ? 1 : 0;
++	}
++	return hid_muted;
++}
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
+ extern "C" void
+ sweet_hid_key(int key, int down)
+ {
++	if (sweet_keys_survey_muted()) {
++		IOLog("SWEET HID: survey-only (sweetkeys=3); key %d suppressed\n", key);
++		return;
++	}
+ 	static const UInt32 usages[] = {
+ 		kHIDUsage_Csmr_Power, kHIDUsage_Csmr_VolumeIncrement,
+ 		kHIDUsage_Csmr_VolumeDecrement, kHIDUsage_Csmr_Menu,
+@@ -638,6 +664,10 @@
+ extern "C" void
+ sweet_hid_key_repeat(int key, int down)
+ {
++	if (sweet_keys_survey_muted()) {
++		IOLog("SWEET HID: survey-only (sweetkeys=3); repeat %d suppressed\n", key);
++		return;
++	}
+ 	static const UInt32 usages[] = {
+ 		kHIDUsage_Csmr_Power, kHIDUsage_Csmr_VolumeIncrement,
+ 		kHIDUsage_Csmr_VolumeDecrement, kHIDUsage_Csmr_Menu,
