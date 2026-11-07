@@ -1,0 +1,280 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -93,6 +93,17 @@
+  * are 32-bit volatile through WCOMB, header -> zero data -> mark LAST.
+  * step 4 also rings the SMP2P modem doorbell once and observes for
+  * 15 s, printing every new item id.  Level 31.
++ *
++ * 0317 keeps that handshake byte for byte and fixes the OBSERVATION.
++ * 0316 printed its ONLY verdict after the 4500 + 7000 step spins;
++ * the phone went into TWRP at sample 4 (the ring runs to FB tick 7080,
++ * no panic), so the ring had no conclusion at all.  0317 prints a
++ * verdict on EVERY sample.  It also names the state bits: 0316's
++ * slave-kernel 0x3 at +3500 ms has DSP_FATAL (1<<0) as well as
++ * DSP_READY (1<<1), dipper mi8_rproc.c:1571, while crash 422 is
++ * absent.  And it dumps the first words of 428/435/478/479/480
++ * byte-wise through the WCOMB map, so the GLINK descriptor can be
++ * read before porting mi8_glink_start().  Level 32.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -402,15 +413,15 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 31) {
+-		/* 0316: AP-side SMEM items before Q6, then W2e + W2f + census. */
++	if (polaris_modem_level() == 32) {
++		/* 0317: same handshake, conclusive post-modem observation. */
+ 		thread_t thread;
+ 
+ 		if (kernel_thread_start(md_w2e_thread, NULL, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+-			MD_SAY("POLARIS MODEM: 0316: W2e+W2f thread started\n");
++			MD_SAY("POLARIS MODEM: 0317: W2e+W2f thread started\n");
+ 		} else {
+-			MD_SAY("POLARIS MODEM: 0316: could not start the W2e+W2f thread\n");
++			MD_SAY("POLARIS MODEM: 0317: could not start the W2e+W2f thread\n");
+ 		}
+ 	} else if (polaris_modem_level() == 23) {
+ 		/* 0305: all seven mss clocks and the Q6's sleep clock, on and back. */
+@@ -3439,7 +3450,11 @@
+ #define MD_SMEM_ITEM_CRASH	422u	/* 421 + modem pid 1 */
+ #define MD_SMEM_ITEMS_MAX	64u
+ #define MD_SMP2P_MAGIC		0x504d5324u	/* "$SMP" */
++#define MD_SMP2P_FATAL		(1u << 0)	/* DSP_FATAL, dipper :1571 */
+ #define MD_SMP2P_READY		(1u << 1)	/* DSP_READY */
++#define MD_SMP2P_HANDOVER	(1u << 2)	/* DSP_HANDOVER */
++#define MD_SMP2P_RESTART_DONE	(1u << 0)	/* bit in the flags word */
++#define MD_SMP2P_RESTART_ACK	(1u << 1)	/* bit in the flags word */
+ #define MD_SMP2P_VERSION	1u
+ #define MD_SMP2P_RESTART_ACKS	1u
+ #define MD_SMP2P_AT_VERSION	4u
+@@ -3487,6 +3502,7 @@
+ 	uint32_t ids[MD_SMEM_ITEMS_MAX];
+ 	uint32_t count, items, walked, skipped;
+ 	uint32_t mss_at, mss_size, crash_at, crash_size;
++	uint32_t item_at[4], item_size[4];	/* 0317: 428 478 479 480 */
+ };
+ 
+ static volatile uint8_t *md_smem_va;
+@@ -3592,6 +3608,21 @@
+ 		s->crash_at = at;
+ 		s->crash_size = e->size - e->padding_data;
+ 	}
++	/* 0317: remember the four handshake items so their words can be
++	 * dumped.  Slot 0=428, 1=478, 2=479, 3=480. */
++	if (e->item == MD_SMEM_ITEM_MSS_AP) {
++		s->item_at[0] = at;
++		s->item_size[0] = e->size - e->padding_data;
++	} else if (e->item == MD_SMEM_ITEM_GLINK_DESC) {
++		s->item_at[1] = at;
++		s->item_size[1] = e->size - e->padding_data;
++	} else if (e->item == MD_SMEM_ITEM_GLINK_FIFO) {
++		s->item_at[2] = at;
++		s->item_size[2] = e->size - e->padding_data;
++	} else if (e->item == MD_SMEM_ITEM_GLINK_FIFO2) {
++		s->item_at[3] = at;
++		s->item_size[3] = e->size - e->padding_data;
++	}
+ }
+ 
+ /* Bottom-up to free_uncached, then top-down from the cacheline-aligned end. */
+@@ -3891,8 +3922,39 @@
+ 	return true;
+ }
+ 
++/* 0317: the first words of an SMEM item, byte-wise WCOMB, no memcpy.
++ * The GLINK descriptor (478) is 32 bytes, so all 8 words fit. */
++static void
++md_smem_words(uint32_t at, uint32_t size, uint32_t nw, const char *label)
++{
++	uint32_t w[8], i, n;
++	uint8_t *raw = (uint8_t *)w;
++
++	for (i = 0; i < (uint32_t)sizeof(w); i++) {
++		raw[i] = 0;
++	}
++	if (at == 0) {
++		MD_SAY("POLARIS MODEM:   W2f step 4:   %s: MISSING\n", label);
++		return;
++	}
++	n = nw < 8u ? nw : 8u;
++	if (size < n * 4u) {
++		n = size / 4u;
++	}
++	if (n == 0 || !md_smem_peek(at, w, n * 4u)) {
++		MD_SAY("POLARIS MODEM:   W2f step 4:   %s: unreadable\n", label);
++		return;
++	}
++	printf("POLARIS MODEM:   W2f step 4:   %s @%#x %u bytes:", label, at, size);
++	for (i = 0; i < n; i++) {
++		printf(" %#x", w[i]);
++	}
++	printf("\n");
++}
++
+ static bool
+-md_smem_smp2p(uint32_t at, uint32_t size, uint32_t elapsed_ms)
++md_smem_smp2p(uint32_t at, uint32_t size, uint32_t elapsed_ms,
++    bool *ever_fatal)
+ {
+ 	struct md_smp2p w;
+ 	uint8_t *raw = (uint8_t *)&w;
+@@ -3933,9 +3995,22 @@
+ 			have_state = TRUE;
+ 		}
+ 	}
+-	MD_SAY("POLARIS MODEM:   W2f step 4: t=+%u ms: slave-kernel %s (%#x), "
+-	    "DSP_READY %s\n", elapsed_ms, have_state ? "present" : "MISSING",
+-	    state, (have_state && (state & MD_SMP2P_READY) != 0) ? "SET" : "not set");
++	MD_SAY("POLARIS MODEM:   W2f step 4: t=+%u ms: 435 flags %#x:%s%s, "
++	    "features %#x\n", elapsed_ms, w.flags,
++	    (w.flags & MD_SMP2P_RESTART_DONE) ? " RESTART_DONE" : "",
++	    (w.flags & MD_SMP2P_RESTART_ACK) ? " RESTART_ACK" : "",
++	    w.version >> 8);
++	MD_SAY("POLARIS MODEM:   W2f step 4: t=+%u ms: slave-kernel %s (%#x) "
++	    "bits:%s%s%s, DSP_READY %s, DSP_FATAL %s\n", elapsed_ms,
++	    have_state ? "present" : "MISSING", state,
++	    (state & MD_SMP2P_FATAL) ? " FATAL" : "",
++	    (state & MD_SMP2P_READY) ? " READY" : "",
++	    (state & MD_SMP2P_HANDOVER) ? " HANDOVER" : "",
++	    (have_state && (state & MD_SMP2P_READY) != 0) ? "SET" : "not set",
++	    (have_state && (state & MD_SMP2P_FATAL) != 0) ? "SET" : "clear");
++	if (have_state && (state & MD_SMP2P_FATAL) != 0) {
++		*ever_fatal = TRUE;
++	}
+ 	return have_state && (state & MD_SMP2P_READY) != 0;
+ }
+ 
+@@ -3960,7 +4035,8 @@
+ 
+ static void
+ md_smem_census(uint32_t sample, uint32_t elapsed_ms,
+-    bool *ever_435, bool *ever_ready, bool *ever_glink)
++    bool *ever_435, bool *ever_ready, bool *ever_glink,
++    bool *ever_fatal)
+ {
+ 	struct md_smem_toc toc;
+ 	struct md_smem_seen s;
+@@ -3977,6 +4053,10 @@
+ 	for (i = 0; i < MD_SMEM_ITEMS_MAX; i++) {
+ 		s.ids[i] = 0;
+ 	}
++	for (i = 0; i < 4u; i++) {
++		s.item_at[i] = 0;
++		s.item_size[i] = 0;
++	}
+ 	if (!md_smem_toc(&toc)) {
+ 		MD_SAY("POLARIS MODEM:   W2f step 4: t=+%u ms: no $TOC at %#x\n",
+ 		    elapsed_ms, MD_SMEM_TOC_AT);
+@@ -4054,10 +4134,22 @@
+ 	md_smem_prev_count = s.count;
+ 	if (s.mss_at != 0) {
+ 		*ever_435 = TRUE;
+-		if (md_smem_smp2p(s.mss_at, s.mss_size, elapsed_ms)) {
++		if (md_smem_smp2p(s.mss_at, s.mss_size, elapsed_ms, ever_fatal)) {
+ 			*ever_ready = TRUE;
+ 		}
+ 	}
++	/* 0317: the GLINK descriptor and both FIFOs on every sample, plus
++	 * the two SMP2P halves on the first one. */
++	MD_SAY("POLARIS MODEM:   W2f step 4: t=+%u ms: SMEM item contents\n",
++	    elapsed_ms);
++	md_smem_words(s.item_at[1], s.item_size[1], 8u, "478 GLINK desc");
++	md_smem_words(s.item_at[2], s.item_size[2], 4u, "479 our FIFO");
++	md_smem_words(s.item_at[3], s.item_size[3], 4u, "480 their FIFO");
++	if (sample == 0) {
++		md_smem_words(s.item_at[0], s.item_size[0], 8u, "428 ours SMP2P");
++		md_smem_words(s.mss_at, s.mss_size, 6u, "435 theirs SMP2P");
++	}
++	sweet_log_flush_now();
+ 	if (s.crash_at != 0) {
+ 		md_smem_crash(s.crash_at, s.crash_size);
+ 	}
+@@ -4068,13 +4160,34 @@
+ 	}
+ }
+ 
++/* 0317: one verdict per sample.  0316 lost its only verdict to the long
++ * post-loop spin and the ring was grabbed before sample 5 ever printed. */
++static const char *
++md_smem_verdict(bool ever_435, bool ever_ready, bool ever_glink,
++    bool ever_fatal)
++{
++	if (!ever_435) {
++		return "NOT A WORD FROM THE MODEM IN SMEM: item 435 never appeared";
++	}
++	if (!ever_ready) {
++		return "item 435 APPEARED but slave-kernel never set DSP_READY";
++	}
++	if (ever_fatal) {
++		return "DSP_READY SET BUT DSP_FATAL ALSO SET: the modem signals a fatal state";
++	}
++	return ever_glink
++	    ? "THE MODEM IS READY AND GLINK ITEMS EXIST: the link can be started"
++	    : "THE MODEM IS READY but no GLINK items yet";
++}
++
+ static void
+ md_smem_post_modem(void)
+ {
+ 	static const uint32_t gaps[MD_SMEM_SAMPLES] =
+ 	    { 0u, 500u, 1000u, 2000u, 4500u, 7000u };
+ 	bool ever_435 = FALSE, ever_ready = FALSE, ever_glink = FALSE;
+-	uint32_t s, k, elapsed = 0;
++	bool ever_fatal = FALSE;
++	uint32_t s, k, elapsed = 0, done = 0;
+ 
+ 	MD_SAY("POLARIS MODEM:   W2f step 4: post-modem SMEM census starts: "
+ 	    "15 s, AP items were made before the Q6, doorbell rung once\n");
+@@ -4084,16 +4197,18 @@
+ 			md_qmp_ms();
+ 		}
+ 		elapsed += gaps[s];
+-		md_smem_census(s, elapsed, &ever_435, &ever_ready, &ever_glink);
+-	}
+-	MD_SAY("POLARIS MODEM: 0316 VERDICT: %s\n",
+-	    ever_ready ? (ever_glink
+-	        ? "THE MODEM IS TALKING: item 435 reached DSP_READY and GLINK items exist"
+-	        : "THE MODEM IS TALKING: item 435 reached DSP_READY, no GLINK items yet")
+-	    : (ever_435
+-	        ? "item 435 APPEARED but slave-kernel never set DSP_READY"
+-	        : "NOT A WORD FROM THE MODEM IN SMEM: item 435 never appeared"));
+-	MD_SAY("POLARIS MODEM:   0316: 428/478/479 were written before the Q6, "
++		md_smem_census(s, elapsed, &ever_435, &ever_ready,
++		    &ever_glink, &ever_fatal);
++		done++;
++		MD_SAY("POLARIS MODEM: 0317 VERDICT @t=+%u ms: %s\n", elapsed,
++		    md_smem_verdict(ever_435, ever_ready, ever_glink, ever_fatal));
++	}
++	MD_SAY("POLARIS MODEM: 0317 FINAL VERDICT: %s (%u/%u samples, "
++	    "ready=%s fatal=%s glink=%s)\n",
++	    md_smem_verdict(ever_435, ever_ready, ever_glink, ever_fatal),
++	    done, MD_SMEM_SAMPLES, ever_ready ? "yes" : "no",
++	    ever_fatal ? "yes" : "no", ever_glink ? "yes" : "no");
++	MD_SAY("POLARIS MODEM:   0317: 428/478/479 were written before the Q6, "
+ 	    "the doorbell was rung once; the modem is left running\n");
+ }
+ 
+@@ -4176,8 +4291,8 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-	MD_SAY("POLARIS MODEM: ======== build 0316 alive: W2e + W2f + "
+-	    "pre-Q6 SMEM handshake (level 31) ========\n");
++	MD_SAY("POLARIS MODEM: ======== build 0317 alive: W2e + W2f + "
++	    "post-ready GLINK probe (level 32) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
+@@ -4202,6 +4317,9 @@
+ 	    "the modem is waiting for OUR half\n");
+ 	MD_SAY("POLARIS MODEM:   0316 makes 428/478/479 before Q6, then rings "
+ 	    "the SMP2P modem doorbell and watches for DSP_READY\n");
++	MD_SAY("POLARIS MODEM:   0317 keeps that handshake, prints a verdict "
++	    "after EVERY sample, decodes DSP_FATAL and dumps 428/435/478/"
++	    "479/480\n");
+ 	MD_SAY("POLARIS MODEM:   after BOOT QDSP6SS is never read; the "
+ 	    "permanent MBA VA is never dereferenced or unmapped\n");
+ 	MD_SAY("POLARIS MODEM:   MBA.MBN + QMP on + three rails + seven clocks "
