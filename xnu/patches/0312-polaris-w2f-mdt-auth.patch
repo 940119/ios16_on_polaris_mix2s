@@ -1,0 +1,200 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -47,6 +47,13 @@
+  * (mi8_rproc.c:3611).  So: keep the permanent mapping (0306 proved
+  * this exact path works), keep the successful-return fix, drop the
+  * unmap.  Level 26.  WCOMB + a legal unmap is a separate build.
++ *
++ * 0312 starts W2f (dipper load=true) on top of the now-green W2e.
++ * MODEM.MDT is staged at MBA+1MB while the Q6 is still in reset, then
++ * RMB_META_DATA / RMB_COMMAND=1 ask the MBA to authenticate the header
++ * once the Q6 is up.  No .bXX segments yet -- those are 0313.  Only
++ * RMB is touched after BOOT; QDSP6SS stays untouched and the permanent
++ * mapping stays mapped.  Level 27.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -356,15 +363,15 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 26) {
+-		/* 0311: W2e, successful-return fix only; NO unmap (0310 panicked). */
++	if (polaris_modem_level() == 27) {
++		/* 0312: green W2e + W2f step 1/2 (MODEM.MDT header authentication). */
+ 		thread_t thread;
+ 
+ 		if (kernel_thread_start(md_w2e_thread, NULL, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+-			MD_SAY("POLARIS MODEM: 0311: W2e thread started\n");
++			MD_SAY("POLARIS MODEM: 0312: W2e+W2f thread started\n");
+ 		} else {
+-			MD_SAY("POLARIS MODEM: 0311: could not start the W2e thread\n");
++			MD_SAY("POLARIS MODEM: 0312: could not start the W2e+W2f thread\n");
+ 		}
+ 	} else if (polaris_modem_level() == 23) {
+ 		/* 0305: all seven mss clocks and the Q6's sleep clock, on and back. */
+@@ -1913,7 +1920,7 @@
+ #define MD_MBA_FILE_LBA		36131u
+ #define MD_MBA_FILE_BYTES	238304u
+ #define MD_MBA_FILE_BLOCKS	59u
+-#define MD_LOAD_MAP_SIZE	0x00040000u	/* 256 KiB, > 238304 B */
++#define MD_LOAD_MAP_SIZE	0x00110000u	/* 0312: 1 MiB + 64 KiB, covers MBA.MBN and MODEM.MDT at +0x100000 */
+ 
+ static uint8_t md_mba_image[MD_MBA_FILE_BLOCKS * MD_BLOCK]
+     __attribute__((aligned(4096)));
+@@ -3348,6 +3355,16 @@
+ #define MD_W2E_PBL_POLLS	1000u		/* ~1 s */
+ #define MD_W2E_MBA_POLLS	2000u		/* ~2 s */
+ 
++/* 0312 W2f: dipper mi8_rproc.c:2257-2264.  The MBA leaves +1 MB of the
++ * MBA region free for the modem's metadata (Linux puts its debug
++ * policy there).  The header must be in place before the Q6 starts. */
++#define MD_MBA_META_OFFSET	0x00100000u
++#define MD_RMB_COMMAND		0x08u
++#define MD_RMB_META_DATA	0x10u
++#define MD_RMB_CODE_START	0x14u
++#define MD_RMB_CODE_LENGTH	0x18u
++#define MD_MBA_META_AUTH_OK	3u
++
+ static bool
+ md_clock_on(vm_offset_t gcc, unsigned i)
+ {
+@@ -3427,14 +3444,17 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-	MD_SAY("POLARIS MODEM: ======== build 0311 alive: W2e, NO UNMAP "
+-	    "(level 26) ========\n");
+-	MD_SAY("POLARIS MODEM:   0306 proved W2e works (MSS_STATUS 0xb, PBL 1, "
+-	    "MBA_STATUS 1), then panicked reading q6+0x3c in its verdict\n");
+-	MD_SAY("POLARIS MODEM:   0310 fixed that but its ml_io_unmap() panicked "
+-	    "at step 4: vm_map_delete permanent VM map entry @map.c:7940\n");
+-	MD_SAY("POLARIS MODEM:   0311 keeps ml_io_map's permanent mapping (never "
+-	    "dereferenced after step 4) and NEVER reads QDSP6SS after BOOT\n");
++	MD_SAY("POLARIS MODEM: ======== build 0312 alive: W2e + W2f mdt "
++	    "header auth (level 27) ========\n");
++	MD_SAY("POLARIS MODEM:   0311 is green: W2e verdict + phase W done, "
++	    "SpringBoard ran to FB tick 11460; the 12 steps are FROZEN\n");
++	MD_SAY("POLARIS MODEM:   0312 W2f step 1: MODEM.MDT -> %#llx while "
++	    "the Q6 is still in reset (dipper mi8_rproc.c:3624)\n",
++	    (unsigned long long)(MD_MBA_REGION + MD_MBA_META_OFFSET));
++	MD_SAY("POLARIS MODEM:   0312 W2f step 2: after the Q6 is up, "
++	    "RMB_META_DATA + COMMAND=1, wait for MBA_STATUS 3\n");
++	MD_SAY("POLARIS MODEM:   NO .bXX segments this build; only RMB is "
++	    "touched after BOOT, QDSP6SS never, no unmap ever\n");
+ 	MD_SAY("POLARIS MODEM:   MBA.MBN + QMP on + three rails + seven clocks "
+ 	    "+ reset pulse + shared owners + two BOOT writes\n");
+ 	MD_SAY("POLARIS MODEM:   0x38004 stays read-only; 0x8 -> 0x8008 shared, "
+@@ -3497,6 +3517,75 @@
+ 		goto out;
+ 	}
+ 
++	/* ---- 0312 W2f step 1: MODEM.MDT -> MBA+1MB, Q6 STILL IN RESET.
++	 * dipper mss_w2e(load=true) does this at mi8_rproc.c:3624-3640,
++	 * before it unmaps the image or starts the core.  The MBA region
++	 * is still HLOS-owned here, so writing is safe. ---- */
++	{
++		struct md_file_want mdt = { "MODEM.MDT", 0, 0, false };
++		uint32_t lba, blocks, b, phnum, i, lowest = ~0u, loads = 0;
++
++		md_walk(md_image_cluster, md_find_entry, &mdt);
++		MD_SAY("POLARIS MODEM:   W2f step 1: MODEM.MDT %s, %u bytes, "
++		    "cluster %u\n", mdt.found ? "found" : "MISSING",
++		    mdt.size, mdt.cluster);
++		if (!mdt.found || mdt.cluster < 2 || mdt.size == 0 ||
++		    mdt.size > sizeof(md_mdt_copy)) {
++			why = "MODEM.MDT is missing or does not fit";
++			goto out;
++		}
++		blocks = (mdt.size + MD_BLOCK - 1) / MD_BLOCK;
++		lba = md_geo.data_lba + (mdt.cluster - 2) * md_geo.spc;
++		for (b = 0; b < blocks; b++) {
++			if (!md_read(lba + b, md_mdt_copy + b * MD_BLOCK)) {
++				why = "a MODEM.MDT block did not read";
++				goto out;
++			}
++		}
++		if (!(md_mdt_copy[0] == 0x7f && md_mdt_copy[1] == 'E' &&
++		    md_mdt_copy[2] == 'L' && md_mdt_copy[3] == 'F')) {
++			why = "MODEM.MDT is not an ELF";
++			goto out;
++		}
++		phnum = (uint32_t)md_mdt_copy[44] |
++		    (uint32_t)md_mdt_copy[45] << 8;
++		MD_SAY("POLARIS MODEM:   W2f step 1: ELF32, %u program headers\n",
++		    phnum);
++		if (phnum == 0 || phnum > 64 || 52 + 32 * phnum > mdt.size) {
++			why = "the MODEM.MDT phdr table is not sane";
++			goto out;
++		}
++		for (i = 0; i < phnum; i++) {
++			const uint8_t *p = md_mdt_copy + 52 + 32 * i;
++			uint32_t type = md_rd32(p), paddr = md_rd32(p + 12);
++			uint32_t memsz = md_rd32(p + 20);
++			uint32_t flags = md_rd32(p + 24);
++			bool hash = ((flags >> 24) & 7) == 2;
++
++			if (type == 1 && !hash && memsz != 0) {
++				loads++;
++				if (paddr < lowest) {
++					lowest = paddr;
++				}
++			}
++		}
++		MD_SAY("POLARIS MODEM:   W2f step 1: %u loadable segments, "
++		    "lowest paddr %#x (0313 will place the .bXX files)\n",
++		    loads, lowest);
++		memcpy((void *)(region + MD_MBA_META_OFFSET), md_mdt_copy,
++		    mdt.size);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if (memcmp((void *)(region + MD_MBA_META_OFFSET), md_mdt_copy,
++		    mdt.size) != 0) {
++			why = "MODEM.MDT reads back differently at MBA+1MB";
++			goto out;
++		}
++		MD_SAY("POLARIS MODEM:   W2f step 1: %u bytes at %#llx READ BACK "
++		    "THE SAME; the metadata is in place before the owner change\n",
++		    mdt.size,
++		    (unsigned long long)(MD_MBA_REGION + MD_MBA_META_OFFSET));
++	}
++
+ 	/* ---- step 4: hand mba and mpss to shared owners, EARLY ---- */
+ 	MD_SAY("POLARIS MODEM:   W2e step 4/12: owners 0x8 -> 0x8008 (shared) "
+ 	    "while the Q6 is still held in reset\n");
+@@ -3737,7 +3826,34 @@
+ 	    "reboot to stop it\n");
+ 	MD_SAY("POLARIS MODEM: phase W done\n");
+ 	if (ok && boot_written) {
+-		return;	/* mi8rp_hold: the Q6 owns the XPU now; touch nothing */
++		/* ---- 0312 W2f step 2: point the MBA at the metadata and let
++		 * it authenticate the header.  dipper mi8_rproc.c:3494-3500.
++		 * ONLY RMB registers here -- QDSP6SS is never read again
++		 * (0306 ESR 0x96000010), and the permanent mapping is never
++		 * unmapped (0310 vm_map.c:7940). ---- */
++		uint32_t status = 0, w;
++
++		md_wr(rmb, MD_RMB_CODE_LENGTH, 0);
++		md_wr(rmb, MD_RMB_META_DATA,
++		    (uint32_t)(MD_MBA_REGION + MD_MBA_META_OFFSET));
++		md_wr(rmb, MD_RMB_COMMAND, 1);
++		for (w = 0; w < 1000u; w++) {
++			status = md_rd(rmb, MD_RMB_MBA_STATUS);
++			if (status == MD_MBA_META_AUTH_OK ||
++			    (int32_t)status < 0) {
++				break;
++			}
++			md_qmp_ms();
++		}
++		MD_SAY("POLARIS MODEM:   W2f step 2: META_DATA_READY -> MBA "
++		    "status %u after ~%u ms (%u = header authenticated)\n",
++		    status, w, MD_MBA_META_AUTH_OK);
++		MD_SAY("POLARIS MODEM: 0312 VERDICT: %s\n",
++		    status == MD_MBA_META_AUTH_OK
++		    ? "THE MBA AUTHENTICATED THE MODEM HEADER: the .bXX "
++		      "segments can go in next (0313)"
++		    : "the MBA did not authenticate the modem header");
++		return;	/* mi8rp_hold: Q6 owns the XPU; touch nothing else */
+ 	}
+ }
+ 
