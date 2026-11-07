@@ -1,0 +1,242 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -104,6 +104,17 @@
+  * absent.  And it dumps the first words of 428/435/478/479/480
+  * byte-wise through the WCOMB map, so the GLINK descriptor can be
+  * read before porting mi8_glink_start().  Level 32.
++ *
++ * 0318 keeps all of that and ANSWERS the modem.  0317 found that
++ * 478 rx head is already 8 and 480 begins with 0x00010000 0x7 --
++ * a GLINK VERSION(cid 1, features 7) that the modem sent right
++ * when it set DSP_READY, with 479 still untouched.  So the next
++ * step is one VERSION_ACK, not a glink port: features 1 & 7 = 1,
++ * write 0x00010001 + 0x00000001 into 479, desc+8=rxhead,
++ * desc+4=8, ring IPC_GLINK_MODEM (1<<12).  The reply is issued
++ * right after the +500 ms census, never after the long spins.
++ * If OPEN "IPCRTR" / INTENT follow, DSP_FATAL bit0 is harmless.
++ * Level 33.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -413,15 +424,15 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 32) {
+-		/* 0317: same handshake, conclusive post-modem observation. */
++	if (polaris_modem_level() == 33) {
++		/* 0318: answer the GLINK VERSION the modem already sent. */
+ 		thread_t thread;
+ 
+ 		if (kernel_thread_start(md_w2e_thread, NULL, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+-			MD_SAY("POLARIS MODEM: 0317: W2e+W2f thread started\n");
++			MD_SAY("POLARIS MODEM: 0318: W2e+W2f thread started\n");
+ 		} else {
+-			MD_SAY("POLARIS MODEM: 0317: could not start the W2e+W2f thread\n");
++			MD_SAY("POLARIS MODEM: 0318: could not start the W2e+W2f thread\n");
+ 		}
+ 	} else if (polaris_modem_level() == 23) {
+ 		/* 0305: all seven mss clocks and the Q6's sleep clock, on and back. */
+@@ -3467,7 +3478,12 @@
+ #define MD_APCS_PHYS		0x17990000ull	/* dipper mi8_rproc.c:1041 */
+ #define MD_APCS_IPC		0x0cu
+ #define MD_IPC_SMP2P_MODEM	(1u << 14)	/* dipper mi8_rproc.c:1045 */
++#define MD_IPC_GLINK_MODEM	(1u << 12)	/* dipper mi8_rproc.c:1046 */
+ #define MD_SMEM_SAMPLES		6u
++#define MD_GLINK_VERSION	0u	/* mi8_glink.c:40 */
++#define MD_GLINK_VERSION_ACK	1u
++#define MD_GLINK_FEATURES	1u	/* mi8_glink_start():890 */
++#define MD_GLINK_CID		1u
+ 
+ struct md_smem_toc {
+ 	uint8_t magic[4];
+@@ -3508,6 +3524,11 @@
+ static volatile uint8_t *md_smem_va;
+ static uint32_t md_smem_prev_ids[MD_SMEM_ITEMS_MAX];
+ static uint32_t md_smem_prev_count;
++/* 0318: shared by both doorbells (ml_io_map is permanent, 0310) and
++ * the offsets of the three GLINK items, filled while walking SMEM. */
++static vm_offset_t md_apcs;
++static uint32_t md_glink_desc_at, md_glink_tx_at, md_glink_rx_at;
++static bool md_glink_acked;
+ 
+ static bool
+ md_smem_peek(uint32_t at, void *to, uint32_t size)
+@@ -3616,12 +3637,15 @@
+ 	} else if (e->item == MD_SMEM_ITEM_GLINK_DESC) {
+ 		s->item_at[1] = at;
+ 		s->item_size[1] = e->size - e->padding_data;
++		md_glink_desc_at = at;
+ 	} else if (e->item == MD_SMEM_ITEM_GLINK_FIFO) {
+ 		s->item_at[2] = at;
+ 		s->item_size[2] = e->size - e->padding_data;
++		md_glink_tx_at = at;
+ 	} else if (e->item == MD_SMEM_ITEM_GLINK_FIFO2) {
+ 		s->item_at[3] = at;
+ 		s->item_size[3] = e->size - e->padding_data;
++		md_glink_rx_at = at;
+ 	}
+ }
+ 
+@@ -3859,22 +3883,101 @@
+ static void
+ md_smem_ring(void)
+ {
+-	static vm_offset_t apcs;
+-
+-	if (apcs == 0) {
+-		apcs = ml_io_map((vm_offset_t)MD_APCS_PHYS, 0x1000);
++	if (md_apcs == 0) {
++		md_apcs = ml_io_map((vm_offset_t)MD_APCS_PHYS, 0x1000);
+ 	}
+-	if (apcs == 0) {
++	if (md_apcs == 0) {
+ 		MD_SAY("POLARIS MODEM:   0316: no APCS map, doorbell NOT rung\n");
+ 		return;
+ 	}
+-	*(volatile uint32_t *)(apcs + MD_APCS_IPC) = MD_IPC_SMP2P_MODEM;
++	*(volatile uint32_t *)(md_apcs + MD_APCS_IPC) = MD_IPC_SMP2P_MODEM;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	MD_SAY("POLARIS MODEM:   0316: SMP2P modem doorbell rung "
+ 	    "(APCS %#x + %#x = %#x)\n", (uint32_t)MD_APCS_PHYS,
+ 	    MD_APCS_IPC, MD_IPC_SMP2P_MODEM);
+ }
+ 
++/* 0318: one word through the WCOMB map, byte-wise, for the final state. */
++static uint32_t
++md_smem_word(uint32_t at)
++{
++	uint32_t v = 0;
++
++	if (!md_smem_peek(at, &v, 4u)) {
++		return 0;
++	}
++	return v;
++}
++
++/* 0318: GLINK has its OWN doorbell bit, not the SMP2P one. */
++static void
++md_glink_ring(void)
++{
++	if (md_apcs == 0) {
++		md_apcs = ml_io_map((vm_offset_t)MD_APCS_PHYS, 0x1000);
++	}
++	if (md_apcs == 0) {
++		MD_SAY("POLARIS MODEM:   0318: no APCS map, GLINK doorbell NOT rung\n");
++		return;
++	}
++	*(volatile uint32_t *)(md_apcs + MD_APCS_IPC) = MD_IPC_GLINK_MODEM;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	MD_SAY("POLARIS MODEM:   0318: GLINK modem doorbell rung "
++	    "(APCS %#x + %#x = %#x)\n", (uint32_t)MD_APCS_PHYS,
++	    MD_APCS_IPC, MD_IPC_GLINK_MODEM);
++}
++
++/* 0318: answer the VERSION the modem already wrote into item 480.
++ * dipper progress() consumes the rx bytes FIRST (mi8_glink.c:675),
++ * then emit() writes the tx FIFO and advances our tx head (:230),
++ * then it rings.  Everything is byte-wise/word-wise volatile through
++ * the existing WCOMB map: no memcpy, no unmap (0312 / 0310). */
++static void
++md_glink_reply(uint32_t elapsed_ms)
++{
++	uint32_t d[4], cmd[2], i, rxhead, features;
++
++	if (md_glink_acked || md_glink_desc_at == 0 ||
++	    md_glink_tx_at == 0 || md_glink_rx_at == 0) {
++		return;
++	}
++	for (i = 0; i < 4u; i++) {
++		d[i] = 0;
++		if (!md_smem_peek(md_glink_desc_at + 4u * i, &d[i], 4u)) {
++			return;
++		}
++	}
++	rxhead = d[3];
++	if (rxhead < 8u || rxhead > MD_GLINK_FIFO_SIZE - 8u) {
++		return;
++	}
++	cmd[0] = 0;
++	cmd[1] = 0;
++	if (!md_smem_peek(md_glink_rx_at, cmd, 8u)) {
++		return;
++	}
++	/* header(): cmd in byte 0, cid in bytes 2..3, arg in bytes 4..7. */
++	if ((cmd[0] & 0xffu) != MD_GLINK_VERSION ||
++	    ((cmd[0] >> 16) & 0xffffu) != MD_GLINK_CID) {
++		MD_SAY("POLARIS MODEM:   0318: 480 first word %#x is not "
++		    "GLINK VERSION/cid=1; no ACK sent\n", cmd[0]);
++		return;
++	}
++	features = MD_GLINK_FEATURES & cmd[1];
++	MD_SAY("POLARIS MODEM:   0318: modem sent GLINK VERSION at t=+%u ms: "
++	    "cid %u, features %#x, rx head %u; answering with %#x\n",
++	    elapsed_ms, MD_GLINK_CID, cmd[1], rxhead, features);
++	md_smem_poke(md_glink_desc_at + 8u, rxhead);	/* rx tail: consumed */
++	md_smem_poke(md_glink_tx_at, MD_GLINK_VERSION_ACK | (MD_GLINK_CID << 16));
++	md_smem_poke(md_glink_tx_at + 4u, features);
++	md_smem_poke(md_glink_desc_at + 4u, 8u);	/* tx head: 8 bytes */
++	md_glink_ring();
++	md_glink_acked = TRUE;
++	MD_SAY("POLARIS MODEM: 0318 VERDICT: GLINK VERSION_ACK SENT "
++	    "(features %#x, tx head 8, rx tail %u); watching for "
++	    "OPEN IPCRTR / INTENT\n", features, rxhead);
++}
++
+ /* Called at the top of md_w2e_probe(), Q6 still in reset, no other writer. */
+ static void
+ md_smem_prepare(void)
+@@ -4199,17 +4302,28 @@
+ 		elapsed += gaps[s];
+ 		md_smem_census(s, elapsed, &ever_435, &ever_ready,
+ 		    &ever_glink, &ever_fatal);
++		/* 0318: 480 exists from +500 ms onward.  Answer immediately,
++		 * never after the 4500/7000 long spins (section 105.4). */
++		md_glink_reply(elapsed);
+ 		done++;
+-		MD_SAY("POLARIS MODEM: 0317 VERDICT @t=+%u ms: %s\n", elapsed,
++		MD_SAY("POLARIS MODEM: 0318 VERDICT @t=+%u ms: %s\n", elapsed,
+ 		    md_smem_verdict(ever_435, ever_ready, ever_glink, ever_fatal));
+ 	}
+-	MD_SAY("POLARIS MODEM: 0317 FINAL VERDICT: %s (%u/%u samples, "
++	MD_SAY("POLARIS MODEM: 0318 FINAL VERDICT: %s (%u/%u samples, "
+ 	    "ready=%s fatal=%s glink=%s)\n",
+ 	    md_smem_verdict(ever_435, ever_ready, ever_glink, ever_fatal),
+ 	    done, MD_SMEM_SAMPLES, ever_ready ? "yes" : "no",
+ 	    ever_fatal ? "yes" : "no", ever_glink ? "yes" : "no");
+-	MD_SAY("POLARIS MODEM:   0317: 428/478/479 were written before the Q6, "
+-	    "the doorbell was rung once; the modem is left running\n");
++	MD_SAY("POLARIS MODEM: 0318 FINAL: ACK sent=%s, 478 now "
++	    "%#x %#x %#x %#x, 480 head word %#x\n",
++	    md_glink_acked ? "YES" : "NO",
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u,
++	    md_glink_rx_at ? md_smem_word(md_glink_rx_at) : 0u);
++	MD_SAY("POLARIS MODEM:   0318: 428/478/479 were written before the Q6, "
++	    "the modem is left running\n");
+ }
+ 
+ static bool
+@@ -4291,8 +4405,8 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-	MD_SAY("POLARIS MODEM: ======== build 0317 alive: W2e + W2f + "
+-	    "post-ready GLINK probe (level 32) ========\n");
++	MD_SAY("POLARIS MODEM: ======== build 0318 alive: W2e + W2f + "
++	    "GLINK VERSION_ACK (level 33) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
+@@ -4320,6 +4434,8 @@
+ 	MD_SAY("POLARIS MODEM:   0317 keeps that handshake, prints a verdict "
+ 	    "after EVERY sample, decodes DSP_FATAL and dumps 428/435/478/"
+ 	    "479/480\n");
++	MD_SAY("POLARIS MODEM:   0318 finds GLINK VERSION in 480 and answers "
++	    "with VERSION_ACK in 479, then rings IPC_GLINK_MODEM (1<<12)\n");
+ 	MD_SAY("POLARIS MODEM:   after BOOT QDSP6SS is never read; the "
+ 	    "permanent MBA VA is never dereferenced or unmapped\n");
+ 	MD_SAY("POLARIS MODEM:   MBA.MBN + QMP on + three rails + seven clocks "
