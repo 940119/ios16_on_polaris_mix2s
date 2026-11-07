@@ -1,0 +1,276 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -62,6 +62,16 @@
+  * ml_io_map_unmappable(..., MD_WIMG_WCOMB) with volatile stores.
+  * 0313 uses that mapping, byte-wise, with 1a/1b/1c step logs, and
+  * puts MD_LOAD_MAP_SIZE back to 0311's proven 256 KiB.  Level 28.
++ *
++ * 0314 adds W2f step 3: the 27 MODEM.BXX segments into MPSS 120 MB.
++ * 0313 got MBA status 3 (the header authenticated), so the MBA is
++ * waiting for the image.  Files are consecutive 4 KiB blocks on this
++ * FAT16 volume (26/26 adjacent pairs contiguous, section 93.1.1);
++ * each segment gets its own WCOMB map and is written BYTE-WISE
++ * volatile, with the BSS tail zero-filled.  No memcpy, no unmap,
++ * no QDSP6SS read after BOOT.  Per segment the MBA is told
++ * RMB_CODE_LENGTH; the first also gets CODE_START + COMMAND=2.
++ * The verdict is MBA_AUTH_COMPLETE (status 4).  Level 29.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -371,15 +381,15 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 28) {
+-		/* 0313: green W2e + W2f mdt over the WCOMB mapping 0296 proved. */
++	if (polaris_modem_level() == 29) {
++		/* 0314: green W2e + authenticated mdt + the .bXX segments. */
+ 		thread_t thread;
+ 
+ 		if (kernel_thread_start(md_w2e_thread, NULL, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+-			MD_SAY("POLARIS MODEM: 0313: W2e+W2f thread started\n");
++			MD_SAY("POLARIS MODEM: 0314: W2e+W2f thread started\n");
+ 		} else {
+-			MD_SAY("POLARIS MODEM: 0313: could not start the W2e+W2f thread\n");
++			MD_SAY("POLARIS MODEM: 0314: could not start the W2e+W2f thread\n");
+ 		}
+ 	} else if (polaris_modem_level() == 23) {
+ 		/* 0305: all seven mss clocks and the Q6's sleep clock, on and back. */
+@@ -3372,6 +3382,7 @@
+ #define MD_RMB_CODE_START	0x14u
+ #define MD_RMB_CODE_LENGTH	0x18u
+ #define MD_MBA_META_AUTH_OK	3u
++#define MD_MBA_AUTH_COMPLETE	4u	/* dipper mi8_rproc.c:2260 */
+ 
+ static bool
+ md_clock_on(vm_offset_t gcc, unsigned i)
+@@ -3452,8 +3463,8 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-	MD_SAY("POLARIS MODEM: ======== build 0313 alive: W2e + W2f mdt "
+-	    "over WCOMB (level 28) ========\n");
++	MD_SAY("POLARIS MODEM: ======== build 0314 alive: W2e + W2f mdt "
++	    "+ .bXX segments (level 29) ========\n");
+ 	MD_SAY("POLARIS MODEM:   0311 is green: W2e verdict + phase W done, "
+ 	    "SpringBoard ran to FB tick 11460; the 12 steps are FROZEN\n");
+ 	MD_SAY("POLARIS MODEM:   0312 W2f step 1: MODEM.MDT -> %#llx while "
+@@ -3464,8 +3475,10 @@
+ 	MD_SAY("POLARIS MODEM:   0312 died at memcpy() into the DEVICE "
+ 	    "mapping; 0313 stages the mdt byte-wise through the WCOMB map "
+ 	    "0296 already proved (0x96a00000)\n");
+-	MD_SAY("POLARIS MODEM:   NO .bXX segments this build; only RMB is "
+-	    "touched after BOOT, QDSP6SS never, no unmap ever\n");
++	MD_SAY("POLARIS MODEM:   0314 moves the .bXX segments into MPSS "
++	    "after MBA status 3; WCOMB + byte-wise + no unmap, only RMB\n");
++	MD_SAY("POLARIS MODEM:   after BOOT QDSP6SS is never read; the "
++	    "permanent MBA VA is never dereferenced or unmapped\n");
+ 	MD_SAY("POLARIS MODEM:   MBA.MBN + QMP on + three rails + seven clocks "
+ 	    "+ reset pulse + shared owners + two BOOT writes\n");
+ 	MD_SAY("POLARIS MODEM:   0x38004 stays read-only; 0x8 -> 0x8008 shared, "
+@@ -3581,7 +3594,7 @@
+ 			}
+ 		}
+ 		MD_SAY("POLARIS MODEM:   W2f step 1: %u loadable segments, "
+-		    "lowest paddr %#x (0313 will place the .bXX files)\n",
++		    "lowest paddr %#x (0314 will place the .bXX files)\n",
+ 		    loads, lowest);
+ 		/* ---- 0313: 0312 died on the memcpy() that used to be here.
+ 		 * ml_io_map() gives DEVICE memory; memcpy() uses wide/NEON
+@@ -3902,8 +3915,194 @@
+ 		MD_SAY("POLARIS MODEM: 0312 VERDICT: %s\n",
+ 		    status == MD_MBA_META_AUTH_OK
+ 		    ? "THE MBA AUTHENTICATED THE MODEM HEADER: the .bXX "
+-		      "segments can go in next (0313)"
++		      "segments can go in next (0314)"
+ 		    : "the MBA did not authenticate the modem header");
++		if (status == MD_MBA_META_AUTH_OK) {
++			/* ---- 0314 W2f step 3: MODEM.BXX -> MPSS 120 MB.
++			 * dipper modem_load_and_run() mi8_rproc.c:3434-3560.
++			 * Three rules from the last three panics are kept:
++			 *   only RMB after BOOT, never QDSP6SS (0306, section 87);
++			 *   never unmap ml_io_map()'s permanent VA (0310, section 89);
++			 *   never memcpy into a DEVICE map (0312, section 92) --
++			 *   WCOMB + byte-wise volatile, exactly what 0313 proved.
++			 * The files are consecutive 4 KiB blocks (section 93.1.1).
++			 * Any failure prints its reason and returns: goto out would
++			 * re-run the verdict / step 2 on a Q6 that is already up.
++			 * ---- */
++			struct {
++				uint32_t paddr, filesz, memsz, index;
++			} seg[32];
++			uint32_t nseg = 0, ph2, s2, lowest2 = ~0u, reloc, boot_addr;
++			uint32_t loaded = 0, used = 0, st2, w2, at2, j2, take2, from2;
++			uint32_t file_lba, outside = 0;
++			bool relocatable = FALSE;
++
++			if (!(md_mdt_copy[0] == 0x7f && md_mdt_copy[1] == 'E' &&
++			    md_mdt_copy[2] == 'L' && md_mdt_copy[3] == 'F')) {
++				MD_SAY("POLARIS MODEM:   W2f step 3: the staged "
++				    "MODEM.MDT is gone; nothing written\n");
++				return;
++			}
++			ph2 = (uint32_t)md_mdt_copy[44] |
++			    (uint32_t)md_mdt_copy[45] << 8;
++			for (s2 = 0; s2 < ph2 && nseg < 32; s2++) {
++				const uint8_t *p2 = md_mdt_copy + 52 + 32 * s2;
++				uint32_t ty2 = md_rd32(p2), pa2 = md_rd32(p2 + 12);
++				uint32_t fz2 = md_rd32(p2 + 16), mz2 = md_rd32(p2 + 20);
++				uint32_t fl2 = md_rd32(p2 + 24);
++
++				if (ty2 != 1 || ((fl2 >> 24) & 7) == 2 ||
++				    mz2 == 0 || fz2 > mz2) {
++					continue;
++				}
++				relocatable |= (fl2 & (1u << 27)) != 0;
++				if (pa2 < lowest2) {
++					lowest2 = pa2;
++				}
++				seg[nseg].paddr = pa2;
++				seg[nseg].filesz = fz2;
++				seg[nseg].memsz = mz2;
++				seg[nseg].index = s2;
++				nseg++;
++			}
++			reloc = relocatable ? lowest2 : (uint32_t)MD_MPSS_REGION;
++			boot_addr = relocatable ? (uint32_t)MD_MPSS_REGION : lowest2;
++			MD_SAY("POLARIS MODEM:   W2f step 3: %u segments from %u "
++			    "phdrs, lowest %#x, reloc %#x, boot_addr %#x, %s\n",
++			    nseg, ph2, lowest2, reloc, boot_addr,
++			    relocatable ? "RELOCATABLE" : "fixed");
++			for (s2 = 0; s2 < nseg; s2++) {
++				if (seg[s2].paddr < reloc ||
++				    (uint64_t)seg[s2].paddr - reloc +
++				    seg[s2].memsz > MD_MPSS_SIZE) {
++					outside++;
++				}
++			}
++			if (nseg == 0 || outside != 0) {
++				MD_SAY("POLARIS MODEM:   W2f step 3: %u segment(s) "
++				    "outside MPSS; nothing written\n", outside);
++				return;
++			}
++			for (s2 = 0; s2 < nseg; s2++) {
++				struct md_file_want want;
++				char name[16] = "MODEM.B00";
++				volatile uint8_t *dst;
++				vm_offset_t map_va, map_phys;
++				vm_size_t span;
++				uint64_t base;
++				uint32_t off;
++
++				want.name = name;
++				want.cluster = 0;
++				want.size = 0;
++				want.found = false;
++				file_lba = 0;
++				if (seg[s2].filesz != 0) {
++					/* the index is the PHDR index, not the segment
++					 * ordinal (dipper mi8_rproc.c:3517) */
++					name[7] = (char)('0' + (seg[s2].index / 10) % 10);
++					name[8] = (char)('0' + seg[s2].index % 10);
++					md_walk(md_image_cluster, md_find_entry, &want);
++					if (!want.found || want.cluster < 2 ||
++					    want.size != seg[s2].filesz) {
++						MD_SAY("POLARIS MODEM:   W2f step 3: "
++						    "segment %u: %s %s (%u bytes, MDT "
++						    "says %u); stopping\n", seg[s2].index,
++						    name, want.found ? "WRONG SIZE" : "MISSING",
++						    want.size, seg[s2].filesz);
++						return;
++					}
++					file_lba = md_geo.data_lba +
++					    (want.cluster - 2) * md_geo.spc;
++				}
++				base = (uint64_t)MD_MPSS_REGION +
++				    (seg[s2].paddr - reloc);
++				map_phys = (vm_offset_t)(base & ~(uint64_t)0x3fffu);
++				off = (uint32_t)(base - map_phys);
++				span = (vm_size_t)((off + seg[s2].memsz +
++				    (uint32_t)0x3fffu) & ~(uint32_t)0x3fffu);
++				map_va = ml_io_map_unmappable(map_phys, span,
++				    MD_WIMG_WCOMB);
++				if (map_va == 0) {
++					MD_SAY("POLARIS MODEM:   W2f step 3: segment %u "
++					    "no WCOMB map for %#llx (%u bytes); "
++					    "stopping\n", seg[s2].index,
++					    (unsigned long long)base, seg[s2].memsz);
++					return;
++				}
++				dst = (volatile uint8_t *)(void *)(map_va + off);
++				MD_SAY("POLARIS MODEM:   W2f step 3: segment %u/%u "
++				    "b%02u paddr %#x mem %u file %u -> WCOMB "
++				    "VA %#llx\n", s2 + 1, nseg, seg[s2].index,
++				    seg[s2].paddr, seg[s2].memsz, seg[s2].filesz,
++				    (unsigned long long)map_va);
++				for (at2 = 0; at2 < seg[s2].memsz; at2 += MD_BLOCK) {
++					take2 = seg[s2].memsz - at2;
++					if (take2 > MD_BLOCK) {
++						take2 = MD_BLOCK;
++					}
++					from2 = 0;
++					if (at2 < seg[s2].filesz) {
++						from2 = seg[s2].filesz - at2;
++						if (from2 > take2) {
++							from2 = take2;
++						}
++						if (!md_read(file_lba + at2 / MD_BLOCK,
++						    md_block)) {
++							MD_SAY("POLARIS MODEM:   W2f "
++							    "step 3: segment %u block %u "
++							    "read failed; stopping\n",
++							    seg[s2].index, at2 / MD_BLOCK);
++							return;
++						}
++					}
++					for (j2 = 0; j2 < take2; j2++) {
++						dst[at2 + j2] = (j2 < from2) ?
++						    md_block[j2] : 0;
++					}
++					__asm__ volatile ("dsb sy" ::: "memory");
++					if ((at2 & 0xfffffu) == 0) {
++						md_qmp_ms();
++					}
++				}
++				loaded += seg[s2].memsz;
++				used += seg[s2].filesz;
++				if (md_rd(rmb, MD_RMB_CODE_LENGTH) == 0) {
++					md_wr(rmb, MD_RMB_CODE_START, boot_addr);
++					md_wr(rmb, MD_RMB_COMMAND, 2);
++				}
++				md_wr(rmb, MD_RMB_CODE_LENGTH, loaded);
++				st2 = md_rd(rmb, MD_RMB_MBA_STATUS);
++				MD_SAY("POLARIS MODEM:   W2f step 3: segment %u "
++				    "done, loaded %u (%u from files), "
++				    "RMB_CODE_LENGTH %u, MBA status %d\n",
++				    seg[s2].index, loaded, used, loaded,
++				    (int32_t)st2);
++				if ((int32_t)st2 < 0) {
++					MD_SAY("POLARIS MODEM:   W2f step 3: THE MBA "
++					    "REJECTS SEGMENT %u; stopping\n",
++					    seg[s2].index);
++					return;
++				}
++			}
++			for (w2 = 0; w2 < 10000u; w2++) {
++				st2 = md_rd(rmb, MD_RMB_MBA_STATUS);
++				if (st2 == MD_MBA_AUTH_COMPLETE ||
++				    (int32_t)st2 < 0) {
++					break;
++				}
++				md_qmp_ms();
++			}
++			MD_SAY("POLARIS MODEM:   W2f step 3: %u segments, %u "
++			    "bytes of memory (%u from files), final MBA "
++			    "status %u after ~%u ms\n", nseg, loaded, used,
++			    st2, w2);
++			MD_SAY("POLARIS MODEM: 0314 VERDICT: %s\n",
++			    st2 == MD_MBA_AUTH_COMPLETE
++			    ? "THE MBA AUTHENTICATED THE WHOLE MODEM IMAGE "
++			      "AND STARTED IT"
++			    : "the MBA did not report AUTH COMPLETE (status 4)");
++		}
+ 		return;	/* mi8rp_hold: Q6 owns the XPU; touch nothing else */
+ 	}
+ }
