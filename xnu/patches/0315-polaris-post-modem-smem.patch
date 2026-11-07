@@ -1,0 +1,510 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -72,6 +72,16 @@
+  * no QDSP6SS read after BOOT.  Per segment the MBA is told
+  * RMB_CODE_LENGTH; the first also gets CODE_START + COMMAND=2.
+  * The verdict is MBA_AUTH_COMPLETE (status 4).  Level 29.
++ *
++ * 0315 adds W2f step 4: a READ-ONLY SMEM census after MBA status 4.
++ * 0314 proved the whole modem image was authenticated and started;
++ * it did not prove the modem ever speaks.  dipper's modem_watch()
++ * (mi8_rproc.c:3376) watches SMP2P item 435 for the slave-kernel
++ * DSP_READY bit and GLINK 478/479/480.  Only AP-owned and global
++ * partitions are read (0164: a foreign one parks the core on the
++ * XPU bus forever), all reads are byte-wise through one WCOMB map,
++ * no item is allocated and no doorbell is rung.  Four samples over
++ * 3.5 s so a late item is not called missing.  Level 30.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -381,15 +391,15 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 29) {
+-		/* 0314: green W2e + authenticated mdt + the .bXX segments. */
++	if (polaris_modem_level() == 30) {
++		/* 0315: green W2e + W2f, then a read-only post-modem SMEM census. */
+ 		thread_t thread;
+ 
+ 		if (kernel_thread_start(md_w2e_thread, NULL, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+-			MD_SAY("POLARIS MODEM: 0314: W2e+W2f thread started\n");
++			MD_SAY("POLARIS MODEM: 0315: W2e+W2f thread started\n");
+ 		} else {
+-			MD_SAY("POLARIS MODEM: 0314: could not start the W2e+W2f thread\n");
++			MD_SAY("POLARIS MODEM: 0315: could not start the W2e+W2f thread\n");
+ 		}
+ 	} else if (polaris_modem_level() == 23) {
+ 		/* 0305: all seven mss clocks and the Q6's sleep clock, on and back. */
+@@ -3384,6 +3394,435 @@
+ #define MD_MBA_META_AUTH_OK	3u
+ #define MD_MBA_AUTH_COMPLETE	4u	/* dipper mi8_rproc.c:2260 */
+ 
++/* ---- 0315 W2f step 4: is the modem talking?  SMEM, READ ONLY -----------
++ * 0314 got MBA status 4: the whole image was authenticated and started.
++ * That proves the bytes were accepted, not that the modem is alive on the
++ * other side of the transport.  dipper answers that in modem_watch()
++ * (mi8_rproc.c:3376): the modem publishes its half of the SMP2P pair as
++ * item 435 in the ap <-> modem partition, its "slave-kernel" entry carries
++ * DSP_READY (1 << 1), and GLINK allocates 478 / 479 / 480 once the transport
++ * is up.  0167's early census saw the WLAN set all zero because this kernel
++ * had never started a remote processor; 0315 is the first build that has.
++ *
++ * READ ONLY: no item is allocated, no doorbell is rung, no service started.
++ * All reads are byte-wise through one WCOMB map, exactly as
++ * bsd/dev/polaris_wifi.c has done since 0154.  The hard rule is the 0164
++ * one: a partition the AP is not a party to is XPU-guarded and reading it
++ * parks the core on the bus forever, so md_smem_ours() gates every header.
++ *
++ * This runs after the 0314 verdict is already in the ring, so a stalled read
++ * cannot cost any W2e / W2f evidence.
++ * ------------------------------------------------------------------------- */
++#define MD_SMEM_PHYS		0x86000000ull
++#define MD_SMEM_SIZE		0x00200000u
++#define MD_SMEM_TOC_AT		(MD_SMEM_SIZE - 0x1000u)
++#define MD_SMEM_CANARY		0xa5a5u
++#define MD_SMEM_HOST_AP		0u
++#define MD_SMEM_HOST_GLOBAL	0xfffeu
++#define MD_SMEM_ITEM_MSS	435u	/* modem's SMP2P half: mi8_rproc.c:152 */
++#define MD_SMEM_ITEM_MSS_AP	428u	/* ours */
++#define MD_SMEM_ITEM_GLINK_DESC	478u
++#define MD_SMEM_ITEM_GLINK_FIFO	479u
++#define MD_SMEM_ITEM_GLINK_FIFO2 480u
++#define MD_SMEM_ITEM_CRASH	422u	/* 421 + modem pid 1 */
++#define MD_SMEM_ITEMS_MAX	64u
++#define MD_SMP2P_MAGIC		0x504d5324u	/* "$SMP" */
++#define MD_SMP2P_READY		(1u << 1)	/* DSP_READY */
++#define MD_SMEM_SAMPLES		4u
++
++struct md_smem_toc {
++	uint8_t magic[4];
++	uint32_t version, count, reserved[5];
++};
++struct md_smem_toc_entry {
++	uint32_t offset, size, flags;
++	uint16_t host0, host1;
++	uint32_t cacheline, reserved[7];
++};
++struct md_smem_part {
++	uint8_t magic[4];
++	uint16_t host0, host1;
++	uint32_t size, free_uncached, free_cached, reserved[3];
++};
++struct md_smem_item {
++	uint16_t canary, item;
++	uint32_t size;
++	uint16_t padding_data, padding_header;
++	uint32_t reserved;
++};
++struct md_smp2p {
++	uint32_t magic, version;
++	uint16_t local, remote, total, valid;
++	uint32_t flags;
++	struct {
++		char name[16];
++		uint32_t value;
++	} entry[16];
++};
++struct md_smem_seen {
++	uint32_t ids[MD_SMEM_ITEMS_MAX];
++	uint32_t count, items, walked, skipped;
++	uint32_t mss_at, mss_size, crash_at, crash_size;
++};
++
++static volatile uint8_t *md_smem_va;
++
++static bool
++md_smem_peek(uint32_t at, void *to, uint32_t size)
++{
++	uint32_t i;
++
++	if (md_smem_va == NULL) {
++		md_smem_va = (volatile uint8_t *)ml_io_map_unmappable(
++		    (vm_offset_t)MD_SMEM_PHYS, (vm_size_t)MD_SMEM_SIZE,
++		    MD_WIMG_WCOMB);
++	}
++	if (md_smem_va == NULL || at > MD_SMEM_SIZE ||
++	    size > MD_SMEM_SIZE - at) {
++		return false;
++	}
++	for (i = 0; i < size; i++) {
++		((uint8_t *)to)[i] = md_smem_va[at + i];
++	}
++	return true;
++}
++
++/* 0164: only the AP's own partitions and the global one may be touched. */
++static bool
++md_smem_ours(uint16_t a, uint16_t b)
++{
++	return a == MD_SMEM_HOST_AP || b == MD_SMEM_HOST_AP ||
++	    a == MD_SMEM_HOST_GLOBAL || b == MD_SMEM_HOST_GLOBAL;
++}
++
++static bool
++md_smem_prt(const uint8_t *magic)
++{
++	return magic[0] == '$' && magic[1] == 'P' &&
++	    magic[2] == 'R' && magic[3] == 'T';
++}
++
++static bool
++md_smem_toc(struct md_smem_toc *t)
++{
++	return md_smem_peek(MD_SMEM_TOC_AT, t, sizeof(*t)) &&
++	    t->magic[0] == '$' && t->magic[1] == 'T' &&
++	    t->magic[2] == 'O' && t->magic[3] == 'C' &&
++	    t->version == 1 && t->count <= MD_SMEM_ITEMS_MAX;
++}
++
++static bool
++md_smem_toc_entry(const struct md_smem_toc *t, uint32_t i,
++    struct md_smem_toc_entry *e)
++{
++	(void)t;
++	return md_smem_peek(MD_SMEM_TOC_AT + (uint32_t)sizeof(*t) +
++	    i * (uint32_t)sizeof(*e), e, sizeof(*e));
++}
++
++static void
++md_smem_seen_add(struct md_smem_seen *s, uint32_t id)
++{
++	uint32_t i;
++
++	for (i = 0; i < s->count; i++) {
++		if (s->ids[i] == id) {
++			return;
++		}
++	}
++	if (s->count < MD_SMEM_ITEMS_MAX) {
++		s->ids[s->count++] = id;
++	}
++}
++
++static bool
++md_smem_seen_has(const struct md_smem_seen *s, uint32_t id)
++{
++	uint32_t i;
++
++	for (i = 0; i < s->count; i++) {
++		if (s->ids[i] == id) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++md_smem_note(struct md_smem_seen *s, uint32_t at,
++    const struct md_smem_item *e, uint32_t sample)
++{
++	md_smem_seen_add(s, e->item);
++	s->items++;
++	if (sample == 0 && s->items <= MD_SMEM_ITEMS_MAX) {
++		MD_SAY("POLARIS MODEM:   W2f step 4:   item %u at %#x, %u bytes\n",
++		    e->item, at, e->size - e->padding_data);
++	}
++	if (e->item == MD_SMEM_ITEM_MSS) {
++		s->mss_at = at;
++		s->mss_size = e->size - e->padding_data;
++	}
++	if (e->item == MD_SMEM_ITEM_CRASH) {
++		s->crash_at = at;
++		s->crash_size = e->size - e->padding_data;
++	}
++}
++
++/* Bottom-up to free_uncached, then top-down from the cacheline-aligned end. */
++static void
++md_smem_walk_part(uint32_t part, uint32_t psize, uint32_t cacheline,
++    struct md_smem_seen *s, uint32_t sample)
++{
++	struct md_smem_part h;
++	struct md_smem_item e;
++	uint32_t at, step_back, guard;
++
++	if (!md_smem_peek(part, &h, sizeof(h))) {
++		MD_SAY("POLARIS MODEM:   W2f step 4:   %#x: unreadable $PRT\n", part);
++		return;
++	}
++	if (!md_smem_prt(h.magic)) {
++		MD_SAY("POLARIS MODEM:   W2f step 4:   %#x: no $PRT\n", part);
++		return;
++	}
++	if (h.free_uncached > h.size || h.free_cached > h.size || h.size > psize) {
++		MD_SAY("POLARIS MODEM:   W2f step 4:   %#x: bad marks (%u/%u of %u)\n",
++		    part, h.free_uncached, h.free_cached, h.size);
++		return;
++	}
++	if (sample == 0) {
++		MD_SAY("POLARIS MODEM:   W2f step 4:   $PRT hosts %u/%u size %u "
++		    "free %u/%u cacheline %u\n", h.host0, h.host1, h.size,
++		    h.free_uncached, h.free_cached, cacheline);
++	}
++	for (at = (uint32_t)sizeof(h), guard = 0;
++	    at + sizeof(e) <= h.free_uncached && guard++ < 512u;) {
++		if (!md_smem_peek(part + at, &e, sizeof(e)) ||
++		    e.canary != MD_SMEM_CANARY || e.size > h.size) {
++			break;
++		}
++		md_smem_note(s, part + at + (uint32_t)sizeof(e) +
++		    e.padding_header, &e, sample);
++		at += (uint32_t)sizeof(e) + e.padding_header + e.size;
++	}
++	if (cacheline == 0 || (cacheline & (cacheline - 1)) != 0) {
++		return;
++	}
++	step_back = ((uint32_t)sizeof(e) + cacheline - 1) & ~(cacheline - 1);
++	if (step_back > h.size) {
++		return;
++	}
++	for (at = h.size - step_back, guard = 0;
++	    at > h.free_cached && at < h.size && guard++ < 512u;) {
++		if (!md_smem_peek(part + at, &e, sizeof(e)) ||
++		    e.canary != MD_SMEM_CANARY || e.size > at) {
++			break;
++		}
++		md_smem_note(s, part + at - e.size, &e, sample);
++		if (e.size + step_back > at) {
++			break;
++		}
++		at -= e.size + step_back;
++	}
++}
++
++static bool
++md_smem_name_is(const char *n, const char *want)
++{
++	uint32_t i;
++
++	for (i = 0; want[i] != 0; i++) {
++		if (n[i] != want[i]) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++md_smem_smp2p(uint32_t at, uint32_t size, uint32_t elapsed_ms)
++{
++	struct md_smp2p w;
++	uint8_t *raw = (uint8_t *)&w;
++	uint32_t i, j, take, valid, state = 0;
++	bool have_state = FALSE;
++	char name[17];
++
++	if (size < 20u) {
++		MD_SAY("POLARIS MODEM:   W2f step 4:   item 435 is only %u bytes\n",
++		    size);
++		return false;
++	}
++	for (i = 0; i < (uint32_t)sizeof(w); i++) {
++		raw[i] = 0;
++	}
++	take = size < (uint32_t)sizeof(w) ? size : (uint32_t)sizeof(w);
++	if (!md_smem_peek(at, &w, take)) {
++		return false;
++	}
++	if (w.magic != MD_SMP2P_MAGIC) {
++		MD_SAY("POLARIS MODEM:   W2f step 4: t=+%u ms: item 435 magic "
++		    "%#x, want %#x\n", elapsed_ms, w.magic, MD_SMP2P_MAGIC);
++		return false;
++	}
++	valid = w.valid < 16u ? w.valid : 16u;
++	MD_SAY("POLARIS MODEM:   W2f step 4: t=+%u ms: item 435 SMP2P magic ok, "
++	    "version %#x, local %u remote %u, flags %#x, %u/%u entries\n",
++	    elapsed_ms, w.version, w.local, w.remote, w.flags, valid, w.total);
++	for (i = 0; i < valid; i++) {
++		for (j = 0; j < 16u; j++) {
++			name[j] = w.entry[i].name[j];
++		}
++		name[16] = 0;
++		MD_SAY("POLARIS MODEM:   W2f step 4:   [%u] \"%s\" = %#x\n",
++		    i, name, w.entry[i].value);
++		if (md_smem_name_is(name, "slave-kernel")) {
++			state = w.entry[i].value;
++			have_state = TRUE;
++		}
++	}
++	MD_SAY("POLARIS MODEM:   W2f step 4: t=+%u ms: slave-kernel %s (%#x), "
++	    "DSP_READY %s\n", elapsed_ms, have_state ? "present" : "MISSING",
++	    state, (have_state && (state & MD_SMP2P_READY) != 0) ? "SET" : "not set");
++	return have_state && (state & MD_SMP2P_READY) != 0;
++}
++
++static void
++md_smem_crash(uint32_t at, uint32_t size)
++{
++	char line[65];
++	uint32_t take = size < 64u ? size : 64u, i;
++
++	for (i = 0; i < take; i++) {
++		uint8_t c = 0;
++
++		if (!md_smem_peek(at + i, &c, 1)) {
++			c = 0;
++		}
++		line[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
++	}
++	line[take] = 0;
++	MD_SAY("POLARIS MODEM:   W2f step 4:   crash reason 422: \"%s\"\n",
++	    line);
++}
++
++static void
++md_smem_census(uint32_t sample, uint32_t elapsed_ms,
++    bool *ever_435, bool *ever_ready, bool *ever_glink)
++{
++	struct md_smem_toc toc;
++	struct md_smem_seen s;
++	uint32_t i;
++
++	s.count = 0;
++	s.items = 0;
++	s.walked = 0;
++	s.skipped = 0;
++	s.mss_at = 0;
++	s.mss_size = 0;
++	s.crash_at = 0;
++	s.crash_size = 0;
++	for (i = 0; i < MD_SMEM_ITEMS_MAX; i++) {
++		s.ids[i] = 0;
++	}
++	if (!md_smem_toc(&toc)) {
++		MD_SAY("POLARIS MODEM:   W2f step 4: t=+%u ms: no $TOC at %#x\n",
++		    elapsed_ms, MD_SMEM_TOC_AT);
++		return;
++	}
++	if (sample == 0) {
++		MD_SAY("POLARIS MODEM:   W2f step 4: $TOC version %u, %u entries "
++		    "at %#x (SMEM phys %#x, %u bytes, WCOMB, byte-wise)\n",
++		    toc.version, toc.count, MD_SMEM_TOC_AT,
++		    (uint32_t)MD_SMEM_PHYS, MD_SMEM_SIZE);
++	}
++	for (i = 0; i < toc.count; i++) {
++		struct md_smem_toc_entry e;
++
++		if (!md_smem_toc_entry(&toc, i, &e)) {
++			break;
++		}
++		if (e.offset == 0 || e.size == 0 || e.size > MD_SMEM_TOC_AT ||
++		    e.offset > MD_SMEM_TOC_AT - e.size) {
++			continue;
++		}
++		if (!md_smem_ours(e.host0, e.host1)) {
++			if (sample == 0) {
++				MD_SAY("POLARIS MODEM:   W2f step 4:   toc %u: hosts "
++				    "%u/%u at %#x: NOT the AP's, not read\n",
++				    i, e.host0, e.host1, e.offset);
++			}
++			s.skipped++;
++			continue;
++		}
++		if (sample == 0) {
++			MD_SAY("POLARIS MODEM:   W2f step 4:   toc %u: hosts %u/%u "
++			    "at %#x, %u bytes, cacheline %u\n", i, e.host0,
++			    e.host1, e.offset, e.size, e.cacheline);
++		}
++		md_smem_walk_part(e.offset, e.size, e.cacheline, &s, sample);
++		s.walked++;
++	}
++	MD_SAY("POLARIS MODEM:   W2f step 4: t=+%u ms: %u partitions walked, "
++	    "%u skipped, %u items; 435 %s, 428 %s, GLINK 478 %s 479 %s 480 %s, "
++	    "crash 422 %s\n", elapsed_ms, s.walked, s.skipped, s.items,
++	    md_smem_seen_has(&s, MD_SMEM_ITEM_MSS) ? "yes" : "no",
++	    md_smem_seen_has(&s, MD_SMEM_ITEM_MSS_AP) ? "yes" : "no",
++	    md_smem_seen_has(&s, MD_SMEM_ITEM_GLINK_DESC) ? "yes" : "no",
++	    md_smem_seen_has(&s, MD_SMEM_ITEM_GLINK_FIFO) ? "yes" : "no",
++	    md_smem_seen_has(&s, MD_SMEM_ITEM_GLINK_FIFO2) ? "yes" : "no",
++	    md_smem_seen_has(&s, MD_SMEM_ITEM_CRASH) ? "yes" : "no");
++	if (sample == 0) {
++		printf("POLARIS MODEM:   W2f step 4: %u distinct ids:", s.count);
++		for (i = 0; i < s.count; i++) {
++			printf(" %u", s.ids[i]);
++		}
++		printf("\n");
++		sweet_log_flush_now();
++	}
++	if (s.mss_at != 0) {
++		*ever_435 = TRUE;
++		if (md_smem_smp2p(s.mss_at, s.mss_size, elapsed_ms)) {
++			*ever_ready = TRUE;
++		}
++	}
++	if (s.crash_at != 0) {
++		md_smem_crash(s.crash_at, s.crash_size);
++	}
++	if (md_smem_seen_has(&s, MD_SMEM_ITEM_GLINK_DESC) ||
++	    md_smem_seen_has(&s, MD_SMEM_ITEM_GLINK_FIFO) ||
++	    md_smem_seen_has(&s, MD_SMEM_ITEM_GLINK_FIFO2)) {
++		*ever_glink = TRUE;
++	}
++}
++
++static void
++md_smem_post_modem(void)
++{
++	static const uint32_t gaps[MD_SMEM_SAMPLES] = { 0u, 500u, 1000u, 2000u };
++	bool ever_435 = FALSE, ever_ready = FALSE, ever_glink = FALSE;
++	uint32_t s, k, elapsed = 0;
++
++	MD_SAY("POLARIS MODEM:   W2f step 4: post-modem SMEM census starts: "
++	    "READ ONLY, nothing written, no doorbell, no service\n");
++	for (s = 0; s < MD_SMEM_SAMPLES; s++) {
++		for (k = 0; k < gaps[s]; k++) {
++			md_qmp_ms();
++		}
++		elapsed += gaps[s];
++		md_smem_census(s, elapsed, &ever_435, &ever_ready, &ever_glink);
++	}
++	MD_SAY("POLARIS MODEM: 0315 VERDICT: %s\n",
++	    ever_ready ? (ever_glink
++	        ? "THE MODEM IS TALKING: item 435 reached DSP_READY and GLINK items exist"
++	        : "THE MODEM IS TALKING: item 435 reached DSP_READY, no GLINK items yet")
++	    : (ever_435
++	        ? "item 435 APPEARED but slave-kernel never set DSP_READY"
++	        : "NOT A WORD FROM THE MODEM IN SMEM: item 435 never appeared"));
++	MD_SAY("POLARIS MODEM:   0315 read only: SMEM untouched, no doorbell "
++	    "rung, the modem is left running\n");
++}
++
+ static bool
+ md_clock_on(vm_offset_t gcc, unsigned i)
+ {
+@@ -3463,8 +3902,8 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-	MD_SAY("POLARIS MODEM: ======== build 0314 alive: W2e + W2f mdt "
+-	    "+ .bXX segments (level 29) ========\n");
++	MD_SAY("POLARIS MODEM: ======== build 0315 alive: W2e + W2f + "
++	    "post-modem SMEM (level 30) ========\n");
+ 	MD_SAY("POLARIS MODEM:   0311 is green: W2e verdict + phase W done, "
+ 	    "SpringBoard ran to FB tick 11460; the 12 steps are FROZEN\n");
+ 	MD_SAY("POLARIS MODEM:   0312 W2f step 1: MODEM.MDT -> %#llx while "
+@@ -3477,6 +3916,10 @@
+ 	    "0296 already proved (0x96a00000)\n");
+ 	MD_SAY("POLARIS MODEM:   0314 moves the .bXX segments into MPSS "
+ 	    "after MBA status 3; WCOMB + byte-wise + no unmap, only RMB\n");
++	MD_SAY("POLARIS MODEM:   0315 then reads SMEM: item 435 slave-kernel "
++	    "DSP_READY + GLINK 478/479/480, AP/global partitions ONLY\n");
++	MD_SAY("POLARIS MODEM:   0315 is READ ONLY: no SMEM item allocated, "
++	    "no doorbell rung, no service started\n");
+ 	MD_SAY("POLARIS MODEM:   after BOOT QDSP6SS is never read; the "
+ 	    "permanent MBA VA is never dereferenced or unmapped\n");
+ 	MD_SAY("POLARIS MODEM:   MBA.MBN + QMP on + three rails + seven clocks "
+@@ -4102,8 +4545,11 @@
+ 			    ? "THE MBA AUTHENTICATED THE WHOLE MODEM IMAGE "
+ 			      "AND STARTED IT"
+ 			    : "the MBA did not report AUTH COMPLETE (status 4)");
++			if (st2 == MD_MBA_AUTH_COMPLETE) {
++				md_smem_post_modem();
++			}
+ 		}
+-		return;	/* mi8rp_hold: Q6 owns the XPU; touch nothing else */
++		return;	/* Q6 owns the XPU; only AP-owned SMEM was read */
+ 	}
+ }
+ 
