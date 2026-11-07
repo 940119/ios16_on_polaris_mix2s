@@ -1,0 +1,137 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -54,6 +54,14 @@
+  * once the Q6 is up.  No .bXX segments yet -- those are 0313.  Only
+  * RMB is touched after BOOT; QDSP6SS stays untouched and the permanent
+  * mapping stays mapped.  Level 27.
++ *
++ * 0313 fixes W2f step 1.  0312 died at memcpy() into ml_io_map()'s
++ * DEVICE mapping: md_load_copy() works because it writes byte-wise
++ * volatile, while memcpy() uses wide/NEON stores.  0296 already
++ * proved MBA+0x100000 is writable through
++ * ml_io_map_unmappable(..., MD_WIMG_WCOMB) with volatile stores.
++ * 0313 uses that mapping, byte-wise, with 1a/1b/1c step logs, and
++ * puts MD_LOAD_MAP_SIZE back to 0311's proven 256 KiB.  Level 28.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -363,15 +371,15 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 27) {
+-		/* 0312: green W2e + W2f step 1/2 (MODEM.MDT header authentication). */
++	if (polaris_modem_level() == 28) {
++		/* 0313: green W2e + W2f mdt over the WCOMB mapping 0296 proved. */
+ 		thread_t thread;
+ 
+ 		if (kernel_thread_start(md_w2e_thread, NULL, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+-			MD_SAY("POLARIS MODEM: 0312: W2e+W2f thread started\n");
++			MD_SAY("POLARIS MODEM: 0313: W2e+W2f thread started\n");
+ 		} else {
+-			MD_SAY("POLARIS MODEM: 0312: could not start the W2e+W2f thread\n");
++			MD_SAY("POLARIS MODEM: 0313: could not start the W2e+W2f thread\n");
+ 		}
+ 	} else if (polaris_modem_level() == 23) {
+ 		/* 0305: all seven mss clocks and the Q6's sleep clock, on and back. */
+@@ -1920,7 +1928,7 @@
+ #define MD_MBA_FILE_LBA		36131u
+ #define MD_MBA_FILE_BYTES	238304u
+ #define MD_MBA_FILE_BLOCKS	59u
+-#define MD_LOAD_MAP_SIZE	0x00110000u	/* 0312: 1 MiB + 64 KiB, covers MBA.MBN and MODEM.MDT at +0x100000 */
++#define MD_LOAD_MAP_SIZE	0x00040000u	/* 0313: back to 0311's proven 256 KiB; the mdt uses its own WCOMB map */
+ 
+ static uint8_t md_mba_image[MD_MBA_FILE_BLOCKS * MD_BLOCK]
+     __attribute__((aligned(4096)));
+@@ -3444,8 +3452,8 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-	MD_SAY("POLARIS MODEM: ======== build 0312 alive: W2e + W2f mdt "
+-	    "header auth (level 27) ========\n");
++	MD_SAY("POLARIS MODEM: ======== build 0313 alive: W2e + W2f mdt "
++	    "over WCOMB (level 28) ========\n");
+ 	MD_SAY("POLARIS MODEM:   0311 is green: W2e verdict + phase W done, "
+ 	    "SpringBoard ran to FB tick 11460; the 12 steps are FROZEN\n");
+ 	MD_SAY("POLARIS MODEM:   0312 W2f step 1: MODEM.MDT -> %#llx while "
+@@ -3453,6 +3461,9 @@
+ 	    (unsigned long long)(MD_MBA_REGION + MD_MBA_META_OFFSET));
+ 	MD_SAY("POLARIS MODEM:   0312 W2f step 2: after the Q6 is up, "
+ 	    "RMB_META_DATA + COMMAND=1, wait for MBA_STATUS 3\n");
++	MD_SAY("POLARIS MODEM:   0312 died at memcpy() into the DEVICE "
++	    "mapping; 0313 stages the mdt byte-wise through the WCOMB map "
++	    "0296 already proved (0x96a00000)\n");
+ 	MD_SAY("POLARIS MODEM:   NO .bXX segments this build; only RMB is "
+ 	    "touched after BOOT, QDSP6SS never, no unmap ever\n");
+ 	MD_SAY("POLARIS MODEM:   MBA.MBN + QMP on + three rails + seven clocks "
+@@ -3572,18 +3583,58 @@
+ 		MD_SAY("POLARIS MODEM:   W2f step 1: %u loadable segments, "
+ 		    "lowest paddr %#x (0313 will place the .bXX files)\n",
+ 		    loads, lowest);
+-		memcpy((void *)(region + MD_MBA_META_OFFSET), md_mdt_copy,
+-		    mdt.size);
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		if (memcmp((void *)(region + MD_MBA_META_OFFSET), md_mdt_copy,
+-		    mdt.size) != 0) {
+-			why = "MODEM.MDT reads back differently at MBA+1MB";
+-			goto out;
++		/* ---- 0313: 0312 died on the memcpy() that used to be here.
++		 * ml_io_map() gives DEVICE memory; memcpy() uses wide/NEON
++		 * stores, which are not legal there.  md_load_copy() works
++		 * because it is a volatile byte loop.  0296 already PROVED
++		 * MBA+0x100000 is writable via ml_io_map_unmappable(...,
++		 * MD_WIMG_WCOMB) with volatile stores.  Use that, byte-wise,
++		 * with step logs that name the failing store.  Never unmap it
++		 * (0310 taught us what a bad unmap costs). ---- */
++		{
++			volatile uint8_t *meta;
++			vm_offset_t meta_va;
++			uint32_t bad = 0, probe;
++
++			meta_va = ml_io_map_unmappable(
++			    (vm_offset_t)(MD_MBA_REGION + MD_MBA_META_OFFSET),
++			    0x10000u, MD_WIMG_WCOMB);
++			MD_SAY("POLARIS MODEM:   W2f step 1a: WCOMB map of %#llx: "
++			    "%s\n",
++			    (unsigned long long)(MD_MBA_REGION + MD_MBA_META_OFFSET),
++			    meta_va ? "ok" : "FAILED");
++			if (meta_va == 0) {
++				why = "the WCOMB metadata mapping failed";
++				goto out;
++			}
++			meta = (volatile uint8_t *)(void *)meta_va;
++			*(volatile uint32_t *)(void *)meta = 0x4d54444du;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			probe = *(volatile uint32_t *)(void *)meta;
++			MD_SAY("POLARIS MODEM:   W2f step 1a: probe word %#x "
++			    "(want 0x4d54444d)\n", probe);
++			MD_SAY("POLARIS MODEM:   W2f step 1b: %u bytes BYTE-WISE "
++			    "(no memcpy on device memory)\n", mdt.size);
++			for (i = 0; i < mdt.size; i++) {
++				meta[i] = md_mdt_copy[i];
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			MD_SAY("POLARIS MODEM:   W2f step 1c: reading back "
++			    "byte-wise\n");
++			for (i = 0; i < mdt.size; i++) {
++				if (meta[i] != md_mdt_copy[i]) {
++					bad++;
++				}
++			}
++			if (bad != 0) {
++				why = "MODEM.MDT reads back differently at MBA+1MB";
++				goto out;
++			}
++			MD_SAY("POLARIS MODEM:   W2f step 1: %u bytes at %#llx "
++			    "READ BACK THE SAME (WCOMB, byte-wise), in place before "
++			    "the owner change\n", mdt.size,
++			    (unsigned long long)(MD_MBA_REGION + MD_MBA_META_OFFSET));
+ 		}
+-		MD_SAY("POLARIS MODEM:   W2f step 1: %u bytes at %#llx READ BACK "
+-		    "THE SAME; the metadata is in place before the owner change\n",
+-		    mdt.size,
+-		    (unsigned long long)(MD_MBA_REGION + MD_MBA_META_OFFSET));
+ 	}
+ 
+ 	/* ---- step 4: hand mba and mpss to shared owners, EARLY ---- */
