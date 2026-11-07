@@ -1,0 +1,351 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -134,6 +134,16 @@
+  * answers EVERY OPEN (mi8_glink.c:687).  0320 does the same, keeps
+  * pumping at every sample, and decodes commands + channel names.
+  * Level 35.
++ *
++ * 0321: all three OPENs were acknowledged and consumed (478 went
++ * to 0x20 0x20 0x50 0x50), yet every later sample was idle.  dipper
++ * open_channel():575 shows why: the AP must ALSO open IPCRTR and
++ * offer() local intents before the modem has a buffer for QRTR.
++ * The 0320 thread also returned at FB tick ~7200 while the system
++ * kept drawing to tick 14880, leaving minutes with no pump at all.
++ * 0321 sends AP OPEN + 3 INTENT frames, decodes QRTR v1 headers,
++ * releases complete DATA with DONE_REUSE, and keeps watching.
++ * Level 36.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -443,15 +453,15 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 35) {
+-		/* 0320: acknowledge every OPEN the modem sent. */
++	if (polaris_modem_level() == 36) {
++		/* 0321: AP opens IPCRTR, offers intents, keeps watching. */
+ 		thread_t thread;
+ 
+ 		if (kernel_thread_start(md_w2e_thread, NULL, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+-			MD_SAY("POLARIS MODEM: 0320: W2e+W2f thread started\n");
++			MD_SAY("POLARIS MODEM: 0321: W2e+W2f thread started\n");
+ 		} else {
+-			MD_SAY("POLARIS MODEM: 0320: could not start the W2e+W2f thread\n");
++			MD_SAY("POLARIS MODEM: 0321: could not start the W2e+W2f thread\n");
+ 		}
+ 	} else if (polaris_modem_level() == 23) {
+ 		/* 0305: all seven mss clocks and the Q6's sleep clock, on and back. */
+@@ -3517,6 +3527,10 @@
+ #define MD_GLINK_MAX_OPEN	8u	/* at most 8 OPEN_ACKs per batch */
+ #define MD_GLINK_FEATURES	1u	/* mi8_glink_start():890 */
+ #define MD_GLINK_CID		1u
++/* 0321: 0320's thread returned at FB tick ~7200 while the system
++ * kept drawing to tick 14880.  One md_qmp_ms() is ~14 ms on this
++ * device, so 3000 ticks keeps the pump alive for ~40 s more. */
++#define MD_GLINK_WATCH_TICKS	3000u
+ 
+ struct md_smem_toc {
+ 	uint8_t magic[4];
+@@ -3561,8 +3575,8 @@
+  * the offsets of the three GLINK items, filled while walking SMEM. */
+ static vm_offset_t md_apcs;
+ static uint32_t md_glink_desc_at, md_glink_tx_at, md_glink_rx_at;
+-static bool md_glink_acked;
+-static uint32_t md_glink_opens;
++static bool md_glink_acked, md_glink_offered, md_glink_quiet;
++static uint32_t md_glink_opens, md_glink_data_count, md_glink_done_count;
+ 
+ static bool
+ md_smem_peek(uint32_t at, void *to, uint32_t size)
+@@ -4012,17 +4026,14 @@
+ 	    "OPEN IPCRTR / INTENT\n", features, rxhead);
+ }
+ 
+-/* 0320: pump the GLINK rx FIFO the way dipper pump() does.
+- * 0319 answered only the LAST OPEN in a batch of three; dipper answers
+- * EVERY OPEN (mi8_glink.c:687: case OPEN: say(g, OPEN_ACK, cid, 0,
+- * NULL, 0)).  The 0319 ring shows the cost: 478 froze at
+- * 0x10 0x10 0x50 0x50 from +500 ms on, rx head never grew past 80,
+- * so the modem was still waiting for the two unacknowledged OPENs
+- * (cid 1 "IPCRTR" and cid 2 "glink_ssr") and never sent QRTR data.
+- * 0320 sends one OPEN_ACK per OPEN, keeps pumping at every sample,
+- * decodes every command by name and prints the channel name.  Still
+- * no intent table and no QRTR port: this version only finds out what
+- * the modem asks for next. */
++/* 0321: the 0320 ring proved the three OPEN_ACKs were consumed
++ * (478: 0x20 0x20 0x50 0x50) but nothing else ever arrived -- all
++ * six samples were idle.  dipper open_channel() (mi8_glink.c:575)
++ * shows why: the AP must ALSO open IPCRTR itself and offer() local
++ * intents before the modem has anywhere to put a QRTR packet.
++ * 0320 also exposed a second bug: the W2e thread returned at FB tick
++ * ~7200 while the system kept drawing until tick 14880, i.e. minutes
++ * with nobody pumping GLINK.  0321 keeps a watch loop alive. */
+ static const char *
+ md_glink_cmd_name(uint32_t cmd)
+ {
+@@ -4036,12 +4047,63 @@
+ 	return cmd < 16u ? names[cmd] : "UNKNOWN";
+ }
+ 
++static const char *
++md_qrtr_type_name(uint32_t t)
++{
++	switch (t) {
++	case 1u: return "Q_DATA";
++	case 2u: return "Q_HELLO";
++	case 3u: return "Q_BYE";
++	case 4u: return "Q_NEW_SERVER";
++	case 5u: return "Q_DEL_SERVER";
++	case 6u: return "Q_DEL_CLIENT";
++	case 7u: return "Q_RESUME";
++	case 10u: return "Q_NEW_LOOKUP";
++	case 11u: return "Q_DEL_LOOKUP";
++	default: return "Q_?";
++	}
++}
++
++/* open_channel():575 + offer():286, written as GLINK frames into 479.
++ * Returns the new tx head.  Every poke is a word-wise volatile store
++ * through the WCOMB map; no memcpy, no unmap (0310 / 0312). */
++static uint32_t
++md_glink_offer(uint32_t head)
++{
++	static const uint32_t sizes[3] = { 0x800u, 0x2000u, 0x4400u };
++	uint32_t i, at = head;
++
++	/* header(OPEN=2, cid=1, arg=7) + "IPCRTR\0" + one pad byte.
++	 * 0x52435049 0x00005254 is exactly what the modem wrote in 480. */
++	md_smem_poke(md_glink_tx_at + at, MD_GLINK_OPEN | (1u << 16));
++	md_smem_poke(md_glink_tx_at + at + 4u, 7u);
++	md_smem_poke(md_glink_tx_at + at + 8u, 0x52435049u);
++	md_smem_poke(md_glink_tx_at + at + 12u, 0x00005254u);
++	at += 16u;
++
++	/* header(INTENT=5, cid=1, arg=1) + {size, id}.  Reusable, so a
++	 * completed DATA is released with DONE_REUSE (pump():670). */
++	for (i = 0; i < 3u; i++) {
++		md_smem_poke(md_glink_tx_at + at,
++		    MD_GLINK_INTENT | (1u << 16));
++		md_smem_poke(md_glink_tx_at + at + 4u, 1u);
++		md_smem_poke(md_glink_tx_at + at + 8u, sizes[i]);
++		md_smem_poke(md_glink_tx_at + at + 12u, i + 1u);
++		at += 16u;
++	}
++	md_glink_offered = TRUE;
++	MD_SAY("POLARIS MODEM: 0321 VERDICT: AP OPENED IPCRTR (cid 1) AND "
++	    "OFFERED 3 INTENTS (0x800/0x2000/0x4400 ids 1..3), "
++	    "tx head %u -> %u\n", head, at);
++	return at;
++}
++
+ static void
+ md_glink_pump(uint32_t elapsed_ms)
+ {
+ 	uint32_t d[4], i, txtail, txhead, rxtail, rxhead;
+ 	uint32_t at, h0, h1, cmd, cid, arg, n, nl, chunk, left;
+-	uint32_t acks = 0, frames = 0, wr;
++	uint32_t frames = 0, wr, q[8];
+ 	char name[33];
+ 	bool rung = FALSE;
+ 
+@@ -4062,16 +4124,17 @@
+ 		return;
+ 	}
+ 	if (rxhead <= rxtail) {
+-		MD_SAY("POLARIS MODEM:   0320: idle at t=+%u ms: 478 "
+-		    "%#x %#x %#x %#x, no new rx bytes\n",
+-		    elapsed_ms, txtail, txhead, rxtail, rxhead);
++		if (!md_glink_quiet) {
++			MD_SAY("POLARIS MODEM:   0321: idle at t=+%u ms: 478 "
++			    "%#x %#x %#x %#x, no new rx bytes\n",
++			    elapsed_ms, txtail, txhead, rxtail, rxhead);
++		}
+ 		return;
+ 	}
+-	if (txhead + 64u > MD_GLINK_FIFO_SIZE) {
+-		MD_SAY("POLARIS MODEM:   0320: tx FIFO nearly full, "
+-		    "no ACKs sent\n");
++	if (txhead + 128u > MD_GLINK_FIFO_SIZE) {
+ 		return;
+ 	}
++	wr = txhead;
+ 	name[0] = 0;
+ 	at = rxtail;
+ 	while (at + 8u <= rxhead) {
+@@ -4102,38 +4165,71 @@
+ 			n = 16u + chunk;
+ 		}
+ 		n = (n + 7u) & ~7u;
+-		MD_SAY("POLARIS MODEM:   0320: 480 frame at +%u: %s "
++		MD_SAY("POLARIS MODEM:   0321: 480 frame at +%u: %s "
+ 		    "(cmd %u) cid %u arg %#x frame %u bytes name '%s' "
+ 		    "chunk %u left %u\n", at, md_glink_cmd_name(cmd),
+ 		    cmd, cid, arg, n, name, chunk, left);
+ 		if (n < 8u || n > rxhead - at) {
+-			MD_SAY("POLARIS MODEM:   0320: truncated frame at "
++			MD_SAY("POLARIS MODEM:   0321: truncated frame at "
+ 			    "+%u: stopping this batch\n", at);
+ 			break;
+ 		}
+ 		if (cmd == MD_GLINK_OPEN && cid != 0u &&
+-		    acks < MD_GLINK_MAX_OPEN) {
+-			wr = txhead + 8u * acks;
++		    md_glink_opens < MD_GLINK_MAX_OPEN) {
+ 			md_smem_poke(md_glink_tx_at + wr,
+ 			    MD_GLINK_OPEN_ACK | (cid << 16));
+ 			md_smem_poke(md_glink_tx_at + wr + 4u, 0u);
+-			acks++;
++			wr += 8u;
+ 			md_glink_opens++;
+ 		}
++		if ((cmd == MD_GLINK_DATA || cmd == MD_GLINK_DATA_MORE) &&
++		    left == 0u && chunk >= 32u) {
++			for (i = 0; i < 8u; i++) {
++				q[i] = md_smem_word(md_glink_rx_at + at +
++				    16u + 4u * i);
++			}
++			MD_SAY("POLARIS MODEM:   0321: QRTR v1 header: "
++			    "version %#x type %u (%s) src node %u port %u "
++			    "confirm %u len %u dst node %u port %u\n",
++			    q[0], q[1], md_qrtr_type_name(q[1]), q[2],
++			    q[3], q[4], q[5], q[6], q[7]);
++			if (chunk >= 52u) {
++				MD_SAY("POLARIS MODEM:   0321: QRTR payload: "
++				    "%#x %#x %#x %#x %#x\n",
++				    md_smem_word(md_glink_rx_at + at + 48u),
++				    md_smem_word(md_glink_rx_at + at + 52u),
++				    md_smem_word(md_glink_rx_at + at + 56u),
++				    md_smem_word(md_glink_rx_at + at + 60u),
++				    md_smem_word(md_glink_rx_at + at + 64u));
++			}
++			md_glink_data_count++;
++			/* dipper pump():670 -- release a complete single-frame
++			 * packet with DONE_REUSE (our intents are reusable). */
++			md_smem_poke(md_glink_tx_at + wr,
++			    MD_GLINK_DONE_REUSE | (1u << 16));
++			md_smem_poke(md_glink_tx_at + wr + 4u, arg);
++			wr += 8u;
++			md_glink_done_count++;
++		}
+ 		frames++;
+ 		at += n;
+ 	}
++	/* After the OPEN handshake the AP must open IPCRTR and offer its
++	 * own intents, otherwise the modem has no buffer to send into. */
++	if (!md_glink_offered && md_glink_opens >= 3u) {
++		wr = md_glink_offer(wr);
++	}
+ 	md_smem_poke(md_glink_desc_at + 8u, at);	/* rx tail: consumed */
+-	if (acks != 0u) {
+-		md_smem_poke(md_glink_desc_at + 4u, txhead + 8u * acks);
++	if (wr != txhead) {
++		md_smem_poke(md_glink_desc_at + 4u, wr);
+ 		md_glink_ring();
+ 		rung = TRUE;
+ 	}
+-	MD_SAY("POLARIS MODEM: 0320 VERDICT @t=+%u ms: %u frames, %u "
+-	    "OPEN_ACKs sent (%u total), tx head %u -> %u, rx tail %u -> "
+-	    "%u, tx tail %u rx head %u, doorbell %s\n", elapsed_ms,
+-	    frames, acks, md_glink_opens, txhead, txhead + 8u * acks,
+-	    rxtail, at, txtail, rxhead, rung ? "RUNG" : "not needed");
++	MD_SAY("POLARIS MODEM: 0321 VERDICT @t=+%u ms: %u frames, "
++	    "OPEN_ACKs %u, DATA %u, DONE_REUSE %u, tx head %u -> %u, "
++	    "rx tail %u -> %u, doorbell %s\n", elapsed_ms, frames,
++	    md_glink_opens, md_glink_data_count, md_glink_done_count,
++	    txhead, wr, rxtail, at, rung ? "RUNG" : "not needed");
+ }
+ 
+ /* Called at the top of md_w2e_probe(), Q6 still in reset, no other writer. */
+@@ -4434,7 +4530,9 @@
+ 		return "item 435 APPEARED but slave-kernel never set DSP_READY";
+ 	}
+ 	if (ever_fatal) {
+-		return "DSP_READY SET BUT DSP_FATAL ALSO SET: the modem signals a fatal state";
++		/* 0318/0319 disproved this: bit0 is dipper's own DSP_FATAL
++		 * label, the modem kept exchanging GLINK commands while set. */
++		return "DSP_READY SET, dipper DSP_FATAL bit0 also set: DISPROVED in 0318/0319, the modem keeps talking GLINK";
+ 	}
+ 	return ever_glink
+ 	    ? "THE MODEM IS READY AND GLINK ITEMS EXIST: the link can be started"
+@@ -4470,16 +4568,16 @@
+ 		 * is consumed + decoded.  No one-shot flag. */
+ 		md_glink_pump(elapsed);
+ 		done++;
+-		MD_SAY("POLARIS MODEM: 0320 STATE @t=+%u ms: %s\n", elapsed,
++		MD_SAY("POLARIS MODEM: 0321 STATE @t=+%u ms: %s\n", elapsed,
+ 		    md_smem_verdict(ever_435, ever_ready, ever_glink, ever_fatal));
+ 	}
+-	MD_SAY("POLARIS MODEM: 0320 FINAL VERDICT: %s (%u/%u samples, "
++	MD_SAY("POLARIS MODEM: 0321 FINAL VERDICT: %s (%u/%u samples, "
+ 	    "ready=%s fatal=%s glink=%s, %u OPEN_ACKs sent)\n",
+ 	    md_smem_verdict(ever_435, ever_ready, ever_glink, ever_fatal),
+ 	    done, MD_SMEM_SAMPLES, ever_ready ? "yes" : "no",
+ 	    ever_fatal ? "yes" : "no", ever_glink ? "yes" : "no",
+ 	    md_glink_opens);
+-	MD_SAY("POLARIS MODEM: 0320 FINAL: ACK sent=%s, 478 now "
++	MD_SAY("POLARIS MODEM: 0321 FINAL: ACK sent=%s, 478 now "
+ 	    "%#x %#x %#x %#x, 480 head word %#x\n",
+ 	    md_glink_acked ? "YES" : "NO",
+ 	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
+@@ -4487,6 +4585,38 @@
+ 	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
+ 	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u,
+ 	    md_glink_rx_at ? md_smem_word(md_glink_rx_at) : 0u);
++	/* 0321: the 0320 thread returned at FB tick ~7200 while the system
++	 * kept drawing until tick 14880.  Nobody pumped GLINK for minutes.
++	 * Stay alive; idle prints are silenced so the 4 MiB ring survives. */
++	md_glink_quiet = TRUE;
++	MD_SAY("POLARIS MODEM: 0321 WATCH START: %u ticks, thread stays "
++	    "alive instead of returning after the census\n",
++	    MD_GLINK_WATCH_TICKS);
++	for (k = 0; k < MD_GLINK_WATCH_TICKS; k++) {
++		md_qmp_ms();
++		md_glink_pump(elapsed + k);
++		if ((k % 300u) == 0u) {
++			MD_SAY("POLARIS MODEM: 0321 WATCH @tick %u: 478 "
++			    "%#x %#x %#x %#x, OPEN_ACKs %u, DATA %u, "
++			    "DONE_REUSE %u, offered=%s\n", k,
++			    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
++			    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
++			    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
++			    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u,
++			    md_glink_opens, md_glink_data_count,
++			    md_glink_done_count,
++			    md_glink_offered ? "YES" : "NO");
++		}
++	}
++	MD_SAY("POLARIS MODEM: 0321 WATCH FINAL VERDICT: %u OPEN_ACKs, "
++	    "%u QRTR DATA frames, %u DONE_REUSE, offered=%s, 478 %#x "
++	    "%#x %#x %#x\n", md_glink_opens, md_glink_data_count,
++	    md_glink_done_count, md_glink_offered ? "YES" : "NO",
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u);
++	md_glink_quiet = FALSE;
+ 	MD_SAY("POLARIS MODEM:   0318: 428/478/479 were written before the Q6, "
+ 	    "the modem is left running\n");
+ }
+@@ -4570,8 +4700,8 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-	MD_SAY("POLARIS MODEM: ======== build 0320 alive: W2e + W2f + "
+-	    "GLINK ACK ALL CHANNELS (level 35) ========\n");
++	MD_SAY("POLARIS MODEM: ======== build 0321 alive: W2e + W2f + "
++	    "GLINK AP OPEN + INTENTS + QRTR WATCH (level 36) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
+@@ -4607,6 +4737,9 @@
+ 	MD_SAY("POLARIS MODEM:   0320 sends ONE OPEN_ACK PER OPEN (cid 1 "
+ 	    "IPCRTR, cid 2 glink_ssr, cid 3), then pumps every sample and "
+ 	    "decodes the next commands\n");
++	MD_SAY("POLARIS MODEM:   0321 opens IPCRTR from the AP, offers 3 "
++	    "intents, decodes QRTR v1 headers, releases DATA with "
++	    "DONE_REUSE, and keeps a watch loop alive after the census\n");
+ 	MD_SAY("POLARIS MODEM:   after BOOT QDSP6SS is never read; the "
+ 	    "permanent MBA VA is never dereferenced or unmapped\n");
+ 	MD_SAY("POLARIS MODEM:   MBA.MBN + QMP on + three rails + seven clocks "
