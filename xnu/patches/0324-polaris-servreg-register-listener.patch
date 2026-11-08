@@ -1,0 +1,316 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -171,6 +171,20 @@
+  * busy wait and prints a full 0323 HEARTBEAT every 200, from the
+  * first seconds of boot, instead of only after the census finished.
+  * Level 38.
++ *
++ * 0324: two changes.  (a) polaris_modem_probe() gated the W2e/W2f
++ * thread on `polaris_modem_level() == 37`; 0323 bumped the boot-arg
++ * to 38 without bumping the gate, so the first 0323 ring held ONLY
++ * the historical read-only probes and no GLINK at all.  The gate is
++ * now >= 37, keeping the 8..23 single-level probes reachable below
++ * 37.  (b) the 0323 level-37 rerun is GREEN: our QRTR Q_HELLO reply
++ * made the modem announce Q_NEW_SERVER service 66 instance 180
++ * (servreg wlan_pd).  dipper mi8_rproc.c:2375 says the next step is
++ * QMI REGISTER_LISTENER (0x20) for "msm/modem/wlan_pd" on that
++ * node:port.  0324 sends exactly one such request as a QRTR v1
++ * Q_DATA packet in an 80-byte GLINK DATA frame, dumps every QMI
++ * response TLV and counts service 69 (WLFW) announcements.
++ * Level 38.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -484,7 +498,11 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 37) {
++	if (polaris_modem_level() >= 37) {
++		/* 0324: >= 37, not == 37.  0323 bumped the boot-arg to 38
++		 * without bumping this gate, and the W2e/W2f thread never
++		 * started; that ring held only historical read-only probes.
++		 * All single-level probes below 37 stay reachable. */
+ 		/* 0322: 0321 GLINK logic, plus a permanent heartbeat. */
+ 		thread_t thread;
+ 
+@@ -3578,6 +3596,16 @@
+ #define MD_QRTR_HELLO_LEN	52u		/* 32 B v1 header + 20 B control */
+ #define MD_QRTR_HELLO_FRAME	72u		/* (16 + 52 + 7) & ~7 */
+ #define MD_GLINK_MAX_FOREIGN	32u		/* modem intents we remember */
++/* 0324: servreg-notifier client (dipper mi8_rproc.c:2375-2560). */
++#define MD_QRTR_LOCAL_PORT	0x4000u		/* mi8_glink.c:891 first port */
++#define MD_SRN_SERVICE		66u
++#define MD_SRN_INSTANCE		180u
++#define MD_SRN_REGISTER_LISTENER 0x20u
++#define MD_SRN_STATE_UPDATED_IND 0x22u
++#define MD_SRN_SET_ACK		0x23u
++#define MD_SRN_WLFW_SERVICE	69u
++#define MD_QRTR_QMI_PACKET	64u		/* 32 B QRTR header + 32 B */
++#define MD_GLINK_QMI_FRAME	80u		/* 16 + 64, already 8-aligned */
+ 
+ struct md_smem_toc {
+ 	uint8_t magic[4];
+@@ -3627,6 +3655,8 @@
+ static uint32_t md_qrtr_hello_count, md_qrtr_new_server_count;
+ static uint32_t md_qrtr_new_lookup_count, md_qrtr_srv66_count;
+ static uint32_t md_qrtr_hello_replies, md_heartbeat_count;
++static uint32_t md_srn_listener_sent, md_qmi_rx_count, md_srv69_count;
++static uint32_t md_srn_node, md_srn_port, md_srn_txn;
+ static uint32_t md_glink_remote_cid;	/* modem's IPCRTR cid, dynamic */
+ static uint32_t md_foreign_id[MD_GLINK_MAX_FOREIGN];
+ static uint32_t md_foreign_size[MD_GLINK_MAX_FOREIGN];
+@@ -4202,17 +4232,19 @@
+ static void
+ md_0323_heartbeat(uint32_t n)
+ {
+-	MD_SAY("POLARIS MODEM: 0323 HEARTBEAT #%u: build 0323 / level 38; "
++	MD_SAY("POLARIS MODEM: 0324 HEARTBEAT #%u: build 0324 / level 38; "
+ 	    "ACK=%s offered=%s remote cid %u, OPEN_ACKs %u, foreign %u, "
+ 	    "QRTR DATA %u (HELLO %u / NEW_SERVER %u / NEW_LOOKUP %u / "
+-	    "srv66 %u), HELLO replies %u, DONE_REUSE %u; "
++	    "srv66 %u / WLFW 69 %u), HELLO replies %u, SRN listener %u, "
++	    "QMI rx %u, DONE_REUSE %u; "
+ 	    "478 %#x %#x %#x %#x; 480 %#x %#x %#x %#x\n",
+ 	    n, md_glink_acked ? "YES" : "NO",
+ 	    md_glink_offered ? "YES" : "NO", md_glink_remote_cid,
+ 	    md_glink_opens, md_foreign_count, md_glink_data_count,
+ 	    md_qrtr_hello_count, md_qrtr_new_server_count,
+ 	    md_qrtr_new_lookup_count, md_qrtr_srv66_count,
+-	    md_qrtr_hello_replies, md_glink_done_count,
++	    md_srv69_count, md_qrtr_hello_replies, md_srn_listener_sent,
++	    md_qmi_rx_count, md_glink_done_count,
+ 	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
+ 	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
+ 	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
+@@ -4222,6 +4254,177 @@
+ 	    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
+ 	    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 12u) : 0u);
+ }
++
++/* 0324: one byte out of the WCOMB SMEM map.  QMI TLVs are byte-packed,
++ * so a word-wise read is not enough.  No memcpy, no unmap (0310/0312). */
++static uint8_t
++md_smem_byte(uint32_t at)
++{
++	uint8_t b = 0;
++
++	if (!md_smem_peek(at, &b, 1u)) {
++		return 0;
++	}
++	return b;
++}
++
++static void
++md_pkt32(uint8_t *p, uint32_t at, uint32_t v)
++{
++	p[at] = (uint8_t)v;
++	p[at + 1u] = (uint8_t)(v >> 8);
++	p[at + 2u] = (uint8_t)(v >> 16);
++	p[at + 3u] = (uint8_t)(v >> 24);
++}
++
++/* dipper queue_packet():302 + flush():407.  A 64-byte QRTR v1 Q_DATA
++ * packet goes out as one 80-byte GLINK DATA frame on our local cid 1,
++ * using one of the modem's advertised foreign intents (0322: 30 x
++ * size 0x80, ids 0..29).  Returns the new tx head, or head unchanged
++ * when there is no usable intent. */
++static uint32_t
++md_qrtr_send_qmi(uint32_t head, uint32_t dst_node, uint32_t dst_port,
++    const uint8_t *qmi, uint32_t qlen)
++{
++	uint8_t pkt[64];
++	uint32_t i, iid = 0u, at = head, w;
++
++	if (qlen == 0u || qlen > 32u ||
++	    head + MD_GLINK_QMI_FRAME > MD_GLINK_FIFO_SIZE) {
++		return head;
++	}
++	for (i = 0u; i < MD_QRTR_QMI_PACKET; i++) {
++		pkt[i] = 0;
++	}
++	md_pkt32(pkt, 0u, 1u);			/* version */
++	md_pkt32(pkt, 4u, MD_QRTR_Q_DATA);
++	md_pkt32(pkt, 8u, MD_QRTR_LOCAL_NODE);
++	md_pkt32(pkt, 12u, MD_QRTR_LOCAL_PORT);
++	md_pkt32(pkt, 16u, 0u);		/* confirm_rx */
++	md_pkt32(pkt, 20u, qlen);		/* actual QMI length */
++	md_pkt32(pkt, 24u, dst_node);
++	md_pkt32(pkt, 28u, dst_port);
++	for (i = 0u; i < qlen; i++) {
++		pkt[32u + i] = qmi[i];
++	}
++	for (i = 0u; i < md_foreign_count; i++) {
++		if (md_foreign_size[i] >= MD_QRTR_QMI_PACKET &&
++		    md_foreign_id[i] != 0u) {
++			iid = md_foreign_id[i];
++			break;
++		}
++	}
++	if (iid == 0u) {
++		MD_SAY("POLARIS MODEM: 0324 VERDICT: no foreign intent "
++		    ">= %u B for the servreg QMI packet; NOT sent\n",
++		    MD_QRTR_QMI_PACKET);
++		return head;
++	}
++	md_smem_poke(md_glink_tx_at + at,
++	    MD_GLINK_DATA | (MD_GLINK_CID << 16));
++	md_smem_poke(md_glink_tx_at + at + 4u, iid);
++	md_smem_poke(md_glink_tx_at + at + 8u, MD_QRTR_QMI_PACKET);
++	md_smem_poke(md_glink_tx_at + at + 12u, 0u);
++	for (i = 0u; i < 16u; i++) {
++		w = (uint32_t)pkt[4u * i] |
++		    ((uint32_t)pkt[4u * i + 1u] << 8) |
++		    ((uint32_t)pkt[4u * i + 2u] << 16) |
++		    ((uint32_t)pkt[4u * i + 3u] << 24);
++		md_smem_poke(md_glink_tx_at + at + 16u + 4u * i, w);
++	}
++	return at + MD_GLINK_QMI_FRAME;
++}
++
++/* dipper srn_send() / srn_tlv() / srn_string() / srn_listen():
++ * QMI 0x20 REGISTER_LISTENER, TLV 0x01 = {1}, TLV 0x02 = the raw
++ * 17-byte "msm/modem/wlan_pd" string (no NUL and no inner length --
++ * with one the modem answered INVALID_HANDLE, EXP-0203g). */
++static uint32_t
++md_srn_listen(uint32_t head, uint32_t node, uint32_t port)
++{
++	static const char name[] = "msm/modem/wlan_pd";
++	uint8_t qmi[32];
++	uint32_t i, before = head, after;
++
++	for (i = 0u; i < sizeof(qmi); i++) {
++		qmi[i] = 0;
++	}
++	md_srn_txn++;
++	qmi[0] = 0u;				/* request */
++	qmi[1] = (uint8_t)md_srn_txn;
++	qmi[2] = (uint8_t)(md_srn_txn >> 8);
++	qmi[3] = (uint8_t)MD_SRN_REGISTER_LISTENER;
++	qmi[4] = 0u;
++	qmi[5] = 24u;				/* TLV byte count */
++	qmi[6] = 0u;
++	qmi[7] = 0x01u; qmi[8] = 1u; qmi[9] = 0u; qmi[10] = 1u;
++	qmi[11] = 0x02u; qmi[12] = 17u; qmi[13] = 0u;
++	for (i = 0u; i < 17u; i++) {
++		qmi[14u + i] = (uint8_t)name[i];
++	}
++	md_srn_node = node;
++	md_srn_port = port;
++	after = md_qrtr_send_qmi(head, node, port, qmi, 31u);
++	if (after != before) {
++		md_srn_listener_sent++;
++	}
++	MD_SAY("POLARIS MODEM: 0324 VERDICT: SERVREG "
++	    "REGISTER_LISTENER (QMI %#x) for '%s' to node %u "
++	    "port %#x, src port %#x, 31 QMI bytes, sent=%s, "
++	    "tx head %u -> %u\n", MD_SRN_REGISTER_LISTENER, name,
++	    node, port, MD_QRTR_LOCAL_PORT,
++	    after != before ? "YES" : "NO", before, after);
++	return after;
++}
++
++/* 0324: dump every QMI control frame and its TLVs.  The next version
++ * needs the real response/indication shape before it implements
++ * SET_ACK (0x23) -- dipper says the modem ACKs state changes with
++ * error 9 while wlan_pd is not up yet (EXP-0203f/g). */
++static void
++md_qmi_dump(uint32_t at, uint32_t len)
++{
++	uint32_t p, t, l, v, i;
++	uint16_t txn, msg, total;
++	char txt[33];
++
++	if (len < 7u || len > 96u) {
++		return;
++	}
++	txn = (uint16_t)(md_smem_byte(at + 1u) |
++	    ((uint16_t)md_smem_byte(at + 2u) << 8));
++	msg = (uint16_t)(md_smem_byte(at + 3u) |
++	    ((uint16_t)md_smem_byte(at + 4u) << 8));
++	total = (uint16_t)(md_smem_byte(at + 5u) |
++	    ((uint16_t)md_smem_byte(at + 6u) << 8));
++	MD_SAY("POLARIS MODEM: 0324: QMI type %u txn %u msg %#x "
++	    "tlvs %u payload %u\n", md_smem_byte(at), txn, msg,
++	    total, len);
++	p = 7u;
++	while (p + 3u <= 7u + total && p + 3u <= len) {
++		t = md_smem_byte(at + p);
++		l = (uint32_t)md_smem_byte(at + p + 1u) |
++		    ((uint32_t)md_smem_byte(at + p + 2u) << 8);
++		if (l > 64u || p + 3u + l > len) {
++			break;
++		}
++		v = 0u;
++		for (i = 0u; i < 4u && i < l; i++) {
++			v |= (uint32_t)md_smem_byte(at + p + 3u + i)
++			    << (8u * i);
++		}
++		for (i = 0u; i < l && i < 32u; i++) {
++			uint8_t c = md_smem_byte(at + p + 3u + i);
++
++			txt[i] = (c >= 0x20u && c < 0x7fu) ?
++			    (char)c : '.';
++		}
++		txt[i] = 0;
++		MD_SAY("POLARIS MODEM: 0324:   TLV %#x len %u "
++		    "word %#x '%s'\n", t, l, v, txt);
++		p += 3u + l;
++	}
++}
+ /* open_channel():575 + offer():286, written as GLINK frames into 479.
+  * Returns the new tx head.  Every poke is a word-wise volatile store
+  * through the WCOMB map; no memcpy, no unmap (0310 / 0312). */
+@@ -4413,6 +4616,32 @@
+ 					md_qrtr_new_lookup_count++;
+ 				}
+ 			}
++			/* 0324: any QMI control response/indication is a
++			 * Q_DATA packet; dump its header and TLVs. */
++			if (q[1] == MD_QRTR_Q_DATA && chunk >= 39u) {
++				md_qmi_dump(md_glink_rx_at + at + 48u,
++				    chunk - 32u);
++				md_qmi_rx_count++;
++			}
++			/* 0324: service 66 / instance 180 is the servreg
++			 * wlan_pd notifier.  dipper srn_server():2540
++			 * registers a listener on that announcement;
++			 * without it WLFW service 69 never appears. */
++			if (chunk >= 52u &&
++			    q[1] == MD_QRTR_Q_NEW_SERVER &&
++			    svc == MD_SRN_SERVICE &&
++			    inst == MD_SRN_INSTANCE &&
++			    md_srn_listener_sent == 0u) {
++				wr = md_srn_listen(wr, qnode, qport);
++			}
++			if (chunk >= 52u &&
++			    q[1] == MD_QRTR_Q_NEW_SERVER &&
++			    svc == MD_SRN_WLFW_SERVICE) {
++				md_srv69_count++;
++				MD_SAY("POLARIS MODEM: 0324: WLFW "
++				    "service 69 announced at node %u "
++				    "port %#x\n", qnode, qport);
++			}
+ 			/* dipper qrtr_input():487 answers the FIRST Q_HELLO
+ 			 * with a Q_HELLO control packet and reads ONLY the
+ 			 * command word.  0322's 0x1ee3 / 0xa are therefore
+@@ -4838,7 +5067,7 @@
+ 	 * per iteration costs almost no CPU, keeps GLINK pumped, and puts a
+ 	 * complete self-describing summary in the NEWEST part of the ring
+ 	 * every five seconds, however long the phone stays in iOS. */
+-	MD_SAY("POLARIS MODEM: 0323 HEARTBEAT START: one summary every %u s, "
++	MD_SAY("POLARIS MODEM: 0324 HEARTBEAT START: one summary every %u s, "
+ 	    "the W2e thread never returns; the census already prints them\n",
+ 	    MD_GLINK_HEARTBEAT_EVERY);
+ 	for (beat = 1u; ; beat++) {
+@@ -4931,8 +5160,8 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-	MD_SAY("POLARIS MODEM: ======== build 0323 alive: W2e + W2f + "
+-	    "GLINK + QRTR Q_HELLO REPLY + EARLY HEARTBEAT (level 38) "
++	MD_SAY("POLARIS MODEM: ======== build 0324 alive: W2e + W2f + "
++	    "GLINK + QRTR HELLO + SERVREG LISTENER + MONOTONIC GATE (level 38) "
+ 	    "========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
