@@ -1,0 +1,101 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -4483,7 +4483,7 @@
+         /* 0329: split in two.  The single 0328 line was longer than the
+          * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
+          * cut at "hostsv" and hsreplies / SRN state never appeared. */
+-        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0336 / level 50; "
++        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0337 / level 51; "
+             "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
+             "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+@@ -5074,24 +5074,9 @@
+             (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+ }
+ 
+-/* 0333 could not tell a read from a write: direction was 0 and the
+- * buffer had just been cleared, so both looked the same.  A real write
+- * carries bytes; a buffer that is still all zero is the modem waiting
+- * to be filled. */
+-static bool
+-md_rmtfs_zero(uint64_t shared, uint32_t bytes)
+-{
+-        volatile uint8_t *p = md_rmtfs_at(shared);
+-        uint32_t i;
+-
+-        for (i = 0u; i < bytes; i++) {
+-                if (p[i] != 0u) {
+-                        return FALSE;
+-                }
+-        }
+-        return TRUE;
+-}
+-
++/* 0333's md_rmtfs_zero() lived here: it guessed a read from "the
++ * buffer is still all zero".  0337 deleted it -- direction is a
++ * field in the request, not something to infer from bytes. */
+ /* An index into md_efs_parts by the path the modem sent, matched over
+  * its whole length: "/boot/modem_fsg" is a prefix of
+  * "/boot/modem_fsg_oem_1", so a prefix test would be wrong here. */
+@@ -5181,7 +5166,7 @@
+ {
+         uint32_t h_at, d_at, v_at, l1 = 0u, l2 = 0u, l3 = 0u;
+         uint32_t k, dir, n, bytes, sector, nsec, total = 0u;
+-        uint32_t handle = 0u, part = MD_EFS_NONE, zero = 0u, served = 0u;
++        uint32_t handle = 0u, part = MD_EFS_NONE, served = 0u;
+         uint64_t shared;
+ 
+         h_at = md_qmi_find(req_at, req_len, 1u, &l1);
+@@ -5232,15 +5217,16 @@
+                         md_rmtfs_denied++;
+                         return 9u;              /* Q_BAD_HANDLE */
+                 }
+-                /* 0335's untouched-first-vector probe did its job
+-                 * and is gone: with the buffer in the MBA region
+-                 * the modem reads it happily and asks for more.
+-                 * md_rmtfs_notouch stays as a counter so the field
+-                 * keeps its meaning across versions. */
+-                if (dir == 0u && md_rmtfs_zero(shared, bytes)) {
+-                        zero++;
+-                }
+-                if (dir != 0u || zero != 0u) {
++                /* 0337: direction 0 is a READ because dir says so.
++                 * rmtfs.c rmtfs_iovec() looks at req.direction and
++                 * nothing else.  The 0333-era "is the buffer all
++                 * zero?" guess cost 0336 a whole boot: rw 1 filled
++                 * base+0x200 with modem_fs1 sector 1, so rw 2 -- a
++                 * genuine read of modem_fs2 at that same offset --
++                 * found the buffer non-zero, was counted as a
++                 * store, and the modem got modem_fs1's stale bytes
++                 * and froze at 478 1432/1440. */
++                if (dir == 0u) {
+                         if (md_efs_read(part, sector * 512u, shared,
+                             bytes) != 0) {
+                                 md_rmtfs_denied++;
+@@ -5260,9 +5246,9 @@
+                 total += nsec;
+                 md_rmtfs_bytes += bytes;
+         }
+-        MD_SAY("POLARIS MODEM: 0335 VERDICT: RMTFS RW h%u p%u dir %u, "
+-            "%u vec, %u sec, ufs %u zero %u, rw %u\n",
+-            handle, part, dir, n, total, served, zero,
++        MD_SAY("POLARIS MODEM: 0337 VERDICT: RMTFS RW h%u p%u dir %u, "
++            "%u vec, %u sec, ufs %u store %u, rw %u\n",
++            handle, part, dir, n, total, served, md_rmtfs_writes,
+             md_rmtfs_rw_count);
+         return 0u;
+ }
+@@ -6438,10 +6424,10 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0336 alive: W2e + W2f + "
++        MD_SAY("POLARIS MODEM: ======== build 0337 alive: W2e + W2f + "
+             "GLINK + QRTR + SERVREG + HOSTSVC + QMI HEADER + "
+-            "RMTFS IN THE MBA REGION + ALL CHANNELS ACKED "
+-            "(level 50) ========\n");
++            "RMTFS IN THE MBA REGION + DIRECTION IS DIRECTION "
++            "(level 51) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
