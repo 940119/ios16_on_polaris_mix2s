@@ -1,0 +1,509 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -305,6 +305,20 @@
+  * MSA region at 0x8c100000 -- printing the first four words before
+  * clearing them, so a wrong address is visible in the log.
+  * Level 47.
++ *
++ * 0334: 0333 answered R_RW out of a pool block that was allocated
++ * and zeroed, so every byte the modem read was zero.  The modem
++ * sent exactly one vector -- handle 1, direction 0, sector 1 --
++ * and then its GLINK rx stopped for good (478 ends 0x548 / 0x550:
++ * the DONE we wrote after the reply was never read).  The EFS is
++ * opaque data, not something to synthesise, so 0334 reads it out
++ * of the partition it lives in: sweet_ufs_raw_read(), the call the
++ * firmware walk already makes, against the LBAs TWRP reports for
++ * modemst1 / modemst2 / fsg / fsc divided by 8.  The handle table
++ * records which /boot/modem_fs* each R_OPEN meant, so a vector is
++ * finally about a partition instead of about one global shadow.
++ * Flash is never written: a store-bound vector is acknowledged.
++ * Level 48.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -3802,24 +3816,46 @@
+  * DMA into, so the buffer has to be contiguous and has to be
+  * reached uncached from here (the modem is not coherent with our
+  * caches; 0312 is the lesson about DEVICE mappings and memcpy).
+- * The file itself is a 4 MiB RAM shadow, zeroed, never flash. */
+-#define MD_RMTFS_MAX	0x00800000u	/* 8 MiB ceiling, it asks 1 MiB */
+-#define MD_RMTFS_FILE	0x00400000u	/* every EFS partition fits */
++ *
++ * 0334: there is no shadow any more.  The file the modem opens is a
++ * partition on UFS and every vector is served from it, so nothing is
++ * allocated for the data plane and nothing has to be freed -- which
++ * is also how 0332's kmem_free() panic stops being possible. */
+ static vm_offset_t md_rmtfs_dev;
+-static vm_offset_t md_rmtfs_file_va;
+ static uint64_t md_rmtfs_shared_pa;
+ static uint32_t md_rmtfs_shared_size;
+ static uint32_t md_rmtfs_opens, md_rmtfs_allocs, md_rmtfs_reads;
+ static uint32_t md_rmtfs_writes, md_rmtfs_denied;
+ static uint32_t md_rmtfs_last_sector, md_rmtfs_last_bytes;
+-/* 0332: why the last R_ALLOC went the way it did, and how big the
+- * EFS shadow actually turned out to be. */
++static uint32_t md_rmtfs_last_handle;
++/* 0332: why the last R_ALLOC went the way it did, and whether the
++ * carveout is the buffer the modem is talking to. */
+ static uint32_t md_rmtfs_step, md_rmtfs_carveout;
+-static uint32_t md_rmtfs_file_size;
+-/* dipper's dt: qcom,rmtfs-mem, 0x200000 at 0x8bf00000, right below
+- * the WLAN MSA region at 0x8c100000 -- and 0x200000 is exactly what
+- * the modem asked for in 0331. */
+-#define MD_RMTFS_CARVEOUT	0x8bf00000ull
++/* Where each /boot/modem_fs* really is.  TWRP reports the starts in
++ * 512-byte sectors (sdf6 16384, sdf7 32768, sde36 65536, sdf1 48) and
++ * the UFS driver speaks 4 KiB blocks, so those are the values over 8.
++ * The log checks the arithmetic for us: block 0 of modemst1 must read
++ * 0x10 0x3 0x1d8 0xc38e4b90 and carry "IMGEFS1" at +40. */
++struct md_efs_part {
++        const char *path;
++        uint8_t lun;
++        uint32_t lba;
++        uint32_t blocks;
++};
++#define MD_EFS_PARTS    6u
++#define MD_EFS_HANDLES  24u
++#define MD_EFS_NONE     0xffffffffu
++#define MD_EFS_CHUNK    16384u          /* four 4 KiB blocks, one bounce */
++static const struct md_efs_part md_efs_parts[MD_EFS_PARTS] = {
++        { "/boot/modem_fs1",       5u, 2048u, 2048u },
++        { "/boot/modem_fs2",       5u, 4096u, 2048u },
++        { "/boot/modem_fsg",       4u, 8192u, 2048u },
++        { "/boot/modem_fsc",       5u,    6u,   64u },
++        { "/boot/modem_fsg_oem_1", 0u,    0u,    0u },
++        { "/boot/modem_fsg_oem_2", 0u,    0u,    0u },
++};
++static uint8_t md_efs_map[MD_EFS_HANDLES];      /* handle -> part + 1 */
++static uint8_t md_efs_buf[MD_EFS_CHUNK];
+ #define MD_RMTFS_CARVEOUT_SIZE	0x00200000u
+ /* The tag is only for accounting; keep the build alive if this
+  * header set does not export it. */
+@@ -4438,13 +4474,13 @@
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 12u) : 0u);
+-        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: rmtfs open %u "
+-            "alloc %u, read %u write %u denied %u, pa %#llx "
+-            "size %#x, last %u/%u\n",
++        MD_SAY("POLARIS MODEM: 0334 HEARTBEAT #%u: rmtfs open %u "
++            "alloc %u, ufs %u store %u denied %u, pa %#llx "
++            "size %#x, last h%u sec %u n%u\n",
+             n, md_rmtfs_opens, md_rmtfs_allocs, md_rmtfs_reads,
+             md_rmtfs_writes, md_rmtfs_denied, md_rmtfs_shared_pa,
+-            md_rmtfs_shared_size, md_rmtfs_last_sector,
+-            md_rmtfs_last_bytes);
++            md_rmtfs_shared_size, md_rmtfs_last_handle,
++            md_rmtfs_last_sector, md_rmtfs_last_bytes / 512u);
+ }
+ /* 0324: one byte out of the WCOMB SMEM map.  QMI TLVs are byte-packed,
+  * so a word-wise read is not enough.  No memcpy, no unmap (0310/0312). */
+@@ -4861,6 +4897,17 @@
+             ((uint32_t)md_smem_byte(at + 3u) << 24);
+ }
+ 
++/* A little-endian word out of a CPU buffer, for the EFS geometry
++ * check.  md_le32() reads SMEM; this one reads memory we own. */
++static uint32_t
++md_rmtfs_mem(const uint8_t *p, uint32_t i)
++{
++        const uint8_t *q = p + i * 4u;
++
++        return (uint32_t)q[0] | (uint32_t)q[1] << 8 |
++            (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24;
++}
++
+ /* An eight-byte TLV value, for R_ALLOC's physical address. */
+ static uint32_t
+ md_hs_number64(uint8_t *rsp, uint32_t at, uint8_t tag, uint64_t value)
+@@ -4946,42 +4993,20 @@
+         return TRUE;
+ }
+ 
+-static bool
+-md_rmtfs_file(void)
++/* The modem's buffer, as a byte pointer into our uncached mapping.
++ * 0312 is the lesson: no memcpy on a DEVICE mapping, ever. */
++static volatile uint8_t *
++md_rmtfs_at(uint64_t shared)
+ {
+-        static const uint32_t tries[3] = { 0x400000u, 0x200000u, 0x100000u };
+-        vm_offset_t va;
+-        uint32_t i;
+-
+-        if (md_rmtfs_file_va != 0u) {
+-                return TRUE;
+-        }
+-        for (i = 0u; i < 3u; i++) {
+-                va = 0;
+-                if (kmem_alloc_contig(kernel_map, &va, tries[i],
+-                    PAGE_MASK, 0, 0,
+-                    KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+-                    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+-                        md_rmtfs_file_va = va;
+-                        md_rmtfs_file_size = tries[i];
+-                        MD_SAY("POLARIS MODEM: 0333 VERDICT: RMTFS FILE "
+-                            "%u bytes at %#lx\n", tries[i],
+-                            (unsigned long)va);
+-                        return TRUE;
+-                }
+-        }
+-        MD_SAY("POLARIS MODEM: 0332 VERDICT: RMTFS FILE none of "
+-            "4/2/1 MiB could be had\n");
+-        return FALSE;
++        return (volatile uint8_t *)(uintptr_t)(md_rmtfs_dev +
++            (uint32_t)(shared - md_rmtfs_shared_pa));
+ }
+ 
+-/* Move bytes between the shadow and the modem's buffer.  Byte-wise and
+- * volatile on the device side, because it is an uncached mapping. */
++/* Move bytes between a CPU buffer and the modem's buffer. */
+ static void
+ md_rmtfs_io(uint64_t shared, uint8_t *mem, uint32_t bytes, uint32_t to_shared)
+ {
+-        volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)(md_rmtfs_dev +
+-            (uint32_t)(shared - md_rmtfs_shared_pa));
++        volatile uint8_t *p = md_rmtfs_at(shared);
+         uint32_t i;
+ 
+         __sync_synchronize();
+@@ -4995,16 +5020,124 @@
+         __sync_synchronize();
+ }
+ 
+-/* 0331: R_RW.  TLV 0x01 handle(4), 0x02 direction(1), 0x03 =
++/* One little-endian word out of the modem's buffer. */
++static uint32_t
++md_rmtfs_word(uint64_t shared, uint32_t idx)
++{
++        volatile uint8_t *p = md_rmtfs_at(shared + idx * 4u);
++
++        return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
++            (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* 0333 could not tell a read from a write: direction was 0 and the
++ * buffer had just been cleared, so both looked the same.  A real write
++ * carries bytes; a buffer that is still all zero is the modem waiting
++ * to be filled. */
++static bool
++md_rmtfs_zero(uint64_t shared, uint32_t bytes)
++{
++        volatile uint8_t *p = md_rmtfs_at(shared);
++        uint32_t i;
++
++        for (i = 0u; i < bytes; i++) {
++                if (p[i] != 0u) {
++                        return FALSE;
++                }
++        }
++        return TRUE;
++}
++
++/* An index into md_efs_parts by the path the modem sent, matched over
++ * its whole length: "/boot/modem_fsg" is a prefix of
++ * "/boot/modem_fsg_oem_1", so a prefix test would be wrong here. */
++static uint32_t
++md_efs_part(uint32_t at, uint32_t len)
++{
++        uint32_t i, k;
++
++        for (i = 0u; i < MD_EFS_PARTS; i++) {
++                const char *s = md_efs_parts[i].path;
++
++                for (k = 0u; s[k] != 0; k++) {
++                        if (k >= len || md_path_char(at, k) != s[k]) {
++                                break;
++                        }
++                }
++                if (s[k] == 0 && k == len) {
++                        return i;
++                }
++        }
++        return MD_EFS_NONE;
++}
++
++/* Serve `bytes` of partition `part` from byte offset `off` into the
++ * modem's buffer, in 4 KiB UFS blocks.  Returns 0 or an error. */
++static int
++md_efs_read(uint32_t part, uint32_t off, uint64_t shared, uint32_t bytes)
++{
++        const struct md_efs_part *p = &md_efs_parts[part];
++
++        if (p->blocks == 0u) {
++                uint8_t zero[64];
++                uint32_t i;
++
++                for (i = 0u; i < sizeof(zero); i++) {
++                        zero[i] = 0u;
++                }
++                while (bytes != 0u) {
++                        uint32_t n = bytes < sizeof(zero) ?
++                            bytes : (uint32_t)sizeof(zero);
++
++                        md_rmtfs_io(shared, zero, n, 1u);
++                        shared += n;
++                        bytes -= n;
++                }
++                return 0;
++        }
++        while (bytes != 0u) {
++                uint32_t in = off & 0xfffu;
++                uint32_t n = MD_EFS_CHUNK - in;
++                uint32_t blk = off / 4096u;
++                uint32_t blocks;
++
++                if (n > bytes) {
++                        n = bytes;
++                }
++                blocks = (in + n + 0xfffu) >> 12;
++                if (blk + blocks > p->blocks) {
++                        return 1;               /* past the partition */
++                }
++                if (sweet_ufs_raw_read(p->lun, p->lba + blk, blocks,
++                    md_efs_buf) != 0) {
++                        return 2;               /* the driver said no */
++                }
++                md_rmtfs_io(shared, md_efs_buf + in, n, 1u);
++                shared += n;
++                off += n;
++                bytes -= n;
++        }
++        return 0;
++}
++
++/* 0334: R_RW.  TLV 0x01 handle(4), 0x02 direction(1), 0x03 =
+  * [count][sector(4) phys(4) sectors(4)]..., dipper rmtfs():262-285.
+- * direction 1 means "put the file's bytes in my buffer", 0 means "take
+- * what I wrote there", so the file is a RAM shadow and flash is never
+- * touched. */
++ *
++ * dipper copies the file into the modem's buffer when direction is
++ * non-zero, so direction 0 reads as "the modem put bytes in my
++ * buffer".  0333's single vector was direction 0 with a buffer we had
++ * just cleared, which is why the first four words are printed before
++ * anything is touched: a write carries data, a read does not.
++ *
++ * Every vector now names a partition through the handle the R_OPEN
++ * returned, and a read is served from UFS.  A store-bound vector is
++ * acknowledged and logged, never written to flash. */
+ static uint32_t
+ md_rmtfs_rw(uint32_t req_at, uint32_t req_len)
+ {
+         uint32_t h_at, d_at, v_at, l1 = 0u, l2 = 0u, l3 = 0u;
+         uint32_t k, dir, n, bytes, sector, nsec, total = 0u;
++        uint32_t handle = 0u, part = MD_EFS_NONE, zero = 0u, served = 0u;
+         uint64_t shared;
+ 
+         h_at = md_qmi_find(req_at, req_len, 1u, &l1);
+@@ -5014,14 +5147,18 @@
+             v_at == 0u || l3 < 1u) {
+                 return 1u;                      /* Q_MALFORMED */
+         }
++        handle = md_le32(h_at);
+         dir = (uint32_t)md_smem_byte(d_at);
+         n = (uint32_t)md_smem_byte(v_at);
+         if (dir > 1u || n == 0u || l3 < 1u + 12u * n) {
+                 return 48u;                     /* Q_INVAL */
+         }
+-        if (md_rmtfs_dev == 0u || md_rmtfs_file_va == 0u) {
++        if (md_rmtfs_dev == 0u) {
+                 return 2u;                      /* Q_NOMEM */
+         }
++        if (handle < MD_EFS_HANDLES && md_efs_map[handle] != 0u) {
++                part = (uint32_t)md_efs_map[handle] - 1u;
++        }
+         for (k = 0u; k < n; k++) {
+                 uint32_t q = v_at + 1u + 12u * k;
+ 
+@@ -5029,37 +5166,55 @@
+                 shared = (uint64_t)md_le32(q + 4u);
+                 nsec = md_le32(q + 8u);
+                 bytes = nsec * 512u;
+-                if (shared >= (uint64_t)md_rmtfs_shared_pa &&
+-                    bytes != 0u &&
+-                    shared - md_rmtfs_shared_pa < md_rmtfs_shared_size &&
+-                    bytes <= md_rmtfs_shared_size -
+-                        (uint32_t)(shared - md_rmtfs_shared_pa) &&
+-                    ((uint64_t)sector + (uint64_t)nsec) * 512u <=
+-                        md_rmtfs_file_size) {
+-                        md_rmtfs_io(shared,
+-                            (uint8_t *)(uintptr_t)(md_rmtfs_file_va +
+-                            sector * 512u), bytes, dir != 0u);
+-                        md_rmtfs_last_sector = sector;
+-                        md_rmtfs_last_bytes = bytes;
+-                        total += nsec;
+-                        if (dir != 0u) {
+-                                md_rmtfs_reads++;
+-                        } else {
+-                                md_rmtfs_writes++;
++                if (nsec == 0u || bytes == 0u ||
++                    shared < (uint64_t)md_rmtfs_shared_pa ||
++                    shared - md_rmtfs_shared_pa >= md_rmtfs_shared_size ||
++                    bytes > md_rmtfs_shared_size -
++                        (uint32_t)(shared - md_rmtfs_shared_pa)) {
++                        md_rmtfs_denied++;
++                        MD_SAY("POLARIS MODEM: 0334 VERDICT: RW REFUSED "
++                            "h%u vec %u/%u sec %u n%u pa %#llx base "
++                            "%#llx %#x\n",
++                            handle, k, n, sector, nsec, shared,
++                            md_rmtfs_shared_pa, md_rmtfs_shared_size);
++                        return 48u;             /* Q_INVAL */
++                }
++                MD_SAY("POLARIS MODEM: 0334 VERDICT: RW h%u p%u dir %u "
++                    "sec %u n%u sh %#x %#x %#x %#x\n",
++                    handle, part, dir, sector, nsec,
++                    md_rmtfs_word(shared, 0u),
++                    md_rmtfs_word(shared, 1u),
++                    md_rmtfs_word(shared, 2u),
++                    md_rmtfs_word(shared, 3u));
++                if (part == MD_EFS_NONE) {
++                        md_rmtfs_denied++;
++                        return 9u;              /* Q_BAD_HANDLE */
++                }
++                if (dir == 0u && md_rmtfs_zero(shared, bytes)) {
++                        zero++;
++                }
++                if (dir != 0u || zero != 0u) {
++                        if (md_efs_read(part, sector * 512u, shared,
++                            bytes) != 0) {
++                                md_rmtfs_denied++;
++                                MD_SAY("POLARIS MODEM: 0334 VERDICT: "
++                                    "RW UFS FAILED h%u p%u sec %u n%u\n",
++                                    handle, part, sector, nsec);
++                                return 3u;      /* Q_INTERNAL */
+                         }
+-                        continue;
++                        md_rmtfs_reads++;
++                        served++;
++                } else {
++                        md_rmtfs_writes++;
+                 }
+-                md_rmtfs_denied++;
+-                MD_SAY("POLARIS MODEM: 0333 VERDICT: RMTFS RW REFUSED "
+-                    "dir %u vector %u/%u sector %u pa %#llx %u sectors, "
+-                    "base %#llx size %#x\n", dir, k, n, sector, shared,
+-                    nsec, md_rmtfs_shared_pa, md_rmtfs_shared_size);
+-                return 48u;
+-        }
+-        MD_SAY("POLARIS MODEM: 0333 VERDICT: RMTFS RW dir %u, %u vectors, "
+-            "%u sectors, last sector %u, %u bytes, handle %u\n",
+-            dir, n, total, md_rmtfs_last_sector, md_rmtfs_last_bytes,
+-            md_le32(h_at));
++                md_rmtfs_last_handle = handle;
++                md_rmtfs_last_sector = sector;
++                md_rmtfs_last_bytes = bytes;
++                total += nsec;
++        }
++        MD_SAY("POLARIS MODEM: 0334 VERDICT: RMTFS RW h%u p%u dir %u, "
++            "%u vec, %u sec, ufs %u zero %u\n",
++            handle, part, dir, n, total, served, zero);
+         return 0u;
+ }
+ 
+@@ -5072,6 +5227,8 @@
+         uint32_t i, n, wr, chunk, frame, path_at = 0u, path_len = 0u;
+         uint32_t iid = 0u, isize = 0u, at = head;
+         uint32_t code = 0u, handle = 0u, what = 0u;
++        uint32_t part = MD_EFS_NONE, w0 = 0u, w1 = 0u, w2 = 0u;
++        uint32_t w3 = 0u;
+         uint16_t msg;
+ 
+         if (req_len < 7u || md_smem_byte(req_at) != 0u) {
+@@ -5176,32 +5333,40 @@
+                  * got past the open.  dipper rmtfs():221-298. */
+                 path_at = md_qmi_find(req_at, req_len, 1u, &path_len);
+                 if (msg == 1u) {                        /* R_OPEN */
+-                        if (path_at != 0u &&
+-                            md_hs_prefix(path_at, path_len,
+-                            "/boot/modem_fs")) {
++                        part = (path_at != 0u) ?
++                            md_efs_part(path_at, path_len) : MD_EFS_NONE;
++                        if (part != MD_EFS_NONE) {
+                                 handle = ++md_hostsvc_handle;
++                                if (handle < MD_EFS_HANDLES) {
++                                        md_efs_map[handle] =
++                                            (uint8_t)(part + 1u);
++                                }
+                                 wr = md_hs_number(rsp, wr, 0x10u,
+                                     handle, 4u);
+                                 md_rmtfs_opens++;
+                                 what = 2u;
+-                                MD_SAY("POLARIS MODEM: 0331 VERDICT: "
+-                                    "RMTFS OPEN handle %u, %u byte path, "
+-                                    "'%c%c%c%c%c%c%c%c%c%c%c%c%c%c'\n",
+-                                    handle, path_len,
+-                                    md_path_char(path_at, 0),
+-                                    md_path_char(path_at, 1),
+-                                    md_path_char(path_at, 2),
+-                                    md_path_char(path_at, 3),
+-                                    md_path_char(path_at, 4),
+-                                    md_path_char(path_at, 5),
+-                                    md_path_char(path_at, 6),
+-                                    md_path_char(path_at, 7),
+-                                    md_path_char(path_at, 8),
+-                                    md_path_char(path_at, 9),
+-                                    md_path_char(path_at, 10),
+-                                    md_path_char(path_at, 11),
+-                                    md_path_char(path_at, 12),
+-                                    md_path_char(path_at, 13));
++                                MD_SAY("POLARIS MODEM: 0334 VERDICT: "
++                                    "RMTFS OPEN h%u -> p%u, lun %u lba "
++                                    "%u blocks %u\n",
++                                    handle, part, md_efs_parts[part].lun,
++                                    md_efs_parts[part].lba,
++                                    md_efs_parts[part].blocks);
++                                if (md_efs_parts[part].blocks != 0u &&
++                                    sweet_ufs_raw_read(
++                                    md_efs_parts[part].lun,
++                                    md_efs_parts[part].lba, 1u,
++                                    md_efs_buf) == 0) {
++                                        w0 = md_rmtfs_mem(md_efs_buf, 0u);
++                                        w1 = md_rmtfs_mem(md_efs_buf, 1u);
++                                        w2 = md_rmtfs_mem(md_efs_buf, 2u);
++                                        w3 = md_rmtfs_mem(md_efs_buf, 3u);
++                                        MD_SAY("POLARIS MODEM: 0334 "
++                                            "VERDICT: EFS p%u block0 "
++                                            "%#x %#x %#x %#x | %#x %#x\n",
++                                            part, w0, w1, w2, w3,
++                                            md_rmtfs_mem(md_efs_buf, 10u),
++                                            md_rmtfs_mem(md_efs_buf, 11u));
++                                }
+                         } else {
+                                 code = 48u;             /* Q_INVAL */
+                         }
+@@ -5217,19 +5382,17 @@
+                         if (at2 != 0u && lw >= 4u) {
+                                 want = md_le32(at2);
+                         }
+-                        if (want != 0u && md_rmtfs_alloc(want) &&
+-                            md_rmtfs_file()) {
++                        if (want != 0u && md_rmtfs_alloc(want)) {
+                                 wr = md_hs_number64(rsp, wr, 0x10u,
+                                     md_rmtfs_shared_pa);
+                                 md_rmtfs_allocs++;
+                                 what = 5u;
+                                 MD_SAY("POLARIS MODEM: 0333 VERDICT: "
+                                     "RMTFS ALLOC %u -> pa %#llx size "
+-                                    "%#x, carveout %u, file %#x\n",
++                                    "%#x, carveout %u\n",
+                                     want, md_rmtfs_shared_pa,
+                                     md_rmtfs_shared_size,
+-                                    md_rmtfs_carveout,
+-                                    md_rmtfs_file_size);
++                                    md_rmtfs_carveout);
+                         } else {
+                                 code = 2u;              /* Q_NOMEM */
+                                 MD_SAY("POLARIS MODEM: 0333 VERDICT: "
+@@ -6226,9 +6389,9 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0333 alive: W2e + W2f + "
++        MD_SAY("POLARIS MODEM: ======== build 0334 alive: W2e + W2f + "
+             "GLINK + QRTR + SERVREG + HOSTSVC + QMI HEADER + "
+-            "RMTFS CARVEOUT (level 47) ========\n");
++            "RMTFS FROM UFS (level 48) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
