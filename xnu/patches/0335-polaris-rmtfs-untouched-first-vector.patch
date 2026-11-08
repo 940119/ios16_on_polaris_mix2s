@@ -1,0 +1,170 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -3828,6 +3828,9 @@
+ static uint32_t md_rmtfs_writes, md_rmtfs_denied;
+ static uint32_t md_rmtfs_last_sector, md_rmtfs_last_bytes;
+ static uint32_t md_rmtfs_last_handle;
++/* 0335: how many R_RW arrived, and how many were answered without
++ * touching the modem's buffer at all. */
++static uint32_t md_rmtfs_rw_count, md_rmtfs_notouch;
+ /* 0332: why the last R_ALLOC went the way it did, and whether the
+  * carveout is the buffer the modem is talking to. */
+ static uint32_t md_rmtfs_step, md_rmtfs_carveout;
+@@ -3861,6 +3864,15 @@
+  * the modem asked for in 0331. */
+ #define MD_RMTFS_CARVEOUT	0x8bf00000ull
+ #define MD_RMTFS_CARVEOUT_SIZE	0x00200000u
++/* 0335: this phone has no qcom,rmtfs-mem.  It has
++ * /soc/qcom,rmtfs_sharedmem@0, compatible "qcom,sharedmem-uio",
++ * reg-names "rmtfs", qcom,client-id 1, qcom,guard-memory, 2 MiB,
++ * whose address field reads zero because the loader patches it --
++ * and 0x8bf00000 on polaris belongs to camera_region, so dipper's
++ * address is not this phone's.  The base is a boot argument in
++ * MiB now: polarisrmtfs=2239 -> 0x8bf00000.  A wrong guess costs a
++ * repack instead of a build. */
++static unsigned long long md_rmtfs_base = MD_RMTFS_CARVEOUT;
+ /* The tag is only for accounting; keep the build alive if this
+  * header set does not export it. */
+ #if !defined(VM_KERN_MEMORY_IOKIT)
+@@ -4455,7 +4467,7 @@
+         /* 0329: split in two.  The single 0328 line was longer than the
+          * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
+          * cut at "hostsv" and hsreplies / SRN state never appeared. */
+-        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0333 / level 47; "
++        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0335 / level 49; "
+             "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
+             "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+@@ -4485,6 +4497,13 @@
+             md_rmtfs_writes, md_rmtfs_denied, md_rmtfs_shared_pa,
+             md_rmtfs_shared_size, md_rmtfs_last_handle,
+             md_rmtfs_last_sector, md_rmtfs_last_bytes / 512u);
++        MD_SAY("POLARIS MODEM: 0335 HEARTBEAT #%u: rw %u, untouched "
++            "%u, base %#llx, tx tail %u tx head %u, rx tail %u\n",
++            n, md_rmtfs_rw_count, md_rmtfs_notouch,
++            (unsigned long long)md_rmtfs_base,
++            md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
++            md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
++            md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u);
+ }
+ /* 0324: one byte out of the WCOMB SMEM map.  QMI TLVs are byte-packed,
+  * so a word-wise read is not enough.  No memcpy, no unmap (0310/0312). */
+@@ -4963,7 +4982,12 @@
+ {
+         volatile uint32_t *w;
+         uint32_t i;
++        int optin = 0;
+ 
++        if (PE_parse_boot_argn("polarisrmtfs", &optin, sizeof(optin)) &&
++            optin > 0) {
++                md_rmtfs_base = (unsigned long long)(uint32_t)optin << 20;
++        }
+         if (md_rmtfs_shared_size != 0u) {
+                 return md_rmtfs_shared_size >= want;
+         }
+@@ -4974,25 +4998,25 @@
+                     want, MD_RMTFS_CARVEOUT_SIZE);
+                 return FALSE;
+         }
+-        md_rmtfs_dev = ml_io_map((vm_offset_t)MD_RMTFS_CARVEOUT,
++        md_rmtfs_dev = ml_io_map((vm_offset_t)md_rmtfs_base,
+             MD_RMTFS_CARVEOUT_SIZE);
+         if (md_rmtfs_dev == 0u) {
+                 md_rmtfs_step = 0x8u;
+                 MD_SAY("POLARIS MODEM: 0333 VERDICT: RMTFS ALLOC "
+                     "ml_io_map(%#llx, %u) FAILED\n",
+-                    MD_RMTFS_CARVEOUT, MD_RMTFS_CARVEOUT_SIZE);
++                    md_rmtfs_base, MD_RMTFS_CARVEOUT_SIZE);
+                 return FALSE;
+         }
+         w = (volatile uint32_t *)(uintptr_t)md_rmtfs_dev;
+         MD_SAY("POLARIS MODEM: 0333 VERDICT: RMTFS ALLOC want %u -> "
+             "carveout %#llx, before %#x %#x %#x %#x\n",
+-            want, MD_RMTFS_CARVEOUT, w[0], w[1], w[2], w[3]);
++            want, md_rmtfs_base, w[0], w[1], w[2], w[3]);
+         for (i = 0u; i < MD_RMTFS_CARVEOUT_SIZE / 4u; i++) {
+                 w[i] = 0u;
+         }
+         __sync_synchronize();
+         md_rmtfs_carveout = 1u;
+-        md_rmtfs_shared_pa = MD_RMTFS_CARVEOUT;
++        md_rmtfs_shared_pa = md_rmtfs_base;
+         md_rmtfs_shared_size = MD_RMTFS_CARVEOUT_SIZE;
+         return TRUE;
+ }
+@@ -5163,6 +5187,7 @@
+         if (handle < MD_EFS_HANDLES && md_efs_map[handle] != 0u) {
+                 part = (uint32_t)md_efs_map[handle] - 1u;
+         }
++        md_rmtfs_rw_count++;
+         for (k = 0u; k < n; k++) {
+                 uint32_t q = v_at + 1u + 12u * k;
+ 
+@@ -5183,17 +5208,34 @@
+                             md_rmtfs_shared_pa, md_rmtfs_shared_size);
+                         return 48u;             /* Q_INVAL */
+                 }
+-                MD_SAY("POLARIS MODEM: 0334 VERDICT: RW h%u p%u dir %u "
+-                    "sec %u n%u sh %#x %#x %#x %#x\n",
+-                    handle, part, dir, sector, nsec,
+-                    md_rmtfs_word(shared, 0u),
+-                    md_rmtfs_word(shared, 1u),
+-                    md_rmtfs_word(shared, 2u),
+-                    md_rmtfs_word(shared, 3u));
++                MD_SAY("POLARIS MODEM: 0335 VERDICT: RW h%u p%u dir %u "
++                    "vec %u/%u sec %u phys %#llx n%u\n",
++                    handle, part, dir, k, n, sector,
++                    (unsigned long long)shared, nsec);
+                 if (part == MD_EFS_NONE) {
+                         md_rmtfs_denied++;
+                         return 9u;              /* Q_BAD_HANDLE */
+                 }
++                /* 0335: the FIRST vector is answered without one
++                 * byte of buffer traffic.  0333 served zeros and
++                 * 0334 served the real partition, and the modem
++                 * froze at the same byte both times: 478 w0 stops
++                 * exactly at the end of this reply and the
++                 * DONE_REUSE written after it is never read.  So
++                 * the content is not the variable, the ACCESS is.
++                 * An untouched answer separates "the modem hangs
++                 * reading the buffer" from "the modem hangs in
++                 * its own EFS parser".  Every later vector is
++                 * served exactly as 0334 did, so one boot answers
++                 * both questions. */
++                if (md_rmtfs_rw_count == 1u) {
++                        md_rmtfs_notouch++;
++                        total += nsec;
++                        MD_SAY("POLARIS MODEM: 0335 VERDICT: RW #%u "
++                            "LEFT UNTOUCHED (no memset, no UFS, no "
++                            "poke)\n", md_rmtfs_rw_count);
++                        continue;
++                }
+                 if (dir == 0u && md_rmtfs_zero(shared, bytes)) {
+                         zero++;
+                 }
+@@ -5216,9 +5258,10 @@
+                 md_rmtfs_last_bytes = bytes;
+                 total += nsec;
+         }
+-        MD_SAY("POLARIS MODEM: 0334 VERDICT: RMTFS RW h%u p%u dir %u, "
+-            "%u vec, %u sec, ufs %u zero %u\n",
+-            handle, part, dir, n, total, served, zero);
++        MD_SAY("POLARIS MODEM: 0335 VERDICT: RMTFS RW h%u p%u dir %u, "
++            "%u vec, %u sec, ufs %u zero %u, rw %u\n",
++            handle, part, dir, n, total, served, zero,
++            md_rmtfs_rw_count);
+         return 0u;
+ }
+ 
+@@ -6393,9 +6436,9 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0334 alive: W2e + W2f + "
++        MD_SAY("POLARIS MODEM: ======== build 0335 alive: W2e + W2f + "
+             "GLINK + QRTR + SERVREG + HOSTSVC + QMI HEADER + "
+-            "RMTFS FROM UFS (level 48) ========\n");
++            "RMTFS FIRST VECTOR UNTOUCHED (level 49) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
