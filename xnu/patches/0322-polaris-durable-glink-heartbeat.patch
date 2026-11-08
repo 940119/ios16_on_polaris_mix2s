@@ -1,0 +1,153 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -144,6 +144,17 @@
+  * 0321 sends AP OPEN + 3 INTENT frames, decodes QRTR v1 headers,
+  * releases complete DATA with DONE_REUSE, and keeps watching.
+  * Level 36.
++ *
++ * 0322: the 0321 ring wrapped.  After 4h15m in iOS the phone had
++ * written 5,098,970 bytes into the 4 MiB ring (flush #15201) and
++ * every POLARIS MODEM line had been overwritten by the once-a-
++ * second SWEET FB tick heartbeat.  The 0321 experiment therefore
++ * has NO evidence and must be re-run.  GLINK logic is untouched;
++ * 0322 adds a permanent low-frequency heartbeat (IOSleep 1 s,
++ * one summary line every 5 s) so the newest part of the ring
++ * always contains a self-describing verdict, however long the
++ * phone stays in iOS before somebody returns it to TWRP.
++ * Level 37.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -159,6 +170,10 @@
+ 
+ extern int sweet_ufs_raw_read(uint8_t lun, uint64_t lba, uint32_t count, void *to);
+ extern void sweet_log_flush_now(void);
++/* 0184 / 0228 GPU probes call IOSleep() in this same kernel; the
++ * symbol is exported with C linkage, so a plain C declaration is
++ * enough here (polaris_modem.c is C, not IOKit C++). */
++extern void IOSleep(unsigned int milliseconds);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ 					/* 0296: dipper maps MBA_MEMORY with VM_WIMG_WCOMB */
+@@ -453,15 +468,15 @@
+ 	if (polaris_modem_level() >= 7) {
+ 		md_firmware_metadata(md_image_cluster);
+ 	}
+-	if (polaris_modem_level() == 36) {
+-		/* 0321: AP opens IPCRTR, offers intents, keeps watching. */
++	if (polaris_modem_level() == 37) {
++		/* 0322: 0321 GLINK logic, plus a permanent heartbeat. */
+ 		thread_t thread;
+ 
+ 		if (kernel_thread_start(md_w2e_thread, NULL, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+-			MD_SAY("POLARIS MODEM: 0321: W2e+W2f thread started\n");
++			MD_SAY("POLARIS MODEM: 0322: W2e+W2f thread started\n");
+ 		} else {
+-			MD_SAY("POLARIS MODEM: 0321: could not start the W2e+W2f thread\n");
++			MD_SAY("POLARIS MODEM: 0322: could not start the W2e+W2f thread\n");
+ 		}
+ 	} else if (polaris_modem_level() == 23) {
+ 		/* 0305: all seven mss clocks and the Q6's sleep clock, on and back. */
+@@ -3531,6 +3546,9 @@
+  * kept drawing to tick 14880.  One md_qmp_ms() is ~14 ms on this
+  * device, so 3000 ticks keeps the pump alive for ~40 s more. */
+ #define MD_GLINK_WATCH_TICKS	3000u
++/* 0322: one summary every 5 s.  ~216 KB/h, always the newest
++ * content in the 4 MiB ring, even after hours in iOS. */
++#define MD_GLINK_HEARTBEAT_EVERY	5u
+ 
+ struct md_smem_toc {
+ 	uint8_t magic[4];
+@@ -3577,6 +3595,7 @@
+ static uint32_t md_glink_desc_at, md_glink_tx_at, md_glink_rx_at;
+ static bool md_glink_acked, md_glink_offered, md_glink_quiet;
+ static uint32_t md_glink_opens, md_glink_data_count, md_glink_done_count;
++static uint32_t md_qrtr_hello_count, md_qrtr_new_server_count;
+ 
+ static bool
+ md_smem_peek(uint32_t at, void *to, uint32_t size)
+@@ -4203,6 +4222,11 @@
+ 				    md_smem_word(md_glink_rx_at + at + 64u));
+ 			}
+ 			md_glink_data_count++;
++			if (q[1] == 2u) {		/* QRTR Q_HELLO */
++				md_qrtr_hello_count++;
++			} else if (q[1] == 4u) {	/* QRTR Q_NEW_SERVER */
++				md_qrtr_new_server_count++;
++			}
+ 			/* dipper pump():670 -- release a complete single-frame
+ 			 * packet with DONE_REUSE (our intents are reusable). */
+ 			md_smem_poke(md_glink_tx_at + wr,
+@@ -4549,7 +4573,7 @@
+ 	    { 0u, 500u, 1000u, 2000u, 500u, 500u };
+ 	bool ever_435 = FALSE, ever_ready = FALSE, ever_glink = FALSE;
+ 	bool ever_fatal = FALSE;
+-	uint32_t s, k, elapsed = 0, done = 0;
++	uint32_t s, k, elapsed = 0, done = 0, beat = 0;
+ 
+ 	MD_SAY("POLARIS MODEM:   W2f step 4: post-modem SMEM census starts: "
+ 	    "6 short samples, AP items made before the Q6, doorbell rung once\n");
+@@ -4616,9 +4640,40 @@
+ 	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
+ 	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
+ 	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u);
+-	md_glink_quiet = FALSE;
+ 	MD_SAY("POLARIS MODEM:   0318: 428/478/479 were written before the Q6, "
+ 	    "the modem is left running\n");
++	/* 0322: the 0321 ring wrapped after 4h15m in iOS: 5,098,970 bytes
++	 * written into a 4 MiB ring, every POLARIS MODEM line overwritten by
++	 * the once-a-second SWEET FB tick.  Never return.  One IOSleep(1000)
++	 * per iteration costs almost no CPU, keeps GLINK pumped, and puts a
++	 * complete self-describing summary in the NEWEST part of the ring
++	 * every five seconds, however long the phone stays in iOS. */
++	MD_SAY("POLARIS MODEM: 0322 HEARTBEAT START: one summary every %u s, "
++	    "the W2e thread never returns; the ring always holds a verdict\n",
++	    MD_GLINK_HEARTBEAT_EVERY);
++	for (beat = 1u; ; beat++) {
++		IOSleep(1000u);
++		md_glink_pump(elapsed + MD_GLINK_WATCH_TICKS + beat);
++		if ((beat % MD_GLINK_HEARTBEAT_EVERY) != 0u) {
++			continue;
++		}
++		MD_SAY("POLARIS MODEM: 0322 HEARTBEAT #%u: build 0322 / level 37; "
++		    "OPEN_ACKs %u, AP OPEN+3 INTENTS offered=%s, QRTR DATA %u "
++		    "(Q_HELLO %u / Q_NEW_SERVER %u), DONE_REUSE %u; "
++		    "478 %#x %#x %#x %#x; 480 %#x %#x %#x %#x\n",
++		    beat / MD_GLINK_HEARTBEAT_EVERY,
++		    md_glink_opens, md_glink_offered ? "YES" : "NO",
++		    md_glink_data_count, md_qrtr_hello_count,
++		    md_qrtr_new_server_count, md_glink_done_count,
++		    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
++		    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
++		    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
++		    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u,
++		    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 0u) : 0u,
++		    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
++		    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
++		    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 12u) : 0u);
++	}
+ }
+ 
+ static bool
+@@ -4700,8 +4755,8 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-	MD_SAY("POLARIS MODEM: ======== build 0321 alive: W2e + W2f + "
+-	    "GLINK AP OPEN + INTENTS + QRTR WATCH (level 36) ========\n");
++	MD_SAY("POLARIS MODEM: ======== build 0322 alive: W2e + W2f + "
++	    "GLINK AP OPEN + INTENTS + DURABLE HEARTBEAT (level 37) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
+@@ -4740,6 +4795,9 @@
+ 	MD_SAY("POLARIS MODEM:   0321 opens IPCRTR from the AP, offers 3 "
+ 	    "intents, decodes QRTR v1 headers, releases DATA with "
+ 	    "DONE_REUSE, and keeps a watch loop alive after the census\n");
++	MD_SAY("POLARIS MODEM:   0322 keeps the same GLINK logic but never "
++	    "returns: a 5 s heartbeat carries the full verdict so the "
++	    "wrapped ring can never erase the evidence again\n");
+ 	MD_SAY("POLARIS MODEM:   after BOOT QDSP6SS is never read; the "
+ 	    "permanent MBA VA is never dereferenced or unmapped\n");
+ 	MD_SAY("POLARIS MODEM:   MBA.MBN + QMP on + three rails + seven clocks "
