@@ -18,7 +18,7 @@
              "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
              "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
              n, md_glink_acked ? "YES" : "NO",
-@@ -4665,6 +4665,148 @@
+@@ -4665,6 +4665,152 @@
          return "UNKNOWN";
  }
  
@@ -123,7 +123,10 @@
 +			    ((uint32_t)md_smem_byte(at + p + 5u) << 16) |
 +			    ((uint32_t)md_smem_byte(at + p + 6u) << 24);
 +		} else if (t == 0x02u && l >= 1u) {
-+			nlen = l < sizeof(name) ? l : (uint32_t)sizeof(name);
++			/* leave room for the terminator: a name that
++			 * fills the buffer must not run %s off the end */
++			nlen = l < sizeof(name) - 1u ?
++			    l : (uint32_t)(sizeof(name) - 1u);
 +			for (i = 0u; i < nlen; i++) {
 +				name[i] = (char)md_smem_byte(at + p + 3u + i);
 +			}
@@ -134,6 +137,7 @@
 +		}
 +		p += 3u + l;
 +	}
++	name[nlen] = 0;
 +	/* printable, because the ring cuts a line at 255 bytes and a
 +	 * binary name would cost a dozen bytes per character */
 +	for (i = 0u; i < nlen; i++) {
@@ -167,7 +171,7 @@
  /* 0325: QRTR v1 Q_NEW_LOOKUP (type 10) control packet, the Linux
   * qrtr_send_new_lookup() equivalent.  dipper lookup_port():789 is
   * XNU-simplified and registers its filter locally WITHOUT sending
-@@ -5286,6 +5428,10 @@
+@@ -5286,6 +5432,10 @@
                          uint32_t svc_at, svc_len = 0u, bit, total = 0u;
                          uint32_t count = 0u, list, k, nl;
                          char svc[33];
@@ -178,7 +182,7 @@
  
                          svc_at = md_qmi_find(req_at, req_len, 1u,
                              &svc_len);
-@@ -5338,6 +5484,21 @@
+@@ -5338,6 +5488,21 @@
                                                      (uint8_t)(md_pd_domains[k].instance >>
                                                      (8u * i));
                                          }
@@ -200,7 +204,7 @@
                                          rsp[list++] = 0u;
                                          for (i = 0u; i < 4u; i++) {
                                                  rsp[list++] = 0u;
-@@ -5355,6 +5516,9 @@
+@@ -5355,6 +5520,9 @@
                                      "PDM QUERY '%s' (%u bytes) -> "
                                      "%u domains, %u listed\n",
                                      svc, svc_len, total, count);
@@ -210,17 +214,18 @@
                          }
                  } else if (msg == 0x24u) {
                          what = 3u;              /* pdm():307 PFR ack */
-@@ -5668,6 +5832,21 @@
+@@ -5668,6 +5836,22 @@
                          txhead = nh;
                  }
          }
 +        /* 0338: 0325-0337 asked once, at heartbeat 6, before the modem
 +         * had announced anything, and never asked again.  Ask twice more
-+         * once the host services are published and the modem has been
-+         * quiet for a while; a lookup costs one 72 B frame. */
++         * once the host services are published; a lookup costs one 72 B
++         * frame.  The spacing is 8 heartbeats, not 16: 0337's whole run
++         * only reached heartbeat 25, so a gate at 32 would never fire. */
 +        if (md_hostsvc_published == 3u && md_qmi_rx_count > 0u &&
 +            md_wlfw_lookups >= 1u && md_wlfw_lookups < 3u &&
-+            md_heartbeat_count > 16u && (md_heartbeat_count % 16u) == 0u) {
++            md_heartbeat_count > 6u && (md_heartbeat_count % 8u) == 0u) {
 +                uint32_t nh = md_qrtr_new_lookup(txhead);
 +
 +                if (nh != txhead) {
@@ -232,7 +237,7 @@
          /* 0327: ONE host-service notice per pump.  0326 wrote all three
           * (plus 0325's lookup) in one pump with two rings microseconds
           * apart, all sharing foreign intent slot 0; 478 w0 stayed at 352
-@@ -5880,6 +6059,14 @@
+@@ -5880,6 +6064,14 @@
                                          wr = nh;
                                          md_hostsvc_replies++;
                                  }
@@ -247,7 +252,7 @@
                          }
  			}
  			/* 0324: service 66 / instance 180 is the servreg
-@@ -6424,10 +6611,10 @@
+@@ -6424,10 +6616,10 @@
  	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
  	const char *why = "nothing went wrong";
  
