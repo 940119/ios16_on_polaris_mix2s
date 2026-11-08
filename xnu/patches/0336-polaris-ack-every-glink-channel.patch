@@ -1,0 +1,118 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -3711,7 +3711,13 @@
+ #define MD_GLINK_READ_NOTIFY	13u
+ #define MD_GLINK_DONE_REUSE	14u
+ #define MD_GLINK_SIGNALS	15u
+-#define MD_GLINK_MAX_OPEN	8u	/* at most 8 OPEN_ACKs per batch */
++/* 0336: 0335 saw twelve OPEN frames (cid 4 apr_voice_svc,
++ * 5 apr_apps2, 6 LOOPBACK_CTL_MPSS, 7 DS, 8..11 DATA1..DATA4,
++ * 12 DATA11) and acknowledged only eight, because this cap was 8.
++ * The four that lost out -- DATA2, DATA3, DATA4, DATA11 -- never
++ * came up.  The tx FIFO is 16 KiB and an OPEN_ACK is 8 bytes, so
++ * the cap bought nothing; 32 leaves room for the whole stack. */
++#define MD_GLINK_MAX_OPEN	32u	/* at most 32 OPEN_ACKs per batch */
+ #define MD_GLINK_FEATURES	1u	/* mi8_glink_start():890 */
+ #define MD_GLINK_CID		1u
+ /* 0321: 0320's thread returned at FB tick ~7200 while the system
+@@ -3831,6 +3837,9 @@
+ /* 0335: how many R_RW arrived, and how many were answered without
+  * touching the modem's buffer at all. */
+ static uint32_t md_rmtfs_rw_count, md_rmtfs_notouch;
++/* 0336: total bytes handed to the modem, so one heartbeat says how
++ * far the EFS load has gone. */
++static uint32_t md_rmtfs_bytes;
+ /* 0332: why the last R_ALLOC went the way it did, and whether the
+  * carveout is the buffer the modem is talking to. */
+ static uint32_t md_rmtfs_step, md_rmtfs_carveout;
+@@ -3872,7 +3881,14 @@
+  * address is not this phone's.  The base is a boot argument in
+  * MiB now: polarisrmtfs=2239 -> 0x8bf00000.  A wrong guess costs a
+  * repack instead of a build. */
+-static unsigned long long md_rmtfs_base = MD_RMTFS_CARVEOUT;
++/* 0335 proved 0x96900000 works and 0x8bf00000 never could, so the
++ * MBA region is the default now.  0x96900000 + 0x200000 is exactly
++ * slpi_region@0x96b00000, i.e. mba_region is exactly the 2 MiB the
++ * modem asks for.  Its first word was 0x464c457f ("\x7fELF"), the
++ * MBA image, which the modem no longer runs once its own firmware
++ * is up -- and it is the one region the modem certainly maps. */
++#define MD_RMTFS_MBA	0x96900000ull
++static unsigned long long md_rmtfs_base = MD_RMTFS_MBA;
+ /* The tag is only for accounting; keep the build alive if this
+  * header set does not export it. */
+ #if !defined(VM_KERN_MEMORY_IOKIT)
+@@ -4467,7 +4483,7 @@
+         /* 0329: split in two.  The single 0328 line was longer than the
+          * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
+          * cut at "hostsv" and hsreplies / SRN state never appeared. */
+-        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0335 / level 49; "
++        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0336 / level 50; "
+             "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
+             "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+@@ -4497,9 +4513,9 @@
+             md_rmtfs_writes, md_rmtfs_denied, md_rmtfs_shared_pa,
+             md_rmtfs_shared_size, md_rmtfs_last_handle,
+             md_rmtfs_last_sector, md_rmtfs_last_bytes / 512u);
+-        MD_SAY("POLARIS MODEM: 0335 HEARTBEAT #%u: rw %u, untouched "
+-            "%u, base %#llx, tx tail %u tx head %u, rx tail %u\n",
+-            n, md_rmtfs_rw_count, md_rmtfs_notouch,
++        MD_SAY("POLARIS MODEM: 0336 HEARTBEAT #%u: rw %u, %u KB, "
++            "base %#llx, tx tail %u tx head %u, rx tail %u\n",
++            n, md_rmtfs_rw_count, md_rmtfs_bytes >> 10,
+             (unsigned long long)md_rmtfs_base,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
+@@ -5216,26 +5232,11 @@
+                         md_rmtfs_denied++;
+                         return 9u;              /* Q_BAD_HANDLE */
+                 }
+-                /* 0335: the FIRST vector is answered without one
+-                 * byte of buffer traffic.  0333 served zeros and
+-                 * 0334 served the real partition, and the modem
+-                 * froze at the same byte both times: 478 w0 stops
+-                 * exactly at the end of this reply and the
+-                 * DONE_REUSE written after it is never read.  So
+-                 * the content is not the variable, the ACCESS is.
+-                 * An untouched answer separates "the modem hangs
+-                 * reading the buffer" from "the modem hangs in
+-                 * its own EFS parser".  Every later vector is
+-                 * served exactly as 0334 did, so one boot answers
+-                 * both questions. */
+-                if (md_rmtfs_rw_count == 1u) {
+-                        md_rmtfs_notouch++;
+-                        total += nsec;
+-                        MD_SAY("POLARIS MODEM: 0335 VERDICT: RW #%u "
+-                            "LEFT UNTOUCHED (no memset, no UFS, no "
+-                            "poke)\n", md_rmtfs_rw_count);
+-                        continue;
+-                }
++                /* 0335's untouched-first-vector probe did its job
++                 * and is gone: with the buffer in the MBA region
++                 * the modem reads it happily and asks for more.
++                 * md_rmtfs_notouch stays as a counter so the field
++                 * keeps its meaning across versions. */
+                 if (dir == 0u && md_rmtfs_zero(shared, bytes)) {
+                         zero++;
+                 }
+@@ -5257,6 +5258,7 @@
+                 md_rmtfs_last_sector = sector;
+                 md_rmtfs_last_bytes = bytes;
+                 total += nsec;
++                md_rmtfs_bytes += bytes;
+         }
+         MD_SAY("POLARIS MODEM: 0335 VERDICT: RMTFS RW h%u p%u dir %u, "
+             "%u vec, %u sec, ufs %u zero %u, rw %u\n",
+@@ -6436,9 +6438,10 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0335 alive: W2e + W2f + "
++        MD_SAY("POLARIS MODEM: ======== build 0336 alive: W2e + W2f + "
+             "GLINK + QRTR + SERVREG + HOSTSVC + QMI HEADER + "
+-            "RMTFS FIRST VECTOR UNTOUCHED (level 49) ========\n");
++            "RMTFS IN THE MBA REGION + ALL CHANNELS ACKED "
++            "(level 50) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
