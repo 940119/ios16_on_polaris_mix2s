@@ -1,0 +1,335 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -235,6 +235,17 @@
+  * TLV 0x10 handle=1 for RMTFS and an empty domain list for PDM.
+  * QRTR Q_DATA from our service port back to the requester's port.
+  * Level 42.
++ *
++ * 0329: the replies worked.  478 w0 == w1 == 760, the modem read
++ * both frames and dropped a Q_DEL_CLIENT on each requesting port
++ * right afterwards -- R_OPEN accepted.  But 0328 capped itself at
++ * two replies while the modem asked for four (fs1, fs2, fsg on
++ * 0x4001 and PDM 0x21 on 0x4003), so it froze: QMI rx stuck at 5,
++ * WLFW 69 stayed 0, SRN state stayed 0x7fffffff down.  0329 removes
++ * the cap, hands out a fresh handle per R_OPEN for any
++ * "/boot/modem_fs*" path, and answers everything it cannot serve
++ * with an explicit result code instead of silence.
++ * Level 43.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -3723,6 +3734,7 @@
+ static uint32_t md_hostsvc_tx_expected, md_hostsvc_stucks;
+ static uint32_t md_hostsvc_all_read;
+ static uint32_t md_hostsvc_replies;
++static uint32_t md_hostsvc_handle;
+ static uint32_t md_srn_node, md_srn_port, md_srn_txn;
+ static uint32_t md_glink_remote_cid;	/* modem's IPCRTR cid, dynamic */
+ static uint32_t md_foreign_id[MD_GLINK_MAX_FOREIGN];
+@@ -4299,31 +4311,33 @@
+ static void
+ md_0323_heartbeat(uint32_t n)
+ {
+-        MD_SAY("POLARIS MODEM: 0328 HEARTBEAT #%u: build 0328 / level 42; "
+-            "ACK=%s offered=%s remote cid %u, OPEN_ACKs %u, foreign %u, "
+-            "QRTR DATA %u (HELLO %u / NEW_SERVER %u / NEW_LOOKUP %u / "
+-            "srv66 %u / WLFW 69 %u), HELLO replies %u, SRN listener %u, "
+-            "QMI rx %u, WLFW lookup %u, hostsvc %u/3, hsreplies %u, "
+-            "SRN state %#x, DONE_REUSE %u; "
+-            "478 %#x %#x %#x %#x; 480 %#x %#x %#x %#x\n",
++        /* 0329: split in two.  The single 0328 line was longer than the
++         * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
++         * cut at "hostsv" and hsreplies / SRN state never appeared. */
++        MD_SAY("POLARIS MODEM: 0329 HEARTBEAT #%u: build 0329 / level 43; "
++            "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
++            "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+             md_glink_offered ? "YES" : "NO", md_glink_remote_cid,
+-            md_glink_opens, md_foreign_count, md_glink_data_count,
+-            md_qrtr_hello_count, md_qrtr_new_server_count,
+-            md_qrtr_new_lookup_count, md_qrtr_srv66_count,
+-            md_srv69_count, md_qrtr_hello_replies, md_srn_listener_sent,
+-            md_qmi_rx_count, md_wlfw_lookups, md_hostsvc_published,
+-            md_hostsvc_replies, md_srn_state, md_glink_done_count,
++            md_glink_opens, md_foreign_count, md_glink_done_count,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
+-            md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u,
++            md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u);
++        MD_SAY("POLARIS MODEM: 0329 HEARTBEAT #%u: DATA %u (HELLO %u / "
++            "SRV %u / LOOKUP %u / srv66 %u / WLFW69 %u), hello rpy %u, "
++            "srn lsn %u, QMI rx %u, wlfw lk %u, hsreplies %u, "
++            "state %#x, 480 %#x %#x %#x %#x\n",
++            n, md_glink_data_count, md_qrtr_hello_count,
++            md_qrtr_new_server_count, md_qrtr_new_lookup_count,
++            md_qrtr_srv66_count, md_srv69_count, md_qrtr_hello_replies,
++            md_srn_listener_sent, md_qmi_rx_count, md_wlfw_lookups,
++            md_hostsvc_replies, md_srn_state,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 0u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 12u) : 0u);
+ }
+-
+ /* 0324: one byte out of the WCOMB SMEM map.  QMI TLVs are byte-packed,
+  * so a word-wise read is not enough.  No memcpy, no unmap (0310/0312). */
+ static uint8_t
+@@ -4575,20 +4589,83 @@
+         return head + MD_QRTR_CTRL_FRAME;
+ }
+ 
+-/* 0328: minimal QMI response to the two host-service requests the modem
+- * began sending in 0327.  dipper receive():360-390, rmtfs():221-249
+- * (R_OPEN = msg 1, TLV 0x10 len4 = handle id), pdm():320-341 (msg 0x21,
+- * TLV 0x10 total / 0x11 / 0x12 domain list).  QMI is byte-packed, so
+- * build it in a byte array and pack little-endian into QRTR words.
+- * Returns the new tx head. */
++/* 0329: answer EVERY host-service QMI request.  0328 capped itself at
++ * two replies, so "/boot/modem_fsg" (0x4001) and PDM 0x21 (0x4003) were
++ * never answered and the modem stopped dead -- QMI rx froze at 5 for the
++ * remaining 18 heartbeats.  Formats from dipper receive():360-390,
++ * rmtfs():217-300 and pdm():320-341:
++ *
++ *   header : [0] = 2 (response), [1..4] = req[1..4] (txn + msg echoed),
++ *            [5..6] = TLV byte count
++ *   result : TLV 0x02 len 4 = [result][error]; success 0/0, failure
++ *            1/code (setle(response + 10, error ? 1 : 0, 2) and
++ *            setle(response + 12, error, 2))
++ *   R_OPEN : + TLV 0x10 len 4 = handle id            (rmtfs():248)
++ *   PDM    : + 0x10 len 2 total, 0x11 len 2 = 1, 0x12 len 1 count
++ * Anything else still gets an explicit result so the modem never waits
++ * on us again.  Returns the new tx head. */
++
++/* QMI TLVs are packed after the 7 byte header as
++ * {tag, len_lo, len_hi, value...}.  Returns the value offset or 0. */
++static uint32_t
++md_qmi_find(uint32_t at, uint32_t len, uint32_t tag, uint32_t *out_len)
++{
++        uint32_t p = 7u, n;
++
++        while (p + 3u <= len) {
++                n = (uint32_t)md_smem_byte(at + p + 1u) |
++                    ((uint32_t)md_smem_byte(at + p + 2u) << 8);
++                if (p + 3u + n > len) {
++                        return 0u;
++                }
++                if ((uint32_t)md_smem_byte(at + p) == tag) {
++                        *out_len = n;
++                        return at + p + 3u;
++                }
++                p += 3u + n;
++        }
++        return 0u;
++}
++
++/* Append one little-endian TLV, return the offset just past it. */
++static uint32_t
++md_hs_number(uint8_t *rsp, uint32_t at, uint8_t tag, uint32_t value,
++    uint32_t bytes)
++{
++        uint32_t i;
++
++        rsp[at] = tag;
++        rsp[at + 1u] = (uint8_t)bytes;
++        rsp[at + 2u] = 0u;
++        for (i = 0u; i < bytes; i++) {
++                rsp[at + 3u + i] = (uint8_t)(value >> (8u * i));
++        }
++        return at + 3u + bytes;
++}
++
++static uint32_t
++md_hs_prefix(uint32_t at, uint32_t len, const char *prefix)
++{
++        uint32_t i;
++
++        for (i = 0u; prefix[i] != 0; i++) {
++                if (i >= len ||
++                    md_smem_byte(at + i) != (uint8_t)prefix[i]) {
++                        return 0u;
++                }
++        }
++        return 1u;
++}
++
+ static uint32_t
+ md_hostsvc_reply(uint32_t head, uint32_t our_port, uint32_t their_port,
+     uint32_t req_at, uint32_t req_len, uint32_t slot)
+ {
+-        uint8_t rsp[40];
+-        uint32_t pkt[16];
+-        uint32_t i, n = 0u, tlv_len, chunk, frame;
++        uint8_t rsp[64];
++        uint32_t pkt[24];
++        uint32_t i, n, wr, chunk, frame, path_at = 0u, path_len = 0u;
+         uint32_t iid = 0u, isize = 0u, at = head;
++        uint32_t code = 0u, handle = 0u, what = 0u;
+         uint16_t msg;
+ 
+         if (req_len < 7u || md_smem_byte(req_at) != 0u) {
+@@ -4596,39 +4673,49 @@
+         }
+         msg = (uint16_t)(md_smem_byte(req_at + 3u) |
+             ((uint16_t)md_smem_byte(req_at + 4u) << 8));
+-        if (msg == 1u && our_port == MD_HOSTSVC_PORT0) {
+-                n = 21u;                        /* RMTFS R_OPEN */
+-        } else if (msg == 0x21u && our_port == MD_HOSTSVC_PORT2) {
+-                n = 28u;                        /* PDM empty domain list */
+-        } else {
+-                return head;                    /* not ours (e.g. 0x4000) */
++        if (our_port != MD_HOSTSVC_PORT0 && our_port != MD_HOSTSVC_PORT1 &&
++            our_port != MD_HOSTSVC_PORT2) {
++                return head;                    /* e.g. 0x4000 servreg */
+         }
+         for (i = 0u; i < sizeof(rsp); i++) {
+                 rsp[i] = 0u;
+         }
+-        rsp[0] = 2u;                           /* QMI response */
+-        for (i = 1u; i < 5u; i++) {
+-                rsp[i] = md_smem_byte(req_at + i);   /* txn + msg echoed */
+-        }
+-        tlv_len = n - 7u;
+-        rsp[5] = (uint8_t)(tlv_len & 0xffu);
+-        rsp[6] = (uint8_t)(tlv_len >> 8);
+-        rsp[7] = 0x02u;                        /* TLV 0x02 result */
+-        rsp[8] = 4u; rsp[9] = 0u;
+-        rsp[10] = 0u; rsp[11] = 0u; rsp[12] = 0u; rsp[13] = 0u;
+-        if (msg == 1u) {
+-                /* TLV 0x10 len 4 = handle id 1 (rmtfs():248). */
+-                rsp[14] = 0x10u; rsp[15] = 4u; rsp[16] = 0u;
+-                rsp[17] = 1u; rsp[18] = 0u; rsp[19] = 0u; rsp[20] = 0u;
++        wr = md_hs_number(rsp, 7u, 0x02u, 0u, 4u);   /* result 0 / error 0 */
++
++        if (our_port == MD_HOSTSVC_PORT2) {
++                if (msg == 0x21u) {
++                        /* pdm():324 -- no sdm845 domain matches
++                         * "tms/pddump_disabled", so the list is empty. */
++                        wr = md_hs_number(rsp, wr, 0x10u, 0u, 2u);
++                        wr = md_hs_number(rsp, wr, 0x11u, 1u, 2u);
++                        wr = md_hs_number(rsp, wr, 0x12u, 0u, 1u);
++                        what = 1u;
++                } else {
++                        code = 94u;             /* Q_UNSUPPORTED */
++                }
+         } else {
+-                /* pdm():327-341 -- "tms/pddump_disabled" matches no
+-                 * sdm845 domain, so total=0 and the list is empty. */
+-                rsp[14] = 0x10u; rsp[15] = 2u; rsp[16] = 0u;
+-                rsp[17] = 0u; rsp[18] = 0u;
+-                rsp[19] = 0x11u; rsp[20] = 2u; rsp[21] = 0u;
+-                rsp[22] = 1u; rsp[23] = 0u;
+-                rsp[24] = 0x12u; rsp[25] = 1u; rsp[26] = 0u;
+-                rsp[27] = 0u;
++                path_at = md_qmi_find(req_at, req_len, 1u, &path_len);
++                if (msg == 1u && path_at != 0u &&
++                    md_hs_prefix(path_at, path_len, "/boot/modem_fs")) {
++                        handle = ++md_hostsvc_handle;
++                        wr = md_hs_number(rsp, wr, 0x10u, handle, 4u);
++                        what = 2u;
++                } else if (msg == 1u) {
++                        code = 1u;              /* Q_MALFORMED */
++                } else {
++                        code = 94u;             /* Q_UNSUPPORTED */
++                }
++        }
++        if (code != 0u) {
++                rsp[10] = 1u; rsp[11] = 0u;
++                rsp[12] = (uint8_t)(code & 0xffu);
++                rsp[13] = (uint8_t)(code >> 8);
++        }
++        n = wr;
++        rsp[5] = (uint8_t)((n - 7u) & 0xffu);
++        rsp[6] = (uint8_t)((n - 7u) >> 8);
++        for (i = 0u; i < sizeof(pkt) / sizeof(pkt[0]); i++) {
++                pkt[i] = 0u;
+         }
+         pkt[0] = 1u;                           /* QRTR version */
+         pkt[1] = MD_QRTR_Q_DATA;               /* type Q_DATA */
+@@ -4638,9 +4725,6 @@
+         pkt[5] = n;                            /* RAW QMI length */
+         pkt[6] = 0u;                           /* dst node = modem */
+         pkt[7] = their_port;                   /* dst port = requester */
+-        for (i = 8u; i < 16u; i++) {
+-                pkt[i] = 0u;
+-        }
+         for (i = 0u; i < n; i++) {
+                 pkt[8u + i / 4u] |= (uint32_t)rsp[i] << (8u * (i % 4u));
+         }
+@@ -4656,7 +4740,7 @@
+                 }
+         }
+         if (iid == 0u || head + frame > MD_GLINK_FIFO_SIZE) {
+-                MD_SAY("POLARIS MODEM: 0328 VERDICT: reply NOT sent "
++                MD_SAY("POLARIS MODEM: 0329 VERDICT: reply NOT sent "
+                     "(slot %u, foreign %u, head %u, frame %u)\n",
+                     slot, md_foreign_count, head, frame);
+                 return head;
+@@ -4672,12 +4756,13 @@
+         if (frame > 16u + chunk) {
+                 md_smem_poke(md_glink_tx_at + at + 16u + chunk, 0u);
+         }
+-        MD_SAY("POLARIS MODEM: 0328 VERDICT: QMI REPLY msg %#x "
+-            "port %#x -> node 0 port %u, %u QMI bytes, %s, "
+-            "cid %u slot %u intent %u size %u, chunk %u frame %u, "
+-            "tx head %u -> %u\n", msg, our_port, their_port, n,
+-            msg == 1u ? "RMTFS R_OPEN" : "PDM 0x21", MD_GLINK_CID,
+-            slot, iid, isize, chunk, frame, head, head + frame);
++        MD_SAY("POLARIS MODEM: 0329 VERDICT: QMI REPLY msg %#x "
++            "port %#x -> node 0 port %u, %u QMI bytes, %s, code %u, "
++            "handle %u, cid %u slot %u intent %u size %u, chunk %u "
++            "frame %u, tx head %u -> %u\n", msg, our_port, their_port, n,
++            what == 2u ? "RMTFS R_OPEN" : (what == 1u ? "PDM 0x21" :
++            "refused"), code, handle, MD_GLINK_CID, slot, iid, isize,
++            chunk, frame, head, head + frame);
+         return head + frame;
+ }
+ /* 0324: dump every QMI control frame and its TLVs.  The next version
+@@ -5004,17 +5089,18 @@
+ 				md_qmi_dump(md_glink_rx_at + at + 48u,
+ 				    chunk - 32u);
+ 				md_qmi_rx_count++;
+-                        /* 0328: answer the two host-service QMI
+-                         * requests the modem began sending in 0327.
+-                         * One reply per request, distinct intent
+-                         * slot; anything else (0x4000 servreg) is
+-                         * ignored by md_hostsvc_reply(). */
+-                        if (md_hostsvc_replies < 2u) {
++                        /* 0329: no reply cap.  0328 stopped after
++                         * two and the modem froze with fsg and PDM
++                         * still unanswered.  Keep the intent slot
++                         * inside the 29 intents the modem offered,
++                         * cycling so a reply never reuses the slot
++                         * of a frame the modem has not released. */
++                        {
+                                 uint32_t nh = md_hostsvc_reply(wr,
+                                     q[7], q[3],
+                                     md_glink_rx_at + at + 48u,
+                                     chunk - 32u,
+-                                    4u + md_hostsvc_replies);
++                                    4u + (md_hostsvc_replies % 24u));
+ 
+                                 if (nh != wr) {
+                                         wr = nh;
+@@ -5469,7 +5555,7 @@
+ 	 * per iteration costs almost no CPU, keeps GLINK pumped, and puts a
+ 	 * complete self-describing summary in the NEWEST part of the ring
+ 	 * every five seconds, however long the phone stays in iOS. */
+-        MD_SAY("POLARIS MODEM: 0328 HEARTBEAT START: one summary every %u s, "
++        MD_SAY("POLARIS MODEM: 0329 HEARTBEAT START: one summary every %u s, "
+             "the W2e thread never returns; the census already prints them\n",
+             MD_GLINK_HEARTBEAT_EVERY);
+ 	for (beat = 1u; ; beat++) {
+@@ -5562,9 +5648,9 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0328 alive: W2e + W2f + "
+-            "GLINK + QRTR + SERVREG + HOSTSVC + MIN QMI REPLY "
+-            "(level 42) ========\n");
++        MD_SAY("POLARIS MODEM: ======== build 0329 alive: W2e + W2f + "
++            "GLINK + QRTR + SERVREG + HOSTSVC + ANSWER EVERY QMI "
++            "(level 43) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
