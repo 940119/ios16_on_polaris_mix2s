@@ -1,0 +1,114 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -3317,6 +3317,78 @@
+ 	return done;
+ }
+ 
++/* 0339: the four supplies the radio needs before it will boot.
++ *
++ * polaris device tree, phandle by phandle (checked against _dtb_all.txt):
++ *   vdd-0.8-cx-mx-supply = 334 = /soc/rpmh-regulator-ldoa5   -> 800 mV
++ *   vdd-1.8-xo-supply    = 335 = /soc/rpmh-regulator-ldoa7   -> 1800 mV
++ *   vdd-1.3-rfa-supply   = 336 = /soc/rpmh-regulator-ldoa17  -> 1300 mV
++ *   vdd-3.3-ch0-supply   = 337 = /soc/rpmh-regulator-ldoa25  -> 3300 mV
++ * The same four names dipper uses (wlan_supplies[] in mi8_rproc.c), so
++ * the voltages transfer; the addresses do not, they come out of this
++ * machine's own command database.
++ *
++ * dipper wlan_power(): rail_position() for the address, then three RPMh
++ * writes at +0 (volts, in mV), +8 (mode 7 = HPM) and +4 (enable 1), and
++ * it turns them on BEFORE the modem starts because "with the chip off
++ * msa_info said INCOMPATIBLE_STATE for 20 s, and with it switched on 3 s
++ * late as well" (EXP-0203).  We never reach msa_info at all, so the
++ * supplies go on first.
++ *
++ * Nothing is read back: RPMh has no usable vreg read here, and
++ * md_rpmh_write() already reports whether the command completed. */
++static const struct md_wlan_rail {
++	const char *name;
++	uint32_t millivolts;
++	const char *what;
++} md_wlan_rails[] = {
++	{ "ldoa5",   800u, "vdd-0.8-cx-mx" },
++	{ "ldoa7",  1800u, "vdd-1.8-xo" },
++	{ "ldoa17", 1300u, "vdd-1.3-rfa" },
++	{ "ldoa25", 3300u, "vdd-3.3-ch0" }
++};
++#define MD_WLAN_RAILS \
++	(sizeof(md_wlan_rails) / sizeof(md_wlan_rails[0]))
++
++static uint32_t
++md_wlan_power(vm_offset_t db, vm_offset_t rsc)
++{
++	uint32_t i, ok = 0u, addr;
++
++	MD_SAY("POLARIS MODEM: 0339 VERDICT: turning on the radio's %u "
++	    "supplies before the modem starts\n", (uint32_t)MD_WLAN_RAILS);
++	for (i = 0u; i < MD_WLAN_RAILS; i++) {
++		addr = md_rail_lookup(db, md_wlan_rails[i].name, NULL);
++		if (addr == 0u) {
++			MD_SAY("POLARIS MODEM: 0339 VERDICT: %s (%s) is NOT "
++			    "in the command database\n", md_wlan_rails[i].name,
++			    md_wlan_rails[i].what);
++			continue;
++		}
++		MD_SAY("POLARIS MODEM: 0339 VERDICT: %s (%s) at %#x: "
++		    "%u mV, then mode 7, then enable\n", md_wlan_rails[i].name,
++		    md_wlan_rails[i].what, addr, md_wlan_rails[i].millivolts);
++		if (!md_rpmh_write(rsc, addr, md_wlan_rails[i].millivolts,
++		    md_wlan_rails[i].name)) {
++			continue;
++		}
++		if (!md_rpmh_write(rsc, addr + 8u, 7u,
++		    md_wlan_rails[i].name)) {
++			continue;
++		}
++		if (!md_rpmh_write(rsc, addr + 4u, 1u,
++		    md_wlan_rails[i].name)) {
++			continue;
++		}
++		ok++;
++		IOSleep(1u);
++	}
++	MD_SAY("POLARIS MODEM: 0339 VERDICT: %u of %u radio supplies up "
++	    "(ldoa5/7/17/25 = cx-mx/xo/rfa/ch0); now watch wlan_pd / WLFW 69\n",
++	    ok, (uint32_t)MD_WLAN_RAILS);
++	return ok;
++}
++
+ static void
+ md_rail_write_probe(void)
+ {
+@@ -4483,7 +4555,7 @@
+         /* 0329: split in two.  The single 0328 line was longer than the
+          * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
+          * cut at "hostsv" and hsreplies / SRN state never appeared. */
+-        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0338 / level 52; "
++        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0339 / level 53; "
+             "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
+             "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+@@ -6616,10 +6688,10 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0338 alive: W2e + W2f + "
++        MD_SAY("POLARIS MODEM: ======== build 0339 alive: W2e + W2f + "
+             "GLINK + QRTR + SERVREG + HOSTSVC + QMI HEADER + "
+             "RMTFS IN THE MBA REGION + DIRECTION IS DIRECTION + "
+-            "SERVREG SET_ACK (level 52) ========\n");
++            "SERVREG SET_ACK + RADIO SUPPLIES (level 53) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
+@@ -6713,6 +6785,10 @@
+ 	mapped = TRUE;
+ 	md_w2e_state(rmb, q6, "before anything");
+ 
++	/* 0339: power first, then the modem.  dipper does the same with
++	 * mi8rp_wlfw=4 and it is the variant that worked. */
++	md_wlan_power(db, rsc);
++
+ 	/* ---- step 3: put MBA.MBN in the region and read it back ---- */
+ 	MD_SAY("POLARIS MODEM:   W2e step 3/12: copy MBA.MBN into "
+ 	    "%#llx and compare\n", (unsigned long long)MD_MBA_REGION);
