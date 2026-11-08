@@ -1,0 +1,274 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -276,6 +276,20 @@
+  * (R_ALLOC: contiguous uncached buffer; R_RW: 512-byte sectors
+  * against a 4 MiB zeroed RAM shadow, never flash) and rotates
+  * through wr.  Level 45.
++ *
++ * 0332: 0331 proved the header fix works -- the modem opened all
++ * six modem_fs partitions, each from its own QRTR port, and every
++ * reply was taken (QMI rx 3 -> 9, hsreplies 2 -> 8).  It then
++ * asked for 0x200000 bytes of shared memory and we refused, and
++ * the ring could not say why because md_rmtfs_alloc() only sets
++ * its globals at the very end.  0332 records the step, asks the
++ * pmap for the physical address the way 0095 does for the USB
++ * gadget (pmap_find_phys + ptoa_64), and falls back to the
++ * platform's rmtfs carveout at 0x8bf00000 -- dipper's dt value,
++ * and exactly the size the modem asked for -- when the pool has
++ * no DMA-able address below 4 GiB.  The EFS shadow no longer
++ * fails the request: it takes the largest of 4 / 2 / 1 MiB.
++ * Level 46.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -300,6 +314,10 @@
+ 					/* 0296: dipper maps MBA_MEMORY with VM_WIMG_WCOMB */
+ static bool md_content_risky;	/* 0296: the dispatch sets it before the thread runs */
+ extern vm_offset_t ml_vtophys(vm_offset_t);	/* 0291: kernel VA -> PA for the mdt */
++/* 0332: 0095 turns the USB gadget's kmem_alloc_contig() address into
++ * a physical one with these two, not with ml_vtophys(). */
++extern pmap_t kernel_pmap;
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ 
+@@ -3780,6 +3798,15 @@
+ static uint32_t md_rmtfs_opens, md_rmtfs_allocs, md_rmtfs_reads;
+ static uint32_t md_rmtfs_writes, md_rmtfs_denied;
+ static uint32_t md_rmtfs_last_sector, md_rmtfs_last_bytes;
++/* 0332: why the last R_ALLOC went the way it did, and how big the
++ * EFS shadow actually turned out to be. */
++static uint32_t md_rmtfs_step, md_rmtfs_carveout;
++static uint32_t md_rmtfs_file_size;
++/* dipper's dt: qcom,rmtfs-mem, 0x200000 at 0x8bf00000, right below
++ * the WLAN MSA region at 0x8c100000 -- and 0x200000 is exactly what
++ * the modem asked for in 0331. */
++#define MD_RMTFS_CARVEOUT	0x8bf00000ull
++#define MD_RMTFS_CARVEOUT_SIZE	0x00200000u
+ /* The tag is only for accounting; keep the build alive if this
+  * header set does not export it. */
+ #if !defined(VM_KERN_MEMORY_IOKIT)
+@@ -4374,7 +4401,7 @@
+         /* 0329: split in two.  The single 0328 line was longer than the
+          * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
+          * cut at "hostsv" and hsreplies / SRN state never appeared. */
+-        MD_SAY("POLARIS MODEM: 0331 HEARTBEAT #%u: build 0331 / level 45; "
++        MD_SAY("POLARIS MODEM: 0332 HEARTBEAT #%u: build 0332 / level 46; "
+             "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
+             "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+@@ -4384,7 +4411,7 @@
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u);
+-        MD_SAY("POLARIS MODEM: 0331 HEARTBEAT #%u: DATA %u (HELLO %u / "
++        MD_SAY("POLARIS MODEM: 0332 HEARTBEAT #%u: DATA %u (HELLO %u / "
+             "SRV %u / LOOKUP %u / srv66 %u / WLFW69 %u), hello rpy %u, "
+             "srn lsn %u, QMI rx %u, wlfw lk %u, hsreplies %u, "
+             "srn w %#x r %#x, 480 %#x %#x %#x %#x\n",
+@@ -4397,7 +4424,7 @@
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 12u) : 0u);
+-        MD_SAY("POLARIS MODEM: 0331 HEARTBEAT #%u: rmtfs open %u "
++        MD_SAY("POLARIS MODEM: 0332 HEARTBEAT #%u: rmtfs open %u "
+             "alloc %u, read %u write %u denied %u, pa %#llx "
+             "size %#x, last %u/%u\n",
+             n, md_rmtfs_opens, md_rmtfs_allocs, md_rmtfs_reads,
+@@ -4870,29 +4897,60 @@
+ md_rmtfs_alloc(uint32_t want)
+ {
+         vm_offset_t va = 0;
+-        uint64_t pa;
++        uint64_t pa = 0u, vtpa = 0u;
++        ppnum_t pn = 0;
+ 
+-        if (md_rmtfs_shared_va != 0u) {
++        if (md_rmtfs_shared_va != 0u || md_rmtfs_shared_size != 0u) {
+                 return md_rmtfs_shared_size >= want;
+         }
+         if (want == 0u || want > MD_RMTFS_MAX) {
++                md_rmtfs_step = 0x1u;
+                 return FALSE;
+         }
+         want = (want + 0xfffu) & ~0xfffu;
+         if (kmem_alloc_contig(kernel_map, &va, want, PAGE_MASK, 0, 0,
+             KMA_DATA | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT)
+             != KERN_SUCCESS) {
+-                return FALSE;
++                md_rmtfs_step = 0x2u;
++                va = 0;
+         }
+-        pa = (uint64_t)ml_vtophys(va);
+-        if (pa == 0u || pa >= 0x100000000ull) {
+-                return FALSE;           /* R_RW vectors carry 32 bits */
++        if (va != 0u) {
++                md_rmtfs_shared_va = va;
++                vtpa = (uint64_t)ml_vtophys(va);
++                pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++                if (pn != 0) {
++                        pa = (uint64_t)ptoa_64(pn);
++                }
++                if (pa == 0u) {
++                        pa = vtpa;
++                }
++                if (pa == 0u || pa >= 0x100000000ull ||
++                    pa + want > 0x100000000ull) {
++                        md_rmtfs_step |= 0x4u;
++                        kmem_free(kernel_map, va, want);
++                        va = 0;
++                        md_rmtfs_shared_va = 0u;
++                        pa = 0u;
++                }
++        }
++        if (va == 0u && want <= MD_RMTFS_CARVEOUT_SIZE) {
++                pa = MD_RMTFS_CARVEOUT;
++                want = MD_RMTFS_CARVEOUT_SIZE;
++                md_rmtfs_carveout = 1u;
++        }
++        MD_SAY("POLARIS MODEM: 0332 VERDICT: RMTFS ALLOC probe want %u, "
++            "step %#x, pa %#llx, ml_vtophys %#llx, carveout %u\n",
++            want, md_rmtfs_step, pa, vtpa, md_rmtfs_carveout);
++        if (pa == 0u) {
++                return FALSE;
+         }
+         md_rmtfs_dev = ml_io_map((vm_offset_t)pa, want);
+         if (md_rmtfs_dev == 0u) {
++                md_rmtfs_step |= 0x8u;
++                MD_SAY("POLARIS MODEM: 0332 VERDICT: RMTFS ALLOC "
++                    "ml_io_map(%#llx, %u) FAILED\n", pa, want);
+                 return FALSE;
+         }
+-        md_rmtfs_shared_va = va;
+         md_rmtfs_shared_pa = pa;
+         md_rmtfs_shared_size = want;
+         {
+@@ -4911,18 +4969,30 @@
+ static bool
+ md_rmtfs_file(void)
+ {
+-        vm_offset_t va = 0;
++        static const uint32_t tries[3] = { 0x400000u, 0x200000u, 0x100000u };
++        vm_offset_t va;
++        uint32_t i;
+ 
+         if (md_rmtfs_file_va != 0u) {
+                 return TRUE;
+         }
+-        if (kmem_alloc_contig(kernel_map, &va, MD_RMTFS_FILE, PAGE_MASK,
+-            0, 0, KMA_DATA | KMA_PERMANENT,
+-            VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-                return FALSE;
++        for (i = 0u; i < 3u; i++) {
++                va = 0;
++                if (kmem_alloc_contig(kernel_map, &va, tries[i],
++                    PAGE_MASK, 0, 0,
++                    KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++                    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++                        md_rmtfs_file_va = va;
++                        md_rmtfs_file_size = tries[i];
++                        MD_SAY("POLARIS MODEM: 0332 VERDICT: RMTFS FILE "
++                            "%u bytes at %#lx\n", tries[i],
++                            (unsigned long)va);
++                        return TRUE;
++                }
+         }
+-        md_rmtfs_file_va = va;
+-        return TRUE;
++        MD_SAY("POLARIS MODEM: 0332 VERDICT: RMTFS FILE none of "
++            "4/2/1 MiB could be had\n");
++        return FALSE;
+ }
+ 
+ /* Move bytes between the shadow and the modem's buffer.  Byte-wise and
+@@ -4985,7 +5055,7 @@
+                     bytes <= md_rmtfs_shared_size -
+                         (uint32_t)(shared - md_rmtfs_shared_pa) &&
+                     ((uint64_t)sector + (uint64_t)nsec) * 512u <=
+-                        MD_RMTFS_FILE) {
++                        md_rmtfs_file_size) {
+                         md_rmtfs_io(shared,
+                             (uint8_t *)(uintptr_t)(md_rmtfs_file_va +
+                             sector * 512u), bytes, dir != 0u);
+@@ -5000,13 +5070,13 @@
+                         continue;
+                 }
+                 md_rmtfs_denied++;
+-                MD_SAY("POLARIS MODEM: 0331 VERDICT: RMTFS RW REFUSED "
++                MD_SAY("POLARIS MODEM: 0332 VERDICT: RMTFS RW REFUSED "
+                     "dir %u vector %u/%u sector %u pa %#llx %u sectors, "
+                     "base %#llx size %#x\n", dir, k, n, sector, shared,
+                     nsec, md_rmtfs_shared_pa, md_rmtfs_shared_size);
+                 return 48u;
+         }
+-        MD_SAY("POLARIS MODEM: 0331 VERDICT: RMTFS RW dir %u, %u vectors, "
++        MD_SAY("POLARIS MODEM: 0332 VERDICT: RMTFS RW dir %u, %u vectors, "
+             "%u sectors, last sector %u, %u bytes, handle %u\n",
+             dir, n, total, md_rmtfs_last_sector, md_rmtfs_last_bytes,
+             md_le32(h_at));
+@@ -5173,17 +5243,19 @@
+                                     md_rmtfs_shared_pa);
+                                 md_rmtfs_allocs++;
+                                 what = 5u;
+-                                MD_SAY("POLARIS MODEM: 0331 VERDICT: "
+-                                    "RMTFS ALLOC %u bytes -> pa %#llx, "
+-                                    "%u mapped, file %#lx\n",
++                                MD_SAY("POLARIS MODEM: 0332 VERDICT: "
++                                    "RMTFS ALLOC %u -> pa %#llx size "
++                                    "%#x, carveout %u, file %#x\n",
+                                     want, md_rmtfs_shared_pa,
+                                     md_rmtfs_shared_size,
+-                                    (unsigned long)md_rmtfs_file_va);
++                                    md_rmtfs_carveout,
++                                    md_rmtfs_file_size);
+                         } else {
+                                 code = 2u;              /* Q_NOMEM */
+-                                MD_SAY("POLARIS MODEM: 0331 VERDICT: "
+-                                    "RMTFS ALLOC %u bytes REFUSED\n",
+-                                    want);
++                                MD_SAY("POLARIS MODEM: 0332 VERDICT: "
++                                    "RMTFS ALLOC %u bytes REFUSED, "
++                                    "step %#x\n",
++                                    want, md_rmtfs_step);
+                         }
+                 } else if (msg == 2u) {                 /* R_CLOSE */
+                         what = 6u;
+@@ -5230,7 +5302,7 @@
+                 }
+         }
+         if (iid == 0u || head + frame > MD_GLINK_FIFO_SIZE) {
+-                MD_SAY("POLARIS MODEM: 0331 VERDICT: reply NOT sent "
++                MD_SAY("POLARIS MODEM: 0332 VERDICT: reply NOT sent "
+                     "(slot %u, foreign %u, head %u, frame %u)\n",
+                     slot, md_foreign_count, head, frame);
+                 return head;
+@@ -5246,7 +5318,7 @@
+         if (frame > 16u + chunk) {
+                 md_smem_poke(md_glink_tx_at + at + 16u + chunk, 0u);
+         }
+-        MD_SAY("POLARIS MODEM: 0331 VERDICT: QMI REPLY msg %#x "
++        MD_SAY("POLARIS MODEM: 0332 VERDICT: QMI REPLY msg %#x "
+             "port %#x -> node 0 port %u, %u QMI bytes, %s, code %u, "
+             "handle %u, cid %u slot %u intent %u size %u, chunk %u "
+             "frame %u, tx head %u -> %u\n", msg, our_port, their_port, n,
+@@ -6081,7 +6153,7 @@
+ 	 * per iteration costs almost no CPU, keeps GLINK pumped, and puts a
+ 	 * complete self-describing summary in the NEWEST part of the ring
+ 	 * every five seconds, however long the phone stays in iOS. */
+-        MD_SAY("POLARIS MODEM: 0331 HEARTBEAT START: one summary every %u s, "
++        MD_SAY("POLARIS MODEM: 0332 HEARTBEAT START: one summary every %u s, "
+             "the W2e thread never returns; the census already prints them\n",
+             MD_GLINK_HEARTBEAT_EVERY);
+ 	for (beat = 1u; ; beat++) {
+@@ -6174,9 +6246,9 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0331 alive: W2e + W2f + "
++        MD_SAY("POLARIS MODEM: ======== build 0332 alive: W2e + W2f + "
+             "GLINK + QRTR + SERVREG + HOSTSVC + QMI HEADER + "
+-            "RMTFS DATA (level 45) ========\n");
++            "RMTFS ALLOC (level 46) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
