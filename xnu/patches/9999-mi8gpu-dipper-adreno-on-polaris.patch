@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,4771 @@
+@@ -0,0 +1,4783 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -88,7 +88,7 @@ new file mode 100644
 +/* ---- the global clock controller ----------------------------------------------------------------- */
 +
 +#define GCC_PHYS                0x00100000UL
-+#define GCC_SIZE                0x001f0000UL
++#define GCC_SIZE                0x00090000UL    /* v2: 0x8c010 is the highest GCC offset read; the old 0x1f0000 cost ~1.94 MB of PERMANENT kernel-map on every ml_io_map() */
 +#define CBCR_OFF                (1u << 31)      /* the branch is off */
 +#define GCC_APPS_VOTE_0         0x52004         /* the apps processor's enables: GPLL0 to the GPU at bit 15, its /2 at 16 */
 +
@@ -113,7 +113,9 @@ new file mode 100644
 +	uint32_t votes;
 +	bool ahb_on = false;
 +
-+	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++	if (gcc == 0) {
++		gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++	}
 +	for (unsigned i = 0; i < sizeof(gcc_branches) / sizeof(gcc_branches[0]); i++) {
 +		uint32_t v = rd(gcc + gcc_branches[i].reg);
 +
@@ -4245,7 +4247,11 @@ new file mode 100644
 +static void
 +stale_stop(void)
 +{
-+	vm_offset_t g = ml_io_map(GCC_PHYS, GCC_SIZE), cc;
++	vm_offset_t g = gcc, cc;
++
++	if (g == 0) {
++		g = gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++	}
 +	uint32_t gdscr;
 +
 +	if (rd(g + GCC_GPU_CFG_AHB) & CBCR_OFF) {
@@ -4430,7 +4436,12 @@ new file mode 100644
 +			}
 +		}
 +	}
-+	stale_stop();
++	/* v2: step 1 is a read-only probe. stale_stop() wrote six registers
++	 * and collapsed CX the other GPU driver had just powered on
++	 * (CX-RACE-WRITE, 04:14 ring). Never do that for N<=1. */
++	if (last > 1) {
++		stale_stop();
++	}
 +	{
 +		uint32_t zap = 0;
 +
@@ -4602,6 +4613,7 @@ new file mode 100644
 +	uint32_t last = 0, only = 0;
 +
 +	printf("mi8gpu: %s (dipper A630 driver on polaris/MIX 2S)\n", mi8gpu_polaris_marker);
++	printf("mi8gpu: read-only step 1, small GCC window (v2)\n");
 +	thread_t thread;
 +
 +	if (!PE_parse_boot_argn("mi8gpu", &last, sizeof(last)) || last == 0) {
