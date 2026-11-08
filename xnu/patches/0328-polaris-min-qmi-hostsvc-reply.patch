@@ -1,0 +1,213 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -223,6 +223,18 @@
+  * to catch up before sending the next frame.  A silent modem now
+  * produces an explicit `0327 VERDICT: TX TAIL STUCK` line.
+  * Level 41.
++ *
++ * 0328: with the transport fixed, the modem immediately sent two
++ * QMI REQUESTS to the services we announced in 0327 -- RMTFS
++ * R_OPEN (msg 1, "/boot/modem_fs1") to 0x4001 and PDM 0x21
++ * ("tms/pddump_disabled") to 0x4003.  We only announced, never
++ * implemented, so it is still waiting: wlan_pd stayed DOWN and
++ * WLFW 69 never appeared.  0328 sends the minimum QMI RESPONSE
++ * to each (dipper receive():360-390 / rmtfs():221 / pdm():320):
++ * type 2, txn+msg echoed, TLV 0x02 result=0/error=0, plus
++ * TLV 0x10 handle=1 for RMTFS and an empty domain list for PDM.
++ * QRTR Q_DATA from our service port back to the requester's port.
++ * Level 42.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -3710,6 +3722,7 @@
+ static uint32_t md_hostsvc_published;
+ static uint32_t md_hostsvc_tx_expected, md_hostsvc_stucks;
+ static uint32_t md_hostsvc_all_read;
++static uint32_t md_hostsvc_replies;
+ static uint32_t md_srn_node, md_srn_port, md_srn_txn;
+ static uint32_t md_glink_remote_cid;	/* modem's IPCRTR cid, dynamic */
+ static uint32_t md_foreign_id[MD_GLINK_MAX_FOREIGN];
+@@ -4286,12 +4299,12 @@
+ static void
+ md_0323_heartbeat(uint32_t n)
+ {
+-        MD_SAY("POLARIS MODEM: 0327 HEARTBEAT #%u: build 0327 / level 41; "
++        MD_SAY("POLARIS MODEM: 0328 HEARTBEAT #%u: build 0328 / level 42; "
+             "ACK=%s offered=%s remote cid %u, OPEN_ACKs %u, foreign %u, "
+             "QRTR DATA %u (HELLO %u / NEW_SERVER %u / NEW_LOOKUP %u / "
+             "srv66 %u / WLFW 69 %u), HELLO replies %u, SRN listener %u, "
+-            "QMI rx %u, WLFW lookup %u, hostsvc %u/3, SRN state %#x, "
+-            "DONE_REUSE %u; "
++            "QMI rx %u, WLFW lookup %u, hostsvc %u/3, hsreplies %u, "
++            "SRN state %#x, DONE_REUSE %u; "
+             "478 %#x %#x %#x %#x; 480 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+             md_glink_offered ? "YES" : "NO", md_glink_remote_cid,
+@@ -4300,7 +4313,7 @@
+             md_qrtr_new_lookup_count, md_qrtr_srv66_count,
+             md_srv69_count, md_qrtr_hello_replies, md_srn_listener_sent,
+             md_qmi_rx_count, md_wlfw_lookups, md_hostsvc_published,
+-            md_srn_state, md_glink_done_count,
++            md_hostsvc_replies, md_srn_state, md_glink_done_count,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
+@@ -4561,6 +4574,112 @@
+             slot, iid, size, head, head + MD_QRTR_CTRL_FRAME);
+         return head + MD_QRTR_CTRL_FRAME;
+ }
++
++/* 0328: minimal QMI response to the two host-service requests the modem
++ * began sending in 0327.  dipper receive():360-390, rmtfs():221-249
++ * (R_OPEN = msg 1, TLV 0x10 len4 = handle id), pdm():320-341 (msg 0x21,
++ * TLV 0x10 total / 0x11 / 0x12 domain list).  QMI is byte-packed, so
++ * build it in a byte array and pack little-endian into QRTR words.
++ * Returns the new tx head. */
++static uint32_t
++md_hostsvc_reply(uint32_t head, uint32_t our_port, uint32_t their_port,
++    uint32_t req_at, uint32_t req_len, uint32_t slot)
++{
++        uint8_t rsp[40];
++        uint32_t pkt[16];
++        uint32_t i, n = 0u, tlv_len, chunk, frame;
++        uint32_t iid = 0u, isize = 0u, at = head;
++        uint16_t msg;
++
++        if (req_len < 7u || md_smem_byte(req_at) != 0u) {
++                return head;                    /* only answer requests */
++        }
++        msg = (uint16_t)(md_smem_byte(req_at + 3u) |
++            ((uint16_t)md_smem_byte(req_at + 4u) << 8));
++        if (msg == 1u && our_port == MD_HOSTSVC_PORT0) {
++                n = 21u;                        /* RMTFS R_OPEN */
++        } else if (msg == 0x21u && our_port == MD_HOSTSVC_PORT2) {
++                n = 28u;                        /* PDM empty domain list */
++        } else {
++                return head;                    /* not ours (e.g. 0x4000) */
++        }
++        for (i = 0u; i < sizeof(rsp); i++) {
++                rsp[i] = 0u;
++        }
++        rsp[0] = 2u;                           /* QMI response */
++        for (i = 1u; i < 5u; i++) {
++                rsp[i] = md_smem_byte(req_at + i);   /* txn + msg echoed */
++        }
++        tlv_len = n - 7u;
++        rsp[5] = (uint8_t)(tlv_len & 0xffu);
++        rsp[6] = (uint8_t)(tlv_len >> 8);
++        rsp[7] = 0x02u;                        /* TLV 0x02 result */
++        rsp[8] = 4u; rsp[9] = 0u;
++        rsp[10] = 0u; rsp[11] = 0u; rsp[12] = 0u; rsp[13] = 0u;
++        if (msg == 1u) {
++                /* TLV 0x10 len 4 = handle id 1 (rmtfs():248). */
++                rsp[14] = 0x10u; rsp[15] = 4u; rsp[16] = 0u;
++                rsp[17] = 1u; rsp[18] = 0u; rsp[19] = 0u; rsp[20] = 0u;
++        } else {
++                /* pdm():327-341 -- "tms/pddump_disabled" matches no
++                 * sdm845 domain, so total=0 and the list is empty. */
++                rsp[14] = 0x10u; rsp[15] = 2u; rsp[16] = 0u;
++                rsp[17] = 0u; rsp[18] = 0u;
++                rsp[19] = 0x11u; rsp[20] = 2u; rsp[21] = 0u;
++                rsp[22] = 1u; rsp[23] = 0u;
++                rsp[24] = 0x12u; rsp[25] = 1u; rsp[26] = 0u;
++                rsp[27] = 0u;
++        }
++        pkt[0] = 1u;                           /* QRTR version */
++        pkt[1] = MD_QRTR_Q_DATA;               /* type Q_DATA */
++        pkt[2] = MD_QRTR_LOCAL_NODE;           /* 1 */
++        pkt[3] = our_port;                     /* from our service port */
++        pkt[4] = 0u;                           /* confirm_rx */
++        pkt[5] = n;                            /* RAW QMI length */
++        pkt[6] = 0u;                           /* dst node = modem */
++        pkt[7] = their_port;                   /* dst port = requester */
++        for (i = 8u; i < 16u; i++) {
++                pkt[i] = 0u;
++        }
++        for (i = 0u; i < n; i++) {
++                pkt[8u + i / 4u] |= (uint32_t)rsp[i] << (8u * (i % 4u));
++        }
++        chunk = 32u + ((n + 3u) & ~3u);
++        frame = (16u + chunk + 7u) & ~7u;
++        for (i = (slot < md_foreign_count ? slot : 0u);
++             i < md_foreign_count; i++) {
++                if (md_foreign_size[i] >= chunk &&
++                    md_foreign_id[i] != 0u) {
++                        iid = md_foreign_id[i];
++                        isize = md_foreign_size[i];
++                        break;
++                }
++        }
++        if (iid == 0u || head + frame > MD_GLINK_FIFO_SIZE) {
++                MD_SAY("POLARIS MODEM: 0328 VERDICT: reply NOT sent "
++                    "(slot %u, foreign %u, head %u, frame %u)\n",
++                    slot, md_foreign_count, head, frame);
++                return head;
++        }
++        md_smem_poke(md_glink_tx_at + at,
++            MD_GLINK_DATA | (MD_GLINK_CID << 16));
++        md_smem_poke(md_glink_tx_at + at + 4u, iid);
++        md_smem_poke(md_glink_tx_at + at + 8u, chunk);
++        md_smem_poke(md_glink_tx_at + at + 12u, 0u);
++        for (i = 0u; i < chunk / 4u; i++) {
++                md_smem_poke(md_glink_tx_at + at + 16u + 4u * i, pkt[i]);
++        }
++        if (frame > 16u + chunk) {
++                md_smem_poke(md_glink_tx_at + at + 16u + chunk, 0u);
++        }
++        MD_SAY("POLARIS MODEM: 0328 VERDICT: QMI REPLY msg %#x "
++            "port %#x -> node 0 port %u, %u QMI bytes, %s, "
++            "cid %u slot %u intent %u size %u, chunk %u frame %u, "
++            "tx head %u -> %u\n", msg, our_port, their_port, n,
++            msg == 1u ? "RMTFS R_OPEN" : "PDM 0x21", MD_GLINK_CID,
++            slot, iid, isize, chunk, frame, head, head + frame);
++        return head + frame;
++}
+ /* 0324: dump every QMI control frame and its TLVs.  The next version
+  * needs the real response/indication shape before it implements
+  * SET_ACK (0x23) -- dipper says the modem ACKs state changes with
+@@ -4885,6 +5004,23 @@
+ 				md_qmi_dump(md_glink_rx_at + at + 48u,
+ 				    chunk - 32u);
+ 				md_qmi_rx_count++;
++                        /* 0328: answer the two host-service QMI
++                         * requests the modem began sending in 0327.
++                         * One reply per request, distinct intent
++                         * slot; anything else (0x4000 servreg) is
++                         * ignored by md_hostsvc_reply(). */
++                        if (md_hostsvc_replies < 2u) {
++                                uint32_t nh = md_hostsvc_reply(wr,
++                                    q[7], q[3],
++                                    md_glink_rx_at + at + 48u,
++                                    chunk - 32u,
++                                    4u + md_hostsvc_replies);
++
++                                if (nh != wr) {
++                                        wr = nh;
++                                        md_hostsvc_replies++;
++                                }
++                        }
+ 			}
+ 			/* 0324: service 66 / instance 180 is the servreg
+ 			 * wlan_pd notifier.  dipper srn_server():2540
+@@ -5333,7 +5469,7 @@
+ 	 * per iteration costs almost no CPU, keeps GLINK pumped, and puts a
+ 	 * complete self-describing summary in the NEWEST part of the ring
+ 	 * every five seconds, however long the phone stays in iOS. */
+-        MD_SAY("POLARIS MODEM: 0327 HEARTBEAT START: one summary every %u s, "
++        MD_SAY("POLARIS MODEM: 0328 HEARTBEAT START: one summary every %u s, "
+             "the W2e thread never returns; the census already prints them\n",
+             MD_GLINK_HEARTBEAT_EVERY);
+ 	for (beat = 1u; ; beat++) {
+@@ -5426,9 +5562,9 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0327 alive: W2e + W2f + "
+-            "GLINK + QRTR + SERVREG + ONE-FRAME-PER-PUMP HOSTSVC "
+-            "(level 41) ========\n");
++        MD_SAY("POLARIS MODEM: ======== build 0328 alive: W2e + W2f + "
++            "GLINK + QRTR + SERVREG + HOSTSVC + MIN QMI REPLY "
++            "(level 42) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
