@@ -1,0 +1,335 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -155,6 +155,22 @@
+  * always contains a self-describing verdict, however long the
+  * phone stays in iOS before somebody returns it to TWRP.
+  * Level 37.
++ *
++ * 0323: 0322 proved the modem sends a real QRTR Q_HELLO over GLINK
++ * (480 DATA cid 2 arg 1, 52 B, type 2) and then waits.  dipper
++ * qrtr_input():487 answers the FIRST hello with a Q_HELLO control
++ * packet and reads ONLY the command word out of the 20-byte payload,
++ * so 0322's 0x1ee3 / 0xa are modem-side metadata, NOT to be echoed.
++ * 0323 records the modem's IPCRTR cid and its advertised foreign
++ * intents, then replies with a 52-byte QRTR v1 hello inside a GLINK
++ * DATA frame (cid 1, one foreign intent id, 72 B with padding).
++ * It also decodes Q_NEW_SERVER payloads (service 66 / instance 180
++ * is the servreg wlan_pd we need for wlfw).
++ * One md_qmp_ms() is ~14 ms of wall time, so the census gaps are
++ * really minutes: 0323 pumps GLINK every 100 nominal ms DURING the
++ * busy wait and prints a full 0323 HEARTBEAT every 200, from the
++ * first seconds of boot, instead of only after the census finished.
++ * Level 38.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -3549,6 +3565,19 @@
+ /* 0322: one summary every 5 s.  ~216 KB/h, always the newest
+  * content in the 4 MiB ring, even after hours in iOS. */
+ #define MD_GLINK_HEARTBEAT_EVERY	5u
++/* 0323: QRTR v1 over the IPCRTR GLINK channel (dipper mi8_glink.c). */
++#define MD_QRTR_CTRL		0xfffffffeu	/* CTRL port / from */
++#define MD_QRTR_BCAST		0xffffffffu
++#define MD_QRTR_LOCAL_NODE	1u		/* mi8_glink.c:852, default node 1 */
++#define MD_QRTR_Q_DATA		1u
++#define MD_QRTR_Q_HELLO		2u
++#define MD_QRTR_Q_NEW_SERVER	4u
++#define MD_QRTR_Q_NEW_LOOKUP	10u
++#define MD_QRTR_SERVREG_SERVICE	66u		/* msm/modem/wlan_pd */
++#define MD_QRTR_SERVREG_INSTANCE 180u
++#define MD_QRTR_HELLO_LEN	52u		/* 32 B v1 header + 20 B control */
++#define MD_QRTR_HELLO_FRAME	72u		/* (16 + 52 + 7) & ~7 */
++#define MD_GLINK_MAX_FOREIGN	32u		/* modem intents we remember */
+ 
+ struct md_smem_toc {
+ 	uint8_t magic[4];
+@@ -3596,6 +3625,12 @@
+ static bool md_glink_acked, md_glink_offered, md_glink_quiet;
+ static uint32_t md_glink_opens, md_glink_data_count, md_glink_done_count;
+ static uint32_t md_qrtr_hello_count, md_qrtr_new_server_count;
++static uint32_t md_qrtr_new_lookup_count, md_qrtr_srv66_count;
++static uint32_t md_qrtr_hello_replies, md_heartbeat_count;
++static uint32_t md_glink_remote_cid;	/* modem's IPCRTR cid, dynamic */
++static uint32_t md_foreign_id[MD_GLINK_MAX_FOREIGN];
++static uint32_t md_foreign_size[MD_GLINK_MAX_FOREIGN];
++static uint32_t md_foreign_count;
+ 
+ static bool
+ md_smem_peek(uint32_t at, void *to, uint32_t size)
+@@ -4083,6 +4118,110 @@
+ 	}
+ }
+ 
++
++/* 0323: the modem advertised 30 INTENT frames on its own IPCRTR cid in
++ * the 0322 ring.  dipper pump():625 stores those as foreign intents --
++ * buffers the AP may fill with a DATA frame.  Remember the ones big
++ * enough for our 52-byte QRTR hello.  Reads are word-wise volatile
++ * through the WCOMB map (0310 / 0312): no memcpy, no unmap. */
++static void
++md_foreign_note(uint32_t at, uint32_t count)
++{
++	uint32_t j, size, id;
++
++	if (count == 0u || count > 16u) {
++		return;
++	}
++	for (j = 0u; j < count; j++) {
++		size = md_smem_word(md_glink_rx_at + at + 8u + 8u * j);
++		id = md_smem_word(md_glink_rx_at + at + 12u + 8u * j);
++		if (size < MD_QRTR_HELLO_LEN || id == 0u ||
++		    md_foreign_count >= MD_GLINK_MAX_FOREIGN) {
++			continue;
++		}
++		md_foreign_id[md_foreign_count] = id;
++		md_foreign_size[md_foreign_count] = size;
++		md_foreign_count++;
++	}
++}
++
++/* dipper qrtr_input():487 + control():326 + queue_packet():302.
++ * A QRTR v1 control packet is 32 B of header + 20 B of payload.  The
++ * Q_HELLO case reads ONLY command = get32(p) and ignores the other four
++ * payload words, so 0322's payload 0x2 0x1ee3 0xa 0 0 is answered with
++ * 0x2 0 0 0 0.  sn is the src node of the modem's hello (0 in 0322);
++ * dipper replies to that exact node, and sets local_node to 1.
++ * Returns the new tx head. */
++static uint32_t
++md_qrtr_hello_reply(uint32_t head, uint32_t sn)
++{
++	static const uint32_t pkt[13] = {
++		1u, MD_QRTR_Q_HELLO, MD_QRTR_LOCAL_NODE, MD_QRTR_CTRL,
++		0u, 20u, 0u, MD_QRTR_CTRL,
++		MD_QRTR_Q_HELLO, 0u, 0u, 0u, 0u
++	};
++	uint32_t i, iid = 0u, size = 0u, at = head;
++
++	for (i = 0u; i < md_foreign_count; i++) {
++		if (md_foreign_size[i] >= MD_QRTR_HELLO_LEN &&
++		    md_foreign_id[i] != 0u) {
++			iid = md_foreign_id[i];
++			size = md_foreign_size[i];
++			break;
++		}
++	}
++	if (iid == 0u || head + MD_QRTR_HELLO_FRAME > MD_GLINK_FIFO_SIZE) {
++		MD_SAY("POLARIS MODEM: 0323 VERDICT: Q_HELLO received but NO "
++		    "usable foreign intent (have %u, tx head %u); reply "
++		    "NOT sent\n", md_foreign_count, head);
++		return head;
++	}
++	/* header(DATA=9, cid=1, arg=iid) + chunk + left (pump():612). */
++	md_smem_poke(md_glink_tx_at + at,
++	    MD_GLINK_DATA | (MD_GLINK_CID << 16));
++	md_smem_poke(md_glink_tx_at + at + 4u, iid);
++	md_smem_poke(md_glink_tx_at + at + 8u, MD_QRTR_HELLO_LEN);
++	md_smem_poke(md_glink_tx_at + at + 12u, 0u);
++	for (i = 0u; i < 13u; i++) {
++		md_smem_poke(md_glink_tx_at + at + 16u + 4u * i,
++		    i == 6u ? sn : pkt[i]);
++	}
++	md_smem_poke(md_glink_tx_at + at + 68u, 0u);	/* pad 68 -> 72 */
++	md_qrtr_hello_replies++;
++	MD_SAY("POLARIS MODEM: 0323 VERDICT: QRTR Q_HELLO REPLY SENT "
++	    "(cid %u, foreign intent id %u size %u, 52 B, dst node %u, "
++	    "src node %u, tx head %u -> %u)\n", MD_GLINK_CID, iid, size,
++	    sn, MD_QRTR_LOCAL_NODE, head,
++	    head + MD_QRTR_HELLO_FRAME);
++	return head + MD_QRTR_HELLO_FRAME;
++}
++
++/* 0323: ONE line that answers "did the modem speak QRTR?" from any point
++ * in the boot.  0322 only got to sample 5 of 6 and never reached its
++ * heartbeat loop; this one runs from the first census gap onward. */
++static void
++md_0323_heartbeat(uint32_t n)
++{
++	MD_SAY("POLARIS MODEM: 0323 HEARTBEAT #%u: build 0323 / level 38; "
++	    "ACK=%s offered=%s remote cid %u, OPEN_ACKs %u, foreign %u, "
++	    "QRTR DATA %u (HELLO %u / NEW_SERVER %u / NEW_LOOKUP %u / "
++	    "srv66 %u), HELLO replies %u, DONE_REUSE %u; "
++	    "478 %#x %#x %#x %#x; 480 %#x %#x %#x %#x\n",
++	    n, md_glink_acked ? "YES" : "NO",
++	    md_glink_offered ? "YES" : "NO", md_glink_remote_cid,
++	    md_glink_opens, md_foreign_count, md_glink_data_count,
++	    md_qrtr_hello_count, md_qrtr_new_server_count,
++	    md_qrtr_new_lookup_count, md_qrtr_srv66_count,
++	    md_qrtr_hello_replies, md_glink_done_count,
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
++	    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u,
++	    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 0u) : 0u,
++	    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
++	    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
++	    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 12u) : 0u);
++}
+ /* open_channel():575 + offer():286, written as GLINK frames into 479.
+  * Returns the new tx head.  Every poke is a word-wise volatile store
+  * through the WCOMB map; no memcpy, no unmap (0310 / 0312). */
+@@ -4123,6 +4262,7 @@
+ 	uint32_t d[4], i, txtail, txhead, rxtail, rxhead;
+ 	uint32_t at, h0, h1, cmd, cid, arg, n, nl, chunk, left;
+ 	uint32_t frames = 0, wr, q[8];
++	uint32_t svc, packed, inst, qnode, qport;
+ 	char name[33];
+ 	bool rung = FALSE;
+ 
+@@ -4150,7 +4290,7 @@
+ 		}
+ 		return;
+ 	}
+-	if (txhead + 128u > MD_GLINK_FIFO_SIZE) {
++	if (txhead + 256u > MD_GLINK_FIFO_SIZE) {
+ 		return;
+ 	}
+ 	wr = txhead;
+@@ -4193,6 +4333,22 @@
+ 			    "+%u: stopping this batch\n", at);
+ 			break;
+ 		}
++		/* 0323: GLINK channel ids are per-endpoint and the modem
++		 * renumbers them between boots (0319 IPCRTR was cid 1,
++		 * 0320/0322 it was cid 2).  Remember the dynamic cid and
++		 * the receive intents it advertises. */
++		if (cmd == MD_GLINK_OPEN && cid != 0u &&
++		    name[0] == 'I' && name[1] == 'P' && name[2] == 'C' &&
++		    name[3] == 'R' && name[4] == 'T' && name[5] == 'R' &&
++		    name[6] == 0) {
++			md_glink_remote_cid = cid;
++			MD_SAY("POLARIS MODEM: 0323: modem IPCRTR channel "
++			    "is cid %u (dynamic, never hardcode)\n", cid);
++		}
++		if (cmd == MD_GLINK_INTENT && cid == md_glink_remote_cid &&
++		    md_glink_remote_cid != 0u && arg > 0u && arg <= 16u) {
++			md_foreign_note(at, arg);
++		}
+ 		if (cmd == MD_GLINK_OPEN && cid != 0u &&
+ 		    md_glink_opens < MD_GLINK_MAX_OPEN) {
+ 			md_smem_poke(md_glink_tx_at + wr,
+@@ -4234,6 +4390,37 @@
+ 			md_smem_poke(md_glink_tx_at + wr + 4u, arg);
+ 			wr += 8u;
+ 			md_glink_done_count++;
++			if (chunk >= 52u) {
++				svc = md_smem_word(md_glink_rx_at + at + 52u);
++				packed = md_smem_word(md_glink_rx_at + at + 56u);
++				qnode = md_smem_word(md_glink_rx_at + at + 60u);
++				qport = md_smem_word(md_glink_rx_at + at + 64u);
++				inst = packed >> 8;
++				if (q[1] == MD_QRTR_Q_NEW_SERVER) {
++					MD_SAY("POLARIS MODEM: 0323: Q_NEW_SERVER "
++					    "service %u version %u instance %u "
++					    "node %u port %#x%s\n", svc,
++					    packed & 0xffu, inst, qnode, qport,
++					    (svc == MD_QRTR_SERVREG_SERVICE &&
++					    inst == MD_QRTR_SERVREG_INSTANCE) ?
++					    "  <<< servreg wlan_pd" : "");
++					if (svc == MD_QRTR_SERVREG_SERVICE &&
++					    inst == MD_QRTR_SERVREG_INSTANCE) {
++						md_qrtr_srv66_count++;
++					}
++				}
++				if (q[1] == MD_QRTR_Q_NEW_LOOKUP) {
++					md_qrtr_new_lookup_count++;
++				}
++			}
++			/* dipper qrtr_input():487 answers the FIRST Q_HELLO
++			 * with a Q_HELLO control packet and reads ONLY the
++			 * command word.  0322's 0x1ee3 / 0xa are therefore
++			 * modem-side metadata and must NOT be echoed. */
++			if (q[1] == MD_QRTR_Q_HELLO &&
++			    md_qrtr_hello_replies == 0u) {
++				wr = md_qrtr_hello_reply(wr, q[2]);
++			}
+ 		}
+ 		frames++;
+ 		at += n;
+@@ -4578,9 +4765,21 @@
+ 	MD_SAY("POLARIS MODEM:   W2f step 4: post-modem SMEM census starts: "
+ 	    "6 short samples, AP items made before the Q6, doorbell rung once\n");
+ 	md_smem_ring();
++	md_glink_quiet = TRUE;	/* 0323: sub-sample pumps must stay quiet */
+ 	for (s = 0; s < MD_SMEM_SAMPLES; s++) {
+ 		for (k = 0; k < gaps[s]; k++) {
+ 			md_qmp_ms();
++			/* 0323: one md_qmp_ms() is ~14 ms of wall time, so a
++			 * 500 nominal-ms gap is ~7 s and 2000 is ~28 s with
++			 * nobody pumping GLINK.  Pump every 100 and put a
++			 * complete verdict in the ring every 200. */
++			if ((k % 100u) == 0u) {
++				md_glink_reply(elapsed + k);
++				md_glink_pump(elapsed + k);
++			}
++			if ((k % 200u) == 0u) {
++				md_0323_heartbeat(++md_heartbeat_count);
++			}
+ 		}
+ 		elapsed += gaps[s];
+ 		md_smem_census(s, elapsed, &ever_435, &ever_ready,
+@@ -4620,16 +4819,7 @@
+ 		md_qmp_ms();
+ 		md_glink_pump(elapsed + k);
+ 		if ((k % 300u) == 0u) {
+-			MD_SAY("POLARIS MODEM: 0321 WATCH @tick %u: 478 "
+-			    "%#x %#x %#x %#x, OPEN_ACKs %u, DATA %u, "
+-			    "DONE_REUSE %u, offered=%s\n", k,
+-			    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
+-			    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
+-			    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
+-			    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u,
+-			    md_glink_opens, md_glink_data_count,
+-			    md_glink_done_count,
+-			    md_glink_offered ? "YES" : "NO");
++			md_0323_heartbeat(++md_heartbeat_count);
+ 		}
+ 	}
+ 	MD_SAY("POLARIS MODEM: 0321 WATCH FINAL VERDICT: %u OPEN_ACKs, "
+@@ -4648,31 +4838,17 @@
+ 	 * per iteration costs almost no CPU, keeps GLINK pumped, and puts a
+ 	 * complete self-describing summary in the NEWEST part of the ring
+ 	 * every five seconds, however long the phone stays in iOS. */
+-	MD_SAY("POLARIS MODEM: 0322 HEARTBEAT START: one summary every %u s, "
+-	    "the W2e thread never returns; the ring always holds a verdict\n",
++	MD_SAY("POLARIS MODEM: 0323 HEARTBEAT START: one summary every %u s, "
++	    "the W2e thread never returns; the census already prints them\n",
+ 	    MD_GLINK_HEARTBEAT_EVERY);
+ 	for (beat = 1u; ; beat++) {
+ 		IOSleep(1000u);
++		md_glink_reply(elapsed + MD_GLINK_WATCH_TICKS + beat);
+ 		md_glink_pump(elapsed + MD_GLINK_WATCH_TICKS + beat);
+ 		if ((beat % MD_GLINK_HEARTBEAT_EVERY) != 0u) {
+ 			continue;
+ 		}
+-		MD_SAY("POLARIS MODEM: 0322 HEARTBEAT #%u: build 0322 / level 37; "
+-		    "OPEN_ACKs %u, AP OPEN+3 INTENTS offered=%s, QRTR DATA %u "
+-		    "(Q_HELLO %u / Q_NEW_SERVER %u), DONE_REUSE %u; "
+-		    "478 %#x %#x %#x %#x; 480 %#x %#x %#x %#x\n",
+-		    beat / MD_GLINK_HEARTBEAT_EVERY,
+-		    md_glink_opens, md_glink_offered ? "YES" : "NO",
+-		    md_glink_data_count, md_qrtr_hello_count,
+-		    md_qrtr_new_server_count, md_glink_done_count,
+-		    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 0u) : 0u,
+-		    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
+-		    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
+-		    md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u,
+-		    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 0u) : 0u,
+-		    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
+-		    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
+-		    md_glink_rx_at ? md_smem_word(md_glink_rx_at + 12u) : 0u);
++		md_0323_heartbeat(++md_heartbeat_count);
+ 	}
+ }
+ 
+@@ -4755,8 +4931,9 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-	MD_SAY("POLARIS MODEM: ======== build 0322 alive: W2e + W2f + "
+-	    "GLINK AP OPEN + INTENTS + DURABLE HEARTBEAT (level 37) ========\n");
++	MD_SAY("POLARIS MODEM: ======== build 0323 alive: W2e + W2f + "
++	    "GLINK + QRTR Q_HELLO REPLY + EARLY HEARTBEAT (level 38) "
++	    "========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
