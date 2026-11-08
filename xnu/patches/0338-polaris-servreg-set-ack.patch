@@ -1,0 +1,263 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -3897,7 +3897,7 @@
+ static uint32_t md_srn_node, md_srn_port, md_srn_txn;
+ /* 0330: servreg responses are matched to a domain by their txn id,
+  * so both domains can be watched in one run. */
+-#define MD_SRN_ASKS	6u
++#define MD_SRN_ASKS	24u	/* 0338: 6 ran out at heartbeat 24 */
+ static uint32_t md_srn_pd_txn[2];
+ static uint32_t md_srn_pd_state[2] = { 0xdeadbeefu, 0xdeadbeefu };
+ static uint32_t md_srn_ask_next, md_srn_ask_at;
+@@ -4483,7 +4483,7 @@
+         /* 0329: split in two.  The single 0328 line was longer than the
+          * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
+          * cut at "hostsv" and hsreplies / SRN state never appeared. */
+-        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0337 / level 51; "
++        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0338 / level 52; "
+             "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
+             "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+@@ -4665,6 +4665,148 @@
+         return "UNKNOWN";
+ }
+ 
++/* 0338: the half of the servreg conversation that never existed.
++ *
++ * dipper srn_receive():2500-2545 is the authority.  A REGISTER_LISTENER
++ * response only tells us the state at registration time; the state that
++ * matters arrives later as a QMI INDICATION (type 4) with message
++ * SRN_STATE_UPDATED_IND 0x22, and the client must answer it with
++ * SRN_SET_ACK 0x23 or the PDR transition never completes.  EXP-0204:
++ * "ACKs its state changes, and only then does icnss reach WLFW";
++ * EXP-0203 saw msa_info answer INCOMPATIBLE_STATE without it.
++ *
++ * TLV layout, byte for byte from dipper srn_string()/srn_tlv():
++ *   0x01 = the PD name, raw bytes, no NUL, no inner length
++ *   0x02 = the transaction id from the indication, 2 bytes LE
++ * A 17-byte name plus both TLVs is 7 + 20 + 5 = 32 QMI bytes, which is
++ * exactly what md_qrtr_send_qmi() can carry in one 64 B packet. */
++static uint32_t
++md_srn_ack(uint32_t head, uint32_t node, uint32_t port,
++    const char *name, uint32_t nlen, uint32_t txn, uint32_t have_txn)
++{
++	uint8_t qmi[40];
++	uint32_t i, n, tlvs, before = head, after;
++
++	if (nlen == 0u || nlen > 22u) {
++		MD_SAY("POLARIS MODEM: 0338 VERDICT: SET_ACK skipped, PD "
++		    "name is %u bytes and does not fit one GLINK DATA "
++		    "frame\n", nlen);
++		return head;
++	}
++	tlvs = 3u + nlen + (have_txn != 0u ? 5u : 0u);
++	for (i = 0u; i < sizeof(qmi); i++) {
++		qmi[i] = 0;
++	}
++	md_srn_txn++;
++	qmi[0] = 0u;				/* request */
++	qmi[1] = (uint8_t)md_srn_txn;
++	qmi[2] = (uint8_t)(md_srn_txn >> 8);
++	qmi[3] = (uint8_t)(MD_SRN_SET_ACK & 0xffu);
++	qmi[4] = (uint8_t)(MD_SRN_SET_ACK >> 8);
++	qmi[5] = (uint8_t)(tlvs & 0xffu);
++	qmi[6] = (uint8_t)(tlvs >> 8);
++	qmi[7] = 0x01u;
++	qmi[8] = (uint8_t)nlen;
++	qmi[9] = 0u;
++	for (i = 0u; i < nlen; i++) {
++		qmi[10u + i] = (uint8_t)name[i];
++	}
++	n = 10u + nlen;
++	if (have_txn != 0u) {
++		qmi[n] = 0x02u;
++		qmi[n + 1u] = 2u;
++		qmi[n + 2u] = 0u;
++		qmi[n + 3u] = (uint8_t)(txn & 0xffu);
++		qmi[n + 4u] = (uint8_t)(txn >> 8);
++		n += 5u;
++	}
++	after = md_qrtr_send_qmi(head, node, port, qmi, n);
++	MD_SAY("POLARIS MODEM: 0338 VERDICT: SERVREG SET_ACK 0x23 for "
++	    "'%s' txn %u%s to node %u port %#x, %u QMI bytes, sent=%s, "
++	    "tx head %u -> %u\n", name, txn,
++	    have_txn != 0u ? "" : " (no txn TLV)", node, port, n,
++	    after != before ? "YES" : "NO", before, after);
++	return after;
++}
++
++/* 0338: every QMI indication the modem sends.  Before this version the
++ * receive path called md_qmi_dump() (which only prints) and then handed
++ * the packet to md_hostsvc_reply(); a type 4 packet is neither a request
++ * nor a response, so md_hostsvc_reply() dropped it and the one message
++ * the PDR state machine waits on was lost. */
++static uint32_t
++md_srn_indication(uint32_t head, uint32_t at, uint32_t len,
++    uint32_t node, uint32_t port)
++{
++	uint32_t p, t, l, i, nlen = 0u, state = 0u, txn = 0u, have_txn = 0u;
++	uint16_t msg, total;
++	char name[24];
++
++	if (len < 7u || md_smem_byte(at) != 4u) {
++		return head;
++	}
++	msg = (uint16_t)(md_smem_byte(at + 3u) |
++	    ((uint16_t)md_smem_byte(at + 4u) << 8));
++	total = (uint16_t)(md_smem_byte(at + 5u) |
++	    ((uint16_t)md_smem_byte(at + 6u) << 8));
++	if (7u + total > len) {
++		total = (uint16_t)(len - 7u);
++	}
++	p = 7u;
++	while (p + 3u <= 7u + total) {
++		t = md_smem_byte(at + p);
++		l = (uint32_t)md_smem_byte(at + p + 1u) |
++		    ((uint32_t)md_smem_byte(at + p + 2u) << 8);
++		if (p + 3u + l > 7u + total) {
++			break;
++		}
++		if (t == 0x01u && l >= 4u) {
++			state = (uint32_t)md_smem_byte(at + p + 3u) |
++			    ((uint32_t)md_smem_byte(at + p + 4u) << 8) |
++			    ((uint32_t)md_smem_byte(at + p + 5u) << 16) |
++			    ((uint32_t)md_smem_byte(at + p + 6u) << 24);
++		} else if (t == 0x02u && l >= 1u) {
++			nlen = l < sizeof(name) ? l : (uint32_t)sizeof(name);
++			for (i = 0u; i < nlen; i++) {
++				name[i] = (char)md_smem_byte(at + p + 3u + i);
++			}
++		} else if (t == 0x03u && l >= 2u) {
++			txn = (uint32_t)md_smem_byte(at + p + 3u) |
++			    ((uint32_t)md_smem_byte(at + p + 4u) << 8);
++			have_txn = 1u;
++		}
++		p += 3u + l;
++	}
++	/* printable, because the ring cuts a line at 255 bytes and a
++	 * binary name would cost a dozen bytes per character */
++	for (i = 0u; i < nlen; i++) {
++		if ((unsigned char)name[i] < 0x20u ||
++		    (unsigned char)name[i] > 0x7eu) {
++			name[i] = '.';
++		}
++	}
++	MD_SAY("POLARIS MODEM: 0338 VERDICT: QMI INDICATION msg %#x "
++	    "from node %u port %#x: '%s' state %#x = %s, txn %u%s\n",
++	    msg, node, port, name, state, md_srn_state_name(state), txn,
++	    have_txn != 0u ? "" : " (no txn TLV)");
++	if (msg != MD_SRN_STATE_UPDATED_IND) {
++		MD_SAY("POLARIS MODEM: 0338 VERDICT: indication %#x is not "
++		    "STATE_UPDATED_IND 0x22, no SET_ACK\n", msg);
++		return head;
++	}
++	if (nlen == 0u) {
++		/* dipper always acks with the name it was told; an
++		 * indication that omits it is about the PD we watch. */
++		for (i = 0u; i < sizeof(name) - 1u &&
++		    md_srn_names[0][i] != 0; i++) {
++			name[i] = md_srn_names[0][i];
++		}
++		nlen = i;
++		name[nlen] = 0;
++	}
++	return md_srn_ack(head, node, port, name, nlen, txn, have_txn);
++}
++
+ /* 0325: QRTR v1 Q_NEW_LOOKUP (type 10) control packet, the Linux
+  * qrtr_send_new_lookup() equivalent.  dipper lookup_port():789 is
+  * XNU-simplified and registers its filter locally WITHOUT sending
+@@ -5286,6 +5428,10 @@
+                         uint32_t svc_at, svc_len = 0u, bit, total = 0u;
+                         uint32_t count = 0u, list, k, nl;
+                         char svc[33];
++                        char d0[33];
++                        uint32_t d0_inst = 0xffffffffu;
++
++                        d0[0] = 0;
+ 
+                         svc_at = md_qmi_find(req_at, req_len, 1u,
+                             &svc_len);
+@@ -5338,6 +5484,21 @@
+                                                     (uint8_t)(md_pd_domains[k].instance >>
+                                                     (8u * i));
+                                         }
++                                        /* 0338: record the first
++                                         * domain so the log shows the
++                                         * modem which instance it is
++                                         * being pointed at. */
++                                        if (count == 0u) {
++                                                for (i = 0u; i < 32u &&
++                                                    md_pd_domains[k].name[i] != 0;
++                                                    i++) {
++                                                        d0[i] =
++                                                            md_pd_domains[k].name[i];
++                                                }
++                                                d0[i] = 0;
++                                                d0_inst =
++                                                    md_pd_domains[k].instance;
++                                        }
+                                         rsp[list++] = 0u;
+                                         for (i = 0u; i < 4u; i++) {
+                                                 rsp[list++] = 0u;
+@@ -5355,6 +5516,9 @@
+                                     "PDM QUERY '%s' (%u bytes) -> "
+                                     "%u domains, %u listed\n",
+                                     svc, svc_len, total, count);
++                                MD_SAY("POLARIS MODEM: 0338 VERDICT: "
++                                    "PDM first domain for '%s' is '%s' "
++                                    "instance %u\n", svc, d0, d0_inst);
+                         }
+                 } else if (msg == 0x24u) {
+                         what = 3u;              /* pdm():307 PFR ack */
+@@ -5668,6 +5832,21 @@
+                         txhead = nh;
+                 }
+         }
++        /* 0338: 0325-0337 asked once, at heartbeat 6, before the modem
++         * had announced anything, and never asked again.  Ask twice more
++         * once the host services are published and the modem has been
++         * quiet for a while; a lookup costs one 72 B frame. */
++        if (md_hostsvc_published == 3u && md_qmi_rx_count > 0u &&
++            md_wlfw_lookups >= 1u && md_wlfw_lookups < 3u &&
++            md_heartbeat_count > 16u && (md_heartbeat_count % 16u) == 0u) {
++                uint32_t nh = md_qrtr_new_lookup(txhead);
++
++                if (nh != txhead) {
++                        md_smem_poke(md_glink_desc_at + 4u, nh);
++                        md_glink_ring();
++                        txhead = nh;
++                }
++        }
+         /* 0327: ONE host-service notice per pump.  0326 wrote all three
+          * (plus 0325's lookup) in one pump with two rings microseconds
+          * apart, all sharing foreign intent slot 0; 478 w0 stayed at 352
+@@ -5880,6 +6059,14 @@
+                                         wr = nh;
+                                         md_hostsvc_replies++;
+                                 }
++                                /* 0338: a type 4 QMI packet is an
++                                 * indication, not a request; before
++                                 * this it fell through every branch
++                                 * of md_hostsvc_reply() and the PDR
++                                 * state machine waited forever. */
++                                wr = md_srn_indication(wr,
++                                    md_glink_rx_at + at + 48u,
++                                    chunk - 32u, q[2], q[3]);
+                         }
+ 			}
+ 			/* 0324: service 66 / instance 180 is the servreg
+@@ -6424,10 +6611,10 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0337 alive: W2e + W2f + "
++        MD_SAY("POLARIS MODEM: ======== build 0338 alive: W2e + W2f + "
+             "GLINK + QRTR + SERVREG + HOSTSVC + QMI HEADER + "
+-            "RMTFS IN THE MBA REGION + DIRECTION IS DIRECTION "
+-            "(level 51) ========\n");
++            "RMTFS IN THE MBA REGION + DIRECTION IS DIRECTION + "
++            "SERVREG SET_ACK (level 52) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
