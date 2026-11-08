@@ -1,0 +1,174 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -3444,18 +3444,31 @@
+ static void
+ md_wlan_msa_grant(void)
+ {
+-	uint64_t next = (1ull << MD_VMID_HLOS) | (1ull << MD_VMID_MSS_MSA) |
+-	    (1ull << MD_VMID_WLAN) | (1ull << MD_VMID_WLAN_CE);
++	/* 0341: 0340 asked for four owners at once (HLOS|MSS_MSA|WLAN|
++	 * WLAN_CE) and SCM answered rc -2 / 0x55.  Two owners is what mba
++	 * and mpss get, and the only handover SCM has ever accepted here, so
++	 * try dipper's own set first (no HLOS) and that pair second. */
++	uint64_t radio = (1ull << MD_VMID_MSS_MSA) | (1ull << MD_VMID_WLAN) |
++	    (1ull << MD_VMID_WLAN_CE);
++	uint64_t pair = (1ull << MD_VMID_HLOS) | (1ull << MD_VMID_MSS_MSA);
+ 	bool ok;
+ 
+-	MD_SAY("POLARIS MODEM: 0340 VERDICT: wlan_fw_region %#llx +%#llx -> "
+-	    "MSS_MSA|WLAN|WLAN_CE before the modem starts\n",
++	MD_SAY("POLARIS MODEM: 0341 VERDICT: wlan_fw_region %#llx +%#llx -> "
++	    "MSS_MSA|WLAN|WLAN_CE (dipper's set, no HLOS)\n",
+ 	    (unsigned long long)MD_WLAN_MSA_PHYS,
+ 	    (unsigned long long)MD_WLAN_MSA_SIZE);
+ 	ok = md_assign_owners("wlan_fw_region", MD_WLAN_MSA_PHYS,
+-	    MD_WLAN_MSA_SIZE, &md_wlan_msa_owners, next);
+-	MD_SAY("POLARIS MODEM: 0340 VERDICT: wlan_fw_region owners %#llx "
+-	    "(%s)\n", md_wlan_msa_owners, ok ? "granted" : "refused");
++	    MD_WLAN_MSA_SIZE, &md_wlan_msa_owners, radio);
++	MD_SAY("POLARIS MODEM: 0341 VERDICT: attempt 1 owners %#llx (%s)\n",
++	    md_wlan_msa_owners, ok ? "granted" : "refused");
++	if (!ok) {
++		MD_SAY("POLARIS MODEM: 0341 VERDICT: attempt 2 -> HLOS|MSS_MSA, "
++		    "the pair mba and mpss use\n");
++		ok = md_assign_owners("wlan_fw_region", MD_WLAN_MSA_PHYS,
++		    MD_WLAN_MSA_SIZE, &md_wlan_msa_owners, pair);
++		MD_SAY("POLARIS MODEM: 0341 VERDICT: attempt 2 owners %#llx "
++		    "(%s)\n", md_wlan_msa_owners, ok ? "granted" : "refused");
++	}
+ }
+ 
+ static void
+@@ -3959,9 +3972,24 @@
+  * announcements and not one repeat, so nothing was ever answered. */
+ static uint64_t md_srv_seen[4];
+ static uint32_t md_srv_repeat;
+-/* 0340c: 69 is wlfw, 70 and 71 the two ids either side of it.  71 is
+- * announced in every ring, so asking for it is the control. */
+-static const uint32_t md_lookup_services[3] = { 69u, 70u, 71u };
++/* 0341: 0340's control came back empty -- service 71, announced in
++ * every ring so far, was not re-announced after three Q_NEW_LOOKUP
++ * frames.  So the modem never answered a lookup at all, and "service 69
++ * does not exist" is still unproven.  0341 asks for 71 three times over
++ * three transports; the first one answered both proves lookups work and
++ * names the transport. */
++struct md_lookup_variant {
++	uint32_t service;
++	uint32_t from;
++	uint32_t dst;
++	const char *what;
++};
++
++static const struct md_lookup_variant md_lookup_variants[3] = {
++	{ 71u, MD_QRTR_LOCAL_PORT, MD_QRTR_CTRL, "our port to CTRL" },
++	{ 71u, MD_QRTR_LOCAL_PORT, 0u, "our port to port 0" },
++	{ 71u, MD_QRTR_CTRL, 0u, "CTRL to port 0" }
++};
+ static uint32_t md_wlfw_lookups, md_srn_state;
+ static uint32_t md_hostsvc_published;
+ static uint32_t md_hostsvc_tx_expected, md_hostsvc_stucks;
+@@ -4633,7 +4661,7 @@
+         /* 0329: split in two.  The single 0328 line was longer than the
+          * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
+          * cut at "hostsv" and hsreplies / SRN state never appeared. */
+-        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0340 / level 54; "
++        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0341 / level 55; "
+             "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
+             "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+@@ -4978,7 +5006,7 @@
+  * the callers walk 69 -> 70 -> 71; 0340's ring then shows a repeat for
+  * whatever is really there. */
+ static uint32_t
+-md_qrtr_new_lookup(uint32_t head, uint32_t service)
++md_qrtr_new_lookup(uint32_t head, const struct md_lookup_variant *v)
+ {
+         uint32_t pkt[13] = {
+                 1u, MD_QRTR_Q_NEW_LOOKUP, MD_QRTR_LOCAL_NODE, MD_QRTR_CTRL,
+@@ -4987,17 +5015,16 @@
+         };
+         uint32_t i, iid = 0u, size = 0u, at = head;
+ 
+-        /* 0340c: the service is a parameter, so the same frame can ask
+-         * about a service that IS announced.  Service 71 is in every
+-         * ring so far; a second Q_NEW_SERVER for it after this frame is
+-         * the control that tells "69 is not there" apart from "our
+-         * lookup is not understood". */
+-        pkt[9] = service;
+-        /* 0340c: and the two words that tell the name service where to
+-         * answer.  0325-0339 left them zero, so any reply could only
+-         * have gone to node 0 port 0 -- the modem itself.  Linux
+-         * qrtr_ctrl_new_lookup() fills them from the requesting socket,
+-         * and 0x4000 is our servreg client port (MD_QRTR_LOCAL_PORT). */
++        /* 0341: the whole frame is now the variant's.
++         *   pkt[3]  = the port this frame is sent FROM,
++         *   pkt[7]  = the port it is sent TO,
++         *   pkt[9]  = the service asked about,
++         *   pkt[11] / pkt[12] = where the answer should go: us.  0325-0339
++         * left those two zero, i.e. told the name service to answer the
++         * modem itself. */
++        pkt[3] = v->from;
++        pkt[7] = v->dst;
++        pkt[9] = v->service;
+         pkt[11] = MD_QRTR_LOCAL_NODE;
+         pkt[12] = MD_QRTR_LOCAL_PORT;
+ 
+@@ -5010,7 +5037,7 @@
+                 }
+         }
+         if (iid == 0u || head + MD_QRTR_CTRL_FRAME > MD_GLINK_FIFO_SIZE) {
+-                MD_SAY("POLARIS MODEM: 0325 VERDICT: WLFW lookup NOT "
++                MD_SAY("POLARIS MODEM: 0341 VERDICT: lookup NOT "
+                     "sent (foreign %u, tx head %u)\n",
+                     md_foreign_count, head);
+                 return head;
+@@ -5025,12 +5052,11 @@
+         }
+         md_smem_poke(md_glink_tx_at + at + 68u, 0u);
+         md_wlfw_lookups++;
+-        MD_SAY("POLARIS MODEM: 0325 VERDICT: WLFW Q_NEW_LOOKUP SENT "
+-            "(service %u v1 inst0, QRTR type %u, 52 B, dst node 0 "
+-            "port %#x, from %#x, cid %u, intent %u size %u, "
+-            "tx head %u -> %u)\n", service,
+-            MD_QRTR_Q_NEW_LOOKUP, MD_QRTR_CTRL, MD_QRTR_CTRL,
+-            MD_GLINK_CID, iid, size, head, head + MD_QRTR_CTRL_FRAME);
++        MD_SAY("POLARIS MODEM: 0341 VERDICT: lookup SENT for service %u "
++            "v1 inst0 (%s): 52 B, from port %#x, dst node 0 port %#x, "
++            "answer to node %u port %#x, tx head %u -> %u\n",
++            v->service, v->what, v->from, v->dst, MD_QRTR_LOCAL_NODE,
++            MD_QRTR_LOCAL_PORT, head, head + MD_QRTR_CTRL_FRAME);
+         return head + MD_QRTR_CTRL_FRAME;
+ }
+ 
+@@ -5999,7 +6025,7 @@
+          * so it still fires when the modem goes completely silent. */
+         if (md_wlfw_lookups == 0u && md_qmi_rx_count > 0u) {
+                 uint32_t nh = md_qrtr_new_lookup(txhead,
+-                    md_lookup_services[0]);
++                    &md_lookup_variants[0]);
+ 
+                 if (nh != txhead) {
+                         md_smem_poke(md_glink_desc_at + 4u, nh);
+@@ -6016,7 +6042,7 @@
+             md_wlfw_lookups >= 1u && md_wlfw_lookups < 3u &&
+             md_heartbeat_count > 6u && (md_heartbeat_count % 8u) == 0u) {
+                 uint32_t nh = md_qrtr_new_lookup(txhead,
+-                    md_lookup_services[md_wlfw_lookups]);
++                    &md_lookup_variants[md_wlfw_lookups]);
+ 
+                 if (nh != txhead) {
+                         md_smem_poke(md_glink_desc_at + 4u, nh);
+@@ -6801,10 +6827,10 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0340 alive: W2e + W2f + "
++        MD_SAY("POLARIS MODEM: ======== build 0341 alive: W2e + W2f + "
+             "GLINK + QRTR + SERVREG + HOSTSVC + RMTFS + RADIO SUPPLIES + "
+-            "REFERENCE CLOCK + WLAN MSA GRANT + LOOKUP CONTROL "
+-            "(level 54) ========\n");
++            "REFERENCE CLOCK + MSA GRANT x2 + THREE LOOKUP TRANSPORTS "
++            "(level 55) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
