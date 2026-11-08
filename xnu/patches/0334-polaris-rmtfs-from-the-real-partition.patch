@@ -21,7 +21,7 @@
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
-@@ -3802,24 +3816,46 @@
+@@ -3802,20 +3816,46 @@
   * DMA into, so the buffer has to be contiguous and has to be
   * reached uncached from here (the modem is not coherent with our
   * caches; 0312 is the lesson about DEVICE mappings and memcpy).
@@ -47,10 +47,6 @@
 + * carveout is the buffer the modem is talking to. */
  static uint32_t md_rmtfs_step, md_rmtfs_carveout;
 -static uint32_t md_rmtfs_file_size;
--/* dipper's dt: qcom,rmtfs-mem, 0x200000 at 0x8bf00000, right below
-- * the WLAN MSA region at 0x8c100000 -- and 0x200000 is exactly what
-- * the modem asked for in 0331. */
--#define MD_RMTFS_CARVEOUT	0x8bf00000ull
 +/* Where each /boot/modem_fs* really is.  TWRP reports the starts in
 + * 512-byte sectors (sdf6 16384, sdf7 32768, sde36 65536, sdf1 48) and
 + * the UFS driver speaks 4 KiB blocks, so those are the values over 8.
@@ -76,10 +72,10 @@
 +};
 +static uint8_t md_efs_map[MD_EFS_HANDLES];      /* handle -> part + 1 */
 +static uint8_t md_efs_buf[MD_EFS_CHUNK];
- #define MD_RMTFS_CARVEOUT_SIZE	0x00200000u
- /* The tag is only for accounting; keep the build alive if this
-  * header set does not export it. */
-@@ -4438,13 +4474,13 @@
+ /* dipper's dt: qcom,rmtfs-mem, 0x200000 at 0x8bf00000, right below
+  * the WLAN MSA region at 0x8c100000 -- and 0x200000 is exactly what
+  * the modem asked for in 0331. */
+@@ -4438,13 +4478,13 @@
              md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
              md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
              md_glink_rx_at ? md_smem_word(md_glink_rx_at + 12u) : 0u);
@@ -98,7 +94,7 @@
  }
  /* 0324: one byte out of the WCOMB SMEM map.  QMI TLVs are byte-packed,
   * so a word-wise read is not enough.  No memcpy, no unmap (0310/0312). */
-@@ -4861,6 +4897,17 @@
+@@ -4861,6 +4901,17 @@
              ((uint32_t)md_smem_byte(at + 3u) << 24);
  }
  
@@ -116,7 +112,7 @@
  /* An eight-byte TLV value, for R_ALLOC's physical address. */
  static uint32_t
  md_hs_number64(uint8_t *rsp, uint32_t at, uint8_t tag, uint64_t value)
-@@ -4946,42 +4993,20 @@
+@@ -4946,42 +4997,20 @@
          return TRUE;
  }
  
@@ -167,7 +163,7 @@
          uint32_t i;
  
          __sync_synchronize();
-@@ -4995,16 +5020,124 @@
+@@ -4995,16 +5024,124 @@
          __sync_synchronize();
  }
  
@@ -296,7 +292,7 @@
          uint64_t shared;
  
          h_at = md_qmi_find(req_at, req_len, 1u, &l1);
-@@ -5014,14 +5147,18 @@
+@@ -5014,14 +5151,18 @@
              v_at == 0u || l3 < 1u) {
                  return 1u;                      /* Q_MALFORMED */
          }
@@ -316,7 +312,7 @@
          for (k = 0u; k < n; k++) {
                  uint32_t q = v_at + 1u + 12u * k;
  
-@@ -5029,37 +5166,55 @@
+@@ -5029,37 +5170,55 @@
                  shared = (uint64_t)md_le32(q + 4u);
                  nsec = md_le32(q + 8u);
                  bytes = nsec * 512u;
@@ -401,7 +397,7 @@
          return 0u;
  }
  
-@@ -5072,6 +5227,8 @@
+@@ -5072,6 +5231,8 @@
          uint32_t i, n, wr, chunk, frame, path_at = 0u, path_len = 0u;
          uint32_t iid = 0u, isize = 0u, at = head;
          uint32_t code = 0u, handle = 0u, what = 0u;
@@ -410,7 +406,7 @@
          uint16_t msg;
  
          if (req_len < 7u || md_smem_byte(req_at) != 0u) {
-@@ -5176,32 +5333,40 @@
+@@ -5176,32 +5337,40 @@
                   * got past the open.  dipper rmtfs():221-298. */
                  path_at = md_qmi_find(req_at, req_len, 1u, &path_len);
                  if (msg == 1u) {                        /* R_OPEN */
@@ -472,7 +468,7 @@
                          } else {
                                  code = 48u;             /* Q_INVAL */
                          }
-@@ -5217,19 +5382,17 @@
+@@ -5217,19 +5386,17 @@
                          if (at2 != 0u && lw >= 4u) {
                                  want = md_le32(at2);
                          }
@@ -495,7 +491,7 @@
                          } else {
                                  code = 2u;              /* Q_NOMEM */
                                  MD_SAY("POLARIS MODEM: 0333 VERDICT: "
-@@ -6226,9 +6389,9 @@
+@@ -6226,9 +6393,9 @@
  	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
  	const char *why = "nothing went wrong";
  
