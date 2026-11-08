@@ -1,0 +1,232 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -1642,6 +1642,11 @@
+  */
+ #define MD_VMID_HLOS		3u
+ #define MD_VMID_MSS_MSA		15u
++/* 0340: the radio's own two views of memory (dipper mi8_rproc.c:3051,
++ * VMID_WLAN 0x18 / VMID_WLAN_CE 0x19; wl_msa_assign() gives the MSA to
++ * MSS_MSA | WLAN | WLAN_CE). */
++#define MD_VMID_WLAN		0x18u
++#define MD_VMID_WLAN_CE		0x19u
+ #define MD_PERM_RW		6u
+ #define MD_PERM_RWX		7u
+ #define MD_MBA_SIZE		0x00200000ull
+@@ -3386,9 +3391,73 @@
+ 	MD_SAY("POLARIS MODEM: 0339 VERDICT: %u of %u radio supplies up "
+ 	    "(ldoa5/7/17/25 = cx-mx/xo/rfa/ch0); now watch wlan_pd / WLFW 69\n",
+ 	    ok, (uint32_t)MD_WLAN_RAILS);
++
++	/* 0340a: and the radio's reference clock.  Android's
++	 * icnss_hw_power_on() does the four rails AND cxo_ref_clk_pin
++	 * before anything asks the modem for service 69, and polaris's own
++	 * icnss node carries clock-names "cxo_ref_clk_pin" with clocks =
++	 * <&rpmhcc RPMH_RF_CLK2> -- the same pair upstream sdm845.dtsi
++	 * wifi@18800000 lists (_sdm845.dtsi:5584).  RPMH_RF_CLK2 is the
++	 * command-database id "rfclka2", and clk-rpmh turns a VRM clock on
++	 * with one write at +4 = 1; dipper mi8_rproc.c:2841 does exactly
++	 * that and calls the clock rfclka2 too.  0339 brought the four
++	 * supplies up and wlan_pd still never moved, so the clock is the one
++	 * item of icnss_hw_power_on() still missing here. */
++	addr = md_rail_lookup(db, "rfclka2", NULL);
++	if (addr == 0u) {
++		MD_SAY("POLARIS MODEM: 0340 VERDICT: rfclka2 (cxo_ref_clk_pin) "
++		    "is NOT in the command database\n");
++	} else {
++		MD_SAY("POLARIS MODEM: 0340 VERDICT: rfclka2 (cxo_ref_clk_pin) "
++		    "at %#x: one write at +4 = 1\n", addr);
++		MD_SAY("POLARIS MODEM: 0340 VERDICT: the radio's reference "
++		    "clock is %s\n", md_rpmh_write(rsc, addr + 4u, 1u,
++		    "rfclka2") ? "ON" : "NOT ON (the command did not complete)");
++	}
+ 	return ok;
+ }
+ 
++/* 0340b: hand the radio its memory before the modem starts.
++ *
++ * W2e step 4 grants mba + mpss to the MSS and that is the whole of the
++ * modem's own memory.  wlan_fw_region is not in that grant: it stays
++ * with HLOS, so a modem that tried to put the radio's firmware there
++ * would be stopped by the XPU -- and 0311 is the round that proved the
++ * XPU is what stops this machine, because the MBA only ran once the
++ * owners changed.  dipper grants the same region at MSA_READY with
++ * MSS_MSA | WLAN | WLAN_CE (mi8_rproc.c:3054 wl_msa_assign).  We can
++ * never reach MSA_READY: it needs service 69, and service 69 is the
++ * thing wlan_pd never brings up.  So grant it up front and keep HLOS in
++ * the list, so this side can still read the region afterwards.
++ *
++ * polaris device tree /reserved-memory/wlan_fw_region@0x8e300000: 1 MiB,
++ * compatible "removed-dma-pool" (_dtb_all.txt:22776).  Same size as
++ * upstream's wlan-msa@8df00000 (_sdm845.dtsi:853) and as the icnss
++ * node's qcom,wlan-msa-memory = 0x100000.  It is also the region
++ * dipper tried for wlfw msa_info and got error 90 for -- which is what
++ * a region the radio was never given would answer. */
++#define MD_WLAN_MSA_PHYS	0x8e300000ull
++#define MD_WLAN_MSA_SIZE	0x00100000ull
++
++static uint64_t md_wlan_msa_owners = 1ull << MD_VMID_HLOS;
++
++static void
++md_wlan_msa_grant(void)
++{
++	uint64_t next = (1ull << MD_VMID_HLOS) | (1ull << MD_VMID_MSS_MSA) |
++	    (1ull << MD_VMID_WLAN) | (1ull << MD_VMID_WLAN_CE);
++	bool ok;
++
++	MD_SAY("POLARIS MODEM: 0340 VERDICT: wlan_fw_region %#llx +%#llx -> "
++	    "MSS_MSA|WLAN|WLAN_CE before the modem starts\n",
++	    (unsigned long long)MD_WLAN_MSA_PHYS,
++	    (unsigned long long)MD_WLAN_MSA_SIZE);
++	ok = md_assign_owners("wlan_fw_region", MD_WLAN_MSA_PHYS,
++	    MD_WLAN_MSA_SIZE, &md_wlan_msa_owners, next);
++	MD_SAY("POLARIS MODEM: 0340 VERDICT: wlan_fw_region owners %#llx "
++	    "(%s)\n", md_wlan_msa_owners, ok ? "granted" : "refused");
++}
++
+ static void
+ md_rail_write_probe(void)
+ {
+@@ -3884,6 +3953,15 @@
+ static uint32_t md_qrtr_new_lookup_count, md_qrtr_srv66_count;
+ static uint32_t md_qrtr_hello_replies, md_heartbeat_count;
+ static uint32_t md_srn_listener_sent, md_qmi_rx_count, md_srv69_count;
++/* 0340c: which services have been announced once.  A second
++ * Q_NEW_SERVER for one of them is the only proof that our
++ * Q_NEW_LOOKUP reaches the modem's name service; 0339 logged 40
++ * announcements and not one repeat, so nothing was ever answered. */
++static uint64_t md_srv_seen[4];
++static uint32_t md_srv_repeat;
++/* 0340c: 69 is wlfw, 70 and 71 the two ids either side of it.  71 is
++ * announced in every ring, so asking for it is the control. */
++static const uint32_t md_lookup_services[3] = { 69u, 70u, 71u };
+ static uint32_t md_wlfw_lookups, md_srn_state;
+ static uint32_t md_hostsvc_published;
+ static uint32_t md_hostsvc_tx_expected, md_hostsvc_stucks;
+@@ -4555,7 +4633,7 @@
+         /* 0329: split in two.  The single 0328 line was longer than the
+          * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
+          * cut at "hostsv" and hsreplies / SRN state never appeared. */
+-        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0339 / level 53; "
++        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0340 / level 54; "
+             "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
+             "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+@@ -4568,12 +4646,13 @@
+         MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: DATA %u (HELLO %u / "
+             "SRV %u / LOOKUP %u / srv66 %u / WLFW69 %u), hello rpy %u, "
+             "srn lsn %u, QMI rx %u, wlfw lk %u, hsreplies %u, "
+-            "srn w %#x r %#x, 480 %#x %#x %#x %#x\n",
++            "repeat %u, srn w %#x r %#x, 480 %#x %#x %#x %#x\n",
+             n, md_glink_data_count, md_qrtr_hello_count,
+             md_qrtr_new_server_count, md_qrtr_new_lookup_count,
+             md_qrtr_srv66_count, md_srv69_count, md_qrtr_hello_replies,
+             md_srn_listener_sent, md_qmi_rx_count, md_wlfw_lookups,
+-            md_hostsvc_replies, md_srn_pd_state[0], md_srn_pd_state[1],
++            md_hostsvc_replies, md_srv_repeat,
++            md_srn_pd_state[0], md_srn_pd_state[1],
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 0u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
+@@ -4893,16 +4972,28 @@
+  * packed=get32(p+8)=version|instance<<8.  52 B QRTR -> 72 B GLINK
+  * DATA frame, the same shape as 0323's Q_HELLO reply.  Returns the
+  * new tx head. */
++/* 0340: 0325-0339 could not tell "service 69 is absent" from "the
++ * modem ignores our lookup", because the only service ever asked for
++ * was the one that never answers.  The service is a parameter now and
++ * the callers walk 69 -> 70 -> 71; 0340's ring then shows a repeat for
++ * whatever is really there. */
+ static uint32_t
+-md_qrtr_new_lookup(uint32_t head)
++md_qrtr_new_lookup(uint32_t head, uint32_t service)
+ {
+-        static const uint32_t pkt[13] = {
++        uint32_t pkt[13] = {
+                 1u, MD_QRTR_Q_NEW_LOOKUP, MD_QRTR_LOCAL_NODE, MD_QRTR_CTRL,
+                 0u, 20u, 0u, MD_QRTR_CTRL,
+                 MD_QRTR_Q_NEW_LOOKUP, MD_SRN_WLFW_SERVICE, 1u, 0u, 0u
+         };
+         uint32_t i, iid = 0u, size = 0u, at = head;
+ 
++        /* 0340c: the service is a parameter, so the same frame can ask
++         * about a service that IS announced.  Service 71 is in every
++         * ring so far; a second Q_NEW_SERVER for it after this frame is
++         * the control that tells "69 is not there" apart from "our
++         * lookup is not understood". */
++        pkt[9] = service;
++
+         for (i = 0u; i < md_foreign_count; i++) {
+                 if (md_foreign_size[i] >= MD_QRTR_CTRL_LEN &&
+                     md_foreign_id[i] != 0u) {
+@@ -4930,7 +5021,7 @@
+         MD_SAY("POLARIS MODEM: 0325 VERDICT: WLFW Q_NEW_LOOKUP SENT "
+             "(service %u v1 inst0, QRTR type %u, 52 B, dst node 0 "
+             "port %#x, from %#x, cid %u, intent %u size %u, "
+-            "tx head %u -> %u)\n", MD_SRN_WLFW_SERVICE,
++            "tx head %u -> %u)\n", service,
+             MD_QRTR_Q_NEW_LOOKUP, MD_QRTR_CTRL, MD_QRTR_CTRL,
+             MD_GLINK_CID, iid, size, head, head + MD_QRTR_CTRL_FRAME);
+         return head + MD_QRTR_CTRL_FRAME;
+@@ -5900,7 +5991,8 @@
+          * response has been seen.  This sits before the idle early-return
+          * so it still fires when the modem goes completely silent. */
+         if (md_wlfw_lookups == 0u && md_qmi_rx_count > 0u) {
+-                uint32_t nh = md_qrtr_new_lookup(txhead);
++                uint32_t nh = md_qrtr_new_lookup(txhead,
++                    md_lookup_services[0]);
+ 
+                 if (nh != txhead) {
+                         md_smem_poke(md_glink_desc_at + 4u, nh);
+@@ -5916,7 +6008,8 @@
+         if (md_hostsvc_published == 3u && md_qmi_rx_count > 0u &&
+             md_wlfw_lookups >= 1u && md_wlfw_lookups < 3u &&
+             md_heartbeat_count > 6u && (md_heartbeat_count % 8u) == 0u) {
+-                uint32_t nh = md_qrtr_new_lookup(txhead);
++                uint32_t nh = md_qrtr_new_lookup(txhead,
++                    md_lookup_services[md_wlfw_lookups]);
+ 
+                 if (nh != txhead) {
+                         md_smem_poke(md_glink_desc_at + 4u, nh);
+@@ -6108,6 +6201,19 @@
+ 					    inst == MD_QRTR_SERVREG_INSTANCE) {
+ 						md_qrtr_srv66_count++;
+ 					}
++					/* 0340c: a repeat means the name service
++					 * acted on a Q_NEW_LOOKUP. */
++					if (svc < 256u) {
++						uint64_t *w = &md_srv_seen[svc >> 6];
++						uint64_t bit = 1ull << (svc & 63u);
++
++						if ((*w & bit) != 0u) {
++							md_srv_repeat++;
++							MD_SAY("POLARIS MODEM: 0340 VERDICT: Q_NEW_SERVER AGAIN for service %u (repeat %u): the name service answers lookups\n", svc, md_srv_repeat);
++						} else {
++							*w |= bit;
++						}
++					}
+ 				}
+ 				if (q[1] == MD_QRTR_Q_NEW_LOOKUP) {
+ 					md_qrtr_new_lookup_count++;
+@@ -6688,10 +6794,10 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0339 alive: W2e + W2f + "
+-            "GLINK + QRTR + SERVREG + HOSTSVC + QMI HEADER + "
+-            "RMTFS IN THE MBA REGION + DIRECTION IS DIRECTION + "
+-            "SERVREG SET_ACK + RADIO SUPPLIES (level 53) ========\n");
++        MD_SAY("POLARIS MODEM: ======== build 0340 alive: W2e + W2f + "
++            "GLINK + QRTR + SERVREG + HOSTSVC + RMTFS + RADIO SUPPLIES + "
++            "REFERENCE CLOCK + WLAN MSA GRANT + LOOKUP CONTROL "
++            "(level 54) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
+@@ -6788,6 +6894,7 @@
+ 	/* 0339: power first, then the modem.  dipper does the same with
+ 	 * mi8rp_wlfw=4 and it is the variant that worked. */
+ 	md_wlan_power(db, rsc);
++	md_wlan_msa_grant();
+ 
+ 	/* ---- step 3: put MBA.MBN in the region and read it back ---- */
+ 	MD_SAY("POLARIS MODEM:   W2e step 3/12: copy MBA.MBN into "
