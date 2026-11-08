@@ -1,0 +1,394 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -246,6 +246,18 @@
+  * "/boot/modem_fs*" path, and answers everything it cannot serve
+  * with an explicit result code instead of silence.
+  * Level 43.
++ *
++ * 0330: 0329 answered every request and the modem then went
++ * completely idle -- QMI rx froze at 3 for 224 heartbeats, no
++ * R_ALLOC, no R_RW, WLFW 69 still 0, servreg still DOWN.  So
++ * hostsvc does NOT gate wlan_pd; it is an incidental EFS mount.
++ * 0330 stops guessing and measures: it asks servreg for BOTH
++ * msm/modem/wlan_pd and msm/modem/root_pd (txn-matched, six asks
++ * rotating) to learn whether only the WLAN child failed or the
++ * whole modem PD tree never came up, and it replaces the
++ * hardcoded "0 domains" PDM answer with dipper's real sdm845
++ * table so the modem's queries get true answers.
++ * Level 44.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -3736,6 +3748,16 @@
+ static uint32_t md_hostsvc_replies;
+ static uint32_t md_hostsvc_handle;
+ static uint32_t md_srn_node, md_srn_port, md_srn_txn;
++/* 0330: servreg responses are matched to a domain by their txn id,
++ * so both domains can be watched in one run. */
++#define MD_SRN_ASKS	6u
++static uint32_t md_srn_pd_txn[2];
++static uint32_t md_srn_pd_state[2] = { 0xdeadbeefu, 0xdeadbeefu };
++static uint32_t md_srn_ask_next, md_srn_ask_at;
++static const char *const md_srn_names[2] = {
++	"msm/modem/wlan_pd",
++	"msm/modem/root_pd"
++};
+ static uint32_t md_glink_remote_cid;	/* modem's IPCRTR cid, dynamic */
+ static uint32_t md_foreign_id[MD_GLINK_MAX_FOREIGN];
+ static uint32_t md_foreign_size[MD_GLINK_MAX_FOREIGN];
+@@ -4314,7 +4336,7 @@
+         /* 0329: split in two.  The single 0328 line was longer than the
+          * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
+          * cut at "hostsv" and hsreplies / SRN state never appeared. */
+-        MD_SAY("POLARIS MODEM: 0329 HEARTBEAT #%u: build 0329 / level 43; "
++        MD_SAY("POLARIS MODEM: 0330 HEARTBEAT #%u: build 0330 / level 44; "
+             "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
+             "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+@@ -4324,15 +4346,15 @@
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 4u) : 0u,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 8u) : 0u,
+             md_glink_desc_at ? md_smem_word(md_glink_desc_at + 12u) : 0u);
+-        MD_SAY("POLARIS MODEM: 0329 HEARTBEAT #%u: DATA %u (HELLO %u / "
++        MD_SAY("POLARIS MODEM: 0330 HEARTBEAT #%u: DATA %u (HELLO %u / "
+             "SRV %u / LOOKUP %u / srv66 %u / WLFW69 %u), hello rpy %u, "
+             "srn lsn %u, QMI rx %u, wlfw lk %u, hsreplies %u, "
+-            "state %#x, 480 %#x %#x %#x %#x\n",
++            "srn w %#x r %#x, 480 %#x %#x %#x %#x\n",
+             n, md_glink_data_count, md_qrtr_hello_count,
+             md_qrtr_new_server_count, md_qrtr_new_lookup_count,
+             md_qrtr_srv66_count, md_srv69_count, md_qrtr_hello_replies,
+             md_srn_listener_sent, md_qmi_rx_count, md_wlfw_lookups,
+-            md_hostsvc_replies, md_srn_state,
++            md_hostsvc_replies, md_srn_pd_state[0], md_srn_pd_state[1],
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 0u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
+@@ -4423,40 +4445,44 @@
+  * 17-byte "msm/modem/wlan_pd" string (no NUL and no inner length --
+  * with one the modem answered INVALID_HANDLE, EXP-0203g). */
+ static uint32_t
+-md_srn_listen(uint32_t head, uint32_t node, uint32_t port)
++md_srn_listen(uint32_t head, uint32_t node, uint32_t port,
++    const char *name, uint32_t slot)
+ {
+-	static const char name[] = "msm/modem/wlan_pd";
+-	uint8_t qmi[32];
+-	uint32_t i, before = head, after;
++	uint8_t qmi[48];
++	uint32_t i, len = 0u, before = head, after;
+ 
++	while (name[len] != 0 && len < 32u) {
++		len++;
++	}
+ 	for (i = 0u; i < sizeof(qmi); i++) {
+ 		qmi[i] = 0;
+ 	}
+ 	md_srn_txn++;
++	if (slot < 2u) {
++		md_srn_pd_txn[slot] = md_srn_txn;
++	}
+ 	qmi[0] = 0u;				/* request */
+ 	qmi[1] = (uint8_t)md_srn_txn;
+ 	qmi[2] = (uint8_t)(md_srn_txn >> 8);
+ 	qmi[3] = (uint8_t)MD_SRN_REGISTER_LISTENER;
+ 	qmi[4] = 0u;
+-	qmi[5] = 24u;				/* TLV byte count */
++	qmi[5] = (uint8_t)(7u + len);		/* TLV bytes: 4 + (3 + len) */
+ 	qmi[6] = 0u;
+ 	qmi[7] = 0x01u; qmi[8] = 1u; qmi[9] = 0u; qmi[10] = 1u;
+-	qmi[11] = 0x02u; qmi[12] = 17u; qmi[13] = 0u;
+-	for (i = 0u; i < 17u; i++) {
++	qmi[11] = 0x02u; qmi[12] = (uint8_t)len; qmi[13] = 0u;
++	for (i = 0u; i < len; i++) {
+ 		qmi[14u + i] = (uint8_t)name[i];
+ 	}
+ 	md_srn_node = node;
+ 	md_srn_port = port;
+-	after = md_qrtr_send_qmi(head, node, port, qmi, 31u);
++	after = md_qrtr_send_qmi(head, node, port, qmi, 14u + len);
+ 	if (after != before) {
+ 		md_srn_listener_sent++;
+ 	}
+-	MD_SAY("POLARIS MODEM: 0324 VERDICT: SERVREG "
+-	    "REGISTER_LISTENER (QMI %#x) for '%s' to node %u "
+-	    "port %#x, src port %#x, 31 QMI bytes, sent=%s, "
+-	    "tx head %u -> %u\n", MD_SRN_REGISTER_LISTENER, name,
+-	    node, port, MD_QRTR_LOCAL_PORT,
+-	    after != before ? "YES" : "NO", before, after);
++	MD_SAY("POLARIS MODEM: 0330 VERDICT: SERVREG REGISTER_LISTENER "
++	    "for '%s' (slot %u) to node %u port %#x, %u QMI bytes, "
++	    "sent=%s, tx head %u -> %u\n", name, slot, node, port,
++	    14u + len, after != before ? "YES" : "NO", before, after);
+ 	return after;
+ }
+ 
+@@ -4657,12 +4683,70 @@
+         return 1u;
+ }
+ 
++/* 0330: dipper mi8_hostsvc.c:44-57, the sdm845 PD domain table the
++ * PDM endpoint answers from.  Services: avs/audio, tms/servreg,
++ * kernel/elf_loader, wlan/fw.  pdm():303-345 semantics: the request's
++ * TLV 0x01 is a SERVICE name, the answer is the list of domains that
++ * serve it (TLV 0x10 total, 0x11 = 1, 0x12 = [count][entries]). */
++#define MD_PD_SVC_AUDIO	0x1u
++#define MD_PD_SVC_SRN	0x2u
++#define MD_PD_SVC_ELF	0x4u
++#define MD_PD_SVC_FW	0x8u
++static const struct md_pd_domain {
++        const char *name;
++        uint32_t instance;
++        uint32_t services;
++} md_pd_domains[] = {
++        { "msm/adsp/audio_pd",   74u, MD_PD_SVC_AUDIO | MD_PD_SVC_SRN },
++        { "msm/adsp/root_pd",    74u, MD_PD_SVC_SRN },
++        { "msm/cdsp/root_pd",    76u, MD_PD_SVC_SRN },
++        { "msm/modem/root_pd",  180u, MD_PD_SVC_SRN },
++        { "msm/modem/wlan_pd",  180u,
++          MD_PD_SVC_SRN | MD_PD_SVC_ELF | MD_PD_SVC_FW },
++        { "msm/slpi/root_pd",    90u, MD_PD_SVC_SRN },
++        { "msm/slpi/sensor_pd",  90u, MD_PD_SVC_SRN }
++};
++#define MD_PD_DOMAINS \
++        (sizeof(md_pd_domains) / sizeof(md_pd_domains[0]))
++
++/* Exact match of a QMI TLV string against a C string. */
++static uint32_t
++md_hs_same(uint32_t at, uint32_t len, const char *s)
++{
++        uint32_t i;
++
++        for (i = 0u; i < len; i++) {
++                if (s[i] == 0 || md_smem_byte(at + i) != (uint8_t)s[i]) {
++                        return 0u;
++                }
++        }
++        return s[len] == 0 ? 1u : 0u;
++}
++
++static uint32_t
++md_pd_service_bit(uint32_t at, uint32_t len)
++{
++        if (md_hs_same(at, len, "avs/audio")) {
++                return MD_PD_SVC_AUDIO;
++        }
++        if (md_hs_same(at, len, "tms/servreg")) {
++                return MD_PD_SVC_SRN;
++        }
++        if (md_hs_same(at, len, "kernel/elf_loader")) {
++                return MD_PD_SVC_ELF;
++        }
++        if (md_hs_same(at, len, "wlan/fw")) {
++                return MD_PD_SVC_FW;
++        }
++        return 0u;
++}
++
+ static uint32_t
+ md_hostsvc_reply(uint32_t head, uint32_t our_port, uint32_t their_port,
+     uint32_t req_at, uint32_t req_len, uint32_t slot)
+ {
+-        uint8_t rsp[64];
+-        uint32_t pkt[24];
++        uint8_t rsp[320];
++        uint32_t pkt[80];
+         uint32_t i, n, wr, chunk, frame, path_at = 0u, path_len = 0u;
+         uint32_t iid = 0u, isize = 0u, at = head;
+         uint32_t code = 0u, handle = 0u, what = 0u;
+@@ -4684,12 +4768,81 @@
+ 
+         if (our_port == MD_HOSTSVC_PORT2) {
+                 if (msg == 0x21u) {
+-                        /* pdm():324 -- no sdm845 domain matches
+-                         * "tms/pddump_disabled", so the list is empty. */
+-                        wr = md_hs_number(rsp, wr, 0x10u, 0u, 2u);
+-                        wr = md_hs_number(rsp, wr, 0x11u, 1u, 2u);
+-                        wr = md_hs_number(rsp, wr, 0x12u, 0u, 1u);
+-                        what = 1u;
++                        uint32_t svc_at, svc_len = 0u, bit, total = 0u;
++                        uint32_t count = 0u, list, k, nl;
++                        char svc[33];
++
++                        svc_at = md_qmi_find(req_at, req_len, 1u,
++                            &svc_len);
++                        if (svc_at == 0u) {
++                                code = 1u;      /* Q_MALFORMED */
++                        } else {
++                                for (i = 0u; i < svc_len && i < 32u; i++) {
++                                        uint8_t c = md_smem_byte(svc_at + i);
++
++                                        svc[i] = (c >= 0x20u &&
++                                            c < 0x7fu) ? (char)c : '.';
++                                }
++                                svc[i] = 0;
++                                bit = md_pd_service_bit(svc_at, svc_len);
++                                for (k = 0u; k < MD_PD_DOMAINS; k++) {
++                                        if (bit != 0u &&
++                                            (md_pd_domains[k].services &
++                                            bit) != 0u) {
++                                                total++;
++                                        }
++                                }
++                                wr = md_hs_number(rsp, wr, 0x10u,
++                                    total, 2u);
++                                wr = md_hs_number(rsp, wr, 0x11u, 1u, 2u);
++                                rsp[wr] = 0x12u;
++                                rsp[wr + 1u] = 0u;
++                                rsp[wr + 2u] = 0u;
++                                list = wr + 3u;
++                                rsp[list] = 0u;         /* count */
++                                list++;
++                                for (k = 0u; k < MD_PD_DOMAINS &&
++                                    count < 32u; k++) {
++                                        if (bit == 0u ||
++                                            (md_pd_domains[k].services &
++                                            bit) == 0u) {
++                                                continue;
++                                        }
++                                        nl = 0u;
++                                        while (md_pd_domains[k].name[nl] !=
++                                            0) {
++                                                nl++;
++                                        }
++                                        rsp[list++] = (uint8_t)nl;
++                                        for (i = 0u; i < nl; i++) {
++                                                rsp[list++] =
++                                                    (uint8_t)md_pd_domains[k].name[i];
++                                        }
++                                        for (i = 0u; i < 4u; i++) {
++                                                rsp[list++] =
++                                                    (uint8_t)(md_pd_domains[k].instance >>
++                                                    (8u * i));
++                                        }
++                                        rsp[list++] = 0u;
++                                        for (i = 0u; i < 4u; i++) {
++                                                rsp[list++] = 0u;
++                                        }
++                                        count++;
++                                }
++                                rsp[wr + 3u] = (uint8_t)count;
++                                rsp[wr + 1u] =
++                                    (uint8_t)((list - wr - 3u) & 0xffu);
++                                rsp[wr + 2u] =
++                                    (uint8_t)((list - wr - 3u) >> 8);
++                                wr = list;
++                                what = 1u;
++                                MD_SAY("POLARIS MODEM: 0330 VERDICT: "
++                                    "PDM QUERY '%s' (%u bytes) -> "
++                                    "%u domains, %u listed\n",
++                                    svc, svc_len, total, count);
++                        }
++                } else if (msg == 0x24u) {
++                        what = 3u;              /* pdm():307 PFR ack */
+                 } else {
+                         code = 94u;             /* Q_UNSUPPORTED */
+                 }
+@@ -4740,7 +4893,7 @@
+                 }
+         }
+         if (iid == 0u || head + frame > MD_GLINK_FIFO_SIZE) {
+-                MD_SAY("POLARIS MODEM: 0329 VERDICT: reply NOT sent "
++                MD_SAY("POLARIS MODEM: 0330 VERDICT: reply NOT sent "
+                     "(slot %u, foreign %u, head %u, frame %u)\n",
+                     slot, md_foreign_count, head, frame);
+                 return head;
+@@ -4756,12 +4909,13 @@
+         if (frame > 16u + chunk) {
+                 md_smem_poke(md_glink_tx_at + at + 16u + chunk, 0u);
+         }
+-        MD_SAY("POLARIS MODEM: 0329 VERDICT: QMI REPLY msg %#x "
++        MD_SAY("POLARIS MODEM: 0330 VERDICT: QMI REPLY msg %#x "
+             "port %#x -> node 0 port %u, %u QMI bytes, %s, code %u, "
+             "handle %u, cid %u slot %u intent %u size %u, chunk %u "
+             "frame %u, tx head %u -> %u\n", msg, our_port, their_port, n,
+             what == 2u ? "RMTFS R_OPEN" : (what == 1u ? "PDM 0x21" :
+-            "refused"), code, handle, MD_GLINK_CID, slot, iid, isize,
++            (what == 3u ? "PDM PFR" : "refused")), code, handle,
++            MD_GLINK_CID, slot, iid, isize,
+             chunk, frame, head, head + frame);
+         return head + frame;
+ }
+@@ -4814,10 +4968,25 @@
+                         MD_SAY("POLARIS MODEM: 0325: QMI result %u "
+                             "error %u\n", v & 0xffffu, v >> 16);
+                 }
+-                if (t == 0x10u && l >= 4u) {
++                if (t == 0x10u && l >= 4u && md_smem_byte(at) == 2u) {
++                        uint32_t rtxn = (uint32_t)md_smem_byte(at + 1u) |
++                            ((uint32_t)md_smem_byte(at + 2u) << 8);
++                        uint32_t slot = 9u;
++
++                        if (rtxn == md_srn_pd_txn[0]) {
++                                slot = 0u;
++                        } else if (rtxn == md_srn_pd_txn[1]) {
++                                slot = 1u;
++                        }
++                        if (slot < 2u) {
++                                md_srn_pd_state[slot] = v;
++                        }
+                         md_srn_state = v;
+-                        MD_SAY("POLARIS MODEM: 0325 VERDICT: servreg "
+-                            "state %#x = %s\n", v, md_srn_state_name(v));
++                        MD_SAY("POLARIS MODEM: 0330 VERDICT: servreg "
++                            "state %#x = %s for '%s' (slot %u)\n",
++                            v, md_srn_state_name(v),
++                            slot < 2u ? md_srn_names[slot] : "?",
++                            slot);
+                 }
+ 		p += 3u + l;
+ 	}
+@@ -4882,6 +5051,20 @@
+ 	    (rxhead & 7u) || (rxtail & 7u)) {
+ 		return;
+ 	}
++        /* 0330: ask BOTH PD domains for their state, rotating, one
++         * ask every fourth heartbeat, six in total.  dipper retries
++         * srn_listen() every 1 s in modem_svc_thread(); the cap keeps
++         * the 16 KiB tx FIFO alive on a long run. */
++        if (md_srn_listener_sent != 0u && md_srn_ask_next < MD_SRN_ASKS &&
++            md_srn_ask_at != md_heartbeat_count &&
++            (md_heartbeat_count & 3u) == 0u) {
++                uint32_t slot = md_srn_ask_next & 1u;
++
++                md_srn_ask_at = md_heartbeat_count;
++                txhead = md_srn_listen(txhead, md_srn_node,
++                    md_srn_port, md_srn_names[slot], slot);
++                md_srn_ask_next++;
++        }
+         /* 0325: ask ONCE for WLFW service 69 after the servreg listener
+          * response has been seen.  This sits before the idle early-return
+          * so it still fires when the modem goes completely silent. */
+@@ -5117,7 +5300,9 @@
+ 			    svc == MD_SRN_SERVICE &&
+ 			    inst == MD_SRN_INSTANCE &&
+ 			    md_srn_listener_sent == 0u) {
+-				wr = md_srn_listen(wr, qnode, qport);
++				wr = md_srn_listen(wr, qnode, qport,
++				    md_srn_names[0], 0u);
++				md_srn_ask_next = 1u;
+ 			}
+ 			if (chunk >= 52u &&
+ 			    q[1] == MD_QRTR_Q_NEW_SERVER &&
+@@ -5555,7 +5740,7 @@
+ 	 * per iteration costs almost no CPU, keeps GLINK pumped, and puts a
+ 	 * complete self-describing summary in the NEWEST part of the ring
+ 	 * every five seconds, however long the phone stays in iOS. */
+-        MD_SAY("POLARIS MODEM: 0329 HEARTBEAT START: one summary every %u s, "
++        MD_SAY("POLARIS MODEM: 0330 HEARTBEAT START: one summary every %u s, "
+             "the W2e thread never returns; the census already prints them\n",
+             MD_GLINK_HEARTBEAT_EVERY);
+ 	for (beat = 1u; ; beat++) {
+@@ -5648,9 +5833,9 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0329 alive: W2e + W2f + "
+-            "GLINK + QRTR + SERVREG + HOSTSVC + ANSWER EVERY QMI "
+-            "(level 43) ========\n");
++        MD_SAY("POLARIS MODEM: ======== build 0330 alive: W2e + W2f + "
++            "GLINK + QRTR + SERVREG + HOSTSVC + WATCH BOTH PDs "
++            "(level 44) ========\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
