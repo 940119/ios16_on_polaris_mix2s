@@ -1,0 +1,427 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -3967,7 +3967,8 @@
+ /* 0342: TFTP counters.  The heartbeat prints them long before the
+  * responder itself appears, so they live here. */
+ static uint32_t md_tftp_wrq, md_tftp_rrq, md_tftp_data, md_tftp_errs;
+-static uint32_t md_tftp_seen, md_tftp_acks;
++static uint32_t md_tftp_seen, md_tftp_acks, md_tftp_oacks;
++static uint32_t md_tftp_opts;
+ static uint32_t md_qrtr_hello_replies, md_heartbeat_count;
+ static uint32_t md_srn_listener_sent, md_qmi_rx_count, md_srv69_count;
+ /* 0340c: which services have been announced once.  A second
+@@ -4665,7 +4666,7 @@
+         /* 0329: split in two.  The single 0328 line was longer than the
+          * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
+          * cut at "hostsv" and hsreplies / SRN state never appeared. */
+-        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0341 / level 55; "
++        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0343 / level 57; "
+             "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
+             "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+@@ -4689,10 +4690,10 @@
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 12u) : 0u);
+-        MD_SAY("POLARIS MODEM: 0342 HEARTBEAT #%u: TFTP wrq %u rrq %u "
+-            "data %u ack %u err %u, seen %u\n",
++        MD_SAY("POLARIS MODEM: 0343 HEARTBEAT #%u: TFTP wrq %u rrq %u "
++            "data %u ack %u err %u, oack %u opts %u, seen %u\n",
+             n, md_tftp_wrq, md_tftp_rrq, md_tftp_data, md_tftp_acks,
+-            md_tftp_errs, md_tftp_seen);
++            md_tftp_errs, md_tftp_oacks, md_tftp_opts, md_tftp_seen);
+         MD_SAY("POLARIS MODEM: 0334 HEARTBEAT #%u: rmtfs open %u "
+             "alloc %u, ufs %u store %u denied %u, pa %#llx "
+             "size %#x, last h%u sec %u n%u\n",
+@@ -5705,6 +5706,207 @@
+ 	dst[i] = 0;
+ }
+ 
++/* ---- 0343: TFTP options ------------------------------------------
++ *
++ * 0342 answered "ACK 0" to a WRQ that carried blksize, timeoutms and
++ * wsize.  A client asks for those precisely so the host can tell it
++ * what will be accepted; a bare ACK 0 says "no options", it cannot know
++ * what block size to send, and it retransmitted instead -- twice per
++ * port, 1000 ms apart, which is its own timeoutms, on port 31 then 65
++ * then 72.  RFC 2347: if the server honours any option it answers OACK.
++ *
++ * The values echoed back are ours, not the client's: blksize is capped
++ * at 1024 and rounded down to a multiple of four (0399: only word
++ * stores into SMEM), wsize at 4 because the whole tx FIFO is 16 KiB.
++ * ----------------------------------------------------------------- */
++static uint32_t
++md_tftp_same(const char *a, const char *b)
++{
++	uint32_t i = 0u;
++
++	for (;;) {
++		char x = a[i], y = b[i];
++
++		if (x >= 'A' && x <= 'Z') {
++			x = (char)(x - 'A' + 'a');
++		}
++		if (y >= 'A' && y <= 'Z') {
++			y = (char)(y - 'A' + 'a');
++		}
++		if (x != y) {
++			return 0u;
++		}
++		if (x == 0) {
++			return 1u;
++		}
++		i++;
++		if (i > 16u) {
++			return 0u;
++		}
++	}
++}
++
++static uint32_t
++md_tftp_dec(const char *s, uint32_t *out)
++{
++	uint32_t v = 0u, n = 0u;
++
++	while (s[n] >= '0' && s[n] <= '9' && n < 8u) {
++		v = v * 10u + (uint32_t)(s[n] - '0');
++		n++;
++	}
++	if (n == 0u || s[n] != 0) {
++		return 0u;
++	}
++	*out = v;
++	return 1u;
++}
++
++static void
++md_tftp_put(uint8_t *rsp, uint32_t *at, uint32_t cap, const char *s)
++{
++	while (*s != 0 && *at + 1u < cap) {
++		rsp[*at] = (uint8_t)*s;
++		(*at)++;
++		s++;
++	}
++	if (*at < cap) {
++		rsp[*at] = 0u;
++		(*at)++;
++	}
++}
++
++static void
++md_tftp_putn(uint8_t *rsp, uint32_t *at, uint32_t cap, uint32_t value)
++{
++	char digits[11];
++	uint32_t n = 0u;
++
++	do {
++		digits[n++] = (char)('0' + value % 10u);
++		value /= 10u;
++	} while (value != 0u && n < sizeof(digits));
++	while (n != 0u && *at + 1u < cap) {
++		n--;
++		rsp[*at] = (uint8_t)digits[n];
++		(*at)++;
++	}
++	if (*at < cap) {
++		rsp[*at] = 0u;
++		(*at)++;
++	}
++}
++
++/* The request is "<path>\0<mode>\0(<name>\0<value>\0)*".  Builds the
++ * OACK body at rsp[2..] and returns its total length, or 0 when the
++ * request named no option we speak -- the caller then answers exactly
++ * as 0342 did, so a plain WRQ still gets its ACK 0. */
++static uint32_t
++md_tftp_options(uint32_t req_at, uint32_t req_len, char *path, uint32_t pcap,
++    uint8_t *rsp, uint32_t cap, uint32_t *blksize, uint32_t *accepted)
++{
++	uint32_t at = 2u, n, out = 2u, opts = 0u, bs = MD_TFTP_BLOCK;
++	char key[24], val[24];
++
++	path[0] = 0;
++	*blksize = MD_TFTP_BLOCK;
++	*accepted = 0u;
++	if (req_len <= at) {
++		return 0u;
++	}
++	n = md_tftp_field(req_at + at, req_len - at, path, pcap);
++	at += n + 1u;
++	if (at >= req_len) {
++		return 0u;			/* path and nothing else */
++	}
++	n = md_tftp_field(req_at + at, req_len - at, key, sizeof(key));
++	at += n + 1u;				/* the mode: octet */
++	while (at < req_len) {
++		uint32_t value = 0u;
++
++		n = md_tftp_field(req_at + at, req_len - at, key, sizeof(key));
++		at += n + 1u;
++		if (n == 0u || at >= req_len) {
++			break;
++		}
++		n = md_tftp_field(req_at + at, req_len - at, val, sizeof(val));
++		at += n + 1u;
++		if (md_tftp_same(key, "blksize")) {
++			if (!md_tftp_dec(val, &value) || value < 8u) {
++				continue;
++			}
++			if (value > 1024u) {
++				value = 1024u;
++			}
++			value &= ~3u;
++			if (value < 8u) {
++				continue;
++			}
++			bs = value;
++		} else if (md_tftp_same(key, "timeoutms") ||
++		    md_tftp_same(key, "timeout")) {
++			if (!md_tftp_dec(val, &value) || value < 1u) {
++				continue;
++			}
++			if (value > 5000u) {
++				value = 5000u;
++			}
++		} else if (md_tftp_same(key, "wsize") ||
++		    md_tftp_same(key, "windowsize")) {
++			if (!md_tftp_dec(val, &value) || value < 1u) {
++				continue;
++			}
++			if (value > 4u) {
++				value = 4u;
++			}
++		} else if (md_tftp_same(key, "tsize")) {
++			if (!md_tftp_dec(val, &value)) {
++				continue;
++			}
++			value = 0u;		/* we keep no size table */
++		} else {
++			continue;		/* not a name we know */
++		}
++		md_tftp_put(rsp, &out, cap, key);
++		md_tftp_putn(rsp, &out, cap, value);
++		opts++;
++	}
++	if (opts == 0u) {
++		return 0u;
++	}
++	rsp[0] = 0u;
++	rsp[1] = 6u;				/* OACK */
++	*blksize = bs;
++	*accepted = opts;
++	return out;
++}
++
++/* The raw tail of a request, so the next ring proves what the options
++ * really are instead of leaving it to arithmetic.  Three bytes per
++ * byte, 48 bytes maximum: one MD_SAY line, under the 255-char cap. */
++static void
++md_tftp_hex(uint32_t req_at, uint32_t from, uint32_t req_len)
++{
++	static const char dig[] = "0123456789abcdef";
++	char hex[3u * 48u + 1u];
++	uint32_t i, n = 0u;
++
++	if (from >= req_len) {
++		hex[0] = 0;
++	} else {
++		for (i = from; i < req_len && n + 4u < sizeof(hex); i++) {
++			uint8_t c = md_smem_byte(req_at + i);
++
++			hex[n++] = dig[c >> 4];
++			hex[n++] = dig[c & 15u];
++			hex[n++] = ' ';
++		}
++		hex[n] = 0;
++	}
++	MD_SAY("POLARIS MODEM: 0343 VERDICT: TFTP request bytes from %u: "
++	    "%s\n", from, hex);
++}
++
+ /* One QRTR Q_DATA frame around an arbitrary payload.  The tail of
+  * md_hostsvc_reply() does exactly this, but only for QMI messages. */
+ static uint32_t
+@@ -5739,7 +5941,7 @@
+ 		}
+ 	}
+ 	if (iid == 0u || head + frame > MD_GLINK_FIFO_SIZE) {
+-		MD_SAY("POLARIS MODEM: 0342 VERDICT: TFTP reply NOT sent "
++		MD_SAY("POLARIS MODEM: 0343 VERDICT: TFTP reply NOT sent "
+ 		    "(%u bytes, slot %u, head %u)\n", n, slot, head);
+ 		return head;
+ 	}
+@@ -5760,34 +5962,65 @@
+ md_tftp_reply(uint32_t head, uint32_t our_port, uint32_t their_port,
+     uint32_t req_at, uint32_t req_len, uint32_t slot)
+ {
+-	uint8_t rsp[MD_TFTP_PATH_MAX + 16u];
++	uint8_t rsp[160];
+ 	char path[MD_TFTP_PATH_MAX];
+ 	struct md_tftp_session *s;
+ 	uint32_t op, blk, bytes, n;
+ 
+ 	md_tftp_seen++;
++	if (md_tftp_seen <= 6u) {
++		md_tftp_hex(req_at, 30u, req_len);
++	}
+ 	op = md_tftp_be16(req_at);
+ 	path[0] = 0;
+ 
+-	if (op == 1u) {				/* RRQ: no file service yet */
+-		md_tftp_field(req_at + 2u, req_len - 2u, path, sizeof(path));
+-		md_tftp_rrq++;
+-		rsp[0] = 0u; rsp[1] = 5u;	/* ERROR */
+-		rsp[2] = 0u; rsp[3] = 1u;	/* file not found */
+-		n = md_tftp_field(req_at + 2u, req_len - 2u,
+-		    (char *)rsp + 4u, sizeof(rsp) - 4u);
+-		/* a TFTP ERROR message is NUL-terminated, so the byte at
+-		 * 4 + n (already written by md_tftp_field) is part of it */
+-		rsp[4u + n] = 0u;
+-		n = 4u + n + 1u;
+-		MD_SAY("POLARIS MODEM: 0342 VERDICT: TFTP RRQ from port %u "
+-		    "for '%s' (%u bytes in the request) -- no file service in "
+-		    "this version, ERROR 1\n", their_port, path, req_len);
+-		return md_tftp_send(head, our_port, their_port, rsp, n, slot);
+-	}
+-	if (op == 2u) {				/* WRQ: accept, discard data */
+-		md_tftp_field(req_at + 2u, req_len - 2u, path, sizeof(path));
+-		md_tftp_wrq++;
++	/* 0343: an open request may carry options, and then the only
++	 * answer that lets the client start is OACK.  0342 said ACK 0
++	 * six times and the radio timed out six times. */
++	if (op == 1u || op == 2u) {
++		uint32_t opts = 0u, oack, bs = MD_TFTP_BLOCK;
++
++		oack = md_tftp_options(req_at, req_len, path, sizeof(path),
++		    rsp, sizeof(rsp), &bs, &opts);
++		md_tftp_opts += opts;
++		if (oack != 0u) {
++			md_tftp_oacks++;
++			if (op == 2u) {
++				s = md_tftp_find(their_port);
++				if (s == NULL) {
++					s = md_tftp_take(their_port);
++				}
++				if (s != NULL) {
++					s->write = 1u;
++					s->block = 0u;
++					s->blocksize = bs;
++					md_tftp_copy(s->path, path);
++				}
++			}
++			MD_SAY("POLARIS MODEM: 0343 VERDICT: TFTP %s from port "
++			    "%u for '%s' -> OACK %u option(s), blksize %u, "
++			    "oack %u so far\n", op == 1u ? "RRQ" : "WRQ",
++			    their_port, path, opts, bs, md_tftp_oacks);
++			return md_tftp_send(head, our_port, their_port, rsp,
++			    oack, slot);
++		}
++		if (op == 1u) {			/* RRQ: no file service yet */
++			md_tftp_rrq++;
++			rsp[0] = 0u; rsp[1] = 5u;	/* ERROR */
++			rsp[2] = 0u; rsp[3] = 1u;	/* file not found */
++			n = md_tftp_field(req_at + 2u, req_len - 2u,
++			    (char *)rsp + 4u, sizeof(rsp) - 4u);
++			/* a TFTP ERROR message is NUL-terminated, so the byte
++			 * at 4 + n (written by md_tftp_field) is part of it */
++			rsp[4u + n] = 0u;
++			n = 4u + n + 1u;
++			MD_SAY("POLARIS MODEM: 0343 VERDICT: TFTP RRQ from port "
++			    "%u for '%s' (%u bytes) -- no file service in this "
++			    "version, ERROR 1\n", their_port, path, req_len);
++			return md_tftp_send(head, our_port, their_port, rsp, n,
++			    slot);
++		}
++		md_tftp_wrq++;			/* WRQ: accept, discard data */
+ 		s = md_tftp_find(their_port);
+ 		if (s == NULL) {
+ 			s = md_tftp_take(their_port);
+@@ -5800,9 +6033,9 @@
+ 		}
+ 		rsp[0] = 0u; rsp[1] = 4u;	/* ACK block 0 */
+ 		rsp[2] = 0u; rsp[3] = 0u;
+-		MD_SAY("POLARIS MODEM: 0342 VERDICT: TFTP WRQ from port %u "
+-		    "for '%s' (%u bytes) -> ACK 0, session %s, %u wrq so far\n",
+-		    their_port, path, req_len,
++		MD_SAY("POLARIS MODEM: 0343 VERDICT: TFTP WRQ from port %u "
++		    "for '%s' (%u bytes) -> ACK 0 (no options), session "
++		    "%s, %u wrq so far\n", their_port, path, req_len,
+ 		    s != NULL ? "open" : "TABLE FULL", md_tftp_wrq);
+ 		return md_tftp_send(head, our_port, their_port, rsp, 4u, slot);
+ 	}
+@@ -5820,7 +6053,7 @@
+ 		rsp[2] = (uint8_t)(blk >> 8);
+ 		rsp[3] = (uint8_t)blk;
+ 		if (md_tftp_data <= 8u || (md_tftp_data % 64u) == 0u) {
+-			MD_SAY("POLARIS MODEM: 0342 VERDICT: TFTP DATA from "
++			MD_SAY("POLARIS MODEM: 0343 VERDICT: TFTP DATA from "
+ 			    "port %u block %u %u bytes -> ACK %u (%u so far, "
+ 			    "path '%s')\n", their_port, blk, bytes, blk,
+ 			    md_tftp_data, s != NULL ? s->path : "?");
+@@ -5834,7 +6067,7 @@
+ 		if (s != NULL) {
+ 			s->block = blk;
+ 		}
+-		MD_SAY("POLARIS MODEM: 0342 VERDICT: TFTP ACK from port %u "
++		MD_SAY("POLARIS MODEM: 0343 VERDICT: TFTP ACK from port %u "
+ 		    "block %u (nothing queued in this version, %s)\n",
+ 		    their_port, blk, s != NULL ? "session live" : "no session");
+ 		return head;			/* nothing to answer */
+@@ -5845,7 +6078,7 @@
+ 		md_tftp_errs++;
+ 		(void)md_tftp_field(req_at + 4u, req_len - 4u, path,
+ 		    sizeof(path));
+-		MD_SAY("POLARIS MODEM: 0342 VERDICT: TFTP ERROR from port "
++		MD_SAY("POLARIS MODEM: 0343 VERDICT: TFTP ERROR from port "
+ 		    "%u code %u '%s'\n", their_port, code, path);
+ 		s = md_tftp_find(their_port);
+ 		if (s != NULL) {
+@@ -5853,7 +6086,7 @@
+ 		}
+ 		return head;
+ 	}
+-	MD_SAY("POLARIS MODEM: 0342 VERDICT: TFTP opcode %u from port %u, "
++	MD_SAY("POLARIS MODEM: 0343 VERDICT: TFTP opcode %u from port %u, "
+ 	    "%u bytes: not an opcode we know\n", op, their_port, req_len);
+ 	return head;
+ }
+@@ -6547,10 +6780,22 @@
+                          * cycling so a reply never reuses the slot
+                          * of a frame the modem has not released. */
+                         {
+-                                uint32_t nh = md_hostsvc_reply(wr,
++                                uint32_t plen = chunk - 32u;
++                                uint32_t nh;
++
++                                /* 0343: the GLINK chunk is
++                                 * padded to four bytes and the
++                                 * QRTR header is not, so 0342
++                                 * parsed 76 bytes of a 73-byte
++                                 * TFTP request. */
++                                if (q[7] == MD_HOSTSVC_PORT1 &&
++                                    q[5] >= 4u && q[5] < plen) {
++                                        plen = q[5];
++                                }
++                                nh = md_hostsvc_reply(wr,
+                                     q[7], q[3],
+                                     md_glink_rx_at + at + 48u,
+-                                    chunk - 32u,
++                                    plen,
+                                     4u + (md_hostsvc_replies % 24u));
+ 
+                                 if (nh != wr) {
+@@ -7109,10 +7354,10 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ======== build 0342 alive: W2e + W2f + "
+-            "GLINK + QRTR + SERVREG + HOSTSVC + RMTFS + RADIO SUPPLIES + "
+-            "REFERENCE CLOCK + MSA GRANT + TFTP SERVER (level 56) "
+-            "========\n");
++        MD_SAY("POLARIS MODEM: ====== build 0343 alive: W2e + W2f + "
++            "GLINK + QRTR + SERVREG + HOSTSVC + RMTFS + RADIO "
++            "SUPPLIES + CLOCK + MSA GRANT + TFTP OACK (level 57) "
++            "======\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
