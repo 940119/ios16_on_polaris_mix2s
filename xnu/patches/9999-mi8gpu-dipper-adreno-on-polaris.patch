@@ -9857,14 +9857,20 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,51 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
 + * dipper's bsd/dev/mi8_adreno.c was written for HackiOS's <sys/redwood_input.h>.
 + * On SWEET/polaris (xnu-8796.141.3) these headers supply processor_t,
-+ * PROCESSOR_NULL, thread_bind(), ml_get_max_cpu_number(), cpu_number() and
-+ * ml_phys_read_word() with the exact signatures the driver uses.
++ * PROCESSOR_NULL, ml_get_max_cpu_number(), cpu_number() and ml_phys_read_word()
++ * with the signatures the driver uses.
++ *
++ * thread_bind() is NOT visible from a BSD translation unit: the build uses a
++ * trimmed EXPORT_HDRS copy of sched_prim.h. dipper declared it locally too
++ * (xnu-mi8.patch, mi8_bind_thread), so we do the same here. First CI run
++ * 42512155412 failed with "call to undeclared function 'thread_bind'" when
++ * the local extern was removed -- do not remove it again.
 + */
 +#include <kern/processor.h>
 +#include <kern/sched_prim.h>
@@ -9872,12 +9878,36 @@ new file mode 100644
 +#include <arm/cpu_number.h>
 +#include <pexpert/pexpert.h>
 +
++extern processor_t thread_bind(processor_t processor);
++
 +/* dipper also echoes every log byte to the loader's serial log. On SWEET,
 + * printf() already reaches the persistent log ring synchronously, so there is
 + * no second sink; keeping say() intact costs one no-op macro. */
 +#define loader_log_putc(c) ((void)(c))
 +
 +void mi8_adreno_init(void);     /* boot-arg mi8gpu=N; default off */
++
++/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
++ * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
++ * C99's implicit-int declaration clashes with the bool definition below
++ * ("call to undeclared function" + "conflicting types", CI 42512155412).
++ * Verbatim from patches/xnu-mi8.patch, redwood_input.h hunk @@ -122,6 +125,24 @@. */
++bool mi8_gpu_kept(void);
++bool mi8_gpu_parameter(uint32_t which, uint64_t *value);
++uint64_t mi8_gpu_address(uint64_t size);
++void mi8_gpu_address_free(uint64_t address, uint64_t size);
++void mi8_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most, uint64_t *lost, uint32_t *refused);
++bool mi8_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void mi8_gpu_mapped(void);
++void mi8_gpu_unmap(uint64_t address, uint64_t size);
++void mi8_gpu_to_memory(void *start, uint64_t size);
++uint32_t mi8_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++bool mi8_gpu_done(uint32_t fence);
++uint32_t mi8_gpu_last(void);
++void mi8_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
++void mi8_gpu_report(const char *why);
++bool mi8_gpu_recover(void);
++void mi8_gpu_stop(void);
 +#endif /* _BSD_DEV_MI8GPU_SWEET_H_ */
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
