@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,4783 @@
+@@ -0,0 +1,4790 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4436,11 +4436,17 @@ new file mode 100644
 +			}
 +		}
 +	}
-+	/* v2: step 1 is a read-only probe. stale_stop() wrote six registers
-+	 * and collapsed CX the other GPU driver had just powered on
-+	 * (CX-RACE-WRITE, 04:14 ring). Never do that for N<=1. */
-+	if (last > 1) {
-+		stale_stop();
++	/* v3: stale_stop() wrote six registers and collapsed CX the other
++	 * GPU driver had just powered on (CX-RACE-WRITE, 04:14 ring).
++	 * v2 gated it on last>1, which would re-arm that write the
++	 * moment mi8gpu>=2 advances the ladder. It is NEVER implied by
++	 * the step count now: only an explicit opt-in runs it. */
++	{
++		uint32_t stale = 0;
++
++		if (PE_parse_boot_argn("mi8gpu_stale", &stale, sizeof(stale)) && stale) {
++			stale_stop();
++		}
 +	}
 +	{
 +		uint32_t zap = 0;
@@ -4614,6 +4620,7 @@ new file mode 100644
 +
 +	printf("mi8gpu: %s (dipper A630 driver on polaris/MIX 2S)\n", mi8gpu_polaris_marker);
 +	printf("mi8gpu: read-only step 1, small GCC window (v2)\n");
++	printf("mi8gpu: v3 stale_stop is opt-in only (mi8gpu_stale=1)\n");
 +	thread_t thread;
 +
 +	if (!PE_parse_boot_argn("mi8gpu", &last, sizeof(last)) || last == 0) {
