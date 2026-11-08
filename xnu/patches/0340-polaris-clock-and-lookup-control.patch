@@ -127,7 +127,7 @@
              md_glink_rx_at ? md_smem_word(md_glink_rx_at + 0u) : 0u,
              md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
              md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
-@@ -4893,16 +4972,28 @@
+@@ -4893,16 +4972,35 @@
   * packed=get32(p+8)=version|instance<<8.  52 B QRTR -> 72 B GLINK
   * DATA frame, the same shape as 0323's Q_HELLO reply.  Returns the
   * new tx head. */
@@ -154,11 +154,18 @@
 +         * the control that tells "69 is not there" apart from "our
 +         * lookup is not understood". */
 +        pkt[9] = service;
++        /* 0340c: and the two words that tell the name service where to
++         * answer.  0325-0339 left them zero, so any reply could only
++         * have gone to node 0 port 0 -- the modem itself.  Linux
++         * qrtr_ctrl_new_lookup() fills them from the requesting socket,
++         * and 0x4000 is our servreg client port (MD_QRTR_LOCAL_PORT). */
++        pkt[11] = MD_QRTR_LOCAL_NODE;
++        pkt[12] = MD_QRTR_LOCAL_PORT;
 +
          for (i = 0u; i < md_foreign_count; i++) {
                  if (md_foreign_size[i] >= MD_QRTR_CTRL_LEN &&
                      md_foreign_id[i] != 0u) {
-@@ -4930,7 +5021,7 @@
+@@ -4930,7 +5028,7 @@
          MD_SAY("POLARIS MODEM: 0325 VERDICT: WLFW Q_NEW_LOOKUP SENT "
              "(service %u v1 inst0, QRTR type %u, 52 B, dst node 0 "
              "port %#x, from %#x, cid %u, intent %u size %u, "
@@ -167,7 +174,7 @@
              MD_QRTR_Q_NEW_LOOKUP, MD_QRTR_CTRL, MD_QRTR_CTRL,
              MD_GLINK_CID, iid, size, head, head + MD_QRTR_CTRL_FRAME);
          return head + MD_QRTR_CTRL_FRAME;
-@@ -5900,7 +5991,8 @@
+@@ -5900,7 +5998,8 @@
           * response has been seen.  This sits before the idle early-return
           * so it still fires when the modem goes completely silent. */
          if (md_wlfw_lookups == 0u && md_qmi_rx_count > 0u) {
@@ -177,7 +184,7 @@
  
                  if (nh != txhead) {
                          md_smem_poke(md_glink_desc_at + 4u, nh);
-@@ -5916,7 +6008,8 @@
+@@ -5916,7 +6015,8 @@
          if (md_hostsvc_published == 3u && md_qmi_rx_count > 0u &&
              md_wlfw_lookups >= 1u && md_wlfw_lookups < 3u &&
              md_heartbeat_count > 6u && (md_heartbeat_count % 8u) == 0u) {
@@ -187,7 +194,7 @@
  
                  if (nh != txhead) {
                          md_smem_poke(md_glink_desc_at + 4u, nh);
-@@ -6108,6 +6201,19 @@
+@@ -6108,6 +6208,19 @@
  					    inst == MD_QRTR_SERVREG_INSTANCE) {
  						md_qrtr_srv66_count++;
  					}
@@ -207,7 +214,7 @@
  				}
  				if (q[1] == MD_QRTR_Q_NEW_LOOKUP) {
  					md_qrtr_new_lookup_count++;
-@@ -6688,10 +6794,10 @@
+@@ -6688,10 +6801,10 @@
  	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
  	const char *why = "nothing went wrong";
  
@@ -222,7 +229,7 @@
  	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
  	 * writer, which is the only time our unlocked item allocator is safe.
  	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
-@@ -6788,6 +6894,7 @@
+@@ -6788,6 +6901,7 @@
  	/* 0339: power first, then the modem.  dipper does the same with
  	 * mi8rp_wlfw=4 and it is the variant that worked. */
  	md_wlan_power(db, rsc);
