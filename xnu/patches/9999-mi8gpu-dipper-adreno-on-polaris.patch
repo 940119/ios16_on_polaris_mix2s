@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,4852 @@
+@@ -0,0 +1,4889 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2641,6 +2641,7 @@ new file mode 100644
 +gpu_fill_screen(void)
 +{
 +	uint32_t *ring = (uint32_t *)g3d_regions[1].memory, wptr = cp_wptr & 8191u, sent = 0;
++	volatile uint32_t *memptrs = (volatile uint32_t *)g3d_regions[2].memory;
 +	const uint32_t total = G3D_FB_WIDTH * G3D_FB_HEIGHT, chunk = 1000, ring_words = 8192;
 +	/* BGRA words 0xAARRGGBB: white, yellow, cyan, green, magenta, red, blue, black */
 +	static const uint32_t bars[8] = { 0xffffffff, 0xffffff00, 0xff00ffff, 0xff00ff00, 0xffff00ff, 0xffff0000, 0xff0000ff, 0xff000000 };
@@ -2706,6 +2707,42 @@ new file mode 100644
 +	cp_wptr = wptr;
 +	printf("mi8gpu: the CP read %u dwords in %u submissions (%s); RBBM_STATUS %#x INT_0 %#x CB1 FSR %#x; timer ticks %llu\n", sent, batches,
 +	    ok ? "all" : "STOPPED", rd(gpu3d + 4 * 0x0210), rd(gpu3d + 4 * 0x0201), rd(smmu_cb(G3D_CTX) + CB_FSR), t1 - t0);
++	/*
++	 * Make the core's writes visible before sampling them.
++	 *
++	 * The ring drain only proves the CP has READ the commands; the writes
++	 * themselves sit in the core's cache until something pushes them out. The
++	 * keep path always ends a submission with CACHE_FLUSH_TS for exactly this
++	 * reason, and without it the readback sees whatever the core happened to
++	 * evict -- which looks identical to "the paint only covered half the
++	 * screen" but is a property of the sample, not of the paint.
++	 */
++	memptrs[4] = memptrs[5] = 0;
++	to_memory((vm_offset_t)memptrs, 0x1000);
++	{
++		uint32_t w = wptr;
++		uint64_t flush_iova = g3d_regions[2].address + 0x10;
++
++		ring[w++ & (ring_words - 1)] = pkt7(0x46u /* CP_EVENT_WRITE */, 4);
++		ring[w++ & (ring_words - 1)] = 0x04u;   /* EVENT_CACHE_FLUSH_TS */
++		ring[w++ & (ring_words - 1)] = (uint32_t)flush_iova;
++		ring[w++ & (ring_words - 1)] = (uint32_t)(flush_iova >> 32);
++		ring[w++ & (ring_words - 1)] = 0;
++		wptr = w & (ring_words - 1);
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (uint32_t i = 0; i < 20000; i++) {
++			if (rd(gpu3d + 4 * 0x0806) == wptr) {
++				break;
++			}
++			sleep_us(10);
++		}
++		to_memory((vm_offset_t)memptrs, 0x1000);
++		printf("mi8gpu: cache flush submitted (ring up to %u); the timestamp it wrote is %#010x %#010x\n",
++		    wptr, memptrs[4], memptrs[5]);
++	}
++	cp_wptr = wptr;
 +	screen_check("right after the CP finished");
 +	screen_scan("after this pass");
 +}
