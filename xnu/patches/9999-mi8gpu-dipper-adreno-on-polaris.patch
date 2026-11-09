@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5467 @@
+@@ -0,0 +1,5511 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2645,11 +2645,26 @@ new file mode 100644
 +	 * value it could produce spontaneously -- a slot that still reads zero after
 +	 * the ring drained was never written, and the packet before it therefore
 +	 * never executed.
++	 *
++	 * B33: the count is 3, not 4. CP_MEM_WRITE's payload is the 64-bit address
++	 * followed by the data dwords, and cnt counts payload dwords only, so one
++	 * data dword is cnt 3. B32 wrote 4 and the CP dutifully wrote a second
++	 * dword taken from the ring itself:
++	 *
++	 *   mark[0] 0xc1de0041   our constant, at the address we asked for
++	 *   mark[1] 0x70268000   == pkt7(0x26, 0), the CP_WAIT_FOR_IDLE header
++	 *                        that happened to follow the packet
++	 *
++	 * -- bit for bit the next ring dword, which is what an over-read by one
++	 * looks like. Everything after it was one dword out of phase, so the ring
++	 * never reached its last marker and the CP stopped. The old CP_MEM_WRITE at
++	 * gpu_zap_and_command() uses cnt 4 with four payload dwords and writes two
++	 * words on purpose, which is why this never showed up before.
 +	 */
 +#define CS_MARK(ph)	do {							\
 +		uint64_t m_ = g3d_regions[2].address + CS_MARKER_OFF			\
 +		    + 4u * (3u * (uint32_t)tag + (uint32_t)(ph));			\
-+		CS_PUT(pkt7(CP_MEM_WRITE_OPCODE, 4u));					\
++		CS_PUT(pkt7(CP_MEM_WRITE_OPCODE, 3u));					\
 +		CS_PUT((uint32_t)m_);							\
 +		CS_PUT((uint32_t)(m_ >> 32));						\
 +		CS_PUT(CS_MARKER(tag, ph));						\
@@ -2720,13 +2735,21 @@ new file mode 100644
 +		CS_MARK(1);				/* the CP accepted the dispatch */
 +	}
 +	CS_PUT(pkt7(0x26u, 0u));		/* CP_WAIT_FOR_IDLE */
-+	CS_PUT(pkt7(0x46u, 4u));		/* CP_EVENT_WRITE: the fence */
-+	CS_PUT(0x04u);				/* EVENT_CACHE_FLUSH_TS */
-+	CS_PUT((uint32_t)fence_iova);
-+	CS_PUT((uint32_t)(fence_iova >> 32));
-+	CS_PUT(0u);
++	/*
++	 * B33: the CP_EVENT_WRITE fence is gone.
++	 *
++	 * It was there as a second completion signal, and it never produced one:
++	 * EVENT_CACHE_FLUSH_TS writes the CP timestamp, the RBBM timer reads zero
++	 * here, so every version of this rung read fence 0 on every launch. A packet
++	 * that cannot be read is not a signal, and with the markers fixed there is
++	 * nothing left for it to add -- but it is one more packet whose length and
++	 * semantics would have to be trusted, so it goes. What remains between the
++	 * dispatch and the last marker is CP_WAIT_FOR_IDLE alone, which makes the
++	 * next bisection a single step.
++	 */
 +	CS_MARK(2);				/* the ring ran to its end */
 +	(void)target;
++	(void)fence_iova;			/* B33: no CP_EVENT_WRITE is emitted */
 +#undef CS_MARK
 +#undef CS_PUT
 +	/*
@@ -2796,6 +2819,7 @@ new file mode 100644
 +	uint64_t target = base + CS_RESULT_OFF;
 +	bool faulted[3] = { false, false, false }, committed = false;
 +	bool stalled[3] = { false, false, false };
++	int reached[3] = { 0, 0, 0 };
 +
 +	printf("mi8gpu: step 23: a shader, on a core whose SECVID_TRUST_CNTL reads %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE, so this is a control and not the test");
@@ -2842,31 +2866,45 @@ new file mode 100644
 +		printf("mi8gpu: step 23: launch %c: %s (store at %#llx, CB1 FSR %#010x -> %#010x after the clear, program word 0 %#x)\n",
 +		    'A' + t, plan[t].what, target, seen, fsr_before, shader[0]);
 +		drained = cs_launch(target, plan[t].exec, plan[t].tag, plan[t].what);
-+		/* the fence and CP_WAIT_FOR_IDLE are inside the ring, so the wave is over once it drains; give the store a moment anyway */
++		/* CP_WAIT_FOR_IDLE is inside the ring, so the wave is over once it drains; give the store a moment anyway */
 +		sleep_us(2000);
 +		/* The core wrote this page behind our back: drop the lines, do not write them back. */
 +		from_memory((vm_offset_t)memptrs, 0x1000);
 +		fsr_after = rd(cb + CB_FSR);
 +		arrived = *result;
-+		printf("mi8gpu: step 23 launch %c target %#llx: result %#010x, the fence %#010x, CB1 FSR %#010x -> %#010x, FSYNR0 %#010x, FAR %#llx%08x\n",
-+		    'A' + t, target, arrived, *fence, fsr_before, fsr_after, rd(cb + CB_FSYNR0),
++		printf("mi8gpu: step 23 launch %c target %#llx: result %#010x, the fence %s, CB1 FSR %#010x -> %#010x, FSYNR0 %#010x, FAR %#llx%08x\n",
++		    'A' + t, target, arrived, "removed", fsr_before, fsr_after, rd(cb + CB_FSYNR0),
 +		    (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
 +		/*
 +		 * B31: which packets the CP actually executed. mark[0] before the
 +		 * dispatch, mark[1] between CP_EXEC_CS and CP_WAIT_FOR_IDLE, mark[2]
-+		 * after the fence. Each is a constant the CP had to write itself.
++		 * after CP_WAIT_FOR_IDLE. Each is a constant the CP had to write itself.
++		 *
++		 * B33: the stage is a count, not a boolean, because "stalled" is now a
++		 * three-way answer -- nowhere, before the dispatch, or after it. B32
++		 * could only say "no last marker" and then blamed CP_EXEC_CS even on the
++		 * launch that never contained one.
 +		 */
 +		printf("mi8gpu: step 23 launch %c markers: state-reached %#010x, exec-accepted %#010x, ring-finished %#010x (want %#010x %#010x %#010x)\n",
 +		    'A' + t, mark[0], mark[1], mark[2],
 +		    CS_MARKER(plan[t].tag, 0), plan[t].exec ? CS_MARKER(plan[t].tag, 1) : 0u,
 +		    CS_MARKER(plan[t].tag, 2));
-+		if (mark[2] != CS_MARKER(plan[t].tag, 2)) {
-+			stalled[t] = true;
++		if (mark[2] == CS_MARKER(plan[t].tag, 2)) {
++			reached[t] = 3;
++		} else if (plan[t].exec && mark[1] == CS_MARKER(plan[t].tag, 1)) {
++			reached[t] = 2;
++		} else if (mark[0] == CS_MARKER(plan[t].tag, 0)) {
++			reached[t] = 1;
++		} else {
++			reached[t] = 0;
 +		}
++		stalled[t] = reached[t] != 3;
 +		if (stalled[t]) {
 +			printf("mi8gpu: step 23 VERDICT launch %c: STALLED at %s -- the CP never wrote the ring's last marker, so this launch's bank reading means nothing\n",
-+			    'A' + t, mark[0] != CS_MARKER(plan[t].tag, 0) ? "the state block" :
-+			    (mark[1] != CS_MARKER(plan[t].tag, 1) ? "CP_EXEC_CS" : "CP_WAIT_FOR_IDLE or the fence"));
++			    'A' + t,
++			    reached[t] == 0 ? "the state block (not even the first marker)" :
++			    reached[t] == 1 ? "CP_WAIT_FOR_IDLE (the only packet between the last marker and the end)" :
++			    "CP_WAIT_FOR_IDLE (the dispatch was accepted, the wait after it was not)");
 +		} else if (arrived == 0x0badf00du) {
 +			committed = true;
 +			printf("mi8gpu: step 23 VERDICT launch %c: THE SP RAN AND THE STORE COMMITTED\n", 'A' + t);
@@ -2889,10 +2927,16 @@ new file mode 100644
 +	 * the bank stayed quiet because nothing reached the shader, and calling that
 +	 * "no fault" is the same mistake 教训 38/42 caught on the modem line.
 +	 */
-+	if (stalled[0]) {
-+		printf("mi8gpu: step 23 SUMMARY: the CP did not execute even the state-only ring (marker missing) -- the ring drain is a read, not a run\n");
++	if (reached[0] == 0) {
++		printf("mi8gpu: step 23 SUMMARY: the CP did not execute even the first marker of the state-only ring -- the ring drain is a read, not a run\n");
++	} else if (stalled[0] && reached[0] == 1) {
++		printf("mi8gpu: step 23 SUMMARY: THE CP STOPS AT CP_WAIT_FOR_IDLE. B33 fixed the marker length and the state block, the wait and nothing else are now the whole ring, so the packet that follows the last marker is the one it dies on\n");
++	} else if (stalled[1] && reached[1] == 1) {
++		printf("mi8gpu: step 23 SUMMARY: THE EMPTY PROGRAM STALLED THE CP after the state block, before CP_EXEC_CS wrote its marker: the dispatch packet itself is where it stops\n");
 +	} else if (stalled[1]) {
-+		printf("mi8gpu: step 23 SUMMARY: THE EMPTY PROGRAM STALLED THE CP: the state-only ring finished, the dispatch ring did not, so CP_EXEC_CS itself (or the wait after it) is where it stops -- the shader never mattered yet\n");
++		printf("mi8gpu: step 23 SUMMARY: THE EMPTY PROGRAM WAS ACCEPTED AND THE WAIT AFTER IT WAS NOT: CP_EXEC_CS ran, CP_WAIT_FOR_IDLE never returned, so a wave was launched and never retired -- the shader is being fetched now\n");
++	} else if (stalled[2]) {
++		printf("mi8gpu: step 23 SUMMARY: the STORE program stalls the CP where the empty one did not -- the store itself (or the fetch of the instruction carrying it) is what kills it\n");
 +	} else if (faulted[0]) {
 +		printf("mi8gpu: step 23 SUMMARY: the state block alone faulted, so nothing after it can be blamed on the store\n");
 +	} else if (committed) {
