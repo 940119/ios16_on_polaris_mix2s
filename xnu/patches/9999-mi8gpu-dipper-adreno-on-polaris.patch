@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,4820 @@
+@@ -0,0 +1,4852 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2606,6 +2606,37 @@ new file mode 100644
 +	}
 +}
 +
++/*
++ * Where the paint actually landed, row by row.
++ *
++ * The pattern is identical on every row outside the bottom strip, so a row that
++ * holds the expected colour was painted and a row that holds anything else was
++ * not. Three x positions catch a horizontal shift as well as a vertical one.
++ * The three-band count says "some of it is missing"; this says which rows, and
++ * that is the difference between a ring that wrapped, a mapping that stops
++ * short and a screen that something repainted.
++ */
++static void
++screen_scan(const char *when)
++{
++	static const uint32_t xs[3] = { 100, 540, 1000 };
++	volatile uint32_t *fb = (volatile uint32_t *)vinfo.v_baseaddr;
++
++	if (fb == NULL || vinfo.v_rowbytes != G3D_FB_WIDTH * 4 || vinfo.v_height != G3D_FB_HEIGHT) {
++		return;
++	}
++	printf("mi8gpu: scan %s: row, the pixel at x 100/540/1000, and what it should be\n", when);
++	for (uint32_t y = 0; y < G3D_FB_HEIGHT; y += 60) {
++		printf("mi8gpu: scan y %4u: %06x %06x %06x  want %06x %06x %06x\n", y,
++		    fb[y * G3D_FB_WIDTH + xs[0]] & 0xffffffu,
++		    fb[y * G3D_FB_WIDTH + xs[1]] & 0xffffffu,
++		    fb[y * G3D_FB_WIDTH + xs[2]] & 0xffffffu,
++		    screen_expected(xs[0], y) & 0xffffffu,
++		    screen_expected(xs[1], y) & 0xffffffu,
++		    screen_expected(xs[2], y) & 0xffffffu);
++	}
++}
++
 +static void
 +gpu_fill_screen(void)
 +{
@@ -2676,6 +2707,7 @@ new file mode 100644
 +	printf("mi8gpu: the CP read %u dwords in %u submissions (%s); RBBM_STATUS %#x INT_0 %#x CB1 FSR %#x; timer ticks %llu\n", sent, batches,
 +	    ok ? "all" : "STOPPED", rd(gpu3d + 4 * 0x0210), rd(gpu3d + 4 * 0x0201), rd(smmu_cb(G3D_CTX) + CB_FSR), t1 - t0);
 +	screen_check("right after the CP finished");
++	screen_scan("after this pass");
 +}
 +
 +
