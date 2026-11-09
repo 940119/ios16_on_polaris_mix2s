@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5298 @@
+@@ -0,0 +1,5354 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2587,7 +2587,7 @@ new file mode 100644
 +
 +/* One dispatch. Returns false only when the CP stopped reading the ring. */
 +static bool
-+cs_launch(uint64_t target, const char *what)
++cs_launch(uint64_t target, bool exec, const char *what)
 +{
 +	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
 +	uint32_t w = cp_wptr & 8191u;
@@ -2630,25 +2630,36 @@ new file mode 100644
 +	CS_PUT((uint32_t)(uav_iova >> 32));
 +	CS_PUT(0x0aa00u);			/* SP_CS_USIZE: one unit was loaded */
 +	CS_PUT(1u);
-+	CS_PUT(pkt7(0x65u, 1u));		/* CP_SET_MARKER */
-+	CS_PUT(8u);				/* RM6_COMPUTE */
-+	/* the grid: one group of eight invocations. NDRANGE_1 is the global size, local times groups. */
-+	CS_PUT(pkt7(0x5cu, 20u));
-+	CS_PUT(0x0b990u); CS_PUT(0x0000001fu);	/* SP_CS_NDRANGE_0: dim 3, local 8x1x1 */
-+	CS_PUT(0x0b991u); CS_PUT(8u);		/* SP_CS_NDRANGE_1: global x */
-+	CS_PUT(0x0b992u); CS_PUT(0u);		/* SP_CS_NDRANGE_2: offset x */
-+	CS_PUT(0x0b993u); CS_PUT(1u);		/* SP_CS_NDRANGE_3: global y */
-+	CS_PUT(0x0b994u); CS_PUT(0u);		/* SP_CS_NDRANGE_4: offset y */
-+	CS_PUT(0x0b995u); CS_PUT(1u);		/* SP_CS_NDRANGE_5: global z */
-+	CS_PUT(0x0b996u); CS_PUT(0u);		/* SP_CS_NDRANGE_6: offset z */
-+	CS_PUT(0x0b999u); CS_PUT(1u);		/* SP_CS_KERNEL_GROUP_X */
-+	CS_PUT(0x0b99au); CS_PUT(1u);		/* SP_CS_KERNEL_GROUP_Y */
-+	CS_PUT(0x0b99bu); CS_PUT(1u);		/* SP_CS_KERNEL_GROUP_Z */
-+	CS_PUT(pkt7(0x33u, 4u));		/* CP_EXEC_CS */
-+	CS_PUT(0u);
-+	CS_PUT(1u);				/* groups x */
-+	CS_PUT(1u);				/* groups y */
-+	CS_PUT(1u);				/* groups z */
++	/*
++	 * B29: the state stops here when exec is false.
++	 *
++	 * 0251's sequence loads state and dispatches in one breath, so a fault seen
++	 * afterwards cannot be attributed: it could come from the state block (the
++	 * UAV view is 64 zero bytes, and an eager preload would dereference its
++	 * null base) or from the store the program performs. Stopping before
++	 * CP_SET_MARKER separates them, and it is the same subtraction 0223 used.
++	 */
++	if (exec) {
++		CS_PUT(pkt7(0x65u, 1u));		/* CP_SET_MARKER */
++		CS_PUT(8u);				/* RM6_COMPUTE */
++		/* the grid: one group of eight invocations. NDRANGE_1 is the global size, local times groups. */
++		CS_PUT(pkt7(0x5cu, 20u));
++		CS_PUT(0x0b990u); CS_PUT(0x0000001fu);	/* SP_CS_NDRANGE_0: dim 3, local 8x1x1 */
++		CS_PUT(0x0b991u); CS_PUT(8u);		/* SP_CS_NDRANGE_1: global x */
++		CS_PUT(0x0b992u); CS_PUT(0u);		/* SP_CS_NDRANGE_2: offset x */
++		CS_PUT(0x0b993u); CS_PUT(1u);		/* SP_CS_NDRANGE_3: global y */
++		CS_PUT(0x0b994u); CS_PUT(0u);		/* SP_CS_NDRANGE_4: offset y */
++		CS_PUT(0x0b995u); CS_PUT(1u);		/* SP_CS_NDRANGE_5: global z */
++		CS_PUT(0x0b996u); CS_PUT(0u);		/* SP_CS_NDRANGE_6: offset z */
++		CS_PUT(0x0b999u); CS_PUT(1u);		/* SP_CS_KERNEL_GROUP_X */
++		CS_PUT(0x0b99au); CS_PUT(1u);		/* SP_CS_KERNEL_GROUP_Y */
++		CS_PUT(0x0b99bu); CS_PUT(1u);		/* SP_CS_KERNEL_GROUP_Z */
++		CS_PUT(pkt7(0x33u, 4u));		/* CP_EXEC_CS */
++		CS_PUT(0u);
++		CS_PUT(1u);				/* groups x */
++		CS_PUT(1u);				/* groups y */
++		CS_PUT(1u);				/* groups z */
++	}
 +	CS_PUT(pkt7(0x26u, 0u));		/* CP_WAIT_FOR_IDLE */
 +	CS_PUT(pkt7(0x46u, 4u));		/* CP_EVENT_WRITE: the fence */
 +	CS_PUT(0x04u);				/* EVENT_CACHE_FLUSH_TS */
@@ -2689,19 +2700,46 @@ new file mode 100644
 +	volatile uint32_t *memptrs = (volatile uint32_t *)g3d_regions[2].memory;
 +	const uint64_t base = g3d_regions[2].address;
 +	uint32_t *shader = (uint32_t *)((vm_offset_t)memptrs + CS_PROGRAM_OFF);
-+	uint64_t targets[2];
++	/*
++	 * B29: three submissions, each one addressable on its own.
++	 *
++	 * B28 dispatched twice and got one FSR transition (0x400 -> 0x402, FAR 0) that
++	 * happened on the first dispatch and did not repeat on the second. Two readings
++	 * survive that: the fault belongs to the state block (which is submitted both
++	 * times, and would therefore have to be sticky to look like one event), or it
++	 * belongs to the first store only. FSR is sticky and FAR was zero in both, so
++	 * the ring cannot separate them. Clearing the bank before each submission and
++	 * adding a submission with no CP_EXEC_CS at all does separate them.
++	 *
++	 *   A  state only, no dispatch   a fault here is the state block or the UAV view
++	 *   B  dispatch, result page     a fault here, A clean, is the store being refused
++	 *   C  dispatch, page with none  a fault here and clean A is the store reaching the SMMU
++	 */
++	static const struct {
++		uint64_t target;
++		bool exec;
++		const char *what;
++	} plan[3] = {
++		{ 0, false, "state only, no CP_EXEC_CS" },
++		{ 0, true,  "dispatch, store to the result page" },
++		{ 0, true,  "dispatch, store to the page with no PTE" },
++	};
++	vm_offset_t cb = smmu_cb(G3D_CTX);
++	uint64_t targets[3];
++	bool faulted[3] = { false, false, false }, committed = false;
++
++	targets[0] = base + CS_RESULT_OFF;
++	targets[1] = base + CS_RESULT_OFF;
++	targets[2] = CS_HOLE_IOVA;
 +
 +	printf("mi8gpu: step 23: a shader, on a core whose SECVID_TRUST_CNTL reads %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE, so this is a control and not the test");
 +	/* The stg uses an absolute address in r2.xy, so no descriptor has to be right for it to work. */
 +	memset((void *)((vm_offset_t)memptrs + CS_UAV_OFF), 0, 64);
 +	memcpy(shader, cs_program, sizeof(cs_program));
-+	targets[0] = base + CS_RESULT_OFF;
-+	targets[1] = CS_HOLE_IOVA;
-+	for (uint32_t t = 0; t < 2; t++) {
++	for (uint32_t t = 0; t < 3; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
 +		volatile uint32_t *fence = (volatile uint32_t *)((vm_offset_t)memptrs + CS_FENCE_OFF);
-+		vm_offset_t cb = smmu_cb(G3D_CTX);
 +		uint32_t fsr_before, fsr_after, arrived;
 +		bool drained;
 +
@@ -2709,31 +2747,49 @@ new file mode 100644
 +		*fence = 0;
 +		shader[0] = (uint32_t)targets[t];
 +		to_memory((vm_offset_t)memptrs, 0x1000);
++		/* clear the bank, so whatever it reports next belongs to this submission alone */
++		wr(cb + CB_FSR, 1u);
++		__asm__ volatile ("dsb sy" ::: "memory");
 +		fsr_before = rd(cb + CB_FSR);
-+		printf("mi8gpu: step 23: launching with the store at %#llx (CB1 FSR before %#010x, program word 0 %#x)\n",
-+		    targets[t], fsr_before, shader[0]);
-+		drained = cs_launch(targets[t], t ? "after the store to the page with no PTE" : "after the store to the result page");
++		printf("mi8gpu: step 23: launch %c: %s (store at %#llx, CB1 FSR cleared to %#010x, program word 0 %#x)\n",
++		    'A' + t, plan[t].what, targets[t], fsr_before, shader[0]);
++		drained = cs_launch(targets[t], plan[t].exec, plan[t].what);
 +		/* the fence and CP_WAIT_FOR_IDLE are inside the ring, so the wave is over once it drains; give the store a moment anyway */
 +		sleep_us(2000);
 +		/* The core wrote this page behind our back: drop the lines, do not write them back. */
 +		from_memory((vm_offset_t)memptrs, 0x1000);
 +		fsr_after = rd(cb + CB_FSR);
 +		arrived = *result;
-+		printf("mi8gpu: step 23 target %#llx: result word %#010x, the fence %#010x, CB1 FSR %#010x -> %#010x FAR %#llx%08x\n",
-+		    targets[t], arrived, *fence, fsr_before, fsr_after, (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
++		printf("mi8gpu: step 23 launch %c target %#llx: result %#010x, the fence %#010x, CB1 FSR %#010x -> %#010x, FSYNR0 %#010x, FAR %#llx%08x\n",
++		    'A' + t, targets[t], arrived, *fence, fsr_before, fsr_after, rd(cb + CB_FSYNR0),
++		    (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
 +		if (arrived == 0x0badf00du) {
-+			printf("mi8gpu: step 23 VERDICT target %#llx: the SP ran and its store committed\n", targets[t]);
++			committed = true;
++			printf("mi8gpu: step 23 VERDICT launch %c: THE SP RAN AND THE STORE COMMITTED\n", 'A' + t);
 +		} else if (fsr_after != fsr_before) {
-+			printf("mi8gpu: step 23 VERDICT target %#llx: the SP ran and its store reached the SMMU (FSR %#010x -> %#010x)\n",
-+			    targets[t], fsr_before, fsr_after);
++			faulted[t] = true;
++			printf("mi8gpu: step 23 VERDICT launch %c: the bank faulted (%#010x -> %#010x, FAR %#llx%08x)\n", 'A' + t,
++			    fsr_before, fsr_after, (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
 +		} else {
-+			printf("mi8gpu: step 23 VERDICT target %#llx: nothing wrote, no fault: the wave did not reach its store\n", targets[t]);
++			printf("mi8gpu: step 23 VERDICT launch %c: nothing wrote, no fault\n", 'A' + t);
 +		}
 +		if (!drained) {
-+			printf("mi8gpu: step 23: the CP stopped reading the ring at the %s target; the second one is not attempted\n",
-+			    t ? "second" : "first");
++			printf("mi8gpu: step 23: the CP stopped reading the ring at launch %c; the rest is not attempted\n", 'A' + t);
 +			break;
 +		}
++	}
++	/*
++	 * The comparison itself, which is what this rung is for. Only the first two
++	 * matter: if A faulted, every later fault is the state block's, not a store's.
++	 */
++	if (faulted[0]) {
++		printf("mi8gpu: step 23 SUMMARY: the state block alone faulted, so nothing after it can be blamed on the store\n");
++	} else if (committed) {
++		printf("mi8gpu: step 23 SUMMARY: THE SP RAN AND ITS STORE COMMITTED (launch B)\n");
++	} else if (faulted[1] || faulted[2]) {
++		printf("mi8gpu: step 23 SUMMARY: THE SP RAN. The state is clean, the store faulted: A clean, B/C faulted\n");
++	} else {
++		printf("mi8gpu: step 23 SUMMARY: the state is clean and no store faulted -- the wave did not reach its store\n");
 +	}
 +}
 +
