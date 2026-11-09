@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,4930 @@
+@@ -0,0 +1,5025 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2484,6 +2484,8 @@ new file mode 100644
 +	return rptr == wptr && !(rd(gpu3d + 4 * 0x0210) & ~0x1u);
 +}
 +
++static void probe_report(const char *when);   /* B27: defined with the step 22 probes */
++
 +static void
 +gpu_zap_and_command(void)
 +{
@@ -2540,8 +2542,24 @@ new file mode 100644
 +			printf("mi8gpu: painting pass %u of %u\n", pass + 1, passes);
 +			gpu_fill_screen();
 +			if (pass + 1 < passes) {
-+				sleep_us(700000);
++				/*
++				 * B27: one 700 ms sample cannot tell "slowly overwritten" from
++				 * "erased once". Sample four times, and read the two known rows
++				 * at every stop. The 700 ms label is kept exactly as it was so
++				 * the judge still finds its next_before sample.
++				 */
++				sleep_us(100000);
++				screen_check("100 ms after the pass");
++				probe_report("100 ms after the pass");
++				sleep_us(200000);
++				screen_check("300 ms after the pass");
++				probe_report("300 ms after the pass");
++				sleep_us(200000);
++				screen_check("500 ms after the pass");
++				probe_report("500 ms after the pass");
++				sleep_us(200000);
 +				screen_check("before the next pass (what is on the screen now)");
++				probe_report("before the next pass (what is on the screen now)");
 +			}
 +		}
 +	}
@@ -2650,6 +2668,40 @@ new file mode 100644
 +		    screen_expected(xs[1], y) & 0xffffffu,
 +		    screen_expected(xs[2], y) & 0xffffffu);
 +	}
++}
++
++/*
++ * B27 probes: two rows of four dwords, both inside the pattern's black bar
++ * (x 960..983, y 200 and y 260), so writing them only spoils 8 of the 4000
++ * samples. The CPU writes one row itself and the CP writes the other, both
++ * AFTER the bulk paint. Whichever row survives tells us who is allowed to keep
++ * data on that page:
++ *   CPU row survives, CP row gone   -> only what the core wrote gets erased
++ *   both rows survive               -> the bulk paint's loss is about the paint
++ *   both rows gone                  -> the whole page is being rewritten
++ * A 700 ms single sample could never separate those three.
++ */
++#define PROBE_X         960u
++#define PROBE_CPU_Y     200u
++#define PROBE_GPU_Y     260u
++#define PROBE_WORDS     4u
++#define PROBE_CPU_VALUE 0x00ff00ffu
++#define PROBE_GPU_VALUE 0x00dead00u
++
++static void
++probe_report(const char *when)
++{
++	volatile uint32_t *fb = (volatile uint32_t *)vinfo.v_baseaddr;
++	uint32_t cpu_at = PROBE_CPU_Y * G3D_FB_WIDTH + PROBE_X;
++	uint32_t gpu_at = PROBE_GPU_Y * G3D_FB_WIDTH + PROBE_X;
++	uint32_t cpu_held = 0, gpu_held = 0;
++
++	for (uint32_t i = 0; i < PROBE_WORDS; i++) {
++		cpu_held += (fb[cpu_at + i] & 0xffffffu) == (PROBE_CPU_VALUE & 0xffffffu);
++		gpu_held += (fb[gpu_at + i] & 0xffffffu) == (PROBE_GPU_VALUE & 0xffffffu);
++	}
++	printf("mi8gpu: B27 %s: the CPU's own row %u/%u, the CP's row %u/%u\n",
++	    when, cpu_held, PROBE_WORDS, gpu_held, PROBE_WORDS);
 +}
 +
 +static void
@@ -2786,6 +2838,49 @@ new file mode 100644
 +	printf("mi8gpu: CPU frame buffer mapping invalidated before the readback\n");
 +	screen_check("right after the CP finished");
 +	screen_scan("after this pass");
++	/*
++	 * B27: two known rows, written after the pattern was sampled, so the pattern
++	 * statistics above stay clean. The CP goes first, then the CPU, then both are
++	 * read back once so the log holds a t=0 value for each.
++	 */
++	{
++		uint32_t w = wptr;
++		uint64_t at = G3D_FB_IOVA + 4ull * (PROBE_GPU_Y * G3D_FB_WIDTH + PROBE_X);
++
++		ring[w++ & (ring_words - 1)] = pkt7(CP_MEM_WRITE_OPCODE, PROBE_WORDS + 2);
++		ring[w++ & (ring_words - 1)] = (uint32_t)at;
++		ring[w++ & (ring_words - 1)] = (uint32_t)(at >> 32);
++		for (uint32_t i = 0; i < PROBE_WORDS; i++) {
++			ring[w++ & (ring_words - 1)] = PROBE_GPU_VALUE;
++		}
++		wptr = w & (ring_words - 1);
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (uint32_t i = 0; i < 20000; i++) {
++			if (rd(gpu3d + 4 * 0x0806) == wptr) {
++				break;
++			}
++			sleep_us(10);
++		}
++		cp_wptr = wptr;
++		printf("mi8gpu: B27 the CP wrote %#x into the frame buffer at (%u,%u)..(%u,%u)\n",
++		    PROBE_GPU_VALUE, PROBE_X, PROBE_GPU_Y, PROBE_X + PROBE_WORDS - 1, PROBE_GPU_Y);
++	}
++	{
++		volatile uint32_t *fb = (volatile uint32_t *)vinfo.v_baseaddr;
++		uint32_t at = PROBE_CPU_Y * G3D_FB_WIDTH + PROBE_X;
++
++		for (uint32_t i = 0; i < PROBE_WORDS; i++) {
++			fb[at + i] = PROBE_CPU_VALUE;
++		}
++		to_memory((vm_offset_t)(fb + at), PROBE_WORDS * 4);
++		from_memory((vm_offset_t)vinfo.v_baseaddr,
++		    (vm_size_t)vinfo.v_rowbytes * vinfo.v_height);
++		printf("mi8gpu: B27 the CPU wrote %#x into the frame buffer at (%u,%u)..(%u,%u)\n",
++		    PROBE_CPU_VALUE, PROBE_X, PROBE_CPU_Y, PROBE_X + PROBE_WORDS - 1, PROBE_CPU_Y);
++	}
++	probe_report("immediately after both wrote");
 +}
 +
 +
