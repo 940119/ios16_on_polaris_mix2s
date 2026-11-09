@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5659 @@
+@@ -0,0 +1,5721 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2521,16 +2521,18 @@ new file mode 100644
 + * authenticate, that would mean secure mode was not the gate either, and the
 + * next question is the launch state itself rather than the core's trust level.
 + *
-+ * Nothing here is a guess about the hardware: the two packets that carry the
-+ * state (CP_LOAD_STATE6_FRAG for the program and for the UAV view, the context
-+ * bunch, CP_SET_MARKER, the grid, CP_EXEC_CS) are copied in the order Mesa's
-+ * computerator emits them, which is the one order 0229 established by copying it.
++ * B37 checked every field of that sequence against Mesa's adreno_pm4.xml and
++ * fd6_compute.cc rather than trusting 0251's transcription, and the UAV view
++ * turned out to be aimed at the shader instruction block -- see cs_launch.
++ * There is one CP_LOAD_STATE6 now, for the program.
 + */
 +#define CS_PROGRAM_WORDS	32u
 +#define CS_PROGRAM_OFF		0x100u
 +#define CS_UAV_OFF		0x200u
 +#define CS_RESULT_OFF		0x300u
 +#define CS_FENCE_OFF		0x380u
++#define CS_PVT_OFF		0x400u	/* a page the core has a PTE for: the pvt-memory base */
++#define CS_RB_OFF		0x600u	/* where CP_REG_TO_MEM drops the register readback */
 +/*
 + * B31: nine CP-visible marker slots, three per launch.
 + *
@@ -2548,6 +2550,16 @@ new file mode 100644
 +#define CS_MARKER_OFF		0x3c0u
 +#define CS_MARKER(tag, ph)	(0xc1de0000u | ((uint32_t)(ph) << 8) | (0x41u + (uint32_t)(tag)))
 +#define CS_HOLE_IOVA		0x10100000ull
++/*
++ * B37: what a ring is allowed to contain. Splitting the state from the
++ * dispatch is the reference driver's own shape -- fd6_compute.cc emits
++ * SP_CS_* and the program once into a state object, and per launch emits only
++ * CP_SET_MARKER, the grid and CP_EXEC_CS -- and it is the only shape in which
++ * "the state is wrong" can be told from "the dispatch is refused".
++ */
++#define CS_F_STATE	0x1u	/* cs_ncr + the CS block + SP_CS_BASE + the program load */
++#define CS_F_EXEC	0x2u	/* CP_SET_MARKER(RM6_COMPUTE) + the grid + CP_EXEC_CS */
++#define CS_F_HOLE	0x4u	/* move only SP_CS_BASE, to a page with no PTE */
 +
 +/*
 + * mov r2.x, <target>; mov r2.y, 0; mov r1.x, 0x0badf00d; nop; stg [r2.x], r1.x; end.
@@ -2619,40 +2631,49 @@ new file mode 100644
 +/* cs_program_emit_regs(): the CS block. Every value here was read back correct from 0219 onward. */
 +static const struct cs_word cs_ctx[] = {
 +	{ 0x0ab00, 0x00000005 },	/* SP_MODE_CNTL: ISAMMODE_GL, constant demotion */
-+	{ 0x0bb08, 0x000000bf },	/* SP_UPDATE_CNTL: the stages, cs and gfx_uav */
++	{ 0x0bb08, 0x000000ff },	/* SP_UPDATE_CNTL: all eight bits, as fd6 sets them */
 +	{ 0x0b987, 0x00000100 },	/* SP_CS_CONST_CONFIG: constlen 0, enabled */
-+	{ 0x0a9bb, 0x00400100 },	/* SP_CS_CONFIG: enabled, nuav 1 */
-+	{ 0x0a9b0, 0x80100100 },	/* SP_CS_CNTL_0: merged regs, THREAD128, footprint 2 */
++	{ 0x0a9bb, 0x00000100 },	/* SP_CS_CONFIG: enabled, nuav 0 (the stg uses no descriptor) */
++	{ 0x0a9b0, 0x80100180 },	/* SP_CS_CNTL_0: mergedregs, THREAD128, full footprint 3 = r0..r2 */
 +	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: 1 KB shared, const ram 128 */
 +	{ 0x0b997, 0x00fcfcfc },	/* SP_CS_CONST_CONFIG_0: every constid INVALID */
 +	{ 0x0b998, 0x000002fc },	/* SP_CS_WGE_CNTL: THREAD128, no linear local id */
 +};
 +
-+/* One dispatch. Returns false only when the CP stopped reading the ring. */
++/*
++ * One ring. Returns false only when the CP stopped reading it.
++ *
++ * B37: the state and the dispatch live in separate rings now, and the state is
++ * the one fd6_compute.cc writes. Everything below was checked field by field
++ * against Mesa's adreno_pm4.xml and fd6_compute.cc rather than derived from
++ * 0251's sequence, and three of those checks were being violated:
++ *
++ *   - the UAV CP_LOAD_STATE6 named state_block 0xd, which is SB6_CS_SHADER,
++ *     not SB6_CS_UAV (0xf) -- that is the shader instruction store, so the
++ *     packet was aimed at the same block the program had just been loaded
++ *     into, with 128 bytes of zeros. It is gone: the stg uses no descriptor.
++ *   - SP_CS_INSTR_SIZE is in 128-byte instruction groups (ir3_shader.h:
++ *     "the instructions length is in units of instruction groups ... each
++ *     instruction is 2 dwords"), so a 32-dword program is 1, not 32.
++ *   - SP_CS_CNTL_0's FULLREGFOOTPRINT is max_reg + 1, and this program uses
++ *     r0 through r2, so 3 -- not 2.
++ *
++ * The reference also writes SP_CS_PROGRAM_COUNTER_OFFSET and the four
++ * SP_CS_PVT_MEM_* registers on every compute launch; all five were missing
++ * here, and they are written now with fd6's own values.
++ */
 +static bool
-+cs_launch(uint64_t target, bool exec, uint32_t tag, bool hole, const char *what)
++cs_launch(uint32_t flags, uint32_t tag, const char *what)
 +{
 +	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
 +	uint32_t w = cp_wptr & 8191u;
 +	const uint32_t n_ctx = (uint32_t)(sizeof(cs_ctx) / sizeof(cs_ctx[0]));
 +	const uint64_t program_iova = g3d_regions[2].address + CS_PROGRAM_OFF;
-+	const uint64_t uav_iova = g3d_regions[2].address + CS_UAV_OFF;
++	const uint64_t pvt_iova = g3d_regions[2].address + CS_PVT_OFF;
 +	const uint64_t fence_iova = g3d_regions[2].address + CS_FENCE_OFF;
-+	/*
-+	 * B35: where the SP is told its program is.
-+	 *
-+	 * Everything in this rung now checks out -- the ring runs to its last marker,
-+	 * the fence lands with the value we supplied, the cache is flushed -- and no
-+	 * shader access ever reaches the SMMU or the memory. That leaves one question
-+	 * the markers cannot answer: is a wave being created at all? If one is, it has
-+	 * to fetch its first instruction, and the fetch is a read of whatever
-+	 * SP_CS_BASE names. Point that at a page with no PTE and the answer is a
-+	 * translation fault, or nothing.
-+	 *
-+	 * The program is still LOADED from the real page (the CP has to read real data
-+	 * to build the state), so this changes only the address the SP is handed.
-+	 */
-+	const uint64_t sp_base = hole ? CS_HOLE_IOVA : program_iova;
++	const uint64_t sp_base = (flags & CS_F_HOLE) != 0 ? CS_HOLE_IOVA : program_iova;
++	const bool state = (flags & CS_F_STATE) != 0;
++	const bool exec = (flags & CS_F_EXEC) != 0;
 +
 +#define CS_PUT(v)	(ring[w++ & 8191u] = (uint32_t)(v))
 +	/*
@@ -2672,9 +2693,7 @@ new file mode 100644
 +	 *
 +	 * -- bit for bit the next ring dword, which is what an over-read by one
 +	 * looks like. Everything after it was one dword out of phase, so the ring
-+	 * never reached its last marker and the CP stopped. The old CP_MEM_WRITE at
-+	 * gpu_zap_and_command() uses cnt 4 with four payload dwords and writes two
-+	 * words on purpose, which is why this never showed up before.
++	 * never reached its last marker and the CP stopped.
 +	 */
 +#define CS_MARK(ph)	do {							\
 +		uint64_t m_ = g3d_regions[2].address + CS_MARKER_OFF			\
@@ -2684,53 +2703,53 @@ new file mode 100644
 +		CS_PUT((uint32_t)(m_ >> 32));						\
 +		CS_PUT(CS_MARKER(tag, ph));						\
 +	} while (0)
-+	for (uint32_t i = 0; i < (uint32_t)(sizeof(cs_ncr) / sizeof(cs_ncr[0])); i++) {
-+		CS_PUT(pkt4(cs_ncr[i].reg, 1u));
-+		CS_PUT(cs_ncr[i].value);
++	if (state) {
++		for (uint32_t i = 0; i < (uint32_t)(sizeof(cs_ncr) / sizeof(cs_ncr[0])); i++) {
++			CS_PUT(pkt4(cs_ncr[i].reg, 1u));
++			CS_PUT(cs_ncr[i].value);
++		}
++		/*
++		 * fd_crb: the block, then the addresses inside it, then the length --
++		 * one bunch, as computerator writes it. Nine pairs follow cs_ctx: the
++		 * instruction size, the program counter offset, the 64-bit SP_CS_BASE,
++		 * the four pvt-memory registers (fd6 writes them even when the shader
++		 * asks for no private memory, with a size of zero).
++		 */
++		CS_PUT(pkt7(0x5cu, 2u * (n_ctx + 9u)));
++		for (uint32_t i = 0; i < n_ctx; i++) {
++			CS_PUT(cs_ctx[i].reg);
++			CS_PUT(cs_ctx[i].value);
++		}
++		CS_PUT(0x0a9bcu); CS_PUT(1u);		/* SP_CS_INSTR_SIZE: one 128-byte group */
++		CS_PUT(0x0a9b3u); CS_PUT(0u);		/* SP_CS_PROGRAM_COUNTER_OFFSET */
++		CS_PUT(0x0a9b4u); CS_PUT((uint32_t)sp_base);
++		CS_PUT(0x0a9b5u); CS_PUT((uint32_t)(sp_base >> 32));
++		CS_PUT(0x0a9b6u); CS_PUT(0u);		/* SP_CS_PVT_MEM_PARAM: no per-fiber item */
++		CS_PUT(0x0a9b7u); CS_PUT((uint32_t)pvt_iova);
++		CS_PUT(0x0a9b8u); CS_PUT((uint32_t)(pvt_iova >> 32));
++		CS_PUT(0x0a9b9u); CS_PUT(0u);		/* SP_CS_PVT_MEM_SIZE: total 0 */
++		CS_PUT(0x0a9bdu); CS_PUT(0u);		/* SP_CS_PVT_MEM_STACK_OFFSET */
++		/* the program, as an indirect state block: ST6_SHADER/INDIRECT/SB6_CS_SHADER/1 */
++		CS_PUT(pkt7(0x34u, 3u));
++		CS_PUT(0x00760000u);
++		CS_PUT((uint32_t)program_iova);
++		CS_PUT((uint32_t)(program_iova >> 32));
 +	}
-+	/* fd_crb: the block, then the addresses inside it, then the length -- one bunch, as computerator writes it. */
-+	CS_PUT(pkt7(0x5cu, 2u * (n_ctx + 3u)));
-+	for (uint32_t i = 0; i < n_ctx; i++) {
-+		CS_PUT(cs_ctx[i].reg);
-+		CS_PUT(cs_ctx[i].value);
++	if ((flags & CS_F_HOLE) != 0) {
++		/* only the base moves, so the program is still the one already loaded */
++		CS_PUT(pkt7(0x5cu, 4u));
++		CS_PUT(0x0a9b4u); CS_PUT((uint32_t)sp_base);
++		CS_PUT(0x0a9b5u); CS_PUT((uint32_t)(sp_base >> 32));
 +	}
-+	CS_PUT(0x0a9b4u);			/* SP_CS_BASE */
-+	CS_PUT((uint32_t)sp_base);
-+	CS_PUT(0x0a9b5u);
-+	CS_PUT((uint32_t)(sp_base >> 32));
-+	CS_PUT(0x0a9bcu);			/* SP_CS_INSTR_SIZE: 128-byte blocks, so 32 dwords is one */
-+	CS_PUT(CS_PROGRAM_WORDS);
-+	/* the program, as an indirect state block */
-+	CS_PUT(pkt7(0x34u, 3u));		/* CP_LOAD_STATE6_FRAG */
-+	CS_PUT(0x00760000u);			/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
-+	CS_PUT((uint32_t)program_iova);
-+	CS_PUT((uint32_t)(program_iova >> 32));
-+	/* and the UAV view: one 64-byte unit, which the stg does not consult but the block names */
-+	CS_PUT(pkt7(0x34u, 3u));
-+	CS_PUT(0x0076c000u);			/* ST6_UAV / INDIRECT / CS / 1 */
-+	CS_PUT((uint32_t)uav_iova);
-+	CS_PUT((uint32_t)(uav_iova >> 32));
-+	CS_PUT(pkt7(0x5cu, 6u));
-+	CS_PUT(0x0a9f2u);			/* SP_CS_UAV_BASE */
-+	CS_PUT((uint32_t)uav_iova);
-+	CS_PUT(0x0a9f3u);
-+	CS_PUT((uint32_t)(uav_iova >> 32));
-+	CS_PUT(0x0aa00u);			/* SP_CS_USIZE: one unit was loaded */
-+	CS_PUT(1u);
-+	/*
-+	 * B29: the state stops here when exec is false.
-+	 *
-+	 * 0251's sequence loads state and dispatches in one breath, so a fault seen
-+	 * afterwards cannot be attributed: it could come from the state block (the
-+	 * UAV view is 64 zero bytes, and an eager preload would dereference its
-+	 * null base) or from the store the program performs. Stopping before
-+	 * CP_SET_MARKER separates them, and it is the same subtraction 0223 used.
-+	 */
-+	CS_MARK(0);				/* the state block executed this far */
++	CS_MARK(0);				/* everything above executed */
 +	if (exec) {
 +		CS_PUT(pkt7(0x65u, 1u));		/* CP_SET_MARKER */
-+		CS_PUT(8u);				/* RM6_COMPUTE */
-+		/* the grid: one group of eight invocations. NDRANGE_1 is the global size, local times groups. */
++		CS_PUT(8u);				/* RM6_COMPUTE, per a6xx_marker in adreno_pm4.xml */
++		/*
++		 * The grid: one group of eight invocations. NDRANGE_1 is local times
++		 * groups (fd6: localsize_x * num_groups[0]) and NDRANGE_0's local
++		 * sizes are minus one, so kerneldim 3 / local 8x1x1 / global 8x1x1.
++		 */
 +		CS_PUT(pkt7(0x5cu, 20u));
 +		CS_PUT(0x0b990u); CS_PUT(0x0000001fu);	/* SP_CS_NDRANGE_0: dim 3, local 8x1x1 */
 +		CS_PUT(0x0b991u); CS_PUT(8u);		/* SP_CS_NDRANGE_1: global x */
@@ -2744,9 +2763,9 @@ new file mode 100644
 +		CS_PUT(0x0b99bu); CS_PUT(1u);		/* SP_CS_KERNEL_GROUP_Z */
 +		CS_PUT(pkt7(0x33u, 4u));		/* CP_EXEC_CS */
 +		CS_PUT(0u);
-+		CS_PUT(1u);				/* groups x */
-+		CS_PUT(1u);				/* groups y */
-+		CS_PUT(1u);				/* groups z */
++		CS_PUT(1u);				/* NGROUPS_X */
++		CS_PUT(1u);				/* NGROUPS_Y */
++		CS_PUT(1u);				/* NGROUPS_Z */
 +		CS_MARK(1);				/* the CP accepted the dispatch */
 +	}
 +	CS_PUT(pkt7(0x26u, 0u));		/* CP_WAIT_FOR_IDLE */
@@ -2763,16 +2782,11 @@ new file mode 100644
 +	 *
 +	 * The last dword is not a timestamp the hardware fills in -- it is a value
 +	 * the driver supplies, and CACHE_FLUSH_TS flushes the core's caches and then
-+	 * writes that value. Every version of this rung supplied zero, so of course
-+	 * every version read zero. The packet was working the whole time; the
-+	 * instrument was pointed at zero.
++	 * writes that value. Every version of this rung before B34 supplied zero, so
++	 * of course every version read zero.
 +	 *
 +	 * It also carries the flush. Without it a shader store can sit in the core's
-+	 * own cache and never reach DRAM, where the CPU reads -- so B33's "nothing
-+	 * wrote" may have been a visibility problem rather than an execution one.
-+	 *
-+	 * The value is recognisable per launch, so fence != 0 is a second completion
-+	 * signal independent of the markers.
++	 * own cache and never reach DRAM, where the CPU reads.
 +	 */
 +	CS_PUT(pkt7(0x46u, 4u));		/* CP_EVENT_WRITE */
 +	CS_PUT(0x04u);				/* EVENT_CACHE_FLUSH_TS */
@@ -2780,7 +2794,6 @@ new file mode 100644
 +	CS_PUT((uint32_t)(fence_iova >> 32));
 +	CS_PUT(0xf00d0000u | (0x41u + (uint32_t)tag));
 +	CS_MARK(2);				/* the ring ran to its end */
-+	(void)target;
 +#undef CS_MARK
 +#undef CS_PUT
 +	/*
@@ -2807,6 +2820,93 @@ new file mode 100644
 +		    rd(gpu3d + 4 * 0x0806), target_wptr, rd(gpu3d + 4 * 0x0210), rd(gpu3d + 4 * 0x0201));
 +		return rd(gpu3d + 4 * 0x0806) == target_wptr;
 +	}
++}
++
++/*
++ * B37: did any of it land?
++ *
++ * Seven rounds have now argued about what the core does with this state while
++ * never establishing that the state is there at all. CP_CONTEXT_REG_BUNCH
++ * writes through the CP, so from the CPU the registers might be write-only,
++ * and a read of zero would then mean nothing -- 教训 30 exactly. So the state
++ * ring runs first, alone, and only then is the core read:
++ *
++ *   - eight registers through the CPU's own aperture, which cannot lie when it
++ *     returns a value only we could have written;
++ *   - the same eight through CP_REG_TO_MEM, whose format msm uses for its
++ *     performance counters (reg, address lo, address hi), in case the CPU's
++ *     view is the one that is blind.
++ *
++ * If both are zero the state never reached the core and nothing downstream of
++ * it has ever been a test of the shader.
++ */
++static void
++cs_state_readback(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t reg;
++	} r[] = {
++		{ "SP_CS_CNTL_0",     0x0a9b0u },
++		{ "SP_CS_BASE_LO",    0x0a9b4u },
++		{ "SP_CS_BASE_HI",    0x0a9b5u },
++		{ "SP_CS_CONFIG",     0x0a9bbu },
++		{ "SP_CS_INSTR_SIZE", 0x0a9bcu },
++		{ "SP_CS_NDRANGE_0",  0x0b990u },
++		{ "SP_UPDATE_CNTL",   0x0bb08u },
++		{ "SP_MODE_CNTL",     0x0ab00u },
++	};
++	const uint32_t n = (uint32_t)(sizeof(r) / sizeof(r[0]));
++	const uint64_t rb = g3d_regions[2].address + CS_RB_OFF;
++	volatile uint32_t *slot = (volatile uint32_t *)((vm_offset_t)g3d_regions[2].memory + CS_RB_OFF);
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++	uint32_t w = cp_wptr & 8191u;
++	uint32_t cpu[8], cpv[8], landed = 0;
++
++	for (uint32_t i = 0; i < n; i++) {
++		slot[i] = 0;
++		cpu[i] = rd(gpu3d + 4 * r[i].reg);
++	}
++	to_memory((vm_offset_t)slot, 4u * n);
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t d = (rb + 4u * i);
++
++		ring[w++ & 8191u] = pkt7(0x3eu, 3u);	/* CP_REG_TO_MEM, CNT 0 == one dword */
++		ring[w++ & 8191u] = r[i].reg & 0x3ffffu;
++		ring[w++ & 8191u] = d;
++		ring[w++ & 8191u] = 0u;
++	}
++	{
++		const uint32_t target_wptr = w & 8191u;
++
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, target_wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (uint32_t i = 0; i < 20000; i++) {
++			if (rd(gpu3d + 4 * 0x0806) == target_wptr) {
++				break;
++			}
++			sleep_us(10);
++		}
++		cp_wptr = target_wptr;
++		if (rd(gpu3d + 4 * 0x0806) != target_wptr) {
++			printf("mi8gpu: step 23 READBACK: the CP did not drain the readback ring; nothing here can be trusted\n");
++			return;
++		}
++	}
++	sleep_us(1000);
++	from_memory((vm_offset_t)slot, 4u * n);
++	for (uint32_t i = 0; i < n; i++) {
++		cpv[i] = slot[i];
++		if (cpu[i] != 0 || cpv[i] != 0) {
++			landed++;
++		}
++		printf("mi8gpu: step 23 READBACK %-18s reg %#07x: the CPU reads %#010x, CP_REG_TO_MEM wrote %#010x\n",
++		    r[i].name, r[i].reg, cpu[i], cpv[i]);
++	}
++	printf("mi8gpu: step 23 READBACK: %u of %u registers are non-zero -> %s\n", landed, n,
++	    landed == 0 ? "NOTHING LANDED. Either CP_CONTEXT_REG_BUNCH reaches nothing readable, or the block/offset pair is not this core's -- and nothing downstream of the state has ever tested the shader" :
++	    "the state IS on the core, so every earlier silence was the dispatch, not the state");
 +}
 +
 +/*
@@ -2920,49 +3020,42 @@ new file mode 100644
 +	const uint64_t base = g3d_regions[2].address;
 +	uint32_t *shader = (uint32_t *)((vm_offset_t)memptrs + CS_PROGRAM_OFF);
 +	/*
-+	 * B31: the same three launches, now with the CP asked directly.
++	 * B37: three rings, and the state is in only the first of them.
 +	 *
-+	 * B30's reading was not what it looked like. Launch C there was the same
-+	 * code, the same target and the same clean bank as launch B in B29, and it
-+	 * produced no fault at all -- while B29's B had produced FSR 0x400 -> 0x402
-+	 * with FSYNR0 0x12. Two runs, one difference: in B29 that program was the
-+	 * first dispatch of the boot, in B30 it was the second. A bank that stays
-+	 * quiet for the second dispatch and not the first does not describe a store
-+	 * being refused; it describes the CP not getting that far.
++	 * B36 closed the question of whether the instrument can produce a signal:
++	 * the CP's own write to 0x10100000 faults with FSR 0x400 -> 0x402 and
++	 * FSYNR0 0x13, so an unmapped access on this core is loud. B35's dispatch
++	 * with SP_CS_BASE on that same page was silent, so no wave was created --
++	 * but that conclusion rests on the state being what we think it is, and
++	 * nothing had ever read the state back.
 +	 *
-+	 * The fence cannot settle it. EVENT_CACHE_FLUSH_TS writes the CP timestamp,
-+	 * and that reads zero when the RBBM timer is stopped, so a zero fence is
-+	 * equally consistent with "never executed" and "executed and wrote zero".
-+	 * Every version of this rung has had fence 0 on every launch.
-+	 *
-+	 * So the ring now carries three CP_MEM_WRITE constants per launch: one after
-+	 * the state block, one between CP_EXEC_CS and CP_WAIT_FOR_IDLE, one after
-+	 * the fence. A constant has no spontaneous value, so a slot that is still
-+	 * zero is a packet that never executed.
++	 * So the state ring goes first and alone, the CPU reads eight registers
++	 * afterwards, and only then are dispatches attempted. The program is
++	 * loaded once, in the state ring, exactly as the reference does it: this
++	 * also retires B30's bug, where the address was patched into whichever
++	 * program was in the buffer, including the empty one.
 +	 */
 +	static const struct {
-+		bool exec;
-+		bool store;
++		uint32_t flags;
 +		uint32_t tag;
-+		bool hole;
 +		const char *what;
-+	} plan[4] = {
-+		{ false, true,  0u, false, "state only, store program, no CP_EXEC_CS" },
-+		{ true,  false, 1u, false, "dispatch, EMPTY program (nop, end)" },
-+		{ true,  true,  2u, false, "dispatch, store program" },
-+		{ true,  true,  3u, true,  "dispatch, store program, SP_CS_BASE on a page with NO PTE" },
++	} plan[3] = {
++		{ CS_F_STATE,            0u, "state only: shader block + program, no CP_EXEC_CS" },
++		{ CS_F_EXEC,             1u, "dispatch alone: one group of eight, state from the ring above" },
++		{ CS_F_HOLE | CS_F_EXEC, 2u, "dispatch with SP_CS_BASE on a page with NO PTE" },
 +	};
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
 +	uint64_t target = base + CS_RESULT_OFF;
-+	bool faulted[4] = { false, false, false, false }, committed = false;
-+	bool stalled[4] = { false, false, false, false };
-+	int reached[4] = { 0, 0, 0, 0 };
++	bool faulted[3] = { false, false, false }, committed = false;
++	int reached[3] = { 0, 0, 0 };
++	uint32_t t;
 +
 +	printf("mi8gpu: step 23: a shader, on a core whose SECVID_TRUST_CNTL reads %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE, so this is a control and not the test");
 +	/* The stg uses an absolute address in r2.xy, so no descriptor has to be right for it to work. */
-+	memset((void *)((vm_offset_t)memptrs + CS_UAV_OFF), 0, 64);
-+	for (uint32_t t = 0; t < 4; t++) {
++	memcpy(shader, cs_program, sizeof(cs_program));
++	shader[0] = (uint32_t)target;
++	for (t = 0; t < 3; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
 +		volatile uint32_t *fence = (volatile uint32_t *)((vm_offset_t)memptrs + CS_FENCE_OFF);
 +		volatile uint32_t *mark = (volatile uint32_t *)((vm_offset_t)memptrs + CS_MARKER_OFF + 12u * t);
@@ -2972,27 +3065,11 @@ new file mode 100644
 +		*result = 0;
 +		*fence = 0;
 +		mark[0] = mark[1] = mark[2] = 0;
-+		memcpy(shader, plan[t].store ? cs_program : cs_program_empty, sizeof(cs_program));
-+		/*
-+		 * B31: patch the address only into the program that has a slot for it.
-+		 *
-+		 * B30 wrote word 0 unconditionally. In cs_program word 0 is the store's
-+		 * target immediate (0xfeed0001 is a placeholder), so patching it is the
-+		 * point of the exercise. In cs_program_empty word 0 is the first nop, and
-+		 * the write replaced it with an IOVA -- an arbitrary 32-bit instruction
-+		 * that could decode as anything, including a load. Launch B was therefore
-+		 * not the empty program it was meant to be, which is exactly the
-+		 * ambiguity this rung exists to remove.
-+		 */
-+		if (plan[t].store) {
-+			shader[0] = (uint32_t)target;
-+		}
 +		to_memory((vm_offset_t)memptrs, 0x1000);
 +		/*
-+		 * B29 wrote 1 here, which clears only bit 0, and CB_FSR is write-1-to-clear
-+		 * per bit: after launch B the bank carried 0x402, the write of 1 cleared
-+		 * nothing, and launch C therefore reported "0x402 -> 0x402" as if nothing
-+		 * had happened. Writing back what is set clears what is set.
++		 * CB_FSR is write-1-to-clear per bit: writing back what is set clears
++		 * what is set. B29 wrote 1, which cleared only bit 0, and the next
++		 * launch then reported "0x402 -> 0x402" as if nothing had happened.
 +		 */
 +		seen = rd(cb + CB_FSR);
 +		if (seen != 0) {
@@ -3000,9 +3077,9 @@ new file mode 100644
 +			__asm__ volatile ("dsb sy" ::: "memory");
 +		}
 +		fsr_before = rd(cb + CB_FSR);
-+		printf("mi8gpu: step 23: launch %c: %s (store at %#llx, CB1 FSR %#010x -> %#010x after the clear, program word 0 %#x)\n",
-+		    'A' + t, plan[t].what, target, seen, fsr_before, shader[0]);
-+		drained = cs_launch(target, plan[t].exec, plan[t].tag, plan[t].hole, plan[t].what);
++		printf("mi8gpu: step 23: launch %c: %s (store at %#llx, CB1 FSR %#010x -> %#010x after the clear)\n",
++		    'A' + t, plan[t].what, target, seen, fsr_before);
++		drained = cs_launch(plan[t].flags, plan[t].tag, plan[t].what);
 +		/* CP_WAIT_FOR_IDLE is inside the ring, so the wave is over once it drains; give the store a moment anyway */
 +		sleep_us(2000);
 +		/* The core wrote this page behind our back: drop the lines, do not write them back. */
@@ -3016,32 +3093,27 @@ new file mode 100644
 +			printf("mi8gpu: step 23 launch %c: the fence did NOT arrive (want %#010x) -- the event write after the wait never executed\n",
 +			    'A' + t, 0xf00d0000u | (0x41u + plan[t].tag));
 +		}
-+		cs_scan_magic(t);
++		cs_scan_magic(plan[t].tag);
 +		/*
-+		 * B31: which packets the CP actually executed. mark[0] before the
-+		 * dispatch, mark[1] between CP_EXEC_CS and CP_WAIT_FOR_IDLE, mark[2]
-+		 * after CP_WAIT_FOR_IDLE. Each is a constant the CP had to write itself.
-+		 *
-+		 * B33: the stage is a count, not a boolean, because "stalled" is now a
-+		 * three-way answer -- nowhere, before the dispatch, or after it. B32
-+		 * could only say "no last marker" and then blamed CP_EXEC_CS even on the
-+		 * launch that never contained one.
++		 * Which packets the CP actually executed: mark[0] before the dispatch,
++		 * mark[1] between CP_EXEC_CS and CP_WAIT_FOR_IDLE, mark[2] after the
++		 * wait. Each is a constant the CP had to write itself, and the stage is
++		 * a count so "stalled" can say where.
 +		 */
 +		printf("mi8gpu: step 23 launch %c markers: state-reached %#010x, exec-accepted %#010x, ring-finished %#010x (want %#010x %#010x %#010x)\n",
 +		    'A' + t, mark[0], mark[1], mark[2],
-+		    CS_MARKER(plan[t].tag, 0), plan[t].exec ? CS_MARKER(plan[t].tag, 1) : 0u,
++		    CS_MARKER(plan[t].tag, 0), ((plan[t].flags & CS_F_EXEC) != 0) ? CS_MARKER(plan[t].tag, 1) : 0u,
 +		    CS_MARKER(plan[t].tag, 2));
 +		if (mark[2] == CS_MARKER(plan[t].tag, 2)) {
 +			reached[t] = 3;
-+		} else if (plan[t].exec && mark[1] == CS_MARKER(plan[t].tag, 1)) {
++		} else if (((plan[t].flags & CS_F_EXEC) != 0) && mark[1] == CS_MARKER(plan[t].tag, 1)) {
 +			reached[t] = 2;
 +		} else if (mark[0] == CS_MARKER(plan[t].tag, 0)) {
 +			reached[t] = 1;
 +		} else {
 +			reached[t] = 0;
 +		}
-+		stalled[t] = reached[t] != 3;
-+		if (stalled[t]) {
++		if (reached[t] != 3) {
 +			printf("mi8gpu: step 23 VERDICT launch %c: STALLED at %s -- the CP never wrote the ring's last marker, so this launch's bank reading means nothing\n",
 +			    'A' + t,
 +			    reached[t] == 0 ? "the state block (not even the first marker)" :
@@ -3057,42 +3129,32 @@ new file mode 100644
 +		} else {
 +			printf("mi8gpu: step 23 VERDICT launch %c: nothing wrote, no fault\n", 'A' + t);
 +		}
-+		if (!drained || stalled[t]) {
++		/* the state ring is the only thing worth reading back, and only once */
++		if (t == 0 && reached[0] == 3) {
++			cs_state_readback();
++		}
++		if (!drained || reached[t] != 3) {
 +			printf("mi8gpu: step 23: the CP stopped at launch %c; the rest is not attempted\n", 'A' + t);
 +			break;
 +		}
 +	}
 +	/*
-+	 * B31 puts the stall question first, because B30 showed that every reading
-+	 * below it was being taken on a ring the CP may not have executed. A launch
-+	 * whose "ring-finished" marker never arrived has no FSR reading to offer:
-+	 * the bank stayed quiet because nothing reached the shader, and calling that
-+	 * "no fault" is the same mistake 教训 38/42 caught on the modem line.
++	 * The order matters: the state ring first, because every reading below it
++	 * was taken on a ring the CP may not have executed. A launch whose
++	 * "ring-finished" marker never arrived has no FSR reading to offer.
 +	 */
-+	if (reached[0] == 0) {
-+		printf("mi8gpu: step 23 SUMMARY: the CP did not execute even the first marker of the state-only ring -- the ring drain is a read, not a run\n");
-+	} else if (stalled[0] && reached[0] == 1) {
-+		printf("mi8gpu: step 23 SUMMARY: THE CP STOPS AT CP_WAIT_FOR_IDLE. B33 fixed the marker length and the state block, the wait and nothing else are now the whole ring, so the packet that follows the last marker is the one it dies on\n");
-+	} else if (stalled[1] && reached[1] == 1) {
-+		printf("mi8gpu: step 23 SUMMARY: THE EMPTY PROGRAM STALLED THE CP after the state block, before CP_EXEC_CS wrote its marker: the dispatch packet itself is where it stops\n");
-+	} else if (stalled[1]) {
-+		printf("mi8gpu: step 23 SUMMARY: THE EMPTY PROGRAM WAS ACCEPTED AND THE WAIT AFTER IT WAS NOT: CP_EXEC_CS ran, CP_WAIT_FOR_IDLE never returned, so a wave was launched and never retired -- the shader is being fetched now\n");
-+	} else if (stalled[2]) {
-+		printf("mi8gpu: step 23 SUMMARY: the STORE program stalls the CP where the empty one did not -- the store itself (or the fetch of the instruction carrying it) is what kills it\n");
-+	} else if (reached[3] == 3 && faulted[3]) {
-+		printf("mi8gpu: step 23 SUMMARY: THE SP FETCHES ITS PROGRAM. Pointing SP_CS_BASE at a page with no PTE produced a fault, so a wave IS created and it does follow the program pointer -- the earlier silence was the program or the store, not the absence of a launch\n");
-+	} else if (reached[3] == 3) {
-+		printf("mi8gpu: step 23 SUMMARY: NO WAVE IS EVER CREATED. An unmapped SP_CS_BASE produced no fault at all: the dispatch completes without the SP reading a single instruction, so the grid or the compute state is what keeps invocations from existing -- the shader has never been the question\n");
-+	} else if (faulted[0]) {
-+		printf("mi8gpu: step 23 SUMMARY: the state block alone faulted, so nothing after it can be blamed on the store\n");
++	if (reached[0] != 3) {
++		printf("mi8gpu: step 23 SUMMARY: the state ring itself did not run to its last marker -- the CP did not execute the shader block, and nothing after it can be read\n");
 +	} else if (committed) {
-+		printf("mi8gpu: step 23 SUMMARY: THE SP RAN AND ITS STORE COMMITTED (launch C)\n");
++		printf("mi8gpu: step 23 SUMMARY: THE SP RAN AND ITS STORE COMMITTED. Step 23 is passed: the core fetches, dispatches and writes memory\n");
 +	} else if (faulted[1]) {
-+		printf("mi8gpu: step 23 SUMMARY: the store is NOT to blame: the empty program faulted too, so the refused access is the fetch or the launch itself\n");
++		printf("mi8gpu: step 23 SUMMARY: THE SP FETCHED THE PROGRAM AND THE ACCESS WAS REFUSED. A wave exists -- the fixture now runs from the reference driver's own state, and the refused access is what it does with it\n");
 +	} else if (faulted[2]) {
-+		printf("mi8gpu: step 23 SUMMARY: THE SP RAN. The empty program was clean and the store program faulted: the store is the refused access\n");
++		printf("mi8gpu: step 23 SUMMARY: THE SP FETCHES FROM SP_CS_BASE. Moving only that register to a page with no PTE produced a fault, so a wave IS created and the earlier silence was the program or the store\n");
++	} else if (reached[1] != 3 || reached[2] != 3) {
++		printf("mi8gpu: step 23 SUMMARY: the DISPATCH ring stops before its last marker, so CP_EXEC_CS is where this core stops reading -- the state is not the question\n");
 +	} else {
-+		printf("mi8gpu: step 23 SUMMARY: every ring ran to its end, every fence arrived, and nothing wrote anywhere in the mapped pages -- so the launch is accepted, retired and flushed, and still no shader access happens\n");
++		printf("mi8gpu: step 23 SUMMARY: STILL NO WAVE, with the reference driver's state and with that state read back from the core. The dispatch is accepted, retired, flushed and produces nothing, so what keeps an invocation from existing is upstream of the SP -- the CP's own scheduling of CP_EXEC_CS, not the compute state and not the shader\n");
 +	}
 +	/* last, because a faulting write here can leave the CP waiting */
 +	cs_hole_sensor();
