@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,4790 @@
+@@ -0,0 +1,4820 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2578,6 +2578,32 @@ new file mode 100644
 +		}
 +	}
 +	printf("mi8gpu: %s: %u of 4000 sampled pixels are the CP's pattern, %u are something else\n", when, same, differ);
++	/* Where the pattern is and is not: thirds of the screen, the same 400
++	 * (x, y-within-band) pairs in each. A partial overwrite by the window
++	 * server shows up as a top band that fails while the bottom holds; a
++	 * paint that never landed fails all three alike. Without this the single
++	 * total cannot tell the two apart. */
++	{
++		static const char *const band_name[3] = { "top", "middle", "bottom" };
++		const uint32_t band_height = G3D_FB_HEIGHT / 3;
++
++		for (uint32_t band = 0; band < 3; band++) {
++			uint32_t held = 0, band_seed = 12345;
++
++			for (uint32_t i = 0; i < 400; i++) {
++				uint32_t x, y;
++
++				band_seed = band_seed * 1664525u + 1013904223u;
++				x = (band_seed >> 8) % G3D_FB_WIDTH;
++				band_seed = band_seed * 1664525u + 1013904223u;
++				y = band * band_height + (band_seed >> 8) % band_height;
++				if ((fb[y * G3D_FB_WIDTH + x] & 0xffffffu) == (screen_expected(x, y) & 0xffffffu)) {
++					held++;
++				}
++			}
++			printf("mi8gpu: %s: %s third %u of 400 pixels are the CP's pattern\n", when, band_name[band], held);
++		}
++	}
 +}
 +
 +static void
@@ -2594,6 +2620,10 @@ new file mode 100644
 +	printf("mi8gpu: painting the screen: %u x %u pixels, %u dwords, from iova %#llx (phys %#llx); kernel's own screen: base %#lx rowbytes %lu %lux%lu\n",
 +	    G3D_FB_WIDTH, G3D_FB_HEIGHT, total, (uint64_t)G3D_FB_IOVA, (uint64_t)G3D_FB_PHYS, PE_state.video.v_baseAddr,
 +	    PE_state.video.v_rowBytes, PE_state.video.v_width, PE_state.video.v_height);
++	/* The control: what the screen holds BEFORE the CP touches it. Without
++	 * this number the "after" count has nothing to be compared against, and a
++	 * partial overwrite cannot be told from a paint that never landed. */
++	screen_check("before the CP paints");
 +	while (sent < total && ok) {
 +		uint32_t batch_start = wptr;
 +
