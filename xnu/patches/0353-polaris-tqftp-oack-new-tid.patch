@@ -1,0 +1,273 @@
+--- a/bsd/dev/polaris_modem.c
++++ b/bsd/dev/polaris_modem.c
+@@ -3914,6 +3914,12 @@
+ #define MD_HOSTSVC_PORT0 0x4001u
+ #define MD_HOSTSVC_PORT1 0x4002u
+ #define MD_HOSTSVC_PORT2 0x4003u
++/* 0353: linux-msm/tqftpserv handle_wrq() opens a NEW per-client
++ * QRTR socket (qrtr_open(0) + connect(sq)) and sends the OACK
++ * from it; the modem then sends DATA to that new local port.
++ * 0x4002 is only the published control socket. */
++#define MD_TFTP_TID_BASE 0x4004u
++#define MD_TFTP_TID_COUNT 8u
+ #define MD_QRTR_QMI_PACKET	64u		/* 32 B QRTR header + 32 B */
+ #define MD_GLINK_QMI_FRAME	80u		/* 16 + 64, already 8-aligned */
+ 
+@@ -4675,7 +4681,7 @@
+         /* 0329: split in two.  The single 0328 line was longer than the
+          * 256 byte log slot, so all 25 heartbeats in the 0328 ring were
+          * cut at "hostsv" and hsreplies / SRN state never appeared. */
+-        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0352 / level 66; "
++        MD_SAY("POLARIS MODEM: 0333 HEARTBEAT #%u: build 0353 / level 67; "
+             "ACK=%s offered=%s cid %u, OPEN_ACKs %u, foreign %u, "
+             "DONE_REUSE %u, 478 %#x %#x %#x %#x\n",
+             n, md_glink_acked ? "YES" : "NO",
+@@ -4699,7 +4705,7 @@
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 4u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 8u) : 0u,
+             md_glink_rx_at ? md_smem_word(md_glink_rx_at + 12u) : 0u);
+-        MD_SAY("POLARIS MODEM: 0352 HEARTBEAT #%u: TFTP wrq %u rrq %u "
++        MD_SAY("POLARIS MODEM: 0353 HEARTBEAT #%u: TFTP wrq %u rrq %u "
+             "data %u ack %u err %u, oack %u conf %u rxconf %u, "
+             "seen %u\n", n, md_tftp_wrq, md_tftp_rrq,
+             md_tftp_data, md_tftp_acks, md_tftp_errs, md_tftp_oacks,
+@@ -5908,7 +5914,7 @@
+ 		}
+ 		hex[n] = 0;
+ 	}
+-	MD_SAY("POLARIS MODEM: 0352 VERDICT: TFTP request bytes from %u: "
++	MD_SAY("POLARIS MODEM: 0353 VERDICT: TFTP request bytes from %u: "
+ 	    "%s\n", from, hex);
+ }
+ 
+@@ -5935,7 +5941,7 @@
+ 		}
+ 	}
+ 	hex[k] = 0;
+-	MD_SAY("POLARIS MODEM: 0352 VERDICT: TFTP TX words @%u: %s\n",
++	MD_SAY("POLARIS MODEM: 0353 VERDICT: TFTP TX words @%u: %s\n",
+ 	    base, hex);
+ }
+ /* One QRTR Q_DATA frame around an arbitrary payload.  The tail of
+@@ -5992,7 +5998,7 @@
+ 		}
+ 	}
+ 	if (iid == 0u || head + frame > MD_GLINK_FIFO_SIZE) {
+-		MD_SAY("POLARIS MODEM: 0352 VERDICT: TFTP reply NOT sent "
++		MD_SAY("POLARIS MODEM: 0353 VERDICT: TFTP reply NOT sent "
+ 		    "(%u bytes, slot %u, head %u)\n", n, slot, head);
+ 		return head;
+ 	}
+@@ -6006,7 +6012,7 @@
+ 	if (frame > 16u + chunk) {
+ 		md_smem_poke(md_glink_tx_at + at + 16u + chunk, 0u);
+ 	}
+-	MD_SAY("POLARIS MODEM: 0352 VERDICT: TFTP TX port %#x -> node 0 "
++	MD_SAY("POLARIS MODEM: 0353 VERDICT: TFTP TX port %#x -> node 0 "
+ 	    "port %u, %u bytes, cid %u slot %u intent %u size %u, chunk %u "
+ 	    "frame %u, tx head %u -> %u, confirm %u\n", our_port, their_port,
+ 	    n, MD_GLINK_CID, slot, iid, isize, chunk, frame, head,
+@@ -6068,7 +6074,7 @@
+ 		}
+ 	}
+ 	if (iid == 0u || head + frame > MD_GLINK_FIFO_SIZE) {
+-		MD_SAY("POLARIS MODEM: 0352 VERDICT: RESUME not sent "
++		MD_SAY("POLARIS MODEM: 0353 VERDICT: RESUME not sent "
+ 		    "(slot %u, head %u, frame %u)\n", slot, head, frame);
+ 		return head;
+ 	}
+@@ -6083,7 +6089,7 @@
+ 	if (frame > 16u + chunk) {
+ 		md_smem_poke(md_glink_tx_at + at + 16u + chunk, 0u);
+ 	}
+-	MD_SAY("POLARIS MODEM: 0352 VERDICT: QRTR RESUME_TX type 7 "
++	MD_SAY("POLARIS MODEM: 0353 VERDICT: QRTR RESUME_TX type 7 "
+ 	    "port %#x -> node 0 port %u, 20 bytes, cid %u slot %u "
+ 	    "intent %u size %u, chunk %u frame %u, head %u -> %u\n",
+ 	    our_port, their_port, MD_GLINK_CID, slot, iid, isize,
+@@ -6092,6 +6098,12 @@
+ }
+ 
+ static uint32_t
++md_tftp_tid(uint32_t their_port)
++{
++	return MD_TFTP_TID_BASE + (their_port & (MD_TFTP_TID_COUNT - 1u));
++}
++
++static uint32_t
+ md_tftp_reply(uint32_t head, uint32_t our_port, uint32_t their_port,
+     uint32_t req_at, uint32_t req_len, uint32_t slot)
+ {
+@@ -6099,7 +6111,13 @@
+ 	char path[MD_TFTP_PATH_MAX];
+ 	struct md_tftp_session *s;
+ 	uint32_t op, blk, bytes, n;
++	uint32_t tid = md_tftp_tid(their_port);
+ 
++	/* 0353: TID switch.  tqftpserv sends EVERY answer from a
++	 * fresh per-client socket, not from the published 0x4002.
++	 * The mapping is stable per client port, so a retransmitted
++	 * WRQ and the DATA/ACK that follow share one TID. */
++	our_port = tid;
+ 	md_tftp_seen++;
+ 	if (md_tftp_seen <= 6u) {
+ 		md_tftp_hex(req_at, 30u, req_len);
+@@ -6136,23 +6154,18 @@
+ 					md_tftp_copy(s->path, path);
+ 				}
+ 			}
+-			MD_SAY("POLARIS MODEM: 0352 VERDICT: TFTP %s from port "
+-			    "%u for '%s' -> DIPPER ACK 0 (%u options ignored, "
++			MD_SAY("POLARIS MODEM: 0353 VERDICT: TFTP %s from port "
++			    "%u for '%s' -> TQFTP OACK %u B TID %#x (%u options, "
+ 			    "blksize %u), oack %u so far\n", op == 1u ? "RRQ" : "WRQ",
+-			    their_port, path, opts, bs, md_tftp_oacks);
++			    their_port, path, oack, tid, opts, bs, md_tftp_oacks);
+ 			{
+ 			uint32_t nh;
+-			/* 0351: ONE variable -- OACK(39 B) -> ACK 0(4 B).
+-			 * dipper mi8_hostsvc.c:577-579 answers WRQ with
+-			 * tftp_ack(s) (ACK block 0) and drops the data;
+-			 * :493 OACK is RRQ-only.  Options are still parsed
+-			 * above so the verdict can report them. */
+-			rsp[0] = 0u; rsp[1] = 4u;
+-			rsp[2] = 0u; rsp[3] = 0u;
++			/* 0353: tqftpserv NEVER answers a WRQ carrying
++			 * options with ACK 0.  It builds the OACK in rsp[]
++			 * (39 B, verified in the 0348 ring) and sends it
++			 * from the new per-client TID. */
+ 			nh = md_tftp_send(head, our_port,
+-			    their_port, rsp, 4u, slot);
+-			/* 0351: no CTRL copy.  Two independent 0350 rings
+-			 * proved it freezes the modem after one WRQ. */
++			    their_port, rsp, oack, slot);
+ 			return nh;
+ 		}
+ 		}
+@@ -6166,7 +6179,7 @@
+ 			 * at 4 + n (written by md_tftp_field) is part of it */
+ 			rsp[4u + n] = 0u;
+ 			n = 4u + n + 1u;
+-			MD_SAY("POLARIS MODEM: 0352 VERDICT: TFTP RRQ from port "
++			MD_SAY("POLARIS MODEM: 0353 VERDICT: TFTP RRQ from port "
+ 			    "%u for '%s' (%u bytes) -- no file service in this "
+ 			    "version, ERROR 1\n", their_port, path, req_len);
+ 			return md_tftp_send(head, our_port, their_port, rsp, n,
+@@ -6185,7 +6198,7 @@
+ 		}
+ 		rsp[0] = 0u; rsp[1] = 4u;	/* ACK block 0 */
+ 		rsp[2] = 0u; rsp[3] = 0u;
+-		MD_SAY("POLARIS MODEM: 0352 VERDICT: TFTP WRQ from port %u "
++		MD_SAY("POLARIS MODEM: 0353 VERDICT: TFTP WRQ from port %u "
+ 		    "for '%s' (%u bytes) -> ACK 0 (no options), session "
+ 		    "%s, %u wrq so far\n", their_port, path, req_len,
+ 		    s != NULL ? "open" : "TABLE FULL", md_tftp_wrq);
+@@ -6205,7 +6218,7 @@
+ 		rsp[2] = (uint8_t)(blk >> 8);
+ 		rsp[3] = (uint8_t)blk;
+ 		if (md_tftp_data <= 8u || (md_tftp_data % 64u) == 0u) {
+-			MD_SAY("POLARIS MODEM: 0352 VERDICT: TFTP DATA from "
++			MD_SAY("POLARIS MODEM: 0353 VERDICT: TFTP DATA from "
+ 			    "port %u block %u %u bytes -> ACK %u (%u so far, "
+ 			    "path '%s')\n", their_port, blk, bytes, blk,
+ 			    md_tftp_data, s != NULL ? s->path : "?");
+@@ -6219,7 +6232,7 @@
+ 		if (s != NULL) {
+ 			s->block = blk;
+ 		}
+-		MD_SAY("POLARIS MODEM: 0352 VERDICT: TFTP ACK from port %u "
++		MD_SAY("POLARIS MODEM: 0353 VERDICT: TFTP ACK from port %u "
+ 		    "block %u (nothing queued in this version, %s)\n",
+ 		    their_port, blk, s != NULL ? "session live" : "no session");
+ 		return head;			/* nothing to answer */
+@@ -6230,7 +6243,7 @@
+ 		md_tftp_errs++;
+ 		(void)md_tftp_field(req_at + 4u, req_len - 4u, path,
+ 		    sizeof(path));
+-		MD_SAY("POLARIS MODEM: 0352 VERDICT: TFTP ERROR from port "
++		MD_SAY("POLARIS MODEM: 0353 VERDICT: TFTP ERROR from port "
+ 		    "%u code %u '%s'\n", their_port, code, path);
+ 		s = md_tftp_find(their_port);
+ 		if (s != NULL) {
+@@ -6238,7 +6251,7 @@
+ 		}
+ 		return head;
+ 	}
+-	MD_SAY("POLARIS MODEM: 0352 VERDICT: TFTP opcode %u from port %u, "
++	MD_SAY("POLARIS MODEM: 0353 VERDICT: TFTP opcode %u from port %u, "
+ 	    "%u bytes: not an opcode we know\n", op, their_port, req_len);
+ 	return head;
+ }
+@@ -6260,8 +6273,12 @@
+          * but it is not QMI at all: the first two bytes are a big-endian
+          * opcode and an ACK is only four bytes long, so it has to be
+          * routed before the seven-byte QMI test below. */
+-        if (our_port == MD_HOSTSVC_PORT1 && req_len >= 4u &&
+-            md_smem_byte(req_at) == 0u) {
++        /* 0353: DATA/ACK arrive on the NEW per-client TID, not
++         * on the published 0x4002 control socket. */
++        if ((our_port == MD_HOSTSVC_PORT1 ||
++             (our_port >= MD_TFTP_TID_BASE &&
++              our_port < MD_TFTP_TID_BASE + MD_TFTP_TID_COUNT)) &&
++            req_len >= 4u && md_smem_byte(req_at) == 0u) {
+                 return md_tftp_reply(head, our_port, their_port, req_at,
+                     req_len, slot);
+         }
+@@ -6492,7 +6509,7 @@
+         if (md_hs_conf < 3u) {
+                 md_hs_conf++;
+                 pkt[4] = 1u;
+-                MD_SAY("POLARIS MODEM: 0352 VERDICT: QMI CONTROL "
++                MD_SAY("POLARIS MODEM: 0353 VERDICT: QMI CONTROL "
+                     "confirm=1 port %#x -> node 0 port %u, ctl %u\n",
+                     our_port, their_port, md_hs_conf);
+         } else {
+@@ -6871,11 +6888,11 @@
+ 			/* 0350: control payload word b (+56) is dp, the
+ 			 * destination port of the packet we sent.  It splits
+ 			 * copy A (31/64/72) from the CTRL copy (0xfffffffe). */
+-			MD_SAY("POLARIS MODEM: 0352 VERDICT: QRTR TARGET "
++			MD_SAY("POLARIS MODEM: 0353 VERDICT: QRTR TARGET "
+ 			    "%u rx %u, seen %u\n",
+ 			    md_smem_word(md_glink_rx_at + at + 56u),
+ 			    md_tftp_rxconf, md_tftp_seen);
+-				MD_SAY("POLARIS MODEM: 0352 VERDICT: QRTR "
++				MD_SAY("POLARIS MODEM: 0353 VERDICT: QRTR "
+ 				    "RESUME_RX type %u node %u port %u -> node %u "
+ 				    "port %u, rx %u, seen %u\n",
+ 				    q[1], q[2], q[3], q[6], q[7],
+@@ -6896,7 +6913,7 @@
+ 					md_hostsvc_replies++;
+ 					md_tftp_resume++;
+ 				}
+-				MD_SAY("POLARIS MODEM: 0352 VERDICT: QRTR RESUME sent "
++				MD_SAY("POLARIS MODEM: 0353 VERDICT: QRTR RESUME sent "
+ 				    "for node %u port %u confirm %u, resume %u, wr %u\n",
+ 				    q[2], q[3], q[4], md_tftp_resume, wr);
+ 			}
+@@ -6995,7 +7012,10 @@
+                                  * QRTR header is not, so 0342
+                                  * parsed 76 bytes of a 73-byte
+                                  * TFTP request. */
+-                                if (q[7] == MD_HOSTSVC_PORT1 &&
++                                if ((q[7] == MD_HOSTSVC_PORT1 ||
++                                     (q[7] >= MD_TFTP_TID_BASE &&
++                                      q[7] < MD_TFTP_TID_BASE +
++                                      MD_TFTP_TID_COUNT)) &&
+                                     q[5] >= 4u && q[5] < plen) {
+                                         plen = q[5];
+                                 }
+@@ -7561,10 +7581,10 @@
+ 	bool ok = FALSE, boot_written = FALSE, mapped = FALSE;
+ 	const char *why = "nothing went wrong";
+ 
+-        MD_SAY("POLARIS MODEM: ===== build 0352 alive: W2e + W2f + "
++        MD_SAY("POLARIS MODEM: ===== build 0353 alive: W2e + W2f + "
+             "GLINK + QRTR + SERVREG + HOSTSVC + RMTFS + RADIO "
+-            "SUPPLIES + CLOCK + MSA GRANT + DIPPER CONFIRM ZERO CONTROL "
+-            "(level 66) =====\n");
++            "SUPPLIES + CLOCK + MSA GRANT + TQFTP OACK NEW TID CONTROL "
++            "(level 67) =====\n");
+ 	/* 0316: the Q6 is still in reset here and SMEM has no concurrent
+ 	 * writer, which is the only time our unlocked item allocator is safe.
+ 	 * dipper does the same in modem_prepare_smp2p() before starting MSS. */
