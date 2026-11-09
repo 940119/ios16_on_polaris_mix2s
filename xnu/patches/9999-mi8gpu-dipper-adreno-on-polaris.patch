@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,4889 @@
+@@ -0,0 +1,4930 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -926,6 +926,21 @@ new file mode 100644
 +{
 +	for (vm_offset_t line = start & ~(vm_offset_t)63; line < start + size; line += 64) {
 +		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * The 3D core wrote DDR behind this CPU's back. Drop every line the CPU holds
++ * WITHOUT writing it back: a "dc civac" here would push a stale black pixel
++ * over the core's picture. Only the screen's own frame buffer is used with
++ * this helper, so discarding dirty lines cannot lose anyone else's data.
++ */
++static void
++from_memory(vm_offset_t start, vm_size_t size)
++{
++	for (vm_offset_t line = start & ~(vm_offset_t)63; line < start + size; line += 64) {
++		__asm__ volatile ("dc ivac, %0" : : "r" (line) : "memory");
 +	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
@@ -2652,6 +2667,22 @@ new file mode 100644
 +	printf("mi8gpu: painting the screen: %u x %u pixels, %u dwords, from iova %#llx (phys %#llx); kernel's own screen: base %#lx rowbytes %lu %lux%lu\n",
 +	    G3D_FB_WIDTH, G3D_FB_HEIGHT, total, (uint64_t)G3D_FB_IOVA, (uint64_t)G3D_FB_PHYS, PE_state.video.v_baseAddr,
 +	    PE_state.video.v_rowBytes, PE_state.video.v_width, PE_state.video.v_height);
++	/*
++	 * The console cleared this frame buffer to black early in the boot. Those
++	 * dirty D-cache lines still belong to this CPU, while the 3D core writes
++	 * straight to DDR through the SMMU -- so every line the CPU later evicts
++	 * is written back ON TOP of the picture. That is why the paint looks
++	 * partly there, why the two passes cover complementary halves, and why
++	 * 700 ms later it is gone: it is the eviction schedule of stale CPU lines,
++	 * not a partial paint, not a ring wrap, and not the window server (whose
++	 * swaps are still 0 at this point in the boot). The selftest already
++	 * avoids this exact trap with mi8_gpu_to_memory(page, PAGE_SIZE) before
++	 * letting the core write. Clean and invalidate here, before the CP starts.
++	 */
++	to_memory((vm_offset_t)vinfo.v_baseaddr,
++	    (vm_size_t)vinfo.v_rowbytes * vinfo.v_height);
++	printf("mi8gpu: CPU frame buffer mapping cleaned before the CP painted (%lu bytes)\n",
++	    (unsigned long)vinfo.v_rowbytes * vinfo.v_height);
 +	/* The control: what the screen holds BEFORE the CP touches it. Without
 +	 * this number the "after" count has nothing to be compared against, and a
 +	 * partial overwrite cannot be told from a paint that never landed. */
@@ -2743,6 +2774,16 @@ new file mode 100644
 +		    wptr, memptrs[4], memptrs[5]);
 +	}
 +	cp_wptr = wptr;
++	/*
++	 * The control sample filled this CPU's cache with the pre-paint black
++	 * pixels. Those lines are clean but stale, so a plain read would still
++	 * hit them. Invalidate without writing back: the next read refetches the
++	 * DDR the core just wrote. A "dc civac" here would be the same mistake
++	 * as leaving the boot-time dirty lines in place.
++	 */
++	from_memory((vm_offset_t)vinfo.v_baseaddr,
++	    (vm_size_t)vinfo.v_rowbytes * vinfo.v_height);
++	printf("mi8gpu: CPU frame buffer mapping invalidated before the readback\n");
 +	screen_check("right after the CP finished");
 +	screen_scan("after this pass");
 +}
