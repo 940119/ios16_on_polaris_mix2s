@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5599 @@
+@@ -0,0 +1,5659 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2810,6 +2810,64 @@ new file mode 100644
 +}
 +
 +/*
++ * B36: is the page with no PTE a sensor at all?
++ *
++ * B35 concluded "no wave is ever created" from one observation: the dispatch
++ * whose SP_CS_BASE named 0x10100000 produced no fault. That conclusion is only
++ * as good as the assumption that an access to 0x10100000 does fault, and nothing
++ * in this line has ever demonstrated it. B29 tried, but its ring was desynced so
++ * the reading was meaningless. 教训 30 is exactly this: when a judgement has no
++ * signal, first establish that the instrument can produce one.
++ *
++ * So the CP -- which has demonstrably written to the memptrs page all night
++ * through the same context bank -- is asked to write to 0x10100000. If that
++ * faults, the hole is a sensor and B35's silence means the SP really never
++ * fetched. If it does not, the hole proves nothing and "no wave" is unproven.
++ *
++ * It runs last, after the four launches: a write that faults may leave the CP
++ * waiting for a completion that never comes, and the dispatch evidence is worth
++ * more than the calibration.
++ */
++static void
++cs_hole_sensor(void)
++{
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++	uint32_t w = cp_wptr & 8191u;
++	uint32_t fsr0, fsr1, seen, rptr;
++	vm_offset_t cb = smmu_cb(G3D_CTX);
++	const uint32_t target_wptr = (w + 4u) & 8191u;
++
++	seen = rd(cb + CB_FSR);
++	if (seen != 0) {
++		wr(cb + CB_FSR, seen);
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	fsr0 = rd(cb + CB_FSR);
++	ring[w++ & 8191u] = pkt7(CP_MEM_WRITE_OPCODE, 3u);
++	ring[w++ & 8191u] = (uint32_t)CS_HOLE_IOVA;
++	ring[w++ & 8191u] = (uint32_t)(CS_HOLE_IOVA >> 32);
++	ring[w++ & 8191u] = 0xdeadbeefu;
++	to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++	wr(gpu3d + 4 * 0x0807, target_wptr);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < 20000; i++) {
++		if (rd(gpu3d + 4 * 0x0806) == target_wptr) {
++			break;
++		}
++		sleep_us(10);
++	}
++	rptr = rd(gpu3d + 4 * 0x0806);
++	cp_wptr = target_wptr;
++	sleep_us(2000);
++	fsr1 = rd(cb + CB_FSR);
++	printf("mi8gpu: step 23 HOLE SENSOR: the CP was told to write %#llx; CB1 FSR %#010x -> %#010x, FSYNR0 %#010x, FAR %#llx%08x, ring %u/%u -> %s\n",
++	    CS_HOLE_IOVA, fsr0, fsr1, rd(cb + CB_FSYNR0),
++	    (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO), rptr, target_wptr,
++	    fsr1 != fsr0 ? "THE HOLE IS A SENSOR, so an unmapped access does fault and B35's silence is real" :
++	    "THE HOLE IS NOT A SENSOR, so a quiet bank there proves nothing either way");
++}
++
++/*
 + * B34: where did the magic go?
 + *
 + * The stg stores 0badf00d at the address in r2.xy. If it lands there, *result
@@ -3036,6 +3094,8 @@ new file mode 100644
 +	} else {
 +		printf("mi8gpu: step 23 SUMMARY: every ring ran to its end, every fence arrived, and nothing wrote anywhere in the mapped pages -- so the launch is accepted, retired and flushed, and still no shader access happens\n");
 +	}
++	/* last, because a faulting write here can leave the CP waiting */
++	cs_hole_sensor();
 +}
 +
 +static void
