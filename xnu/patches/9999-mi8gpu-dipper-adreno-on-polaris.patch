@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5511 @@
+@@ -0,0 +1,5577 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2736,20 +2736,36 @@ new file mode 100644
 +	}
 +	CS_PUT(pkt7(0x26u, 0u));		/* CP_WAIT_FOR_IDLE */
 +	/*
-+	 * B33: the CP_EVENT_WRITE fence is gone.
++	 * B34: the fence goes back in, with a value that can be read.
 +	 *
-+	 * It was there as a second completion signal, and it never produced one:
-+	 * EVENT_CACHE_FLUSH_TS writes the CP timestamp, the RBBM timer reads zero
-+	 * here, so every version of this rung read fence 0 on every launch. A packet
-+	 * that cannot be read is not a signal, and with the markers fixed there is
-+	 * nothing left for it to add -- but it is one more packet whose length and
-+	 * semantics would have to be trusted, so it goes. What remains between the
-+	 * dispatch and the last marker is CP_WAIT_FOR_IDLE alone, which makes the
-+	 * next bisection a single step.
++	 * B33 removed this packet on the grounds that it never produced a signal.
++	 * That was wrong, and the reference driver on the same a630 says why
++	 * (_dipper/bsd/dev/mi8_adreno.c:3026):
++	 *
++	 *     keep_ring_cmd(CP_EVENT_WRITE_OP, 4);
++	 *     keep_ring(EVENT_CACHE_FLUSH_TS);
++	 *     keep_ring(lo); keep_ring(hi); keep_ring(keep_fence);
++	 *
++	 * The last dword is not a timestamp the hardware fills in -- it is a value
++	 * the driver supplies, and CACHE_FLUSH_TS flushes the core's caches and then
++	 * writes that value. Every version of this rung supplied zero, so of course
++	 * every version read zero. The packet was working the whole time; the
++	 * instrument was pointed at zero.
++	 *
++	 * It also carries the flush. Without it a shader store can sit in the core's
++	 * own cache and never reach DRAM, where the CPU reads -- so B33's "nothing
++	 * wrote" may have been a visibility problem rather than an execution one.
++	 *
++	 * The value is recognisable per launch, so fence != 0 is a second completion
++	 * signal independent of the markers.
 +	 */
++	CS_PUT(pkt7(0x46u, 4u));		/* CP_EVENT_WRITE */
++	CS_PUT(0x04u);				/* EVENT_CACHE_FLUSH_TS */
++	CS_PUT((uint32_t)fence_iova);
++	CS_PUT((uint32_t)(fence_iova >> 32));
++	CS_PUT(0xf00d0000u | (0x41u + (uint32_t)tag));
 +	CS_MARK(2);				/* the ring ran to its end */
 +	(void)target;
-+	(void)fence_iova;			/* B33: no CP_EVENT_WRITE is emitted */
 +#undef CS_MARK
 +#undef CS_PUT
 +	/*
@@ -2775,6 +2791,51 @@ new file mode 100644
 +		printf("mi8gpu: step 23: %s: RB_RPTR %u WPTR %u, RBBM_STATUS %#010x INT_0_STATUS %#010x\n", what,
 +		    rd(gpu3d + 4 * 0x0806), target_wptr, rd(gpu3d + 4 * 0x0210), rd(gpu3d + 4 * 0x0201));
 +		return rd(gpu3d + 4 * 0x0806) == target_wptr;
++	}
++}
++
++static void
++/*
++ * B34: where did the magic go?
++ *
++ * The stg stores 0badf00d at the address in r2.xy. If it lands there, *result
++ * reads it and nothing else is needed. If it lands somewhere else -- because the
++ * store's address form is not the absolute one 0251 assumed, or because the core
++ * adds a base we did not think of -- then the CPU sees nothing at the target
++ * while the write is still perfectly real, and the only unmapped-page probe that
++ * would catch it is the one that faults. So before concluding "nothing wrote",
++ * walk every page the core can reach and look for the constant.
++ *
++ * The program itself contains 0badf00d as an immediate (mov r1.x), so the
++ * program page always reports one hit at its own offset; that hit is expected
++ * and is not evidence.
++ */
++static void
++cs_scan_magic(uint32_t tag)
++{
++	uint32_t hits = 0;
++
++	for (uint32_t r = 0; r < G3D_REGIONS && r < 3; r++) {
++		uint32_t *p = (uint32_t *)g3d_regions[r].memory;
++		uint32_t n;
++
++		if (p == NULL) {
++			continue;
++		}
++		n = g3d_regions[r].size / 4u;
++		/* the core may have written behind our cache: read what is in DRAM */
++		from_memory(g3d_regions[r].memory, g3d_regions[r].size);
++		for (uint32_t i = 0; i < n && hits < 6; i++) {
++			if (p[i] == 0x0badf00du) {
++				printf("mi8gpu: step 23 launch %c: 0badf00d in %s at %#llx (region offset %#x)\n",
++				    'A' + tag, g3d_regions[r].name, g3d_regions[r].address + 4ull * i, 4u * i);
++				hits++;
++			}
++		}
++	}
++	if (hits == 0) {
++		printf("mi8gpu: step 23 launch %c: 0badf00d is nowhere in the %u KiB of GPU-mapped pages either\n",
++		    'A' + tag, (uint32_t)((g3d_regions[0].size + g3d_regions[1].size + g3d_regions[2].size) / 1024u));
 +	}
 +}
 +
@@ -2872,9 +2933,14 @@ new file mode 100644
 +		from_memory((vm_offset_t)memptrs, 0x1000);
 +		fsr_after = rd(cb + CB_FSR);
 +		arrived = *result;
-+		printf("mi8gpu: step 23 launch %c target %#llx: result %#010x, the fence %s, CB1 FSR %#010x -> %#010x, FSYNR0 %#010x, FAR %#llx%08x\n",
-+		    'A' + t, target, arrived, "removed", fsr_before, fsr_after, rd(cb + CB_FSYNR0),
++		printf("mi8gpu: step 23 launch %c target %#llx: result %#010x, the fence %#010x, CB1 FSR %#010x -> %#010x, FSYNR0 %#010x, FAR %#llx%08x\n",
++		    'A' + t, target, arrived, *fence, fsr_before, fsr_after, rd(cb + CB_FSYNR0),
 +		    (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
++		if (*fence != (0xf00d0000u | (0x41u + plan[t].tag))) {
++			printf("mi8gpu: step 23 launch %c: the fence did NOT arrive (want %#010x) -- the event write after the wait never executed\n",
++			    'A' + t, 0xf00d0000u | (0x41u + plan[t].tag));
++		}
++		cs_scan_magic(t);
 +		/*
 +		 * B31: which packets the CP actually executed. mark[0] before the
 +		 * dispatch, mark[1] between CP_EXEC_CS and CP_WAIT_FOR_IDLE, mark[2]
