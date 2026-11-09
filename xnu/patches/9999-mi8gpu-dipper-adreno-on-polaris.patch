@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5381 @@
+@@ -0,0 +1,5394 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2762,7 +2762,20 @@ new file mode 100644
 +		*result = 0;
 +		*fence = 0;
 +		memcpy(shader, plan[t].store ? cs_program : cs_program_empty, sizeof(cs_program));
-+		shader[0] = (uint32_t)target;
++		/*
++		 * B31: patch the address only into the program that has a slot for it.
++		 *
++		 * B30 wrote word 0 unconditionally. In cs_program word 0 is the store's
++		 * target immediate (0xfeed0001 is a placeholder), so patching it is the
++		 * point of the exercise. In cs_program_empty word 0 is the first nop, and
++		 * the write replaced it with an IOVA -- an arbitrary 32-bit instruction
++		 * that could decode as anything, including a load. Launch B was therefore
++		 * not the empty program it was meant to be, which is exactly the
++		 * ambiguity this rung exists to remove.
++		 */
++		if (plan[t].store) {
++			shader[0] = (uint32_t)target;
++		}
 +		to_memory((vm_offset_t)memptrs, 0x1000);
 +		/*
 +		 * B29 wrote 1 here, which clears only bit 0, and CB_FSR is write-1-to-clear
