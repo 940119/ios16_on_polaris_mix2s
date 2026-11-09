@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5354 @@
+@@ -0,0 +1,5381 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2558,6 +2558,33 @@ new file mode 100644
 +	0x00000000u, 0x00000000u,
 +};
 +
++/*
++ * B30: the same program with every instruction that is not the terminator removed.
++ *
++ * B29 settled that the state block alone is clean: three submissions, the bank
++ * cleared between them, and the one that loads the state without dispatching
++ * left FSR at 0x400 with FSYNR0 0. The dispatch is what moves the bank
++ * (0x400 -> 0x402, FSYNR0 0x12, FAR 0), and FSYNR0's bit 0 is WnR -- zero, so
++ * the refused access is a READ, not the store this rung aims at. A read that is
++ * also privileged (bit 1) is what an instruction fetch looks like.
++ *
++ * So the next subtraction is the program itself: thirty-two nop and one end.
++ * It fetches, dispatches and terminates, and it contains no store at all.
++ *
++ *   A  state only, store program, no dispatch   control
++ *   B  dispatch, EMPTY program                  a fault here is the fetch/launch,
++ *                                               because there is no store to blame
++ *   C  dispatch, store program                  a fault here and clean B is the store
++ */
++static const uint32_t cs_program_empty[CS_PROGRAM_WORDS] = {
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x03000000u,	/* end */
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++};
++
 +struct cs_word {
 +	uint32_t reg;
 +	uint32_t value;
@@ -2701,59 +2728,57 @@ new file mode 100644
 +	const uint64_t base = g3d_regions[2].address;
 +	uint32_t *shader = (uint32_t *)((vm_offset_t)memptrs + CS_PROGRAM_OFF);
 +	/*
-+	 * B29: three submissions, each one addressable on its own.
++	 * B30: one more subtraction on top of B29.
 +	 *
-+	 * B28 dispatched twice and got one FSR transition (0x400 -> 0x402, FAR 0) that
-+	 * happened on the first dispatch and did not repeat on the second. Two readings
-+	 * survive that: the fault belongs to the state block (which is submitted both
-+	 * times, and would therefore have to be sticky to look like one event), or it
-+	 * belongs to the first store only. FSR is sticky and FAR was zero in both, so
-+	 * the ring cannot separate them. Clearing the bank before each submission and
-+	 * adding a submission with no CP_EXEC_CS at all does separate them.
-+	 *
-+	 *   A  state only, no dispatch   a fault here is the state block or the UAV view
-+	 *   B  dispatch, result page     a fault here, A clean, is the store being refused
-+	 *   C  dispatch, page with none  a fault here and clean A is the store reaching the SMMU
++	 * B29 cleared the state block of blame (A: FSR 0x400, FSYNR0 0) and left the
++	 * dispatch as the only thing that moves the bank. What it could not say is
++	 * which access inside the dispatch is refused. The program is the cheapest
++	 * variable: the same launch, the same page, one program that stores and one
++	 * that only fetches and ends.
 +	 */
 +	static const struct {
-+		uint64_t target;
 +		bool exec;
++		bool store;
 +		const char *what;
 +	} plan[3] = {
-+		{ 0, false, "state only, no CP_EXEC_CS" },
-+		{ 0, true,  "dispatch, store to the result page" },
-+		{ 0, true,  "dispatch, store to the page with no PTE" },
++		{ false, true,  "state only, store program, no CP_EXEC_CS" },
++		{ true,  false, "dispatch, EMPTY program (nop, end)" },
++		{ true,  true,  "dispatch, store program" },
 +	};
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
-+	uint64_t targets[3];
++	uint64_t target = base + CS_RESULT_OFF;
 +	bool faulted[3] = { false, false, false }, committed = false;
-+
-+	targets[0] = base + CS_RESULT_OFF;
-+	targets[1] = base + CS_RESULT_OFF;
-+	targets[2] = CS_HOLE_IOVA;
 +
 +	printf("mi8gpu: step 23: a shader, on a core whose SECVID_TRUST_CNTL reads %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE, so this is a control and not the test");
 +	/* The stg uses an absolute address in r2.xy, so no descriptor has to be right for it to work. */
 +	memset((void *)((vm_offset_t)memptrs + CS_UAV_OFF), 0, 64);
-+	memcpy(shader, cs_program, sizeof(cs_program));
 +	for (uint32_t t = 0; t < 3; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
 +		volatile uint32_t *fence = (volatile uint32_t *)((vm_offset_t)memptrs + CS_FENCE_OFF);
-+		uint32_t fsr_before, fsr_after, arrived;
++		uint32_t fsr_before, fsr_after, arrived, seen;
 +		bool drained;
 +
 +		*result = 0;
 +		*fence = 0;
-+		shader[0] = (uint32_t)targets[t];
++		memcpy(shader, plan[t].store ? cs_program : cs_program_empty, sizeof(cs_program));
++		shader[0] = (uint32_t)target;
 +		to_memory((vm_offset_t)memptrs, 0x1000);
-+		/* clear the bank, so whatever it reports next belongs to this submission alone */
-+		wr(cb + CB_FSR, 1u);
-+		__asm__ volatile ("dsb sy" ::: "memory");
++		/*
++		 * B29 wrote 1 here, which clears only bit 0, and CB_FSR is write-1-to-clear
++		 * per bit: after launch B the bank carried 0x402, the write of 1 cleared
++		 * nothing, and launch C therefore reported "0x402 -> 0x402" as if nothing
++		 * had happened. Writing back what is set clears what is set.
++		 */
++		seen = rd(cb + CB_FSR);
++		if (seen != 0) {
++			wr(cb + CB_FSR, seen);
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
 +		fsr_before = rd(cb + CB_FSR);
-+		printf("mi8gpu: step 23: launch %c: %s (store at %#llx, CB1 FSR cleared to %#010x, program word 0 %#x)\n",
-+		    'A' + t, plan[t].what, targets[t], fsr_before, shader[0]);
-+		drained = cs_launch(targets[t], plan[t].exec, plan[t].what);
++		printf("mi8gpu: step 23: launch %c: %s (store at %#llx, CB1 FSR %#010x -> %#010x after the clear, program word 0 %#x)\n",
++		    'A' + t, plan[t].what, target, seen, fsr_before, shader[0]);
++		drained = cs_launch(target, plan[t].exec, plan[t].what);
 +		/* the fence and CP_WAIT_FOR_IDLE are inside the ring, so the wave is over once it drains; give the store a moment anyway */
 +		sleep_us(2000);
 +		/* The core wrote this page behind our back: drop the lines, do not write them back. */
@@ -2761,7 +2786,7 @@ new file mode 100644
 +		fsr_after = rd(cb + CB_FSR);
 +		arrived = *result;
 +		printf("mi8gpu: step 23 launch %c target %#llx: result %#010x, the fence %#010x, CB1 FSR %#010x -> %#010x, FSYNR0 %#010x, FAR %#llx%08x\n",
-+		    'A' + t, targets[t], arrived, *fence, fsr_before, fsr_after, rd(cb + CB_FSYNR0),
++		    'A' + t, target, arrived, *fence, fsr_before, fsr_after, rd(cb + CB_FSYNR0),
 +		    (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
 +		if (arrived == 0x0badf00du) {
 +			committed = true;
@@ -2785,11 +2810,13 @@ new file mode 100644
 +	if (faulted[0]) {
 +		printf("mi8gpu: step 23 SUMMARY: the state block alone faulted, so nothing after it can be blamed on the store\n");
 +	} else if (committed) {
-+		printf("mi8gpu: step 23 SUMMARY: THE SP RAN AND ITS STORE COMMITTED (launch B)\n");
-+	} else if (faulted[1] || faulted[2]) {
-+		printf("mi8gpu: step 23 SUMMARY: THE SP RAN. The state is clean, the store faulted: A clean, B/C faulted\n");
++		printf("mi8gpu: step 23 SUMMARY: THE SP RAN AND ITS STORE COMMITTED (launch C)\n");
++	} else if (faulted[1]) {
++		printf("mi8gpu: step 23 SUMMARY: the store is NOT to blame: the empty program faulted too, so the refused access is the fetch or the launch itself\n");
++	} else if (faulted[2]) {
++		printf("mi8gpu: step 23 SUMMARY: THE SP RAN. The empty program was clean and the store program faulted: the store is the refused access\n");
 +	} else {
-+		printf("mi8gpu: step 23 SUMMARY: the state is clean and no store faulted -- the wave did not reach its store\n");
++		printf("mi8gpu: step 23 SUMMARY: the state and both programs are clean and nothing wrote -- the launch runs but its store never commits\n");
 +	}
 +}
 +
