@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5025 @@
+@@ -0,0 +1,5298 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2390,6 +2390,14 @@ new file mode 100644
 +	return 0x70000000u | cnt | (pm4_parity(cnt) << 15) | ((opcode & 0x7f) << 16) | (pm4_parity(opcode) << 23);
 +}
 +
++/* Type 4, the shape a non-context register write takes: its own parity over the
++ * count and the register number rather than over an opcode (fd_ncrb / computerator). */
++static uint32_t
++pkt4(uint32_t reg, uint32_t cnt)
++{
++	return 0x40000000u | (cnt & 0x7fu) | (pm4_parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (pm4_parity(reg & 0x3ffffu) << 27);
++}
++
 +#define CP_ME_INIT_OPCODE       0x48u
 +#define CP_MEM_WRITE_OPCODE    0x3du
 +#define CP_SET_SECURE_MODE_OPCODE 0x66u
@@ -2486,6 +2494,249 @@ new file mode 100644
 +
 +static void probe_report(const char *when);   /* B27: defined with the step 22 probes */
 +
++/* ---- step 23: the shader the SP runs --------------------------------------------------------- */
++
++/*
++ * Every step before this one ends in a packet the CP understands. This one ends
++ * in a program whose meaning comes from somewhere else: thirty-two dwords of
++ * ir3, and a block of SP registers that say how to launch it. Both are the other
++ * line's, unchanged -- 0251 reduced that program to the four instructions below
++ * and derived every register value from Mesa's own a6xx.xml.h. That build
++ * submitted it, watched a wave fetch, dispatch and honour its fence, and never
++ * saw the store at word 8 commit, because on that line CP_SET_SECURE_MODE had
++ * never been able to leave secure mode.
++ *
++ * Step 21 above shows SECVID_TRUST_CNTL reading 0x1 and then 0x0 with the ring
++ * having consumed CP_SET_SECURE_MODE(0) in between. So the same program is asked
++ * again, and its store is aimed at two addresses in one boot:
++ *
++ *   memptrs + 0x300   a page the 3D core has a PTE for -- the result is readable
++ *   0x10100000        a page with no PTE, which step 20 proved faults through ATOS
++ *
++ * One program, one launch sequence, only the immediate of the first mov differs.
++ * 0x0badf00d in the result word says the wave ran and its store committed; a
++ * translation fault with FAR 0x10100000 says the wave ran and its store reached
++ * the SMMU. Either is the first evidence this phone's SP has ever produced.
++ * Both staying silent is 0251's answer again -- and after a zap that really did
++ * authenticate, that would mean secure mode was not the gate either, and the
++ * next question is the launch state itself rather than the core's trust level.
++ *
++ * Nothing here is a guess about the hardware: the two packets that carry the
++ * state (CP_LOAD_STATE6_FRAG for the program and for the UAV view, the context
++ * bunch, CP_SET_MARKER, the grid, CP_EXEC_CS) are copied in the order Mesa's
++ * computerator emits them, which is the one order 0229 established by copying it.
++ */
++#define CS_PROGRAM_WORDS	32u
++#define CS_PROGRAM_OFF		0x100u
++#define CS_UAV_OFF		0x200u
++#define CS_RESULT_OFF		0x300u
++#define CS_FENCE_OFF		0x380u
++#define CS_HOLE_IOVA		0x10100000ull
++
++/*
++ * mov r2.x, <target>; mov r2.y, 0; mov r1.x, 0x0badf00d; nop; stg [r2.x], r1.x; end.
++ * Word 0 is the address's low half and is rewritten for each target; the one nop
++ * between the value and the store is the assembler's minimum delay slot, and the
++ * zeros after `end` decode as nop.
++ */
++static const uint32_t cs_program[CS_PROGRAM_WORDS] = {
++	0xfeed0001u, 0x204cc008u,	/* mov.u32u32 r2.x, <the target> */
++	0x00000000u, 0x204cc009u,	/* mov.u32u32 r2.y, 0 */
++	0x0badf00du, 0x204cc004u,	/* mov.u32u32 r1.x, 0x0badf00d */
++	0x00000000u, 0x00000000u,	/* nop: one delay slot */
++	0x01800008u, 0xc0c61100u,	/* stg.u32 g[r2.x+0], r1.x, 1 */
++	0x00000000u, 0x03000000u,	/* end */
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,
++};
++
++struct cs_word {
++	uint32_t reg;
++	uint32_t value;
++};
++
++/* fd_ncrb: the non-context registers, as type-4 writes, in the order computerator does them. */
++static const struct cs_word cs_ncr[] = {
++	{ 0x0ae0f, 0x00000020 },	/* SP_PERFCTR_SHADER_MASK: .cs */
++	{ 0x0ae04, 0x00000000 },	/* SP_NC_MODE_CNTL_2 */
++	{ 0x09804, 0x0000001f }, { 0x09805, 0x00000001 }, { 0x0a0f8, 0x00000001 },
++	{ 0x0b600, 0x00108000 }, { 0x08600, 0x00000880 }, { 0x0ae03, 0x00001430 },
++	{ 0x0ae00, 0x00000000 }, { 0x0be04, 0x00080000 }, { 0x09600, 0x00000000 },
++	{ 0x00e12, 0x10000001 }, { 0x08e01, 0x00000001 }, { 0x08e04, 0x04100000 },
++};
++
++/* cs_program_emit_regs(): the CS block. Every value here was read back correct from 0219 onward. */
++static const struct cs_word cs_ctx[] = {
++	{ 0x0ab00, 0x00000005 },	/* SP_MODE_CNTL: ISAMMODE_GL, constant demotion */
++	{ 0x0bb08, 0x000000bf },	/* SP_UPDATE_CNTL: the stages, cs and gfx_uav */
++	{ 0x0b987, 0x00000100 },	/* SP_CS_CONST_CONFIG: constlen 0, enabled */
++	{ 0x0a9bb, 0x00400100 },	/* SP_CS_CONFIG: enabled, nuav 1 */
++	{ 0x0a9b0, 0x80100100 },	/* SP_CS_CNTL_0: merged regs, THREAD128, footprint 2 */
++	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: 1 KB shared, const ram 128 */
++	{ 0x0b997, 0x00fcfcfc },	/* SP_CS_CONST_CONFIG_0: every constid INVALID */
++	{ 0x0b998, 0x000002fc },	/* SP_CS_WGE_CNTL: THREAD128, no linear local id */
++};
++
++/* One dispatch. Returns false only when the CP stopped reading the ring. */
++static bool
++cs_launch(uint64_t target, const char *what)
++{
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++	uint32_t w = cp_wptr & 8191u;
++	const uint32_t n_ctx = (uint32_t)(sizeof(cs_ctx) / sizeof(cs_ctx[0]));
++	const uint64_t program_iova = g3d_regions[2].address + CS_PROGRAM_OFF;
++	const uint64_t uav_iova = g3d_regions[2].address + CS_UAV_OFF;
++	const uint64_t fence_iova = g3d_regions[2].address + CS_FENCE_OFF;
++
++#define CS_PUT(v)	(ring[w++ & 8191u] = (uint32_t)(v))
++	for (uint32_t i = 0; i < (uint32_t)(sizeof(cs_ncr) / sizeof(cs_ncr[0])); i++) {
++		CS_PUT(pkt4(cs_ncr[i].reg, 1u));
++		CS_PUT(cs_ncr[i].value);
++	}
++	/* fd_crb: the block, then the addresses inside it, then the length -- one bunch, as computerator writes it. */
++	CS_PUT(pkt7(0x5cu, 2u * (n_ctx + 3u)));
++	for (uint32_t i = 0; i < n_ctx; i++) {
++		CS_PUT(cs_ctx[i].reg);
++		CS_PUT(cs_ctx[i].value);
++	}
++	CS_PUT(0x0a9b4u);			/* SP_CS_BASE */
++	CS_PUT((uint32_t)program_iova);
++	CS_PUT(0x0a9b5u);
++	CS_PUT((uint32_t)(program_iova >> 32));
++	CS_PUT(0x0a9bcu);			/* SP_CS_INSTR_SIZE: 128-byte blocks, so 32 dwords is one */
++	CS_PUT(CS_PROGRAM_WORDS);
++	/* the program, as an indirect state block */
++	CS_PUT(pkt7(0x34u, 3u));		/* CP_LOAD_STATE6_FRAG */
++	CS_PUT(0x00760000u);			/* ST6_SHADER / INDIRECT / CS_SHADER / 1 */
++	CS_PUT((uint32_t)program_iova);
++	CS_PUT((uint32_t)(program_iova >> 32));
++	/* and the UAV view: one 64-byte unit, which the stg does not consult but the block names */
++	CS_PUT(pkt7(0x34u, 3u));
++	CS_PUT(0x0076c000u);			/* ST6_UAV / INDIRECT / CS / 1 */
++	CS_PUT((uint32_t)uav_iova);
++	CS_PUT((uint32_t)(uav_iova >> 32));
++	CS_PUT(pkt7(0x5cu, 6u));
++	CS_PUT(0x0a9f2u);			/* SP_CS_UAV_BASE */
++	CS_PUT((uint32_t)uav_iova);
++	CS_PUT(0x0a9f3u);
++	CS_PUT((uint32_t)(uav_iova >> 32));
++	CS_PUT(0x0aa00u);			/* SP_CS_USIZE: one unit was loaded */
++	CS_PUT(1u);
++	CS_PUT(pkt7(0x65u, 1u));		/* CP_SET_MARKER */
++	CS_PUT(8u);				/* RM6_COMPUTE */
++	/* the grid: one group of eight invocations. NDRANGE_1 is the global size, local times groups. */
++	CS_PUT(pkt7(0x5cu, 20u));
++	CS_PUT(0x0b990u); CS_PUT(0x0000001fu);	/* SP_CS_NDRANGE_0: dim 3, local 8x1x1 */
++	CS_PUT(0x0b991u); CS_PUT(8u);		/* SP_CS_NDRANGE_1: global x */
++	CS_PUT(0x0b992u); CS_PUT(0u);		/* SP_CS_NDRANGE_2: offset x */
++	CS_PUT(0x0b993u); CS_PUT(1u);		/* SP_CS_NDRANGE_3: global y */
++	CS_PUT(0x0b994u); CS_PUT(0u);		/* SP_CS_NDRANGE_4: offset y */
++	CS_PUT(0x0b995u); CS_PUT(1u);		/* SP_CS_NDRANGE_5: global z */
++	CS_PUT(0x0b996u); CS_PUT(0u);		/* SP_CS_NDRANGE_6: offset z */
++	CS_PUT(0x0b999u); CS_PUT(1u);		/* SP_CS_KERNEL_GROUP_X */
++	CS_PUT(0x0b99au); CS_PUT(1u);		/* SP_CS_KERNEL_GROUP_Y */
++	CS_PUT(0x0b99bu); CS_PUT(1u);		/* SP_CS_KERNEL_GROUP_Z */
++	CS_PUT(pkt7(0x33u, 4u));		/* CP_EXEC_CS */
++	CS_PUT(0u);
++	CS_PUT(1u);				/* groups x */
++	CS_PUT(1u);				/* groups y */
++	CS_PUT(1u);				/* groups z */
++	CS_PUT(pkt7(0x26u, 0u));		/* CP_WAIT_FOR_IDLE */
++	CS_PUT(pkt7(0x46u, 4u));		/* CP_EVENT_WRITE: the fence */
++	CS_PUT(0x04u);				/* EVENT_CACHE_FLUSH_TS */
++	CS_PUT((uint32_t)fence_iova);
++	CS_PUT((uint32_t)(fence_iova >> 32));
++	CS_PUT(0u);
++	(void)target;
++#undef CS_PUT
++	/*
++	 * gpu_wait_ring() is not used here: its second condition is a6xx_idle's
++	 * "RBBM_STATUS with bit 0 masked out is zero", and a compute dispatch
++	 * leaves bits that a quiet ring does not clear. Draining the ring is the
++	 * judgement this probe needs, and CP_WAIT_FOR_IDLE plus the fence inside
++	 * that same ring already order the wave before the drain completes.
++	 */
++	{
++		const uint32_t target_wptr = w & 8191u;
++
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, target_wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (uint32_t i = 0; i < 20000; i++) {
++			if (rd(gpu3d + 4 * 0x0806) == target_wptr) {
++				break;
++			}
++			sleep_us(10);
++		}
++		cp_wptr = target_wptr;
++		printf("mi8gpu: step 23: %s: RB_RPTR %u WPTR %u, RBBM_STATUS %#010x INT_0_STATUS %#010x\n", what,
++		    rd(gpu3d + 4 * 0x0806), target_wptr, rd(gpu3d + 4 * 0x0210), rd(gpu3d + 4 * 0x0201));
++		return rd(gpu3d + 4 * 0x0806) == target_wptr;
++	}
++}
++
++static void
++cs_probe(void)
++{
++	volatile uint32_t *memptrs = (volatile uint32_t *)g3d_regions[2].memory;
++	const uint64_t base = g3d_regions[2].address;
++	uint32_t *shader = (uint32_t *)((vm_offset_t)memptrs + CS_PROGRAM_OFF);
++	uint64_t targets[2];
++
++	printf("mi8gpu: step 23: a shader, on a core whose SECVID_TRUST_CNTL reads %#x (%s)\n",
++	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE, so this is a control and not the test");
++	/* The stg uses an absolute address in r2.xy, so no descriptor has to be right for it to work. */
++	memset((void *)((vm_offset_t)memptrs + CS_UAV_OFF), 0, 64);
++	memcpy(shader, cs_program, sizeof(cs_program));
++	targets[0] = base + CS_RESULT_OFF;
++	targets[1] = CS_HOLE_IOVA;
++	for (uint32_t t = 0; t < 2; t++) {
++		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
++		volatile uint32_t *fence = (volatile uint32_t *)((vm_offset_t)memptrs + CS_FENCE_OFF);
++		vm_offset_t cb = smmu_cb(G3D_CTX);
++		uint32_t fsr_before, fsr_after, arrived;
++		bool drained;
++
++		*result = 0;
++		*fence = 0;
++		shader[0] = (uint32_t)targets[t];
++		to_memory((vm_offset_t)memptrs, 0x1000);
++		fsr_before = rd(cb + CB_FSR);
++		printf("mi8gpu: step 23: launching with the store at %#llx (CB1 FSR before %#010x, program word 0 %#x)\n",
++		    targets[t], fsr_before, shader[0]);
++		drained = cs_launch(targets[t], t ? "after the store to the page with no PTE" : "after the store to the result page");
++		/* the fence and CP_WAIT_FOR_IDLE are inside the ring, so the wave is over once it drains; give the store a moment anyway */
++		sleep_us(2000);
++		/* The core wrote this page behind our back: drop the lines, do not write them back. */
++		from_memory((vm_offset_t)memptrs, 0x1000);
++		fsr_after = rd(cb + CB_FSR);
++		arrived = *result;
++		printf("mi8gpu: step 23 target %#llx: result word %#010x, the fence %#010x, CB1 FSR %#010x -> %#010x FAR %#llx%08x\n",
++		    targets[t], arrived, *fence, fsr_before, fsr_after, (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
++		if (arrived == 0x0badf00du) {
++			printf("mi8gpu: step 23 VERDICT target %#llx: the SP ran and its store committed\n", targets[t]);
++		} else if (fsr_after != fsr_before) {
++			printf("mi8gpu: step 23 VERDICT target %#llx: the SP ran and its store reached the SMMU (FSR %#010x -> %#010x)\n",
++			    targets[t], fsr_before, fsr_after);
++		} else {
++			printf("mi8gpu: step 23 VERDICT target %#llx: nothing wrote, no fault: the wave did not reach its store\n", targets[t]);
++		}
++		if (!drained) {
++			printf("mi8gpu: step 23: the CP stopped reading the ring at the %s target; the second one is not attempted\n",
++			    t ? "second" : "first");
++			break;
++		}
++	}
++}
++
 +static void
 +gpu_zap_and_command(void)
 +{
@@ -2533,6 +2784,17 @@ new file mode 100644
 +	to_memory((vm_offset_t)memptrs, 0x1000);
 +	printf("mi8gpu: memptrs[2..3] = %#010x %#010x -> the CP's first write %s\n", memptrs[2], memptrs[3],
 +	    (memptrs[2] == 0xc0ffee21 && memptrs[3] == 0x0badf00d) ? "ARRIVED in memory" : "did NOT arrive");
++	/*
++	 * Step 23 runs before the paint, and only when the CP has been shown to
++	 * write memory: the shader test needs a working ring and a fence that
++	 * arrives, and it must not be read through a picture that step 22 has
++	 * just put on the screen.
++	 */
++	if (ok && gmu_last_step >= 23) {
++		cp_wptr = wptr;
++		cs_probe();
++		wptr = cp_wptr;
++	}
 +	if (ok && gmu_last_step >= 22 && memptrs[2] == 0xc0ffee21 && memptrs[3] == 0x0badf00d) {
 +		uint32_t passes = 1;
 +
@@ -4416,6 +4678,17 @@ new file mode 100644
 +static bool
 +step_gpu_paint(void)
 +{
++	if (gmu_last_step >= 23) {
++		printf("mi8gpu: step 22 is carried out inside step 23\n");
++		return true;
++	}
++	return gmu_run(true, true);
++}
++
++/* Step 23 is carried out inside the same run, after the CP's first write: gpu_zap_and_command() calls cs_probe(). */
++static bool
++step_gpu_shader(void)
++{
 +	return gmu_run(true, true);
 +}
 +
@@ -4651,7 +4924,7 @@ new file mode 100644
 +	}
 +}
 +
-+static bool (*const steps[])(void) = { step_gcc, step_rpmh, step_gpucc, step_cx_on, step_clocks, step_gmu_registers, step_smmu_global, step_smmu_contexts, step_gmu_tcm_test, step_gmu_firmware, step_rsc_pdc, step_gmu_smmu, step_trustzone, step_gmu_prepare, step_gmu_start, step_gmu_rail, step_gmu_hfi, step_gpu_look, step_gpu_init, step_gpu_cp, step_gpu_zap, step_gpu_paint };
++static bool (*const steps[])(void) = { step_gcc, step_rpmh, step_gpucc, step_cx_on, step_clocks, step_gmu_registers, step_smmu_global, step_smmu_contexts, step_gmu_tcm_test, step_gmu_firmware, step_rsc_pdc, step_gmu_smmu, step_trustzone, step_gmu_prepare, step_gmu_start, step_gmu_rail, step_gmu_hfi, step_gpu_look, step_gpu_init, step_gpu_cp, step_gpu_zap, step_gpu_paint, step_gpu_shader };
 +#define STEPS ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
 +
 +static void
