@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5576 @@
+@@ -0,0 +1,5599 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2630,7 +2630,7 @@ new file mode 100644
 +
 +/* One dispatch. Returns false only when the CP stopped reading the ring. */
 +static bool
-+cs_launch(uint64_t target, bool exec, uint32_t tag, const char *what)
++cs_launch(uint64_t target, bool exec, uint32_t tag, bool hole, const char *what)
 +{
 +	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
 +	uint32_t w = cp_wptr & 8191u;
@@ -2638,6 +2638,21 @@ new file mode 100644
 +	const uint64_t program_iova = g3d_regions[2].address + CS_PROGRAM_OFF;
 +	const uint64_t uav_iova = g3d_regions[2].address + CS_UAV_OFF;
 +	const uint64_t fence_iova = g3d_regions[2].address + CS_FENCE_OFF;
++	/*
++	 * B35: where the SP is told its program is.
++	 *
++	 * Everything in this rung now checks out -- the ring runs to its last marker,
++	 * the fence lands with the value we supplied, the cache is flushed -- and no
++	 * shader access ever reaches the SMMU or the memory. That leaves one question
++	 * the markers cannot answer: is a wave being created at all? If one is, it has
++	 * to fetch its first instruction, and the fetch is a read of whatever
++	 * SP_CS_BASE names. Point that at a page with no PTE and the answer is a
++	 * translation fault, or nothing.
++	 *
++	 * The program is still LOADED from the real page (the CP has to read real data
++	 * to build the state), so this changes only the address the SP is handed.
++	 */
++	const uint64_t sp_base = hole ? CS_HOLE_IOVA : program_iova;
 +
 +#define CS_PUT(v)	(ring[w++ & 8191u] = (uint32_t)(v))
 +	/*
@@ -2680,9 +2695,9 @@ new file mode 100644
 +		CS_PUT(cs_ctx[i].value);
 +	}
 +	CS_PUT(0x0a9b4u);			/* SP_CS_BASE */
-+	CS_PUT((uint32_t)program_iova);
++	CS_PUT((uint32_t)sp_base);
 +	CS_PUT(0x0a9b5u);
-+	CS_PUT((uint32_t)(program_iova >> 32));
++	CS_PUT((uint32_t)(sp_base >> 32));
 +	CS_PUT(0x0a9bcu);			/* SP_CS_INSTR_SIZE: 128-byte blocks, so 32 dwords is one */
 +	CS_PUT(CS_PROGRAM_WORDS);
 +	/* the program, as an indirect state block */
@@ -2813,8 +2828,9 @@ new file mode 100644
 +cs_scan_magic(uint32_t tag)
 +{
 +	uint32_t hits = 0;
++	uint32_t total = 0;
 +
-+	for (uint32_t r = 0; r < G3D_REGIONS && r < 3; r++) {
++	for (uint32_t r = 0; r < G3D_REGIONS; r++) {
 +		uint32_t *p = (uint32_t *)g3d_regions[r].memory;
 +		uint32_t n;
 +
@@ -2822,6 +2838,7 @@ new file mode 100644
 +			continue;
 +		}
 +		n = g3d_regions[r].size / 4u;
++		total += g3d_regions[r].size;
 +		/* the core may have written behind our cache: read what is in DRAM */
 +		from_memory(g3d_regions[r].memory, g3d_regions[r].size);
 +		for (uint32_t i = 0; i < n && hits < 6; i++) {
@@ -2833,8 +2850,8 @@ new file mode 100644
 +		}
 +	}
 +	if (hits == 0) {
-+		printf("mi8gpu: step 23 launch %c: 0badf00d is nowhere in the %u KiB of GPU-mapped pages either\n",
-+		    'A' + tag, (uint32_t)((g3d_regions[0].size + g3d_regions[1].size + g3d_regions[2].size) / 1024u));
++		printf("mi8gpu: step 23 launch %c: 0badf00d is nowhere in the %u KiB of GPU-mapped memory either\n",
++		    'A' + tag, total / 1024u);
 +	}
 +}
 +
@@ -2869,23 +2886,25 @@ new file mode 100644
 +		bool exec;
 +		bool store;
 +		uint32_t tag;
++		bool hole;
 +		const char *what;
-+	} plan[3] = {
-+		{ false, true,  0u, "state only, store program, no CP_EXEC_CS" },
-+		{ true,  false, 1u, "dispatch, EMPTY program (nop, end)" },
-+		{ true,  true,  2u, "dispatch, store program" },
++	} plan[4] = {
++		{ false, true,  0u, false, "state only, store program, no CP_EXEC_CS" },
++		{ true,  false, 1u, false, "dispatch, EMPTY program (nop, end)" },
++		{ true,  true,  2u, false, "dispatch, store program" },
++		{ true,  true,  3u, true,  "dispatch, store program, SP_CS_BASE on a page with NO PTE" },
 +	};
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
 +	uint64_t target = base + CS_RESULT_OFF;
-+	bool faulted[3] = { false, false, false }, committed = false;
-+	bool stalled[3] = { false, false, false };
-+	int reached[3] = { 0, 0, 0 };
++	bool faulted[4] = { false, false, false, false }, committed = false;
++	bool stalled[4] = { false, false, false, false };
++	int reached[4] = { 0, 0, 0, 0 };
 +
 +	printf("mi8gpu: step 23: a shader, on a core whose SECVID_TRUST_CNTL reads %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE, so this is a control and not the test");
 +	/* The stg uses an absolute address in r2.xy, so no descriptor has to be right for it to work. */
 +	memset((void *)((vm_offset_t)memptrs + CS_UAV_OFF), 0, 64);
-+	for (uint32_t t = 0; t < 3; t++) {
++	for (uint32_t t = 0; t < 4; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
 +		volatile uint32_t *fence = (volatile uint32_t *)((vm_offset_t)memptrs + CS_FENCE_OFF);
 +		volatile uint32_t *mark = (volatile uint32_t *)((vm_offset_t)memptrs + CS_MARKER_OFF + 12u * t);
@@ -2925,7 +2944,7 @@ new file mode 100644
 +		fsr_before = rd(cb + CB_FSR);
 +		printf("mi8gpu: step 23: launch %c: %s (store at %#llx, CB1 FSR %#010x -> %#010x after the clear, program word 0 %#x)\n",
 +		    'A' + t, plan[t].what, target, seen, fsr_before, shader[0]);
-+		drained = cs_launch(target, plan[t].exec, plan[t].tag, plan[t].what);
++		drained = cs_launch(target, plan[t].exec, plan[t].tag, plan[t].hole, plan[t].what);
 +		/* CP_WAIT_FOR_IDLE is inside the ring, so the wave is over once it drains; give the store a moment anyway */
 +		sleep_us(2000);
 +		/* The core wrote this page behind our back: drop the lines, do not write them back. */
@@ -3002,6 +3021,10 @@ new file mode 100644
 +		printf("mi8gpu: step 23 SUMMARY: THE EMPTY PROGRAM WAS ACCEPTED AND THE WAIT AFTER IT WAS NOT: CP_EXEC_CS ran, CP_WAIT_FOR_IDLE never returned, so a wave was launched and never retired -- the shader is being fetched now\n");
 +	} else if (stalled[2]) {
 +		printf("mi8gpu: step 23 SUMMARY: the STORE program stalls the CP where the empty one did not -- the store itself (or the fetch of the instruction carrying it) is what kills it\n");
++	} else if (reached[3] == 3 && faulted[3]) {
++		printf("mi8gpu: step 23 SUMMARY: THE SP FETCHES ITS PROGRAM. Pointing SP_CS_BASE at a page with no PTE produced a fault, so a wave IS created and it does follow the program pointer -- the earlier silence was the program or the store, not the absence of a launch\n");
++	} else if (reached[3] == 3) {
++		printf("mi8gpu: step 23 SUMMARY: NO WAVE IS EVER CREATED. An unmapped SP_CS_BASE produced no fault at all: the dispatch completes without the SP reading a single instruction, so the grid or the compute state is what keeps invocations from existing -- the shader has never been the question\n");
 +	} else if (faulted[0]) {
 +		printf("mi8gpu: step 23 SUMMARY: the state block alone faulted, so nothing after it can be blamed on the store\n");
 +	} else if (committed) {
@@ -3011,7 +3034,7 @@ new file mode 100644
 +	} else if (faulted[2]) {
 +		printf("mi8gpu: step 23 SUMMARY: THE SP RAN. The empty program was clean and the store program faulted: the store is the refused access\n");
 +	} else {
-+		printf("mi8gpu: step 23 SUMMARY: all three rings executed and nothing wrote -- the launch completes without the shader storing, so the store is being dropped rather than refused\n");
++		printf("mi8gpu: step 23 SUMMARY: every ring ran to its end, every fence arrived, and nothing wrote anywhere in the mapped pages -- so the launch is accepted, retired and flushed, and still no shader access happens\n");
 +	}
 +}
 +
