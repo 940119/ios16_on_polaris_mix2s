@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5887 @@
+@@ -0,0 +1,5897 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2599,48 +2599,50 @@ new file mode 100644
 + */
 +#define CS_F_Q_ROLL	0x200u	/* CP_EVENT_WRITE(DEBUG_LABEL): roll the register context */
 +#define CS_F_Q_INV	0x400u	/* CACHE_INVALIDATE between the seed write and CP_EXEC_CS */
++#define CS_F_Q_NOALU	0x800u	/* B47: patch the add.u back to a nop in this ring */
++#define CS_ALU_IMM	0x111u	/* add.u r1.y, r1.y, 0x111 */
++#define CS_ALU_IDX	8u	/* instruction slot of the add.u (dwords 16,17) */
 +#define CS_WANT		0x0badf00du
 +#define CS_SEED_OFF	0x340u	/* result + 0x40: the ldg reads here */
 +static uint32_t cs_seed_value;	/* B45: CP_MEM_WRITE puts this in the ring */
 +
 +/*
-+ * B45: the same wave now READS before it writes.
++ * B47: the same wave now COMPUTES before it stores.
 + *
-+ * B37-B44 proved a store lands, but the value was always an immediate baked
-+ * into the instruction stream. A mov-plus-stg does not prove the load path,
-+ * the address path or the global-memory window are alive. So one instruction
-+ * stream does both:
++ * B37-B44 proved a store lands. B45 proved the SP can ldg a seed the CP wrote
++ * into the very same ring. B46 proved CACHE_INVALIDATE (0x31) makes that load
++ * see the new seed on EVERY launch. But the value that came back was still
++ * only a MOVE: ldg r1.y, then stg r1.y. Nothing so far required an ALU.
 + *
-+ *   stg g[r2.x+0], r1.x    -> 0badf00d, the exact B37 control store
-+ *   ldg r1.y, g[r2.x+0x40] -> a seed the CP wrote into this very ring
-+ *   stg g[r2.x+8], r1.y    -> the value the SP actually read
++ * One cat2 instruction now sits between the load and the store:
 + *
-+ * result[0] is therefore a built-in control that says the program ran, and
-+ * result[2] is the reading. The seed lives at CS_SEED_OFF (result+0x40),
-+ * outside the eight words cs_probe() clears before each launch; it is written
-+ * by CP_MEM_WRITE inside the ring, ahead of CP_EXEC_CS, so it cannot be a
-+ * stale CPU cache line. Three launches with two different seeds make a
-+ * reading that cannot be produced by a fixed value.
++ *   add.u r1.y, r1.y, 0x111 (sy)
 + *
-+ * The ir3 words are NOT transcribed. _ir3enc.py derives the cat6 field map
-+ * from Mesa's isa/ir3-cat6.xml, validates it by reproducing B37's proven stg
-+ * word for word, and agrees bit for bit with a real compiled shader's
-+ * ldg.u32 in Mesa's reference disassembly. r0..r2 only, so
-+ * FULLREGFOOTPRINT stays 3 -- the one field B44 proved load-bearing.
-+ * Four nops and (sy) on the second store cover the load latency.
++ * Its (sy) is load-bearing: it is the first instruction to consume the ldg's
++ * result, so it must wait for the global load. The second store keeps the (sy)
++ * B45/B46 already proved. The encoding is NOT transcribed -- _ir3enc.py
++ * derives cat2's field map from Mesa's ir3-cat2.xml and ir3-common.xml and
++ * validates it bit for bit against three real compiled add.u instructions.
++ * All the other 15 instruction words are byte-identical to B46; this is a
++ * single-variable experiment.
++ *
++ * Rings A and D patch just those two dwords back to nops after the memcpy, so
++ * they are a within-boot A/B control: they must return the seed unchanged,
++ * while B and C must return seed + 0x111. r0..r2 only, so FULLREGFOOTPRINT
++ * stays 3 -- the one field B44 proved load-bearing.
 + */
 +static const uint32_t cs_program[CS_PROGRAM_WORDS] = {
 +	0xfeed0001u, 0x204cc008u,	/* mov.u32u32 r2.x, <result address> (patched) */
 +	0x00000000u, 0x204cc009u,	/* mov.u32u32 r2.y, 0 */
 +	0x0badf00du, 0x204cc004u,	/* mov.u32u32 r1.x, 0x0badf00d (control) */
 +	0x00000000u, 0x00000000u,	/* nop: delay slot */
-+	0x01820081u, 0xc0060005u,	/* ldg.u32 r1.y, g[r2.x+0x40], 1  (NEW) */
++	0x01820081u, 0xc0060005u,	/* ldg.u32 r1.y, g[r2.x+0x40], 1 */
 +	0x00000000u, 0x00000000u,	/* nop: load latency */
 +	0x00000000u, 0x00000000u,	/* nop: load latency */
 +	0x00000000u, 0x00000000u,	/* nop: load latency */
-+	0x00000000u, 0x00000000u,	/* nop: load latency */
++	0x21110005u, 0x52100005u,	/* add.u r1.y, r1.y, 0x111 (sy)  (B47: THE ONE CHANGE) */
 +	0x01800008u, 0xc0c61100u,	/* stg.u32 g[r2.x+0], r1.x, 1 (control) */
-+	0x0180000au, 0xd0c61108u,	/* stg.u32 g[r2.x+8], r1.y, 1 (sy, NEW) */
++	0x0180000au, 0xd0c61108u,	/* stg.u32 g[r2.x+8], r1.y, 1 (sy) */
 +	0x00000000u, 0x03000000u,	/* end */
 +	0x00000000u, 0x00000000u,	/* nop */
 +	0x00000000u, 0x00000000u,	/* nop */
@@ -3172,25 +3174,15 @@ new file mode 100644
 +	const uint64_t base = g3d_regions[2].address;
 +	uint32_t *shader = (uint32_t *)((vm_offset_t)memptrs + CS_PROGRAM_OFF);
 +	/*
-+	 * B45: make the shader READ something before it writes.
++	 * B47: make the shader COMPUTE, not just copy.
 +	 *
-+	 * Every earlier ladder put an immediate into a register and stored it. The
-+	 * store landing proves a wave runs and the address path works, but says
-+	 * nothing about the global load path. Now the CP writes a seed into the
-+	 * ring itself and the shader has to ldg it and store it back. Two control
-+	 * properties are built into the same program: result[0] must still be
-+	 * 0badf00d, and result[2] must equal that launch's seed. If the control
-+	 * holds and the reading follows two different seeds, the SP read memory.
-+	 *
-+	 * B46: B45 showed the load itself works but only ONCE -- the second launch
-+	 * read the first launch's seed even though cp-seed proved the CP had written
-+	 * a new one. So the missing piece is UCHE invalidation. Rings B and C emit
-+	 * CACHE_INVALIDATE (0x31) after the seed write; A and D do not, so D is a
-+	 * control that must go stale if the invalidate is what makes it visible.
-+	 *
-+	 * The instrument B43 fixed is kept: one shared target, cleared before every
-+	 * launch. B44's t == 0 "no dispatch control" shortcut is gone -- all four
-+	 * rings are full one-ring launches and are judged identically.
++	 * B46 closed the load path, but result[2] was still a MOVE. A cat2 add.u
++	 * now sits between the ldg and the store, so result[2] must be seed+0x111.
++	 * The A/B control is built into the same program image: on A and D the two
++	 * add.u dwords are patched back to nops after the memcpy, so those rings
++	 * must return the seed unchanged. Four different seeds, all four rings INV,
++	 * one shared target cleared before every launch. cp-seed remains the
++	 * instrument's own instrument and result[0] keeps B37's control store.
 +	 */
 +	static const struct {
 +		uint32_t flags;
@@ -3198,10 +3190,10 @@ new file mode 100644
 +		uint32_t seed;
 +		const char *what;
 +	} plan[4] = {
-+		{ CS_F_STATE | CS_F_EXEC,			0u, 0x5eedc0deu, "NO-INV 1: first launch, cold cache" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,	1u, 0xa5a5c3c3u, "INV 2: UCHE invalidated after the seed write" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,	2u, 0x1badb002u, "INV 3: a third, different seed" },
-+		{ CS_F_STATE | CS_F_EXEC,			3u, 0x2f00d123u, "NO-INV 4: expect the third value stale" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU, 0u, 0x5eedc0deu, "NOALU 1: add.u -> nop, seed must come back unchanged" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  1u, 0xa5a5c3c3u, "ALU 2: expect seed + 0x111" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  2u, 0x1badb002u, "ALU 3: a third different seed, same add.u" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU, 3u, 0x2f00d123u, "NOALU 4: closing control, add.u off again" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
@@ -3209,9 +3201,10 @@ new file mode 100644
 +	int reached[4] = { 0, 0, 0, 0 };
 +	uint32_t ctl[4] = { 0, 0, 0, 0 };
 +	uint32_t loaded[4] = { 0, 0, 0, 0 };
++	uint32_t expected[4] = { 0, 0, 0, 0 };
 +	uint32_t t;
 +
-+	printf("mi8gpu: step 23: a shader that loads, SECVID_TRUST_CNTL %#x (%s)\n",
++	printf("mi8gpu: step 23: a shader that computes, SECVID_TRUST_CNTL %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE");
 +	for (t = 0; t < n_plan; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
@@ -3228,6 +3221,13 @@ new file mode 100644
 +		mark[0] = mark[1] = mark[2] = 0;
 +		memcpy(shader, cs_program, sizeof(cs_program));
 +		shader[0] = (uint32_t)(base + CS_RESULT_OFF);
++		if ((plan[t].flags & CS_F_Q_NOALU) != 0) {
++			/* the A/B control: put exactly the add.u slot back to a nop */
++			shader[2u * CS_ALU_IDX] = 0;
++			shader[2u * CS_ALU_IDX + 1u] = 0;
++		}
++		expected[t] = ((plan[t].flags & CS_F_Q_NOALU) != 0)
++		    ? plan[t].seed : (uint32_t)(plan[t].seed + CS_ALU_IMM);
 +		to_memory((vm_offset_t)memptrs, 0x1000);
 +		cs_seed_value = plan[t].seed;
 +		printf("mi8gpu: step 23 launch %c: %s (seed 0x%08x at %#llx)\n",
@@ -3249,9 +3249,10 @@ new file mode 100644
 +		/* the B38-onward shape, so the judge's result/fence/FSR regex still fits */
 +		printf("mi8gpu: step 23 launch %c: result 0x%08x, fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x\n",
 +		    'A' + t, ctl[t], *fence, fsr_before, fsr_after);
-+		printf("mi8gpu: step 23 launch %c: loaded 0x%08x, seed 0x%08x, cp-seed 0x%08x, inv %u\n",
-+		    'A' + t, loaded[t], plan[t].seed, seed_seen,
-+		    ((plan[t].flags & CS_F_Q_INV) != 0) ? 1u : 0u);
++		printf("mi8gpu: step 23 launch %c: computed 0x%08x, seed 0x%08x, expected 0x%08x, cp-seed 0x%08x, inv %u, alu %u\n",
++		    'A' + t, loaded[t], plan[t].seed, expected[t], seed_seen,
++		    ((plan[t].flags & CS_F_Q_INV) != 0) ? 1u : 0u,
++		    ((plan[t].flags & CS_F_Q_NOALU) != 0) ? 0u : 1u);
 +		printf("mi8gpu: step 23 launch %c: FSYNR0 0x%08x, FAR 0x%llx%08x\n", 'A' + t,
 +		    rd(cb + CB_FSYNR0), (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
 +		if (*fence != (0xf00d0000u | (0x41u + plan[t].tag))) {
@@ -3278,10 +3279,13 @@ new file mode 100644
 +			faulted[t] = true;
 +			printf("mi8gpu: step 23 VERDICT launch %c: the bank faulted (%#010x -> %#010x)\n", 'A' + t,
 +			    fsr_before, fsr_after);
-+		} else if (ctl[t] == CS_WANT && loaded[t] == plan[t].seed) {
-+			printf("mi8gpu: step 23 VERDICT launch %c: BOTH STORES LANDED, LOAD FOLLOWED THE SEED\n", 'A' + t);
++		} else if (ctl[t] == CS_WANT && loaded[t] == expected[t]) {
++			printf("mi8gpu: step 23 VERDICT launch %c: %s\n", 'A' + t,
++			    ((plan[t].flags & CS_F_Q_NOALU) != 0)
++			    ? "COPY LANDED, ADD.U WAS PATCHED OUT"
++			    : "ADD.U RAN, RESULT IS SEED + 0x111");
 +		} else if (ctl[t] == CS_WANT) {
-+			printf("mi8gpu: step 23 VERDICT launch %c: control stored, THE LOAD DID NOT\n", 'A' + t);
++			printf("mi8gpu: step 23 VERDICT launch %c: control stored, THE VALUE IS NOT THE EXPECTED ONE\n", 'A' + t);
 +		} else {
 +			printf("mi8gpu: step 23 VERDICT launch %c: even the control store is missing\n", 'A' + t);
 +		}
@@ -3293,7 +3297,7 @@ new file mode 100644
 +			break;
 +		}
 +	}
-+	printf("mi8gpu: step 23 LOAD TABLE: control 0badf00d, then the value the SP read\n");
++	printf("mi8gpu: step 23 ALU TABLE: control 0badf00d, then seed or seed + 0x111\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
@@ -3303,8 +3307,12 @@ new file mode 100644
 +			v = "the bank faulted";
 +		} else if (ctl[t] != CS_WANT) {
 +			v = "the program did not store";
++		} else if (loaded[t] == expected[t]) {
++			v = ((plan[t].flags & CS_F_Q_NOALU) != 0) ? "COPY OK (alu off)" : "ALU OK (seed + 0x111)";
++		} else if (loaded[t] == plan[t].seed) {
++			v = "plain copy -- add.u had no effect";
 +		} else {
-+			v = loaded[t] == plan[t].seed ? "LOAD + STORE OK" : "load did not follow";
++			v = "unexpected value";
 +		}
 +		printf("mi8gpu: step 23   %c  %-46s  %s\n", 'A' + t, plan[t].what, v);
 +	}
@@ -3312,15 +3320,17 @@ new file mode 100644
 +		uint32_t n_ok = 0;
 +
 +		for (t = 0; t < n_plan; t++) {
-+			if (reached[t] == 3 && !faulted[t] && ctl[t] == CS_WANT && loaded[t] == plan[t].seed) {
++			if (reached[t] == 3 && !faulted[t] && ctl[t] == CS_WANT && loaded[t] == expected[t]) {
 +				n_ok++;
 +			}
 +		}
-+		printf("mi8gpu: step 23 SUMMARY: %u of %u launches read their seed and stored it\n", n_ok, n_plan);
++		printf("mi8gpu: step 23 SUMMARY: %u of %u launches produced the expected value\n", n_ok, n_plan);
 +		if (ctl[0] != CS_WANT) {
 +			printf("mi8gpu: step 23 SUMMARY: even the control store failed; not comparable\n");
++		} else if (n_ok == n_plan) {
++			printf("mi8gpu: step 23 SUMMARY: THE ALU RAN ON EVERY LAUNCH; the nop controls copied\n");
 +		} else {
-+			printf("mi8gpu: step 23 SUMMARY: INV rings must follow; NO-INV rings must go stale\n");
++			printf("mi8gpu: step 23 SUMMARY: the two pairs did not separate; add.u is not load-bearing as built\n");
 +		}
 +	}
 +	cs_hole_sensor();
