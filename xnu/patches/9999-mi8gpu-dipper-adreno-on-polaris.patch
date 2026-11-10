@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6021 @@
+@@ -0,0 +1,6029 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -3340,6 +3340,11 @@ new file mode 100644
 +		expected3[t] = ((plan[t].flags & CS_F_Q_NOPVT) != 0)
 +		    ? 0u : (uint32_t)(plan[t].constval + CS_ALU2_IMM);
 +		to_memory((vm_offset_t)memptrs, 0x1000);
++		/* B54: the pvt clear above is a CPU write like any other. Without this
++		 * flush the core would read stale DRAM, and pvt-raw would read the
++		 * cached zero back -- B53's exact signature, for free, as a false
++		 * negative. The clear and the region must travel together. */
++		to_memory((vm_offset_t)g3d_regions[G3D_R_PVTMEM].memory, 0x1000);
 +		cs_const_value = plan[t].constval;
 +		printf("mi8gpu: step 23 launch %c: %s (const 0x%08x, sentinel 0x%08x)\n",
 +		    'A' + t, plan[t].what, plan[t].constval, (uint32_t)CS_CONST_SENTINEL);
@@ -3352,6 +3357,9 @@ new file mode 100644
 +		drained = cs_launch(plan[t].flags, plan[t].tag, plan[t].what);
 +		sleep_us(2000);
 +		from_memory((vm_offset_t)memptrs, 0x1000);
++		/* B54: drop the cached copy of the pvt page before reading it, or the
++		 * CPU returns the zero it wrote and never sees the core's store. */
++		from_memory((vm_offset_t)g3d_regions[G3D_R_PVTMEM].memory, 0x1000);
 +		fsr_after = rd(cb + CB_FSR);
 +		ctl[t] = result[0];
 +		loaded[t] = result[2];
