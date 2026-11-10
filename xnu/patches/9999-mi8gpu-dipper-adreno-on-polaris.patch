@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6029 @@
+@@ -0,0 +1,6073 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -3275,11 +3275,20 @@ new file mode 100644
 +	 * equal c0.x + 0x222 once the configuration takes effect.
 +	 *
 +	 * B54 IS THE CONFIGURATION RUNG: B53 proved PARAM=0 / SIZE=0 produces
-+	 * nothing at all (run 42824810251, no fault, no write, no reload). This
-+	 * rung changes ONLY g3d_regions[]/pvt_iova, PARAM 0->1, SIZE 0->64 and
-+	 * the two pvt-raw addresses; the 32 instruction words are byte-for-byte
-+	 * B53. A zero pvt-raw with a matching result[6] now means the hardware
-+	 * applied the fiber/wave/SP transform of a6xx.xml:3753-3763.
++	 * nothing at all (run 42824810251, no fault, no write, no reload). It
++	 * changed ONLY g3d_regions[]/pvt_iova, PARAM 0->1, SIZE 0->64 and the
++	 * two pvt-raw addresses; the 32 instruction words were byte-for-byte
++	 * B53. It worked: result[6] followed c0.x + 0x222 (run 42835349817).
++	 *
++	 * B55 IS THE LOCALISATION RUNG: B54's pvt-raw (the region's FIRST dword)
++	 * was still 0 while result[6] matched, so the store landed somewhere the
++	 * fiber/wave/SP transform of a6xx.xml:3753-3763 chose, not at BASE+0.
++	 * This rung keeps the region size, pvt_iova, PARAM, SIZE and every one
++	 * of the 32 instruction words identical to B54; it only clears the whole
++	 * region before each launch and scans the whole region afterwards, so
++	 * pvt-first / pvt-last / pvt-hits / pvt-nz say WHERE the writes went.
++	 * pvt-nz is what makes a nop control that writes some OTHER value
++	 * visible; hits alone would only see the value the pvt path stores.
 +	 */
 +	static const struct {
 +		uint32_t flags;
@@ -3303,9 +3312,14 @@ new file mode 100644
 +	uint32_t expected[4] = { 0, 0, 0, 0 };
 +	uint32_t expected2[4] = { 0, 0, 0, 0 };
 +	uint32_t expected3[4] = { 0, 0, 0, 0 };	/* B52: result[6] */
++	/* B55: the region is walked as a whole, so its base and word count are
++	 * computed once. The probe no longer asks "what is at BASE+0" but
++	 * "where inside the 256 KB did anything land". */
++	volatile uint32_t *pvt_mem = (volatile uint32_t *)((vm_offset_t)g3d_regions[G3D_R_PVTMEM].memory);
++	const uint32_t pvt_words = g3d_regions[G3D_R_PVTMEM].size / 4u;
 +	uint32_t t;
 +
-+	printf("mi8gpu: step 23: a shader against configured private memory, SECVID_TRUST_CNTL %#x (%s)\n",
++	printf("mi8gpu: step 23: a shader whose private writes are located, SECVID_TRUST_CNTL %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE");
 +	for (t = 0; t < n_plan; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
@@ -3317,8 +3331,14 @@ new file mode 100644
 +		for (uint32_t k = 0; k < 8u; k++) {
 +			result[k] = 0;
 +		}
-+		/* B53/B54: clear the pvt-memory base so pvt-raw is per-launch evidence */
-+		*(volatile uint32_t *)((vm_offset_t)g3d_regions[G3D_R_PVTMEM].memory) = 0;
++		/* B55: clear the WHOLE region, not just its first word. Every non-zero
++		 * dword the scan finds afterwards then belongs to THIS launch, and a
++		 * nop control that writes anywhere is as visible as one that writes at
++		 * BASE+0. 256 KB is microseconds; not doing it fills the scan with the
++		 * previous launch's values and makes every offset meaningless. */
++		for (uint32_t k = 0; k < pvt_words; k++) {
++			pvt_mem[k] = 0;
++		}
 +		*(volatile uint32_t *)((vm_offset_t)memptrs + CS_SEED_OFF) = 0;
 +		*fence = 0;
 +		mark[0] = mark[1] = mark[2] = 0;
@@ -3344,7 +3364,7 @@ new file mode 100644
 +		 * flush the core would read stale DRAM, and pvt-raw would read the
 +		 * cached zero back -- B53's exact signature, for free, as a false
 +		 * negative. The clear and the region must travel together. */
-+		to_memory((vm_offset_t)g3d_regions[G3D_R_PVTMEM].memory, 0x1000);
++		to_memory((vm_offset_t)g3d_regions[G3D_R_PVTMEM].memory, g3d_regions[G3D_R_PVTMEM].size);
 +		cs_const_value = plan[t].constval;
 +		printf("mi8gpu: step 23 launch %c: %s (const 0x%08x, sentinel 0x%08x)\n",
 +		    'A' + t, plan[t].what, plan[t].constval, (uint32_t)CS_CONST_SENTINEL);
@@ -3359,7 +3379,7 @@ new file mode 100644
 +		from_memory((vm_offset_t)memptrs, 0x1000);
 +		/* B54: drop the cached copy of the pvt page before reading it, or the
 +		 * CPU returns the zero it wrote and never sees the core's store. */
-+		from_memory((vm_offset_t)g3d_regions[G3D_R_PVTMEM].memory, 0x1000);
++		from_memory((vm_offset_t)g3d_regions[G3D_R_PVTMEM].memory, g3d_regions[G3D_R_PVTMEM].size);
 +		fsr_after = rd(cb + CB_FSR);
 +		ctl[t] = result[0];
 +		loaded[t] = result[2];
@@ -3368,13 +3388,37 @@ new file mode 100644
 +		/* the instrument's own instrument: did the CP write the sentinel? */
 +		uint32_t seed_seen = *(volatile uint32_t *)((vm_offset_t)memptrs + CS_SEED_OFF);
 +		/* B53/B54: did stp really write the pvt base? CPU reads the region back. */
-+		uint32_t pvt_raw = *(volatile uint32_t *)((vm_offset_t)g3d_regions[G3D_R_PVTMEM].memory);
++		uint32_t pvt_raw = pvt_mem[0];
++		/* B55: WHERE did it write? The region was cleared and flushed before the
++		 * launch, so every non-zero dword now belongs to this launch. pvt-hits
++		 * counts dwords equal to c0.x + 0x222 (what the private path stores);
++		 * pvt-nz counts every non-zero dword, so a nop control that writes some
++		 * OTHER value is caught too. Offsets are bytes from the region base. */
++		uint32_t want3 = (uint32_t)(plan[t].constval + CS_ALU2_IMM);
++		uint32_t pvt_hits = 0, pvt_nz = 0, pvt_first = 0xffffffffu, pvt_last = 0;
++
++		for (uint32_t k = 0; k < pvt_words; k++) {
++			uint32_t v = pvt_mem[k];
++
++			if (v == 0) {
++				continue;
++			}
++			pvt_nz++;
++			if (v == want3) {
++				if (pvt_hits == 0) {
++					pvt_first = k * 4u;
++				}
++				pvt_last = k * 4u;
++				pvt_hits++;
++			}
++		}
 +		/* the B38-onward shape, so the judge's result/fence/FSR regex still fits */
 +		printf("mi8gpu: step 23 launch %c: result 0x%08x, fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x\n",
 +		    'A' + t, ctl[t], *fence, fsr_before, fsr_after);
-+		printf("mi8gpu: step 23 launch %c: computed 0x%08x, computed2 0x%08x, computed3 0x%08x, const 0x%08x, expected 0x%08x, expected2 0x%08x, expected3 0x%08x, cp-seed 0x%08x, pvt-raw 0x%08x, inv %u, pvt %u, groups %u\n",
++		printf("mi8gpu: step 23 launch %c: computed 0x%08x, computed2 0x%08x, computed3 0x%08x, const 0x%08x, expected 0x%08x, expected2 0x%08x, expected3 0x%08x, cp-seed 0x%08x, pvt-raw 0x%08x, pvt-hits %u, pvt-first 0x%x, pvt-last 0x%x, pvt-nz %u, inv %u, pvt %u, groups %u\n",
 +		    'A' + t, loaded[t], loaded2[t], loaded3[t], plan[t].constval,
 +		    expected[t], expected2[t], expected3[t], seed_seen, pvt_raw,
++		    pvt_hits, pvt_first, pvt_last, pvt_nz,
 +		    ((plan[t].flags & CS_F_Q_INV) != 0) ? 1u : 0u,
 +		    ((plan[t].flags & CS_F_Q_NOPVT) == 0) ? 1u : 0u,
 +		    (uint32_t)CS_GROUPS);
@@ -3424,7 +3468,7 @@ new file mode 100644
 +			break;
 +		}
 +	}
-+	printf("mi8gpu: step 23 PVT2 TABLE: control 0badf00d, invariants c0.x/(+0x222), PARAM=1 (512 B/fiber) SIZE=64 (64 KB/SP) STACK=0, pvt rings result[6] = c0.x+0x222 and pvt-raw = c0.x+0x222, nop controls 0\n");
++	printf("mi8gpu: step 23 PVT3 TABLE: control 0badf00d, invariants c0.x/(+0x222), 256 KB region cleared before and scanned after every launch, pvt rings result[6] = c0.x+0x222, nop controls pvt-nz 0\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
@@ -3436,7 +3480,7 @@ new file mode 100644
 +			v = "the program did not store";
 +		} else if (loaded[t] == expected[t] && loaded2[t] == expected2[t]
 +		    && loaded3[t] == expected3[t]) {
-+			v = ((plan[t].flags & CS_F_Q_NOPVT) != 0) ? "CONFIGURED-PVT NOP CONTROL OK (result[6] stayed zero)" : "CONFIGURED PVT ROUND TRIP OK (result[6] == c0.x + 0x222)";
++			v = ((plan[t].flags & CS_F_Q_NOPVT) != 0) ? "PVT3 NOP CONTROL OK (region stayed empty)" : "PVT3 ROUND TRIP OK (result[6] == c0.x + 0x222)";
 +		} else if (loaded[t] == expected[t] && loaded2[t] == expected2[t]) {
 +			v = "PRIVATE ROUND-TRIP VALUE WRONG (the invariant pair still matched)";
 +		} else if (loaded3[t] == CS_CONST_SENTINEL || loaded3[t] == (uint32_t)(CS_CONST_SENTINEL + CS_ALU2_IMM)) {
@@ -3460,7 +3504,7 @@ new file mode 100644
 +		if (ctl[0] != CS_WANT) {
 +			printf("mi8gpu: step 23 SUMMARY: even the control store failed; not comparable\n");
 +		} else if (n_ok == n_plan) {
-+			printf("mi8gpu: step 23 SUMMARY: PRIVATE MEMORY EXISTS ONCE IT IS CONFIGURED -- result[6] and pvt-raw both followed c0.x; the nop controls stayed zero\n");
++			printf("mi8gpu: step 23 SUMMARY: PRIVATE WRITES LOCATED IN THE REGION -- result[6] followed c0.x on every pvt ring, the scan found c0.x+0x222 at pvt-first, and the nop controls left the 256 KB empty\n");
 +		} else {
 +			printf("mi8gpu: step 23 SUMMARY: the private-memory program did not separate the pairs\n");
 +		}
