@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5992 @@
+@@ -0,0 +1,6002 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2601,9 +2601,9 @@ new file mode 100644
 +#define CS_F_Q_INV	0x400u	/* CACHE_INVALIDATE between the seed write and CP_EXEC_CS */
 +#define CS_F_Q_NOALU	0x800u	/* B47: patch the add.u back to a nop in this ring */
 +#define CS_F_Q_NOJUMP	0x1000u	/* B51: patch slot 7's compiled jump back to a nop */
-+#define CS_F_Q_NOLOCAL	0x2000u	/* B52: patch the ten local-path slots back to nops */
-+#define CS_LOCAL_FIRST	21u	/* B52: slot of the stl */
-+#define CS_LOCAL_LAST	30u	/* B52: slot of the stg to result[6] */
++#define CS_F_Q_NOPVT	0x2000u	/* B53: patch the ten private-path slots back to nops */
++#define CS_PVT_FIRST	21u	/* B53: slot of the stp */
++#define CS_PVT_LAST	30u	/* B53: slot of the stg to result[6] */
 +#define CS_JUMP_IDX	7u	/* B51: slot of the real compiled cat0 jump */
 +#define CS_JUMP_IMM	2u	/* B51: target = slot 7 + 2 = slot 9 */
 +#define CS_ALU_IMM	0x111u	/* add.u r1.y, r1.y, 0x111 */
@@ -2617,47 +2617,50 @@ new file mode 100644
 +static uint32_t cs_const_value;	/* B48: CP_LOAD_STATE6_FRAG uploads this as c0.x */
 +
 +/*
-+ * B52: a REAL compiled local/shared-memory round trip (stl -> ldl -> stg).
++ * B53: private memory (stp -> ldp -> stg) with ZERO state changes.
 + *
-+ * B51 proved a real compiled cat0 branch executes on this minimal a6xx gen1
-+ * state (BRANCHSTACK 0, no preamble, no HLSQ_CS_CTRL_REG1). What remains of
-+ * HANDOFF 5b.28 item 6 is pvtmem / constlen management and loading a whole
-+ * compiled program. Before touching any of the four SP_CS_PVT_MEM_* regs,
-+ * take the cheapest remaining structural feature: LOCAL (shared) MEMORY.
++ * B52 proved a real compiled local-memory round trip runs on this minimal
++ * a6xx gen1 state. HANDOFF 5b.28 item 6 is now down to pvtmem / constlen
++ * management and loading a whole compiled program. B51 and B52 established
++ * the method: prove the REAL instruction runs on the minimal state FIRST,
++ * and add state only if it fails. B53 does that for private memory.
 + *
 + * Ground truth, not transcription:
-+ *   isa/ir3-cat6.xml:396-411 (#instruction-cat6-a3xx-ld), :516-542
-+ *   (#instruction-cat6-a3xx-st), :802-806 "Still used as of a6xx for local".
-+ *   tests/reference/compute-a540.log:446-452, a REAL compiled shader:
-+ *     stl.u32 l[r0.y], r0.y, 1  = 0x01800002 0xc1060300
-+ *     (rpt4)nop                 = five latency slots
-+ *     stl.u32 l[r0.x], r0.z, 1  = 0x01800004 0xc1060100
-+ *     ldl.u32 r0.x, l[r0.y], 1  = 0x01804001 0xc0460000
-+ *     (ss)nop                   = 0x00000000 0x00001000  (cat0.xml:41, SS bit44)
-+ *     stgb ... g[0], r0.x       = the consumer
-+ *   _ir3enc.py reproduces all three real words bit-for-bit before deriving
-+ *   the B52 words (the fifth independent calibration chain).
++ *   isa/ir3-cat6.xml:423 (ldp) and :555 (stp) both extend the SAME
++ *     #instruction-cat6-a3xx-ld / #instruction-cat6-a3xx-st skeletons B52
++ *     calibrated against a real compiled shader. ONLY the 5-bit OPC changes:
++ *       stl 00100 -> stp 00101    ldl 00001 -> ldp 00010
++ *   ir3/tests/disasm.c:364,480-486: SEVEN Mesa disassembler unit-test words
++ *     covering f32/u16 TYPEs, negative and +256 offsets, sizes 1/2/3.
++ *     _ir3enc.py reproduces all seven bit-for-bit before deriving these
++ *     words (the sixth independent calibration chain).
 + *
-+ * THE ONE VARIABLE: the ten EMPTY slots 21..30 of B51's second instruction
-+ * group. The cat0 jump at slot 7 stays ON IN EVERY RING, so result[2] = c0.x
-+ * and result[4] = c0.x + 0x222 are INVARIANTS -- they prove the program is
-+ * still B51's. The only switch is CS_F_Q_NOLOCAL, which patches slots 21..30
-+ * back to nops on A/D. r2.y is 0 (slot 1), the local address; r0.x was unused.
++ * KEY FINDING: cs_launch() ALREADY emits all four SP_CS_PVT_MEM_* regs.
++ * BASE points at a mapped page (CS_PVT_OFF); PARAM=0, SIZE=0,
++ * STACK_OFFSET=0 (a6xx.xml:3734-3752; computerator/a6xx.cc:256-277 emits
++ * them only when pvtmem_size > 0). So the earlier estimate "we must touch
++ * four registers" was wrong: only PARAM/SIZE would need non-zero values.
 + *
-+ *   21 stl.u32 l[r2.y], r1.y, 1
-+ *   22..26 five nops          (the compiled (rpt4)nop delay)
-+ *   27 ldl.u32 r0.x, l[r2.y], 1
-+ *   28 (ss)nop                (the compiled post-load sync)
-+ *   29 nop
-+ *   30 stg.u32 g[r2.x+0x18], r0.x, 1 (sy)  -> result[6]
++ * THE ONE EXPERIMENTAL VARIABLE: two dwords.
++ *   slot 21 stl 0x0180000a 0xc1061300 -> stp 0x0180000a 0xc1461300
++ *   slot 27 ldl 0x01824001 0xc0460000 -> ldp 0x01824001 0xc0860000
++ * Every other instruction word, every state register, the const upload,
++ * the grid, CACHE_INVALIDATE, the fence and the cp-seed sentinel are
++ * byte-for-byte B52. The cat0 jump at slot 7 stays ON in every ring, so
++ * result[2] = c0.x and result[4] = c0.x + 0x222 are INVARIANTS.
 + *
-+ *   no-local (A/D): result[6] = 0            -- only the new stg can write it
-+ *   local    (B/C): result[6] = c0.x + 0x222
++ *   no-pvt (A/D, CS_F_Q_NOPVT patches 21..30 to nops): result[6] = 0
++ *   pvt    (B/C):                                      result[6] = c0.x + 0x222
 + *
-+ * NO state register changes: SP_CS_CNTL_1.shared_size stays 1 (a6xx.xml:
-+ * 4126-4130, (SHARED_SIZE+1)*1k = 2 KB), SP_CS_INSTR_SIZE stays 2,
-+ * BRANCHSTACK stays 0. Const upload, grid, CACHE_INVALIDATE, fence and
-+ * cp-seed sentinel are byte-for-byte B51. result[0] stays 0badf00d.
++ * 判据的判据: cs_probe() also clears and reads CS_PVT_OFF directly and
++ * prints `pvt-raw`. If stp really wrote the pvt-memory base it follows
++ * c0.x; if it stays zero while result[6] matches, the hardware applied a
++ * fiber/wave address transform (a6xx.xml:3753-3763) and the reload still
++ * proves the store. pvt-raw must be ZERO on the nop controls.
++ *
++ * If result[6] stays 0 or the bank faults, the next rung changes ONLY
++ * SP_CS_PVT_MEM_PARAM.MEMSIZEPERITEM and SP_CS_PVT_MEM_SIZE.
++ * TOTALPVTMEMSIZE -- do NOT blame "real shaders cannot run".
 + */
 +static const uint32_t cs_program[CS_PROGRAM_WORDS] = {
 +	0xfeed0001u, 0x204cc008u,	/* mov.u32u32 r2.x, <result address> (patched) */
@@ -2681,13 +2684,13 @@ new file mode 100644
 +	0x00000000u, 0x00000000u,	/* B50 LATENCY SLOT 2/3 -- the ONE change */
 +	0x00000000u, 0x00000000u,	/* B50 LATENCY SLOT 3/3 -- the ONE change */
 +	0x0180000au, 0xd0c61110u,	/* stg.u32 g[r2.x+0x10], r1.y, 1 (sy) -> result[4] (moved from slot 17) */
-+	0x0180000au, 0xc1061300u,	/* B52: REAL-compiled-shape stl.u32 l[r2.y], r1.y, 1 */
++	0x0180000au, 0xc1461300u,	/* B53: stp.u32 p[r2.y], r1.y, 1 (OPC 4 -> 5) */
 +	0x00000000u, 0x00000000u,	/* nop: the compiled (rpt4)nop delay 1/5 */
 +	0x00000000u, 0x00000000u,	/* nop: the compiled (rpt4)nop delay 2/5 */
 +	0x00000000u, 0x00000000u,	/* nop: the compiled (rpt4)nop delay 3/5 */
 +	0x00000000u, 0x00000000u,	/* nop: the compiled (rpt4)nop delay 4/5 */
 +	0x00000000u, 0x00000000u,	/* nop: the compiled (rpt4)nop delay 5/5 */
-+	0x01824001u, 0xc0460000u,	/* B52: REAL-compiled-shape ldl.u32 r0.x, l[r2.y], 1 */
++	0x01824001u, 0xc0860000u,	/* B53: ldp.u32 r0.x, p[r2.y], 1 (OPC 1 -> 2) */
 +	0x00000000u, 0x00001000u,	/* B52: REAL compiled (ss)nop -- cat0 SS (ir3-cat0.xml:41), post-load sync */
 +	0x00000000u, 0x00000000u,	/* nop: one more latency slot before the consumer */
 +	0x01800000u, 0xd0c61118u,	/* B52: stg.u32 g[r2.x+0x18], r0.x, 1 (sy) -> result[6] */
@@ -3238,23 +3241,26 @@ new file mode 100644
 +	const uint64_t base = g3d_regions[2].address;
 +	uint32_t *shader = (uint32_t *)((vm_offset_t)memptrs + CS_PROGRAM_OFF);
 +	/*
-+	 * B52: does a REAL compiled local/shared-memory round trip work here?
++	 * B53: does a REAL compiled private-memory round trip work with the
++	 * pvtmem registers at their B52 values (PARAM=0, SIZE=0)?
 +	 *
-+	 * Slots 21..30 now hold stl -> five nops -> ldl -> (ss)nop -> nop -> stg,
-+	 * the shape of a real compiled a540 compute shader (see cs_program).
-+	 * The cat0 jump at slot 7 stays ON IN EVERY RING, so
++	 * Slots 21..30 are B52's shape with ONLY the two OPC fields changed:
++	 * stp -> five nops -> ldp -> (ss)nop -> nop -> stg. The cat0 jump at
++	 * slot 7 stays ON IN EVERY RING, so
 +	 *
 +	 *   result[2] = c0.x         (invariant, group 1's add.u is skipped)
 +	 *   result[4] = c0.x + 0x222 (invariant, group 2's add.u landed)
-+	 *   result[6] = 0            on A/D (CS_F_Q_NOLOCAL patches 21..30 to nops)
-+	 *             = c0.x + 0x222 on B/C (the local round trip)
++	 *   result[6] = 0            on A/D (CS_F_Q_NOPVT patches 21..30 to nops)
++	 *             = c0.x + 0x222 on B/C (the private round trip)
 +	 *
-+	 * result[6] can ONLY be written by the new stg at slot 30, and the
-+	 * invariant pair proves the B51 program is still intact. Four distinct
-+	 * uploads, all INVated, one shared cleared target (result[0..7]), the
-+	 * 0xdeadbeef sentinel at cp-seed, SP_CS_INSTR_SIZE reads back 2, zero
-+	 * faults. If result[6] stays 0 on B/C, the next rung asks which half of
-+	 * the round trip failed -- do NOT blame "real shaders cannot run".
++	 * result[6] can ONLY be written by the new stg at slot 30. Four distinct
++	 * uploads, all INVated, one shared cleared target, the 0xdeadbeef
++	 * sentinel at cp-seed, SP_CS_INSTR_SIZE reads back 2, zero faults.
++	 * EXTRA: CS_PVT_OFF is cleared before each launch and read back by the
++	 * CPU as `pvt-raw` -- a direct check that stp wrote the pvt base rather
++	 * than ldp merely re-reading a stale line. If result[6] stays 0 or the
++	 * bank faults, the next rung changes ONLY PARAM.MEMSIZEPERITEM and
++	 * SIZE.TOTALPVTMEMSIZE (a6xx.xml:3734-3752).
 +	 */
 +	static const struct {
 +		uint32_t flags;
@@ -3262,10 +3268,10 @@ new file mode 100644
 +		uint32_t constval;
 +		const char *what;
 +	} plan[4] = {
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOLOCAL, 0u, 0x5eedc0deu, "LOCAL 1: nop control, result[6] must stay zero" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  1u, 0xa5a5c3c3u, "LOCAL 2: stl/ldl round trip must return c0.x+0x222" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  2u, 0x1badb002u, "LOCAL 3: a third different upload, same local path" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOLOCAL,  3u, 0x2f00d123u, "LOCAL 4: closing nop control, result[6] zero again" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOPVT, 0u, 0x5eedc0deu, "PVT 1: nop control, result[6] must stay zero" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  1u, 0xa5a5c3c3u, "PVT 2: stp/ldp round trip must return c0.x+0x222" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  2u, 0x1badb002u, "PVT 3: a third different upload, same private path" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOPVT,  3u, 0x2f00d123u, "PVT 4: closing nop control, result[6] zero again" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
@@ -3280,7 +3286,7 @@ new file mode 100644
 +	uint32_t expected3[4] = { 0, 0, 0, 0 };	/* B52: result[6] */
 +	uint32_t t;
 +
-+	printf("mi8gpu: step 23: a shader with a real compiled local-memory round trip, SECVID_TRUST_CNTL %#x (%s)\n",
++	printf("mi8gpu: step 23: a shader with a compiled private-memory round trip, SECVID_TRUST_CNTL %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE");
 +	for (t = 0; t < n_plan; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
@@ -3292,25 +3298,27 @@ new file mode 100644
 +		for (uint32_t k = 0; k < 8u; k++) {
 +			result[k] = 0;
 +		}
++		/* B53: clear the pvt-memory base so pvt-raw is per-launch evidence */
++		*(volatile uint32_t *)((vm_offset_t)memptrs + CS_PVT_OFF) = 0;
 +		*(volatile uint32_t *)((vm_offset_t)memptrs + CS_SEED_OFF) = 0;
 +		*fence = 0;
 +		mark[0] = mark[1] = mark[2] = 0;
 +		memcpy(shader, cs_program, sizeof(cs_program));
 +		shader[0] = (uint32_t)(base + CS_RESULT_OFF);
-+		if ((plan[t].flags & CS_F_Q_NOLOCAL) != 0) {
-+			/* the A/D control: put the whole local-memory path back to nops.
++		if ((plan[t].flags & CS_F_Q_NOPVT) != 0) {
++			/* the A/D control: put the whole private-memory path back to nops.
 +			 * Slots 22..26 and 29 are already nops, so numerically only
-+			 * 21 (stl), 27 (ldl), 28 ((ss)nop) and 30 (stg) change. */
-+			for (uint32_t k = CS_LOCAL_FIRST; k <= CS_LOCAL_LAST; k++) {
++			 * 21 (stp), 27 (ldp), 28 ((ss)nop) and 30 (stg) change. */
++			for (uint32_t k = CS_PVT_FIRST; k <= CS_PVT_LAST; k++) {
 +				shader[2u * k] = 0;
 +				shader[2u * k + 1u] = 0;
 +			}
 +		}
-+		/* B52: the cat0 jump stays ON in all four rings, so result[2] and
-+		 * result[4] are invariants. The ONLY variable is the local path. */
++		/* B53: the cat0 jump stays ON in all four rings, so result[2] and
++		 * result[4] are invariants. The ONLY variable is the private path. */
 +		expected[t] = plan[t].constval;
 +		expected2[t] = (uint32_t)(plan[t].constval + CS_ALU2_IMM);
-+		expected3[t] = ((plan[t].flags & CS_F_Q_NOLOCAL) != 0)
++		expected3[t] = ((plan[t].flags & CS_F_Q_NOPVT) != 0)
 +		    ? 0u : (uint32_t)(plan[t].constval + CS_ALU2_IMM);
 +		to_memory((vm_offset_t)memptrs, 0x1000);
 +		cs_const_value = plan[t].constval;
@@ -3332,14 +3340,16 @@ new file mode 100644
 +		loaded3[t] = result[6];	/* B52: only the new stg can write this */
 +		/* the instrument's own instrument: did the CP write the sentinel? */
 +		uint32_t seed_seen = *(volatile uint32_t *)((vm_offset_t)memptrs + CS_SEED_OFF);
++		/* B53: did stp really write the pvt-memory base? CPU reads it back. */
++		uint32_t pvt_raw = *(volatile uint32_t *)((vm_offset_t)memptrs + CS_PVT_OFF);
 +		/* the B38-onward shape, so the judge's result/fence/FSR regex still fits */
 +		printf("mi8gpu: step 23 launch %c: result 0x%08x, fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x\n",
 +		    'A' + t, ctl[t], *fence, fsr_before, fsr_after);
-+		printf("mi8gpu: step 23 launch %c: computed 0x%08x, computed2 0x%08x, computed3 0x%08x, const 0x%08x, expected 0x%08x, expected2 0x%08x, expected3 0x%08x, cp-seed 0x%08x, inv %u, local %u, groups %u\n",
++		printf("mi8gpu: step 23 launch %c: computed 0x%08x, computed2 0x%08x, computed3 0x%08x, const 0x%08x, expected 0x%08x, expected2 0x%08x, expected3 0x%08x, cp-seed 0x%08x, pvt-raw 0x%08x, inv %u, pvt %u, groups %u\n",
 +		    'A' + t, loaded[t], loaded2[t], loaded3[t], plan[t].constval,
-+		    expected[t], expected2[t], expected3[t], seed_seen,
++		    expected[t], expected2[t], expected3[t], seed_seen, pvt_raw,
 +		    ((plan[t].flags & CS_F_Q_INV) != 0) ? 1u : 0u,
-+		    ((plan[t].flags & CS_F_Q_NOLOCAL) == 0) ? 1u : 0u,
++		    ((plan[t].flags & CS_F_Q_NOPVT) == 0) ? 1u : 0u,
 +		    (uint32_t)CS_GROUPS);
 +		printf("mi8gpu: step 23 launch %c: FSYNR0 0x%08x, FAR 0x%llx%08x\n", 'A' + t,
 +		    rd(cb + CB_FSYNR0), (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
@@ -3371,7 +3381,7 @@ new file mode 100644
 +		    && loaded3[t] == expected3[t]) {
 +			printf("mi8gpu: step 23 VERDICT launch %c: ALL THREE STORES MATCHED\n", 'A' + t);
 +		} else if (ctl[t] == CS_WANT && loaded[t] == expected[t] && loaded2[t] == expected2[t]) {
-+			printf("mi8gpu: step 23 VERDICT launch %c: THE LOCAL ROUND TRIP DID NOT MATCH\n", 'A' + t);
++			printf("mi8gpu: step 23 VERDICT launch %c: THE PRIVATE ROUND TRIP DID NOT MATCH\n", 'A' + t);
 +		} else if (ctl[t] == CS_WANT && loaded[t] == expected[t]) {
 +			printf("mi8gpu: step 23 VERDICT launch %c: GROUP 1 STORED, GROUP 2 DID NOT\n", 'A' + t);
 +		} else if (ctl[t] == CS_WANT) {
@@ -3387,7 +3397,7 @@ new file mode 100644
 +			break;
 +		}
 +	}
-+	printf("mi8gpu: step 23 LOCAL TABLE: control 0badf00d, invariants c0.x/(+0x222), local rings result[6] = c0.x+0x222, nop controls 0\n");
++	printf("mi8gpu: step 23 PVT TABLE: control 0badf00d, invariants c0.x/(+0x222), pvt rings result[6] = c0.x+0x222, nop controls 0\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
@@ -3399,11 +3409,11 @@ new file mode 100644
 +			v = "the program did not store";
 +		} else if (loaded[t] == expected[t] && loaded2[t] == expected2[t]
 +		    && loaded3[t] == expected3[t]) {
-+			v = ((plan[t].flags & CS_F_Q_NOLOCAL) != 0) ? "NO-LOCAL CONTROL OK (result[6] stayed zero)" : "LOCAL ROUND TRIP OK (result[6] == c0.x + 0x222)";
++			v = ((plan[t].flags & CS_F_Q_NOPVT) != 0) ? "NO-PVT CONTROL OK (result[6] stayed zero)" : "PRIVATE ROUND TRIP OK (result[6] == c0.x + 0x222)";
 +		} else if (loaded[t] == expected[t] && loaded2[t] == expected2[t]) {
-+			v = "LOCAL ROUND-TRIP VALUE WRONG (the invariant pair still matched)";
++			v = "PRIVATE ROUND-TRIP VALUE WRONG (the invariant pair still matched)";
 +		} else if (loaded3[t] == CS_CONST_SENTINEL || loaded3[t] == (uint32_t)(CS_CONST_SENTINEL + CS_ALU2_IMM)) {
-+			v = "READ THE SENTINEL -- memory path, not local";
++			v = "READ THE SENTINEL -- memory path, not private";
 +		} else {
 +			v = "unexpected value";
 +		}
@@ -3423,9 +3433,9 @@ new file mode 100644
 +		if (ctl[0] != CS_WANT) {
 +			printf("mi8gpu: step 23 SUMMARY: even the control store failed; not comparable\n");
 +		} else if (n_ok == n_plan) {
-+			printf("mi8gpu: step 23 SUMMARY: THE COMPILED LOCAL-MEMORY ROUND TRIP STORED AND RELOADED; the nop controls stayed zero\n");
++			printf("mi8gpu: step 23 SUMMARY: THE COMPILED PRIVATE-MEMORY ROUND TRIP STORED AND RELOADED; the nop controls stayed zero\n");
 +		} else {
-+			printf("mi8gpu: step 23 SUMMARY: the local-memory program did not separate the pairs\n");
++			printf("mi8gpu: step 23 SUMMARY: the private-memory program did not separate the pairs\n");
 +		}
 +	}
 +	cs_hole_sensor();
