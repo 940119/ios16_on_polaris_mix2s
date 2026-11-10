@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6469 @@
+@@ -0,0 +1,6555 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2648,6 +2648,13 @@ new file mode 100644
 +#define RS_MARK(ph)	(0xc1de0000u | ((uint32_t)(ph) << 8) | (0x41u + RS_TAG))
 +#define RS_CNTL3	0x00000201u		/* B70b: BINW 32>>5 (0:5), BINH 32>>4 (8:14) */
 +#define RS_RB_OFF	0x640u			/* where CP_REG_TO_MEM drops the resolve readback */
++/* B71: the calibration probes. All five are C macros generated from the very
++ * constants this script asserts on, so the C and the model cannot drift. */
++#define RS_CAL_A	0x88d0u			/* RB_RESOLVE_CNTL_0: YUV plane, harmless */
++#define RS_CAL_B	0x88d1u			/* RB_RESOLVE_CNTL_1: rect origin, harmless */
++#define RS_CAL_CTL	0x0a9b0u			/* SP_CS_CNTL_0: the positive control */
++#define RS_CAL_VA	0x0000000au
++#define RS_CAL_VB	0x0000000bu
 +#define CS_CONST_SENTINEL 0xdeadbeefu	/* B48: memory value, deliberately != c0.x */
 +static uint32_t cs_const_value;	/* B48: CP_LOAD_STATE6_FRAG uploads this as c0.x */
 +
@@ -3811,6 +3818,84 @@ new file mode 100644
 +}
 +
 +/*
++ * B71: three questions, one ring, no behaviour changed.
++ *
++ * The resolve rung has produced two nulls, and the instrument meant to explain
++ * them returned values nobody wrote. A null read through a blind instrument is
++ * not evidence, so this runs before any more theory: can the CPU write and read
++ * this block, does a type-4 packet from the CP reach it, and can the CP read it
++ * back at all -- with a control register step 23 already reads non-zero through
++ * the same packet.
++ */
++static void
++rs_calibrate(void)
++{
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++	uint32_t w = cp_wptr & 8191u;
++	const uint64_t rb = g3d_regions[2].address + RS_RB_OFF + 0x20u;
++	volatile uint32_t *slot = (volatile uint32_t *)((vm_offset_t)g3d_regions[2].memory
++	    + RS_RB_OFF + 0x20u);
++	uint32_t back;
++
++	/* A: an MMIO write, read straight back. Nothing is in flight. */
++	wr(gpu3d + 4 * RS_CAL_A, RS_CAL_VA);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	back = rd(gpu3d + 4 * RS_CAL_A);
++	printf("mi8gpu: step 24 CAL A: the CPU wrote %#010x to %#07x, reads back %#010x\n",
++	    RS_CAL_VA, RS_CAL_A, back);
++
++	/* B and C share one ring, so a single drain answers both. */
++	wr(gpu3d + 4 * RS_CAL_B, 0u);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	slot[0] = 0;
++	slot[1] = 0;
++	to_memory((vm_offset_t)slot, 8u);
++	ring[w++ & 8191u] = pkt4(RS_CAL_B, 1u);		/* B: the write */
++	ring[w++ & 8191u] = RS_CAL_VB;
++	ring[w++ & 8191u] = pkt7(0x3eu, 3u);		/* C: control register */
++	ring[w++ & 8191u] = RS_CAL_CTL & 0x3ffffu;
++	ring[w++ & 8191u] = (uint32_t)rb;
++	ring[w++ & 8191u] = 0u;
++	ring[w++ & 8191u] = pkt7(0x3eu, 3u);		/* C: the register B just wrote */
++	ring[w++ & 8191u] = RS_CAL_B & 0x3ffffu;
++	ring[w++ & 8191u] = (uint32_t)(rb + 4u);
++	ring[w++ & 8191u] = 0u;
++	{
++		const uint32_t target_wptr = w & 8191u;
++
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, target_wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (uint32_t i = 0; i < 20000; i++) {
++			if (rd(gpu3d + 4 * 0x0806) == target_wptr) {
++				break;
++			}
++			sleep_us(10);
++		}
++		cp_wptr = target_wptr;
++		if (rd(gpu3d + 4 * 0x0806) != target_wptr) {
++			printf("mi8gpu: step 24 CAL: the CP did not drain the calibration ring; B and C are unmeasured\n");
++			wr(gpu3d + 4 * RS_CAL_A, 0u);
++			__asm__ volatile ("dsb sy" ::: "memory");
++			return;
++		}
++	}
++	sleep_us(1000);
++	from_memory((vm_offset_t)slot, 8u);
++
++	back = rd(gpu3d + 4 * RS_CAL_B);
++	printf("mi8gpu: step 24 CAL B: the CP wrote %#010x to %#07x by pkt4, the CPU reads %#010x\n",
++	    RS_CAL_VB, RS_CAL_B, back);
++	printf("mi8gpu: step 24 CAL C: CP_REG_TO_MEM %#07x wrote %#010x, control %#07x wrote %#010x\n",
++	    RS_CAL_B, slot[1], RS_CAL_CTL, slot[0]);
++
++	/* leave the block as it was found: neither probe register is read again */
++	wr(gpu3d + 4 * RS_CAL_A, 0u);
++	wr(gpu3d + 4 * RS_CAL_B, 0u);
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
 + * B70a: two phases against one target, so one boot answers both questions.
 + *
 + *   RS1  TYPE=STORE only. The CPU fills the target with 0xcdcdcdcd first, so
@@ -3890,6 +3975,7 @@ new file mode 100644
 +		    changed3, (unsigned)RS_DWORDS, rt[0], rt[RS_DWORDS], drained ? 1u : 0u);
 +	}
 +	rs_state_readback();
++	rs_calibrate();
 +	printf("mi8gpu: step 24 VERDICT: %s\n",
 +	    (changed3 > 0 && rs3_clipped)
 +	    ? "BIN GEOMETRY WAS THE GATE: with CNTL_3 non-zero the render backend wrote our buffer"
@@ -3898,7 +3984,7 @@ new file mode 100644
 +	    : (rs2_exact == RS_DWORDS && rs2_clipped)
 +	    ? "THE RESOLVE ENGINE WROTE THE COLOUR WE ASKED FOR, AND STOPPED AT THE RECTANGLE"
 +	    : (rs2_exact == 0 && rs2_clipped)
-+	    ? "STILL NOTHING with bin 32x32 -- RB_CCU_CNTL is the next single variable"
++	    ? "STILL NOTHING with bin 32x32 -- read the three CAL lines before naming a variable"
 +	    : "PARTIAL -- count the dwords above: the rectangle or the pitch is off");
 +}
 +
