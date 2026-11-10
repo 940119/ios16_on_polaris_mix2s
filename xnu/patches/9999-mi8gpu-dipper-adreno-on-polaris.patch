@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6361 @@
+@@ -0,0 +1,6362 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2643,6 +2643,7 @@ new file mode 100644
 +#define RS_DWORDS	(RS_W * RS_H)			/* 1024 dwords = 4 KB */
 +#define RS_TARGET_OFF	0u			/* inside the "rt" region */
 +#define RS_FILL		0xcdcdcdcdu			/* what the CPU leaves behind */
++#define RS_COLOR0	0x80402010u			/* clear colour DW0, i.e. what RS2 must find */
 +#define RS_TAG		4u			/* markers: 0..3 are the plans' */
 +#define RS_MARK(ph)	(0xc1de0000u | ((uint32_t)(ph) << 8) | (0x41u + RS_TAG))
 +#define CS_CONST_SENTINEL 0xdeadbeefu	/* B48: memory value, deliberately != c0.x */
@@ -3751,7 +3752,7 @@ new file mode 100644
 +	printf("mi8gpu: step 24: the render backend writes a buffer we own, RB resolve, %ux%u RGBA8, no shader\n",
 +	    (unsigned)RS_W, (unsigned)RS_H);
 +	printf("mi8gpu: step 24 RS TABLE: eleven resolve registers and CCU_RESOLVE 0x1e, linear RGBA8, GMEM offset 0, %u bytes, TYPE=STORE then TYPE=CLEAR\n",
-+	    (unsigned)RT_BYTES);
++	    (unsigned)(RS_DWORDS * 4u));
 +
 +	/* RS1: the CPU leaves a pattern the GPU has to destroy */
 +	for (i = 0; i < bytes / 4u; i++) {
@@ -3778,12 +3779,12 @@ new file mode 100644
 +	from_memory(g3d_regions[G3D_R_RT].memory, bytes);
 +	exact = 0;
 +	for (i = 0; i < RS_DWORDS; i++) {
-+		if (rt[i] == COLOR[0]) {
++		if (rt[i] == RS_COLOR0) {
 +			exact++;
 +		}
 +	}
 +	printf("mi8gpu: step 24 RS2: %u of %u dwords are %#010x, last %#010x, just past the rect %#010x, drained %u\n",
-+	    exact, (unsigned)RS_DWORDS, COLOR[0], rt[RS_DWORDS - 1u], rt[RS_DWORDS], drained ? 1u : 0u);
++	    exact, (unsigned)RS_DWORDS, RS_COLOR0, rt[RS_DWORDS - 1u], rt[RS_DWORDS], drained ? 1u : 0u);
 +	printf("mi8gpu: step 24 VERDICT: %s\n",
 +	    (exact == RS_DWORDS && rt[RS_DWORDS] == RS_FILL)
 +	    ? "THE RESOLVE ENGINE WROTE THE COLOUR WE ASKED FOR, AND STOPPED AT THE RECTANGLE"
