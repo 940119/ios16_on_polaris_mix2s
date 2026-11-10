@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5870 @@
+@@ -0,0 +1,5872 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -3130,35 +3130,35 @@ new file mode 100644
 +	 * each quirk gets its own ring and its own result word, two dwords apart, and
 +	 * a ring that leaves its word empty names the change that mattered.
 +	 *
-+	 * B42 answered (b): the second identical dispatch was silent too. But B42 also
-+	 * exposed a defect in the instrument that had been there since B38 -- each ring
-+	 * wrote to its own word and no ring ever cleared the previous one, so the magic
-+	 * scan reported 0x304 under every launch whether that launch wrote it or not.
-+	 * A dispatch that ran but stored to the address baked into a cached program
-+	 * image would have looked exactly like a dispatch that never ran.
++	 * B43 settled the instrument and with it four rounds of conclusions: a one-ring
++	 * launch stores, a repeated dispatch stores, and a state ring after them does not
++	 * stop the next one from storing. There is no poison and the split was never
++	 * needed -- B38-B42 read a target word nobody cleared.
 +	 *
-+	 * So this build fixes the reading before asking anything else: one target, the
-+	 * whole area zeroed before each launch. Then DISPATCH 2 is a real repeat test,
-+	 * and the combined ring after it is the first combined ring that can be read at
-+	 * all -- not because it is first, but because a cleared word cannot lie.
++	 * So B38's question can finally be asked. B37 changed three state fields and the
++	 * SP ran; which of them mattered has never been established, because every ring
++	 * built to answer it was confounded. Now each one can be put back inside a ring
++	 * that is otherwise known-good, all five in one boot: a base ring first, the
++	 * three reverts, and the base ring again. The closing ring is not decoration --
++	 * if a revert damages something that outlives its own ring, the closing ring is
++	 * what says so, and then the three readings between them mean nothing.
 +	 */
 +	static const struct {
 +		uint32_t flags;
 +		uint32_t tag;
 +		const char *what;
-+	} plan[6] = {
-+		{ CS_F_STATE,	0u, "CONTROL: the state alone, as B37 ran it (no dispatch)" },
-+		{ CS_F_EXEC,	1u, "CONTROL: the dispatch alone on that state -- B37's passing ring" },
-+		{ CS_F_EXEC,	2u, "DISPATCH 2: identical, on a target we cleared in between" },
-+		{ CS_F_STATE | CS_F_EXEC,		3u, "ONE ring: the combined launch, readable for the first time" },
-+		{ CS_F_STATE,	4u, "the state written once more" },
-+		{ CS_F_EXEC,	5u, "DISPATCH 4: after the combined ring" },
++	} plan[5] = {
++		{ CS_F_STATE | CS_F_EXEC,		0u, "BASE: the state B37 ships, in one ring (must store)" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_UAV,	1u, "put back: the old UAV load at block 0xd" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_SIZE,	2u, "put back: SP_CS_INSTR_SIZE counted in dwords (32)" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_REGS,	3u, "put back: SP_CS_CNTL_0's footprint, one register short" },
++		{ CS_F_STATE | CS_F_EXEC,		4u, "CLOSING: the base ring again (must store)" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
-+	bool faulted[6] = { false, false, false, false, false, false };
-+	int reached[6] = { 0, 0, 0, 0, 0, 0 };
-+	uint32_t stored[6] = { 0, 0, 0, 0, 0, 0 };
++	bool faulted[5] = { false, false, false, false, false };
++	int reached[5] = { 0, 0, 0, 0, 0 };
++	uint32_t stored[5] = { 0, 0, 0, 0, 0 };
 +	uint32_t t, n_stored = 0;
 +
 +	printf("mi8gpu: step 23: a shader, on a core whose SECVID_TRUST_CNTL reads %#x (%s)\n",
@@ -3275,30 +3275,32 @@ new file mode 100644
 +	}
 +	/*
 +	/*
-+	 * B43: with the target cleared, three separate questions become readable.
++	 * B44: two controls around three single-field reverts.
 +	 *
-+	 * DISPATCH 2 either stores or does not, and that is the repeat question with
-+	 * an instrument that can see it. Then the combined ring, which is only worth
-+	 * reading if the repeat worked -- otherwise its silence is the order again.
++	 * The base ring must store or nothing below it can be read. The closing ring
++	 * must store or a revert damaged something that outlives its own ring, which
++	 * would make the revert rings silent for a reason of their own.
 +	 */
-+	if (reached[1] != 3 || stored[1] != CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: THE FIRST DISPATCH DID NOT STORE -- nothing below it means anything\n");
-+	} else if (reached[2] == 3 && stored[2] == CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: A SECOND DISPATCH STORES once the target is cleared\n");
-+		if (reached[3] == 3 && stored[3] == CS_WANT) {
-+			printf("mi8gpu: step 23 SUMMARY: and the ONE-ring launch stores too -- the split was never needed\n");
-+		} else {
-+			printf("mi8gpu: step 23 SUMMARY: but the ONE-ring launch does not, so the split is required after all\n");
-+		}
++	if (reached[0] != 3 || stored[0] != CS_WANT) {
++		printf("mi8gpu: step 23 SUMMARY: THE BASE RING DID NOT STORE -- nothing below it can be read\n");
++	} else if (reached[4] != 3 || stored[4] != CS_WANT) {
++		printf("mi8gpu: step 23 SUMMARY: THE CLOSING RING DID NOT STORE -- a revert outlived its own ring\n");
++		printf("mi8gpu: step 23 SUMMARY: so the three revert rings between them are silent for their own\n");
++		printf("mi8gpu: step 23 SUMMARY: reasons and name no field\n");
++	} else if (stored[1] == CS_WANT && stored[2] == CS_WANT && stored[3] == CS_WANT) {
++		printf("mi8gpu: step 23 SUMMARY: ALL THREE REVERTS STILL STORE -- none of B37's three fixes was\n");
++		printf("mi8gpu: step 23 SUMMARY: load-bearing on its own, so what B37 fixed was the state as a set\n");
 +	} else {
-+		printf("mi8gpu: step 23 SUMMARY: ONLY THE FIRST DISPATCH STORES even with a cleared target -- order is the rule\n");
-+		printf("mi8gpu: step 23 SUMMARY: so B38-B41's one-ring and poison readings were both the order, and the\n");
-+		printf("mi8gpu: step 23 SUMMARY: split-vs-one-ring question is still untested\n");
-+	}
-+	if (reached[5] == 3 && stored[5] == CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: dispatch 4, after the combined ring, does store\n");
-+	} else if (reached[5] == 3) {
-+		printf("mi8gpu: step 23 SUMMARY: dispatch 4, after the combined ring, is silent\n");
++		printf("mi8gpu: step 23 SUMMARY: A REVERT WHOSE RING IS SILENT NAMES A FIELD THE SP NEEDS:\n");
++		if (stored[1] != CS_WANT) {
++			printf("mi8gpu: step 23 SUMMARY:   block 0xd UAV load -- it overwrites the shader store\n");
++		}
++		if (stored[2] != CS_WANT) {
++			printf("mi8gpu: step 23 SUMMARY:   SP_CS_INSTR_SIZE -- the unit is 128-byte groups, not dwords\n");
++		}
++		if (stored[3] != CS_WANT) {
++			printf("mi8gpu: step 23 SUMMARY:   SP_CS_CNTL_0 footprint -- it has to cover r0..r2\n");
++		}
 +	}
 +	printf("mi8gpu: step 23 SUMMARY: %u of %u rings stored 0badf00d\n", n_stored, n_plan - 1u);
 +	/*
