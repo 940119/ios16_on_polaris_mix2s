@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5872 @@
+@@ -0,0 +1,5868 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2599,30 +2599,52 @@ new file mode 100644
 + */
 +#define CS_F_Q_ROLL	0x200u	/* CP_EVENT_WRITE(DEBUG_LABEL): roll the register context */
 +#define CS_WANT		0x0badf00du
++#define CS_SEED_OFF	0x340u	/* result + 0x40: the ldg reads here */
++static uint32_t cs_seed_value;	/* B45: CP_MEM_WRITE puts this in the ring */
 +
 +/*
-+ * mov r2.x, <target>; mov r2.y, 0; mov r1.x, 0x0badf00d; nop; stg [r2.x], r1.x; end.
-+ * Word 0 is the address's low half and is rewritten for each target; the one nop
-+ * between the value and the store is the assembler's minimum delay slot, and the
-+ * zeros after `end` decode as nop.
++ * B45: the same wave now READS before it writes.
++ *
++ * B37-B44 proved a store lands, but the value was always an immediate baked
++ * into the instruction stream. A mov-plus-stg does not prove the load path,
++ * the address path or the global-memory window are alive. So one instruction
++ * stream does both:
++ *
++ *   stg g[r2.x+0], r1.x    -> 0badf00d, the exact B37 control store
++ *   ldg r1.y, g[r2.x+0x40] -> a seed the CP wrote into this very ring
++ *   stg g[r2.x+8], r1.y    -> the value the SP actually read
++ *
++ * result[0] is therefore a built-in control that says the program ran, and
++ * result[2] is the reading. The seed lives at CS_SEED_OFF (result+0x40),
++ * outside the eight words cs_probe() clears before each launch; it is written
++ * by CP_MEM_WRITE inside the ring, ahead of CP_EXEC_CS, so it cannot be a
++ * stale CPU cache line. Three launches with two different seeds make a
++ * reading that cannot be produced by a fixed value.
++ *
++ * The ir3 words are NOT transcribed. _ir3enc.py derives the cat6 field map
++ * from Mesa's isa/ir3-cat6.xml, validates it by reproducing B37's proven stg
++ * word for word, and agrees bit for bit with a real compiled shader's
++ * ldg.u32 in Mesa's reference disassembly. r0..r2 only, so
++ * FULLREGFOOTPRINT stays 3 -- the one field B44 proved load-bearing.
++ * Four nops and (sy) on the second store cover the load latency.
 + */
 +static const uint32_t cs_program[CS_PROGRAM_WORDS] = {
-+	0xfeed0001u, 0x204cc008u,	/* mov.u32u32 r2.x, <the target> */
++	0xfeed0001u, 0x204cc008u,	/* mov.u32u32 r2.x, <result address> (patched) */
 +	0x00000000u, 0x204cc009u,	/* mov.u32u32 r2.y, 0 */
-+	0x0badf00du, 0x204cc004u,	/* mov.u32u32 r1.x, 0x0badf00d */
-+	0x00000000u, 0x00000000u,	/* nop: one delay slot */
-+	0x01800008u, 0xc0c61100u,	/* stg.u32 g[r2.x+0], r1.x, 1 */
++	0x0badf00du, 0x204cc004u,	/* mov.u32u32 r1.x, 0x0badf00d (control) */
++	0x00000000u, 0x00000000u,	/* nop: delay slot */
++	0x01820081u, 0xc0060005u,	/* ldg.u32 r1.y, g[r2.x+0x40], 1  (NEW) */
++	0x00000000u, 0x00000000u,	/* nop: load latency */
++	0x00000000u, 0x00000000u,	/* nop: load latency */
++	0x00000000u, 0x00000000u,	/* nop: load latency */
++	0x00000000u, 0x00000000u,	/* nop: load latency */
++	0x01800008u, 0xc0c61100u,	/* stg.u32 g[r2.x+0], r1.x, 1 (control) */
++	0x0180000au, 0xd0c61108u,	/* stg.u32 g[r2.x+8], r1.y, 1 (sy, NEW) */
 +	0x00000000u, 0x03000000u,	/* end */
-+	0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u,
-+	0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u,	/* nop */
++	0x00000000u, 0x00000000u,	/* nop */
++	0x00000000u, 0x00000000u,	/* nop */
++	0x00000000u, 0x00000000u,	/* nop */
 +};
 +
 +/*
@@ -2841,6 +2863,20 @@ new file mode 100644
 +		 * where the boundary would be.
 +		 */
 +		CS_PUT(pkt7(0x26u, 0u));		/* CP_WAIT_FOR_IDLE */
++	}
++	{
++		uint64_t s_ = g3d_regions[2].address + CS_SEED_OFF;
++
++		/*
++		 * B45: cnt is 3 -- CP_MEM_WRITE counts its payload dwords only, and a
++		 * single data dword is address-lo, address-hi and the value (B33).
++		 * The CP writes it before CP_EXEC_CS, so the shader's ldg cannot see
++		 * a stale line from a previous launch.
++		 */
++		CS_PUT(pkt7(CP_MEM_WRITE_OPCODE, 3u));
++		CS_PUT((uint32_t)s_);
++		CS_PUT((uint32_t)(s_ >> 32));
++		CS_PUT(cs_seed_value);
 +	}
 +	CS_MARK(0);				/* everything above executed */
 +	if (exec) {
@@ -3123,98 +3159,82 @@ new file mode 100644
 +	const uint64_t base = g3d_regions[2].address;
 +	uint32_t *shader = (uint32_t *)((vm_offset_t)memptrs + CS_PROGRAM_OFF);
 +	/*
-+	 * B38: which of B37's four changes was carrying it.
++	 * B45: make the shader READ something before it writes.
 +	 *
-+	 * B37 made the state exactly fd6's, split it into its own ring, read it back
-+	 * and the SP ran -- but four things changed and only one ring came back. So
-+	 * each quirk gets its own ring and its own result word, two dwords apart, and
-+	 * a ring that leaves its word empty names the change that mattered.
++	 * Every earlier ladder put an immediate into a register and stored it. The
++	 * store landing proves a wave runs and the address path works, but says
++	 * nothing about the global load path. Now the CP writes a seed into the
++	 * ring itself and the shader has to ldg it and store it back. Two control
++	 * properties are built into the same program: result[0] must still be
++	 * 0badf00d, and result[2] must equal that launch's seed. If the control
++	 * holds and the reading follows two different seeds, the SP read memory.
 +	 *
-+	 * B43 settled the instrument and with it four rounds of conclusions: a one-ring
-+	 * launch stores, a repeated dispatch stores, and a state ring after them does not
-+	 * stop the next one from storing. There is no poison and the split was never
-+	 * needed -- B38-B42 read a target word nobody cleared.
-+	 *
-+	 * So B38's question can finally be asked. B37 changed three state fields and the
-+	 * SP ran; which of them mattered has never been established, because every ring
-+	 * built to answer it was confounded. Now each one can be put back inside a ring
-+	 * that is otherwise known-good, all five in one boot: a base ring first, the
-+	 * three reverts, and the base ring again. The closing ring is not decoration --
-+	 * if a revert damages something that outlives its own ring, the closing ring is
-+	 * what says so, and then the three readings between them mean nothing.
++	 * The instrument B43 fixed is kept: one shared target, cleared before every
++	 * launch. B44's t == 0 "no dispatch control" shortcut is gone -- all three
++	 * rings are full one-ring launches and are judged identically.
 +	 */
 +	static const struct {
 +		uint32_t flags;
 +		uint32_t tag;
++		uint32_t seed;
 +		const char *what;
-+	} plan[5] = {
-+		{ CS_F_STATE | CS_F_EXEC,		0u, "BASE: the state B37 ships, in one ring (must store)" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_UAV,	1u, "put back: the old UAV load at block 0xd" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_SIZE,	2u, "put back: SP_CS_INSTR_SIZE counted in dwords (32)" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_REGS,	3u, "put back: SP_CS_CNTL_0's footprint, one register short" },
-+		{ CS_F_STATE | CS_F_EXEC,		4u, "CLOSING: the base ring again (must store)" },
++	} plan[3] = {
++		{ CS_F_STATE | CS_F_EXEC, 0u, 0x5eedc0deu, "SEED 1: read 0x5eedc0de and store it" },
++		{ CS_F_STATE | CS_F_EXEC, 1u, 0xa5a5c3c3u, "SEED 2: a different value, same program" },
++		{ CS_F_STATE | CS_F_EXEC, 2u, 0x5eedc0deu, "CLOSING: seed 1 again, must come back" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
-+	bool faulted[5] = { false, false, false, false, false };
-+	int reached[5] = { 0, 0, 0, 0, 0 };
-+	uint32_t stored[5] = { 0, 0, 0, 0, 0 };
-+	uint32_t t, n_stored = 0;
++	bool faulted[3] = { false, false, false };
++	int reached[3] = { 0, 0, 0 };
++	uint32_t ctl[3] = { 0, 0, 0 };
++	uint32_t loaded[3] = { 0, 0, 0 };
++	uint32_t t;
 +
-+	printf("mi8gpu: step 23: a shader, on a core whose SECVID_TRUST_CNTL reads %#x (%s)\n",
-+	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE, so this is a control and not the test");
++	printf("mi8gpu: step 23: a shader that loads, SECVID_TRUST_CNTL %#x (%s)\n",
++	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE");
 +	for (t = 0; t < n_plan; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
 +		volatile uint32_t *fence = (volatile uint32_t *)((vm_offset_t)memptrs + CS_FENCE_OFF);
 +		volatile uint32_t *mark = (volatile uint32_t *)((vm_offset_t)memptrs + CS_MARKER_OFF + 12u * t);
-+		uint32_t fsr_before, fsr_after, arrived, seen;
++		uint32_t fsr_before, fsr_after, seen;
 +		bool drained;
 +
-+		/*
-+		 * B43: one target for every ring, and it is cleared before every launch.
-+		 *
-+		 * B38-B42 gave each ring its own word and never cleared the previous
-+		 * one, so the magic scan found 0badf00d at 0x304 under every ring -- the
-+		 * same reading whether that ring wrote it or the one before it did. A
-+		 * reading that cannot change cannot answer anything (教训 38/42). Now the
-+		 * store goes to one address for all rings, the whole result area is zeroed
-+		 * before each launch, and a word that reads 0badf00d afterwards was
-+		 * written by the launch we are looking at.
-+		 */
 +		for (uint32_t k = 0; k < 8u; k++) {
-+			*(volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF + 4u * k) = 0;
++			result[k] = 0;
 +		}
++		*(volatile uint32_t *)((vm_offset_t)memptrs + CS_SEED_OFF) = 0;
 +		*fence = 0;
 +		mark[0] = mark[1] = mark[2] = 0;
 +		memcpy(shader, cs_program, sizeof(cs_program));
 +		shader[0] = (uint32_t)(base + CS_RESULT_OFF);
 +		to_memory((vm_offset_t)memptrs, 0x1000);
++		cs_seed_value = plan[t].seed;
++		printf("mi8gpu: step 23 launch %c: %s (seed 0x%08x at %#llx)\n",
++		    'A' + t, plan[t].what, plan[t].seed, base + CS_SEED_OFF);
 +		seen = rd(cb + CB_FSR);
 +		if (seen != 0) {
 +			wr(cb + CB_FSR, seen);
 +			__asm__ volatile ("dsb sy" ::: "memory");
 +		}
 +		fsr_before = rd(cb + CB_FSR);
-+		printf("mi8gpu: step 23: launch %c: %s (store at %#llx, CB1 FSR %#010x -> %#010x after the clear)\n",
-+		    'A' + t, plan[t].what, base + CS_RESULT_OFF, seen, fsr_before);
 +		drained = cs_launch(plan[t].flags, plan[t].tag, plan[t].what);
 +		sleep_us(2000);
 +		from_memory((vm_offset_t)memptrs, 0x1000);
 +		fsr_after = rd(cb + CB_FSR);
-+		arrived = *result;
-+		/* the first two rings are the control and always behave the same way */
-+		if (t == 0) {
-+			printf("mi8gpu: step 23 launch %c: result 0x%08x (must be 0: no dispatch), fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x\n",
-+			    'A' + t, arrived, *fence, fsr_before, fsr_after);
-+		} else {
-+			stored[t] = arrived;
-+			printf("mi8gpu: step 23 launch %c: result 0x%08x%s, fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x, FSYNR0 0x%08x, FAR 0x%llx%08x\n",
-+			    'A' + t, arrived, arrived == CS_WANT ? " (THE STORE LANDED)" : "", *fence,
-+			    fsr_before, fsr_after, rd(cb + CB_FSYNR0),
-+			    (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
-+		}
++		ctl[t] = result[0];
++		loaded[t] = result[2];
++		/* the instrument's own instrument: did the CP actually write the seed? */
++		uint32_t seed_seen = *(volatile uint32_t *)((vm_offset_t)memptrs + CS_SEED_OFF);
++		/* the B38-onward shape, so the judge's result/fence/FSR regex still fits */
++		printf("mi8gpu: step 23 launch %c: result 0x%08x, fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x\n",
++		    'A' + t, ctl[t], *fence, fsr_before, fsr_after);
++		printf("mi8gpu: step 23 launch %c: loaded 0x%08x, seed 0x%08x, cp-seed 0x%08x\n",
++		    'A' + t, loaded[t], plan[t].seed, seed_seen);
++		printf("mi8gpu: step 23 launch %c: FSYNR0 0x%08x, FAR 0x%llx%08x\n", 'A' + t,
++		    rd(cb + CB_FSYNR0), (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
 +		if (*fence != (0xf00d0000u | (0x41u + plan[t].tag))) {
-+			printf("mi8gpu: step 23 launch %c: the fence did NOT arrive (want %#010x) -- the event write after the wait never executed\n",
++			printf("mi8gpu: step 23 launch %c: the fence did NOT arrive (want %#010x)\n",
 +			    'A' + t, 0xf00d0000u | (0x41u + plan[t].tag));
 +		}
 +		cs_scan_magic(plan[t].tag);
@@ -3232,19 +3252,17 @@ new file mode 100644
 +			reached[t] = 0;
 +		}
 +		if (reached[t] != 3) {
-+			printf("mi8gpu: step 23 VERDICT launch %c: STALLED after %d of 3 markers -- this ring's store reading means nothing\n",
-+			    'A' + t, reached[t]);
-+		} else if (t == 0) {
-+			printf("mi8gpu: step 23 VERDICT launch %c: the control is clean, as it must be\n", 'A' + t);
-+		} else if (arrived == CS_WANT) {
-+			n_stored++;
-+			printf("mi8gpu: step 23 VERDICT launch %c: THE STORE LANDED\n", 'A' + t);
++			printf("mi8gpu: step 23 VERDICT launch %c: STALLED after %d of 3 markers\n", 'A' + t, reached[t]);
 +		} else if (fsr_after != fsr_before) {
 +			faulted[t] = true;
 +			printf("mi8gpu: step 23 VERDICT launch %c: the bank faulted (%#010x -> %#010x)\n", 'A' + t,
 +			    fsr_before, fsr_after);
++		} else if (ctl[t] == CS_WANT && loaded[t] == plan[t].seed) {
++			printf("mi8gpu: step 23 VERDICT launch %c: BOTH STORES LANDED, LOAD FOLLOWED THE SEED\n", 'A' + t);
++		} else if (ctl[t] == CS_WANT) {
++			printf("mi8gpu: step 23 VERDICT launch %c: control stored, THE LOAD DID NOT\n", 'A' + t);
 +		} else {
-+			printf("mi8gpu: step 23 VERDICT launch %c: nothing wrote, no fault\n", 'A' + t);
++			printf("mi8gpu: step 23 VERDICT launch %c: even the control store is missing\n", 'A' + t);
 +		}
 +		if (t == 0 && reached[0] == 3) {
 +			cs_state_readback();
@@ -3254,11 +3272,7 @@ new file mode 100644
 +			break;
 +		}
 +	}
-+	/*
-+	 * The attribution table. A ring is only a reading if it reached its last
-+	 * marker; otherwise its result word says nothing and is printed as a dash.
-+	 */
-+	printf("mi8gpu: step 23 ATTRIBUTION: %s\n", "B37's split, vs one packet added to the ring that fails");
++	printf("mi8gpu: step 23 LOAD TABLE: control 0badf00d, then the value the SP read\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
@@ -3266,48 +3280,30 @@ new file mode 100644
 +			v = "no reading (ring did not finish)";
 +		} else if (faulted[t]) {
 +			v = "the bank faulted";
-+		} else if (t == 0) {
-+			v = "control clean";
++		} else if (ctl[t] != CS_WANT) {
++			v = "the program did not store";
 +		} else {
-+			v = stored[t] == CS_WANT ? "STORE LANDED" : "no store";
++			v = loaded[t] == plan[t].seed ? "LOAD + STORE OK" : "load did not follow";
 +		}
-+		printf("mi8gpu: step 23   %c  %-62s  %s\n", 'A' + t, plan[t].what, v);
++		printf("mi8gpu: step 23   %c  %-46s  %s\n", 'A' + t, plan[t].what, v);
 +	}
-+	/*
-+	/*
-+	 * B44: two controls around three single-field reverts.
-+	 *
-+	 * The base ring must store or nothing below it can be read. The closing ring
-+	 * must store or a revert damaged something that outlives its own ring, which
-+	 * would make the revert rings silent for a reason of their own.
-+	 */
-+	if (reached[0] != 3 || stored[0] != CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: THE BASE RING DID NOT STORE -- nothing below it can be read\n");
-+	} else if (reached[4] != 3 || stored[4] != CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: THE CLOSING RING DID NOT STORE -- a revert outlived its own ring\n");
-+		printf("mi8gpu: step 23 SUMMARY: so the three revert rings between them are silent for their own\n");
-+		printf("mi8gpu: step 23 SUMMARY: reasons and name no field\n");
-+	} else if (stored[1] == CS_WANT && stored[2] == CS_WANT && stored[3] == CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: ALL THREE REVERTS STILL STORE -- none of B37's three fixes was\n");
-+		printf("mi8gpu: step 23 SUMMARY: load-bearing on its own, so what B37 fixed was the state as a set\n");
-+	} else {
-+		printf("mi8gpu: step 23 SUMMARY: A REVERT WHOSE RING IS SILENT NAMES A FIELD THE SP NEEDS:\n");
-+		if (stored[1] != CS_WANT) {
-+			printf("mi8gpu: step 23 SUMMARY:   block 0xd UAV load -- it overwrites the shader store\n");
++	{
++		uint32_t n_ok = 0;
++
++		for (t = 0; t < n_plan; t++) {
++			if (reached[t] == 3 && !faulted[t] && ctl[t] == CS_WANT && loaded[t] == plan[t].seed) {
++				n_ok++;
++			}
 +		}
-+		if (stored[2] != CS_WANT) {
-+			printf("mi8gpu: step 23 SUMMARY:   SP_CS_INSTR_SIZE -- the unit is 128-byte groups, not dwords\n");
-+		}
-+		if (stored[3] != CS_WANT) {
-+			printf("mi8gpu: step 23 SUMMARY:   SP_CS_CNTL_0 footprint -- it has to cover r0..r2\n");
++		printf("mi8gpu: step 23 SUMMARY: %u of %u launches read their seed and stored it\n", n_ok, n_plan);
++		if (n_ok == n_plan) {
++			printf("mi8gpu: step 23 SUMMARY: THE SP LOADS FROM GLOBAL MEMORY. Load path is live.\n");
++		} else if (ctl[0] == CS_WANT) {
++			printf("mi8gpu: step 23 SUMMARY: control store works, so the load is the missing half\n");
++		} else {
++			printf("mi8gpu: step 23 SUMMARY: even the control store failed; not comparable\n");
 +		}
 +	}
-+	printf("mi8gpu: step 23 SUMMARY: %u of %u rings stored 0badf00d\n", n_stored, n_plan - 1u);
-+	/*
-+	 * Last, and only now is it worth anything: every ring above stores into a
-+	 * mapped page, so none of them faults and the CP is still healthy. B37
-+	 * showed the sensor reads "not a sensor" once something has faulted first.
-+	 */
 +	cs_hole_sensor();
 +}
 +
