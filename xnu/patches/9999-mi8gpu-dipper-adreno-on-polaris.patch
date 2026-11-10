@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6105 @@
+@@ -0,0 +1,6112 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2979,13 +2979,20 @@ new file mode 100644
 +		CS_PUT(0u);				/* c0.z */
 +		CS_PUT(0u);				/* c0.w */
 +		/*
-+		 * The grid: one group of eight invocations. NDRANGE_1 is local times
-+		 * groups (fd6: localsize_x * num_groups[0]) and NDRANGE_0's local
-+		 * sizes are minus one, so kerneldim 3 / local 8x1x1 / global 8x1x1.
++		 * B57: the grid is one group of SIXTEEN invocations. NDRANGE_1 is
++		 * local times groups (fd6: localsize_x * num_groups[0]), and
++		 * NDRANGE_0's local sizes are minus one, so kerneldim 3 / local
++		 * 16x1x1 / global 16x1x1: 0x3f = 3 | ((16-1) << 2).
++		 * This is the ONLY variable: B56 had 8 invocations and produced two
++		 * 2 KB windows of four fibers, 32 KB apart. 16 tells us whether the
++		 * 4-fiber group is a wave-like index (two more windows appear at
++		 * 0x17800 / 0x1f800) or an SP-like share (the same two windows get
++		 * eight hits each). NGROUPS_X stays 1; CS_GROUPS is the instruction
++		 * length and must NOT be touched.
 +		 */
 +		CS_PUT(pkt7(0x5cu, 20u));
-+		CS_PUT(0x0b990u); CS_PUT(0x0000001fu);	/* SP_CS_NDRANGE_0: dim 3, local 8x1x1 */
-+		CS_PUT(0x0b991u); CS_PUT(8u);		/* SP_CS_NDRANGE_1: global x */
++		CS_PUT(0x0b990u); CS_PUT(0x0000003fu);	/* B57: SP_CS_NDRANGE_0: dim 3, local 16x1x1 */
++		CS_PUT(0x0b991u); CS_PUT(16u);		/* B57: SP_CS_NDRANGE_1: global x */
 +		CS_PUT(0x0b992u); CS_PUT(0u);		/* SP_CS_NDRANGE_2: offset x */
 +		CS_PUT(0x0b993u); CS_PUT(1u);		/* SP_CS_NDRANGE_3: global y */
 +		CS_PUT(0x0b994u); CS_PUT(0u);		/* SP_CS_NDRANGE_4: offset y */
@@ -3319,7 +3326,7 @@ new file mode 100644
 +	const uint32_t pvt_words = g3d_regions[G3D_R_PVTMEM].size / 4u;
 +	uint32_t t;
 +
-+	printf("mi8gpu: step 23: a shader whose private writes are enumerated, SECVID_TRUST_CNTL %#x (%s)\n",
++	printf("mi8gpu: step 23: a shader with sixteen private writers, SECVID_TRUST_CNTL %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE");
 +	for (t = 0; t < n_plan; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
@@ -3500,7 +3507,7 @@ new file mode 100644
 +			break;
 +		}
 +	}
-+	printf("mi8gpu: step 23 PVT4 TABLE: control 0badf00d, invariants c0.x/(+0x222), 256 KB cleared before and scanned after every launch, every hit offset printed as pvt-hit[k], pvt rings result[6] = c0.x+0x222, nop controls pvt-nz 0\n");
++	printf("mi8gpu: step 23 PVT5 TABLE: control 0badf00d, invariants c0.x/(+0x222), one group of 16 invocations (local 16x1x1, global 16), 16 hit offsets as pvt-hit[k], pvt rings result[6] = c0.x+0x222, nop controls pvt-nz 0\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
