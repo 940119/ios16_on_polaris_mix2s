@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5950 @@
+@@ -0,0 +1,5963 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2600,6 +2600,9 @@ new file mode 100644
 +#define CS_F_Q_ROLL	0x200u	/* CP_EVENT_WRITE(DEBUG_LABEL): roll the register context */
 +#define CS_F_Q_INV	0x400u	/* CACHE_INVALIDATE between the seed write and CP_EXEC_CS */
 +#define CS_F_Q_NOALU	0x800u	/* B47: patch the add.u back to a nop in this ring */
++#define CS_F_Q_NOJUMP	0x1000u	/* B51: patch slot 7's compiled jump back to a nop */
++#define CS_JUMP_IDX	7u	/* B51: slot of the real compiled cat0 jump */
++#define CS_JUMP_IMM	2u	/* B51: target = slot 7 + 2 = slot 9 */
 +#define CS_ALU_IMM	0x111u	/* add.u r1.y, r1.y, 0x111 */
 +#define CS_ALU_IDX	8u	/* instruction slot of the add.u (dwords 16,17) */
 +#define CS_ALU2_IMM	0x222u	/* B49: the second group's add.u immediate */
@@ -2611,29 +2614,36 @@ new file mode 100644
 +static uint32_t cs_const_value;	/* B48: CP_LOAD_STATE6_FRAG uploads this as c0.x */
 +
 +/*
-+ * B50: give group 2's add.u a latency slot.
++ * B51: put ONE real compiled ir3 cat0 jump into the working two-group shader.
 + *
-+ * B49 proved the fetch crosses the 128-byte instruction-group boundary:
-+ * result[4], which only group 2 can write, was non-zero in all four rings
-+ * and followed four different c0.x uploads. But result[4] == result[2] in
-+ * every ring, i.e. the group-2 stg still read group 1's value of r1.y and
-+ * +0x222 never landed. instrlen 2 / NUM_UNIT 2 / SP_CS_INSTR_SIZE 2 all
-+ * read back correct, so this is neither a fetch stop nor UCHE staleness.
++ * B50 finished rung 23: two 128-byte instruction groups, an ALU in each, the
++ * const-parameter path, UCHE invalidation, zero faults. What is still missing
++ * versus a real ir3 shader (HANDOFF 5b.28 item 6) is STRUCTURE -- above all
++ * control flow. Pasting a whole compiled shader at once would change the
++ * preamble, pvtmem, constlen, register footprint and branch stack together,
++ * so a failure could not be attributed. This rung changes ONE slot.
 + *
-+ * In B47/B48's group 1, add.u (slot 8) and the stg_val that consumes its
-+ * result (slot 10) are separated by stg_ctl (slot 9). B49's group 2 put
-+ * its stg IMMEDIATELY after add.u (slot 16 -> 17) with nothing between.
-+ * ir3 needs a latency slot before an ALU result can be read.
++ * slot 7 (B50's last latency nop) becomes `jump +2`, taken verbatim from a
++ * real compiled shader disassembly (isa/ir3-cat0.xml, enc_jump(2) in
++ * _ir3enc.py, cross-checked bit-for-bit against four real instruction words
++ * including a negative delta). IMMED is an instruction-slot delta:
++ * target = current slot + IMMED. Seven plus two is nine -- slot 9 holds the
++ * 0badf00d control store -- so the jump skips EXACTLY slot 8's
++ * add.u r1.y, r1.y, 0x111.
 + *
-+ * THE ONE VARIABLE: three nops at slots 17..19, and B49's slot-17 stg word
-+ * moved unchanged to slot 20. Every other instruction word, all SP_CS_*
-+ * state, the const upload, the grid, CACHE_INVALIDATE, the four-ring A/B
-+ * plan and the cp-seed sentinel are byte-for-byte B49.
++ * THE ONE VARIABLE: two dwords at slot 7. Every other instruction word, all
++ * SP_CS_* state (BRANCHSTACK stays 0), the const upload, the grid,
++ * CACHE_INVALIDATE, the fence, the four uploads and the cp-seed sentinel are
++ * byte-for-byte B50. BOTH add.u stay ON in all four rings now; the only
++ * A/D control is CS_F_Q_NOJUMP, which patches slot 7 back to a nop.
 + *
-+ *   slot 20 writes result[4] = c0.x + 0x333 on alu=1 rings (B/C),
-+ *                            = c0.x        on alu=0 rings (A/D).
-+ * If result[4] still equals result[2], the add.u never executed at all and
-+ * the next rung must ask whether group 2's instructions are really fetched.
++ *   no-jump (A/D): result[2] = c0.x + 0x111, result[4] = c0.x + 0x333
++ *   jump    (B/C): result[2] = c0.x,         result[4] = c0.x + 0x222
++ *
++ * Both result words must lose exactly 0x111. result[0] must stay 0badf00d:
++ * that store is slot 9, so an overshooting jump would erase it. If the two
++ * pairs do NOT separate, the next rung changes ONLY SP_CS_CNTL_0's
++ * BRANCHSTACK (a6xx.xml bits 13..19; the real blob uses 16), not the program.
 + */
 +static const uint32_t cs_program[CS_PROGRAM_WORDS] = {
 +	0xfeed0001u, 0x204cc008u,	/* mov.u32u32 r2.x, <result address> (patched) */
@@ -2643,7 +2653,7 @@ new file mode 100644
 +	0x00000000u, 0x202cc005u,	/* mov.u32u32 r1.y, c0.x */
 +	0x00000000u, 0x00000000u,	/* nop: latency */
 +	0x00000000u, 0x00000000u,	/* nop: latency */
-+	0x00000000u, 0x00000000u,	/* nop: latency */
++	0x00000002u, 0x01000000u,	/* B51: REAL compiled cat0 jump +2 -> slot 9, skips slot 8 */
 +	0x21110005u, 0x52100005u,	/* add.u r1.y, r1.y, 0x111 (sy)   [group 1] */
 +	0x01800008u, 0xc0c61100u,	/* stg.u32 g[r2.x+0], r1.x, 1 (control) */
 +	0x0180000au, 0xd0c61108u,	/* stg.u32 g[r2.x+8], r1.y, 1 (sy)  -> result[2] */
@@ -3214,18 +3224,20 @@ new file mode 100644
 +	const uint64_t base = g3d_regions[2].address;
 +	uint32_t *shader = (uint32_t *)((vm_offset_t)memptrs + CS_PROGRAM_OFF);
 +	/*
-+	 * B50: did a latency slot let group 2's add.u land? B49 proved the
-+	 * fetch crosses 128 bytes (result[4] is group 2's own word), but
-+	 * result[4] equalled result[2]: the stg read the stale r1.y. Three
-+	 * nops now separate that add.u from its consuming stg.
++	 * B51: does a REAL compiled cat0 jump branch on this minimal state?
 +	 *
-+	 * result[2] is B48's group-1 store; result[4] can ONLY be written by the
-+	 * second group's stg. The two add.u slots (8 and 16) are patched back to
-+	 * nops together on A/D, so both stores must then return c0.x unchanged;
-+	 * on B/C both run, so result[2] = c0.x + 0x111 and result[4] = c0.x +
-+	 * 0x111 + 0x222. Four different uploads, all INVated, one shared cleared
-+	 * target, 0xdeadbeef sentinel at cp-seed. A stale line, a baked immediate
-+	 * or a group-1-only fetch cannot follow four values into a NEW word.
++	 * slot 7 now holds `jump +2` from a real shader disassembly; it lands on
++	 * slot 9 (the control store) and skips only slot 8's add.u +0x111. BOTH
++	 * add.u stay ON in every ring, so the ONLY variable is whether slot 7 is
++	 * the jump (B/C) or a nop (A/D, CS_F_Q_NOJUMP patched after memcpy).
++	 *
++	 *   A/D (nop): result[2] = c0.x + 0x111, result[4] = c0.x + 0x333
++	 *   B/C (jmp): result[2] = c0.x,         result[4] = c0.x + 0x222
++	 *
++	 * Two independent result words lose exactly 0x111 at once. result[0] is
++	 * the control store at slot 9: if it vanishes, the jump overshot. Four
++	 * distinct uploads, all INVated, one shared cleared target, 0xdeadbeef
++	 * sentinel at cp-seed, SP_CS_INSTR_SIZE reads back 2, zero faults.
 +	 */
 +	static const struct {
 +		uint32_t flags;
@@ -3233,10 +3245,10 @@ new file mode 100644
 +		uint32_t constval;
 +		const char *what;
 +	} plan[4] = {
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU, 0u, 0x5eedc0deu, "LATENCY 1: both add.u off, both stores must copy c0.x" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  1u, 0xa5a5c3c3u, "LATENCY 2: expect +0x111 in group 1, +0x333 in group 2" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  2u, 0x1badb002u, "LATENCY 3: a third different upload" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU,  3u, 0x2f00d123u, "LATENCY 4: closing control, both add.u off again" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOJUMP, 0u, 0x5eedc0deu, "JUMP 1: nop control, both add.u must land (+0x111/+0x333)" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  1u, 0xa5a5c3c3u, "JUMP 2: compiled jump skips group 1's add.u (c0.x/+0x222)" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  2u, 0x1badb002u, "JUMP 3: a third different upload, same jump" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOJUMP,  3u, 0x2f00d123u, "JUMP 4: closing nop control, both add.u again" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
@@ -3249,7 +3261,7 @@ new file mode 100644
 +	uint32_t expected2[4] = { 0, 0, 0, 0 };
 +	uint32_t t;
 +
-+	printf("mi8gpu: step 23: a shader with a group-2 latency slot, SECVID_TRUST_CNTL %#x (%s)\n",
++	printf("mi8gpu: step 23: a shader with a real compiled jump, SECVID_TRUST_CNTL %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE");
 +	for (t = 0; t < n_plan; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
@@ -3266,17 +3278,18 @@ new file mode 100644
 +		mark[0] = mark[1] = mark[2] = 0;
 +		memcpy(shader, cs_program, sizeof(cs_program));
 +		shader[0] = (uint32_t)(base + CS_RESULT_OFF);
-+		if ((plan[t].flags & CS_F_Q_NOALU) != 0) {
-+			/* the A/B control: put BOTH add.u slots back to a nop */
-+			shader[2u * CS_ALU_IDX] = 0;
-+			shader[2u * CS_ALU_IDX + 1u] = 0;
-+			shader[2u * CS_ALU2_IDX] = 0;
-+			shader[2u * CS_ALU2_IDX + 1u] = 0;
++		if ((plan[t].flags & CS_F_Q_NOJUMP) != 0) {
++			/* the A/D control: put slot 7's compiled jump back to a nop */
++			shader[2u * CS_JUMP_IDX] = 0;
++			shader[2u * CS_JUMP_IDX + 1u] = 0;
 +		}
-+		expected[t] = ((plan[t].flags & CS_F_Q_NOALU) != 0)
++		/* B51: BOTH add.u stay ON in every ring. The ONLY variable is whether
++		 * slot 7's jump skips group 1's add.u (slot 8). */
++		expected[t] = ((plan[t].flags & CS_F_Q_NOJUMP) == 0)
 +		    ? plan[t].constval : (uint32_t)(plan[t].constval + CS_ALU_IMM);
-+		expected2[t] = ((plan[t].flags & CS_F_Q_NOALU) != 0)
-+		    ? plan[t].constval : (uint32_t)(plan[t].constval + CS_ALU_IMM + CS_ALU2_IMM);
++		expected2[t] = ((plan[t].flags & CS_F_Q_NOJUMP) == 0)
++		    ? (uint32_t)(plan[t].constval + CS_ALU2_IMM)
++		    : (uint32_t)(plan[t].constval + CS_ALU_IMM + CS_ALU2_IMM);
 +		to_memory((vm_offset_t)memptrs, 0x1000);
 +		cs_const_value = plan[t].constval;
 +		printf("mi8gpu: step 23 launch %c: %s (const 0x%08x, sentinel 0x%08x)\n",
@@ -3299,10 +3312,10 @@ new file mode 100644
 +		/* the B38-onward shape, so the judge's result/fence/FSR regex still fits */
 +		printf("mi8gpu: step 23 launch %c: result 0x%08x, fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x\n",
 +		    'A' + t, ctl[t], *fence, fsr_before, fsr_after);
-+		printf("mi8gpu: step 23 launch %c: computed 0x%08x, computed2 0x%08x, const 0x%08x, expected 0x%08x, expected2 0x%08x, cp-seed 0x%08x, inv %u, alu %u, groups %u\n",
++		printf("mi8gpu: step 23 launch %c: computed 0x%08x, computed2 0x%08x, const 0x%08x, expected 0x%08x, expected2 0x%08x, cp-seed 0x%08x, inv %u, jump %u, groups %u\n",
 +		    'A' + t, loaded[t], loaded2[t], plan[t].constval, expected[t], expected2[t], seed_seen,
 +		    ((plan[t].flags & CS_F_Q_INV) != 0) ? 1u : 0u,
-+		    ((plan[t].flags & CS_F_Q_NOALU) != 0) ? 0u : 1u,
++		    ((plan[t].flags & CS_F_Q_NOJUMP) == 0) ? 1u : 0u,
 +		    (uint32_t)CS_GROUPS);
 +		printf("mi8gpu: step 23 launch %c: FSYNR0 0x%08x, FAR 0x%llx%08x\n", 'A' + t,
 +		    rd(cb + CB_FSYNR0), (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
@@ -3347,7 +3360,7 @@ new file mode 100644
 +			break;
 +		}
 +	}
-+	printf("mi8gpu: step 23 LATENCY TABLE: control 0badf00d, group 1 c0.x(+0x111), group 2 c0.x(+0x333)\n");
++	printf("mi8gpu: step 23 JUMP TABLE: control 0badf00d, nop rings c0.x(+0x111)/(+0x333), jump rings c0.x/(+0x222)\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
@@ -3358,7 +3371,7 @@ new file mode 100644
 +		} else if (ctl[t] != CS_WANT) {
 +			v = "the program did not store";
 +		} else if (loaded[t] == expected[t] && loaded2[t] == expected2[t]) {
-+			v = ((plan[t].flags & CS_F_Q_NOALU) != 0) ? "GROUP 1 + 2 OK (alu off)" : "GROUP 1 + 2 + ALU OK";
++			v = ((plan[t].flags & CS_F_Q_NOJUMP) != 0) ? "NO-JUMP CONTROL OK (both add.u landed)" : "COMPILED JUMP OK (group 1 add.u skipped)";
 +		} else if (loaded[t] == expected[t] && loaded2[t] == 0) {
 +			v = "GROUP 2 DID NOT RUN -- fetch stopped at 128 bytes";
 +		} else if (loaded2[t] == CS_CONST_SENTINEL || loaded2[t] == (uint32_t)(CS_CONST_SENTINEL + CS_ALU_IMM + CS_ALU2_IMM)) {
@@ -3381,9 +3394,9 @@ new file mode 100644
 +		if (ctl[0] != CS_WANT) {
 +			printf("mi8gpu: step 23 SUMMARY: even the control store failed; not comparable\n");
 +		} else if (n_ok == n_plan) {
-+			printf("mi8gpu: step 23 SUMMARY: THE GROUP-2 ALU COMPUTED AFTER A LATENCY SLOT; the nop controls copied\n");
++			printf("mi8gpu: step 23 SUMMARY: THE COMPILED JUMP SKIPPED GROUP 1'S ADD.U; the nop controls kept both adds\n");
 +		} else {
-+			printf("mi8gpu: step 23 SUMMARY: the latency-slot program did not separate the pairs\n");
++			printf("mi8gpu: step 23 SUMMARY: the real-compiled-jump program did not separate the pairs\n");
 +		}
 +	}
 +	cs_hole_sensor();
