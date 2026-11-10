@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5868 @@
+@@ -0,0 +1,5870 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -3130,21 +3130,17 @@ new file mode 100644
 +	 * each quirk gets its own ring and its own result word, two dwords apart, and
 +	 * a ring that leaves its word empty names the change that mattered.
 +	 *
-+	 * B42 is not a new mechanism. It is the control that four rounds never had.
++	 * B42 answered (b): the second identical dispatch was silent too. But B42 also
++	 * exposed a defect in the instrument that had been there since B38 -- each ring
++	 * wrote to its own word and no ring ever cleared the previous one, so the magic
++	 * scan reported 0x304 under every launch whether that launch wrote it or not.
++	 * A dispatch that ran but stored to the address baked into a cached program
++	 * image would have looked exactly like a dispatch that never ran.
 +	 *
-+	 * B37, B38, B39, B40 and B41 all stored exactly one ring: ring B, and ring B is
-+	 * always the FIRST dispatch of its boot. Every dispatch after it was silent,
-+	 * whatever shape it had. Two readings fit that pattern equally well, and every
-+	 * build so far assumed the interesting one:
-+	 *
-+	 *   (a) the shape matters -- one ring cannot launch, the split can; or
-+	 *   (b) the order matters -- only the first CP_EXEC_CS of a boot runs, and the
-+	 *       shape was never the variable at all.
-+	 *
-+	 * B38 called C's silence "the ring". B39 and B40 then called everything after
-+	 * it "poison". Both were inferred from rings that were not first. Nobody ever
-+	 * ran two plain dispatches back to back -- that is this build, and it costs no
-+	 * new packet: A state, then the same dispatch ring four times.
++	 * So this build fixes the reading before asking anything else: one target, the
++	 * whole area zeroed before each launch. Then DISPATCH 2 is a real repeat test,
++	 * and the combined ring after it is the first combined ring that can be read at
++	 * all -- not because it is first, but because a cleared word cannot lie.
 +	 */
 +	static const struct {
 +		uint32_t flags;
@@ -3153,10 +3149,10 @@ new file mode 100644
 +	} plan[6] = {
 +		{ CS_F_STATE,	0u, "CONTROL: the state alone, as B37 ran it (no dispatch)" },
 +		{ CS_F_EXEC,	1u, "CONTROL: the dispatch alone on that state -- B37's passing ring" },
-+		{ CS_F_EXEC,	2u, "DISPATCH 2: the very same ring again, nothing in between" },
-+		{ CS_F_EXEC,	3u, "DISPATCH 3: and again" },
++		{ CS_F_EXEC,	2u, "DISPATCH 2: identical, on a target we cleared in between" },
++		{ CS_F_STATE | CS_F_EXEC,		3u, "ONE ring: the combined launch, readable for the first time" },
 +		{ CS_F_STATE,	4u, "the state written once more" },
-+		{ CS_F_EXEC,	5u, "DISPATCH 4: on freshly written state" },
++		{ CS_F_EXEC,	5u, "DISPATCH 4: after the combined ring" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
@@ -3168,23 +3164,30 @@ new file mode 100644
 +	printf("mi8gpu: step 23: a shader, on a core whose SECVID_TRUST_CNTL reads %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE, so this is a control and not the test");
 +	for (t = 0; t < n_plan; t++) {
-+		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF + 4u * t);
++		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
 +		volatile uint32_t *fence = (volatile uint32_t *)((vm_offset_t)memptrs + CS_FENCE_OFF);
 +		volatile uint32_t *mark = (volatile uint32_t *)((vm_offset_t)memptrs + CS_MARKER_OFF + 12u * t);
 +		uint32_t fsr_before, fsr_after, arrived, seen;
 +		bool drained;
 +
 +		/*
-+		 * Every ring aims the store at its own word, so a ring that never ran
-+		 * cannot be confused with one that ran and wrote zero. The program is
-+		 * reloaded by every ring that carries CS_F_STATE, including the ones
-+		 * whose quirk damages it.
++		 * B43: one target for every ring, and it is cleared before every launch.
++		 *
++		 * B38-B42 gave each ring its own word and never cleared the previous
++		 * one, so the magic scan found 0badf00d at 0x304 under every ring -- the
++		 * same reading whether that ring wrote it or the one before it did. A
++		 * reading that cannot change cannot answer anything (教训 38/42). Now the
++		 * store goes to one address for all rings, the whole result area is zeroed
++		 * before each launch, and a word that reads 0badf00d afterwards was
++		 * written by the launch we are looking at.
 +		 */
-+		*result = 0;
++		for (uint32_t k = 0; k < 8u; k++) {
++			*(volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF + 4u * k) = 0;
++		}
 +		*fence = 0;
 +		mark[0] = mark[1] = mark[2] = 0;
 +		memcpy(shader, cs_program, sizeof(cs_program));
-+		shader[0] = (uint32_t)(base + CS_RESULT_OFF + 4u * t);
++		shader[0] = (uint32_t)(base + CS_RESULT_OFF);
 +		to_memory((vm_offset_t)memptrs, 0x1000);
 +		seen = rd(cb + CB_FSR);
 +		if (seen != 0) {
@@ -3193,7 +3196,7 @@ new file mode 100644
 +		}
 +		fsr_before = rd(cb + CB_FSR);
 +		printf("mi8gpu: step 23: launch %c: %s (store at %#llx, CB1 FSR %#010x -> %#010x after the clear)\n",
-+		    'A' + t, plan[t].what, base + CS_RESULT_OFF + 4u * t, seen, fsr_before);
++		    'A' + t, plan[t].what, base + CS_RESULT_OFF, seen, fsr_before);
 +		drained = cs_launch(plan[t].flags, plan[t].tag, plan[t].what);
 +		sleep_us(2000);
 +		from_memory((vm_offset_t)memptrs, 0x1000);
@@ -3272,31 +3275,30 @@ new file mode 100644
 +	}
 +	/*
 +	/*
-+	 * B42: one question, and it decides how five earlier rounds are read.
++	 * B43: with the target cleared, three separate questions become readable.
 +	 *
-+	 * If the second plain dispatch stores, dispatch order was never the variable,
-+	 * the one-ring reading stands, and B39/B40's poison is real. If it does not,
-+	 * then ring B is the only ring in any of these builds that was ever first --
-+	 * and every conclusion drawn from C onwards has to be thrown away.
++	 * DISPATCH 2 either stores or does not, and that is the repeat question with
++	 * an instrument that can see it. Then the combined ring, which is only worth
++	 * reading if the repeat worked -- otherwise its silence is the order again.
 +	 */
 +	if (reached[1] != 3 || stored[1] != CS_WANT) {
 +		printf("mi8gpu: step 23 SUMMARY: THE FIRST DISPATCH DID NOT STORE -- nothing below it means anything\n");
 +	} else if (reached[2] == 3 && stored[2] == CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: A SECOND DISPATCH STORES. Dispatch order is not the confound\n");
++		printf("mi8gpu: step 23 SUMMARY: A SECOND DISPATCH STORES once the target is cleared\n");
 +		if (reached[3] == 3 && stored[3] == CS_WANT) {
-+			printf("mi8gpu: step 23 SUMMARY: and a third, so repeated dispatch works in this boot\n");
++			printf("mi8gpu: step 23 SUMMARY: and the ONE-ring launch stores too -- the split was never needed\n");
 +		} else {
-+			printf("mi8gpu: step 23 SUMMARY: but a third does not, so exactly two is itself a puzzle\n");
++			printf("mi8gpu: step 23 SUMMARY: but the ONE-ring launch does not, so the split is required after all\n");
 +		}
 +	} else {
-+		printf("mi8gpu: step 23 SUMMARY: ONLY THE FIRST DISPATCH OF A BOOT STORES. Ring B is the only ring in\n");
-+		printf("mi8gpu: step 23 SUMMARY: B37-B41 that was ever first, so C onwards measured the order and not\n");
-+		printf("mi8gpu: step 23 SUMMARY: the shape. The one-ring reading and the poison both have to be redone\n");
++		printf("mi8gpu: step 23 SUMMARY: ONLY THE FIRST DISPATCH STORES even with a cleared target -- order is the rule\n");
++		printf("mi8gpu: step 23 SUMMARY: so B38-B41's one-ring and poison readings were both the order, and the\n");
++		printf("mi8gpu: step 23 SUMMARY: split-vs-one-ring question is still untested\n");
 +	}
 +	if (reached[5] == 3 && stored[5] == CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: dispatch 4, on freshly written state, does store\n");
++		printf("mi8gpu: step 23 SUMMARY: dispatch 4, after the combined ring, does store\n");
 +	} else if (reached[5] == 3) {
-+		printf("mi8gpu: step 23 SUMMARY: dispatch 4, on freshly written state, is silent too\n");
++		printf("mi8gpu: step 23 SUMMARY: dispatch 4, after the combined ring, is silent\n");
 +	}
 +	printf("mi8gpu: step 23 SUMMARY: %u of %u rings stored 0badf00d\n", n_stored, n_plan - 1u);
 +	/*
