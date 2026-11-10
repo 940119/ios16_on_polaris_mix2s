@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5897 @@
+@@ -0,0 +1,5925 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2603,44 +2603,51 @@ new file mode 100644
 +#define CS_ALU_IMM	0x111u	/* add.u r1.y, r1.y, 0x111 */
 +#define CS_ALU_IDX	8u	/* instruction slot of the add.u (dwords 16,17) */
 +#define CS_WANT		0x0badf00du
-+#define CS_SEED_OFF	0x340u	/* result + 0x40: the ldg reads here */
-+static uint32_t cs_seed_value;	/* B45: CP_MEM_WRITE puts this in the ring */
++#define CS_SEED_OFF	0x340u	/* result + 0x40: B48 sentinel, NOT read by the shader */
++#define CS_CONST_SENTINEL 0xdeadbeefu	/* B48: memory value, deliberately != c0.x */
++static uint32_t cs_const_value;	/* B48: CP_LOAD_STATE6_FRAG uploads this as c0.x */
 +
 +/*
-+ * B47: the same wave now COMPUTES before it stores.
++ * B48: the parameter now comes from the const RAM the real driver uses.
 + *
-+ * B37-B44 proved a store lands. B45 proved the SP can ldg a seed the CP wrote
-+ * into the very same ring. B46 proved CACHE_INVALIDATE (0x31) makes that load
-+ * see the new seed on EVERY launch. But the value that came back was still
-+ * only a MOVE: ldg r1.y, then stg r1.y. Nothing so far required an ALU.
++ * B47 proved ldg -> add.u -> stg, but the seed was planted by CP_MEM_WRITE
++ * straight into global memory. fd6_launch_grid() instead calls
++ * fd6_emit_cs_user_consts(), whose a6xx.cc:emit_const() emits
++ * CP_LOAD_STATE6_FRAG with ST6_CONSTANTS / SS6_DIRECT / SB6_CS_SHADER /
++ * NUM_UNIT=1 and one vec4 of inline dwords. The shader reads c0.x.
 + *
-+ * One cat2 instruction now sits between the load and the store:
++ * This program is B47's with exactly ONE instruction replaced:
 + *
-+ *   add.u r1.y, r1.y, 0x111 (sy)
++ *   ldg.u32 r1.y, g[r2.x+0x40], 1  ->  mov.u32u32 r1.y, c0.x
++ *                                       0x00000000 0x202cc005
 + *
-+ * Its (sy) is load-bearing: it is the first instruction to consume the ldg's
-+ * result, so it must wait for the global load. The second store keeps the (sy)
-+ * B45/B46 already proved. The encoding is NOT transcribed -- _ir3enc.py
-+ * derives cat2's field map from Mesa's ir3-cat2.xml and ir3-common.xml and
-+ * validates it bit for bit against three real compiled add.u instructions.
-+ * All the other 15 instruction words are byte-identical to B46; this is a
-+ * single-variable experiment.
++ * The cat1 mov-const word is derived from ir3-cat1.xml (#cat1-const-src,
++ * DST_TYPE/SRC_TYPE u32=3, pattern bits53-54="01") and validated bit for bit
++ * against two real compiled shaders' mov.u32u32 r11.x/r11.y, c0.z/c0.w.
++ * All 15 other instruction words are byte-identical to B47.
 + *
-+ * Rings A and D patch just those two dwords back to nops after the memcpy, so
-+ * they are a within-boot A/B control: they must return the seed unchanged,
-+ * while B and C must return seed + 0x111. r0..r2 only, so FULLREGFOOTPRINT
-+ * stays 3 -- the one field B44 proved load-bearing.
++ * Two state changes necessarily accompany the new source:
++ *   SP_CS_CONST_CONFIG 0x100 -> 0x101 (CONSTLEN=4 vec4, ENABLED), the exact
++ *     value in Mesa's crash.log:7010 for a real compute shader;
++ *   a 7-dword CP_LOAD_STATE6_FRAG const packet after RM6_COMPUTE, whose
++ *     header 0x00744000 is derived from adreno_pm4.xml's CP_LOAD_STATE6
++ *     domain and cross-checked by reproducing B37's 0x00760000 shader packet.
++ *
++ * The old CP_MEM_WRITE stays, but now writes 0xdeadbeef instead of the const
++ * value. If the shader were still reading memory, result[2] would be
++ * 0xdeadbeef + 0x111 and could never match. cp-seed also remains a
++ * ring-health instrument. r0..r2 only: FULLREGFOOTPRINT stays 3.
 + */
 +static const uint32_t cs_program[CS_PROGRAM_WORDS] = {
 +	0xfeed0001u, 0x204cc008u,	/* mov.u32u32 r2.x, <result address> (patched) */
 +	0x00000000u, 0x204cc009u,	/* mov.u32u32 r2.y, 0 */
 +	0x0badf00du, 0x204cc004u,	/* mov.u32u32 r1.x, 0x0badf00d (control) */
 +	0x00000000u, 0x00000000u,	/* nop: delay slot */
-+	0x01820081u, 0xc0060005u,	/* ldg.u32 r1.y, g[r2.x+0x40], 1 */
-+	0x00000000u, 0x00000000u,	/* nop: load latency */
-+	0x00000000u, 0x00000000u,	/* nop: load latency */
-+	0x00000000u, 0x00000000u,	/* nop: load latency */
-+	0x21110005u, 0x52100005u,	/* add.u r1.y, r1.y, 0x111 (sy)  (B47: THE ONE CHANGE) */
++	0x00000000u, 0x202cc005u,	/* mov.u32u32 r1.y, c0.x  (B48: THE ONE CHANGE) */
++	0x00000000u, 0x00000000u,	/* nop: latency (kept from B47) */
++	0x00000000u, 0x00000000u,	/* nop: latency (kept from B47) */
++	0x00000000u, 0x00000000u,	/* nop: latency (kept from B47) */
++	0x21110005u, 0x52100005u,	/* add.u r1.y, r1.y, 0x111 (sy) */
 +	0x01800008u, 0xc0c61100u,	/* stg.u32 g[r2.x+0], r1.x, 1 (control) */
 +	0x0180000au, 0xd0c61108u,	/* stg.u32 g[r2.x+8], r1.y, 1 (sy) */
 +	0x00000000u, 0x03000000u,	/* end */
@@ -2696,7 +2703,7 @@ new file mode 100644
 +static const struct cs_word cs_ctx[] = {
 +	{ 0x0ab00, 0x00000005 },	/* SP_MODE_CNTL: ISAMMODE_GL, constant demotion */
 +	{ 0x0bb08, 0x000000ff },	/* SP_UPDATE_CNTL: all eight bits, as fd6 sets them */
-+	{ 0x0b987, 0x00000100 },	/* SP_CS_CONST_CONFIG: constlen 0, enabled */
++	{ 0x0b987, 0x00000101 },	/* SP_CS_CONST_CONFIG: CONSTLEN=4 vec4, enabled */
 +	{ 0x0a9bb, 0x00000100 },	/* SP_CS_CONFIG: enabled, nuav 0 (the stg uses no descriptor) */
 +	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: 1 KB shared, const ram 128 */
 +	{ 0x0b997, 0x00fcfcfc },	/* SP_CS_CONST_CONFIG_0: every constid INVALID */
@@ -2879,7 +2886,7 @@ new file mode 100644
 +		CS_PUT(pkt7(CP_MEM_WRITE_OPCODE, 3u));
 +		CS_PUT((uint32_t)s_);
 +		CS_PUT((uint32_t)(s_ >> 32));
-+		CS_PUT(cs_seed_value);
++		CS_PUT(CS_CONST_SENTINEL);	/* B48: != c0.x, so a memory read cannot pass */
 +	}
 +	if ((flags & CS_F_Q_INV) != 0) {
 +		/*
@@ -2899,6 +2906,22 @@ new file mode 100644
 +			CS_PUT(pkt7(0x65u, 1u));	/* CP_SET_MARKER */
 +			CS_PUT(8u);			/* RM6_COMPUTE, per a6xx_marker in adreno_pm4.xml */
 +		}
++		/*
++		 * B48: a6xx.cc:emit_const()'s exact shape, one vec4 at c0.
++		 * dword0 = CP_LOAD_STATE6_0(dst_off 0, ST6_CONSTANTS, SS6_DIRECT,
++		 * SB6_CS_SHADER, NUM_UNIT 1) = 0x00744000. The 64-bit EXT_SRC_ADDR
++		 * slot is still present (zeros) even for DIRECT; pkt7 cnt counts only
++		 * these 7 payload dwords (教训 32). Derived from adreno_pm4.xml's
++		 * CP_LOAD_STATE6 domain, cross-checked against B37's 0x00760000.
++		 */
++		CS_PUT(pkt7(0x34u, 7u));		/* CP_LOAD_STATE6_FRAG */
++		CS_PUT(0x00744000u);
++		CS_PUT(0u);				/* EXT_SRC_ADDR lo */
++		CS_PUT(0u);				/* EXT_SRC_ADDR hi */
++		CS_PUT(cs_const_value);		/* c0.x */
++		CS_PUT(0u);				/* c0.y */
++		CS_PUT(0u);				/* c0.z */
++		CS_PUT(0u);				/* c0.w */
 +		/*
 +		 * The grid: one group of eight invocations. NDRANGE_1 is local times
 +		 * groups (fd6: localsize_x * num_groups[0]) and NDRANGE_0's local
@@ -3174,26 +3197,29 @@ new file mode 100644
 +	const uint64_t base = g3d_regions[2].address;
 +	uint32_t *shader = (uint32_t *)((vm_offset_t)memptrs + CS_PROGRAM_OFF);
 +	/*
-+	 * B47: make the shader COMPUTE, not just copy.
++	 * B48: is the real driver's const parameter path alive?
 +	 *
-+	 * B46 closed the load path, but result[2] was still a MOVE. A cat2 add.u
-+	 * now sits between the ldg and the store, so result[2] must be seed+0x111.
-+	 * The A/B control is built into the same program image: on A and D the two
-+	 * add.u dwords are patched back to nops after the memcpy, so those rings
-+	 * must return the seed unchanged. Four different seeds, all four rings INV,
-+	 * one shared target cleared before every launch. cp-seed remains the
-+	 * instrument's own instrument and result[0] keeps B37's control store.
++	 * Only the data source changed: emit_const()'s CP_LOAD_STATE6_FRAG puts
++	 * this ring's value into c0.x, and slot 4 is mov.u32u32 r1.y, c0.x.
++	 * The A/B instrument from B47 is unchanged: A and D patch the add.u back
++	 * to nops (they must return c0.x unchanged), B and C keep it (c0.x+0x111).
++	 * Four different uploads, all four rings INVated, one shared cleared target.
++	 *
++	 * cp-seed is now a SENTINEL (0xdeadbeef), deliberately different from
++	 * every const value: it proves the CP still writes and the ring is not out
++	 * of phase, while making it impossible for a memory read to masquerade
++	 * as a successful const read.
 +	 */
 +	static const struct {
 +		uint32_t flags;
 +		uint32_t tag;
-+		uint32_t seed;
++		uint32_t constval;
 +		const char *what;
 +	} plan[4] = {
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU, 0u, 0x5eedc0deu, "NOALU 1: add.u -> nop, seed must come back unchanged" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  1u, 0xa5a5c3c3u, "ALU 2: expect seed + 0x111" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  2u, 0x1badb002u, "ALU 3: a third different seed, same add.u" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU, 3u, 0x2f00d123u, "NOALU 4: closing control, add.u off again" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU, 0u, 0x5eedc0deu, "CONST 1: add.u off, c0.x must come back unchanged" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  1u, 0xa5a5c3c3u, "CONST 2: expect c0.x + 0x111" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  2u, 0x1badb002u, "CONST 3: a third different upload" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU,  3u, 0x2f00d123u, "CONST 4: closing control, add.u off again" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
@@ -3204,7 +3230,7 @@ new file mode 100644
 +	uint32_t expected[4] = { 0, 0, 0, 0 };
 +	uint32_t t;
 +
-+	printf("mi8gpu: step 23: a shader that computes, SECVID_TRUST_CNTL %#x (%s)\n",
++	printf("mi8gpu: step 23: a shader that reads a const, SECVID_TRUST_CNTL %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE");
 +	for (t = 0; t < n_plan; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
@@ -3227,11 +3253,11 @@ new file mode 100644
 +			shader[2u * CS_ALU_IDX + 1u] = 0;
 +		}
 +		expected[t] = ((plan[t].flags & CS_F_Q_NOALU) != 0)
-+		    ? plan[t].seed : (uint32_t)(plan[t].seed + CS_ALU_IMM);
++		    ? plan[t].constval : (uint32_t)(plan[t].constval + CS_ALU_IMM);
 +		to_memory((vm_offset_t)memptrs, 0x1000);
-+		cs_seed_value = plan[t].seed;
-+		printf("mi8gpu: step 23 launch %c: %s (seed 0x%08x at %#llx)\n",
-+		    'A' + t, plan[t].what, plan[t].seed, base + CS_SEED_OFF);
++		cs_const_value = plan[t].constval;
++		printf("mi8gpu: step 23 launch %c: %s (const 0x%08x, sentinel 0x%08x)\n",
++		    'A' + t, plan[t].what, plan[t].constval, (uint32_t)CS_CONST_SENTINEL);
 +		seen = rd(cb + CB_FSR);
 +		if (seen != 0) {
 +			wr(cb + CB_FSR, seen);
@@ -3244,13 +3270,13 @@ new file mode 100644
 +		fsr_after = rd(cb + CB_FSR);
 +		ctl[t] = result[0];
 +		loaded[t] = result[2];
-+		/* the instrument's own instrument: did the CP actually write the seed? */
++		/* the instrument's own instrument: did the CP write the sentinel? */
 +		uint32_t seed_seen = *(volatile uint32_t *)((vm_offset_t)memptrs + CS_SEED_OFF);
 +		/* the B38-onward shape, so the judge's result/fence/FSR regex still fits */
 +		printf("mi8gpu: step 23 launch %c: result 0x%08x, fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x\n",
 +		    'A' + t, ctl[t], *fence, fsr_before, fsr_after);
-+		printf("mi8gpu: step 23 launch %c: computed 0x%08x, seed 0x%08x, expected 0x%08x, cp-seed 0x%08x, inv %u, alu %u\n",
-+		    'A' + t, loaded[t], plan[t].seed, expected[t], seed_seen,
++		printf("mi8gpu: step 23 launch %c: computed 0x%08x, const 0x%08x, expected 0x%08x, cp-seed 0x%08x, inv %u, alu %u\n",
++		    'A' + t, loaded[t], plan[t].constval, expected[t], seed_seen,
 +		    ((plan[t].flags & CS_F_Q_INV) != 0) ? 1u : 0u,
 +		    ((plan[t].flags & CS_F_Q_NOALU) != 0) ? 0u : 1u);
 +		printf("mi8gpu: step 23 launch %c: FSYNR0 0x%08x, FAR 0x%llx%08x\n", 'A' + t,
@@ -3282,8 +3308,8 @@ new file mode 100644
 +		} else if (ctl[t] == CS_WANT && loaded[t] == expected[t]) {
 +			printf("mi8gpu: step 23 VERDICT launch %c: %s\n", 'A' + t,
 +			    ((plan[t].flags & CS_F_Q_NOALU) != 0)
-+			    ? "COPY LANDED, ADD.U WAS PATCHED OUT"
-+			    : "ADD.U RAN, RESULT IS SEED + 0x111");
++			    ? "C0.X CAME BACK UNCHANGED, ADD.U WAS PATCHED OUT"
++			    : "ADD.U RAN, RESULT IS C0.X + 0x111");
 +		} else if (ctl[t] == CS_WANT) {
 +			printf("mi8gpu: step 23 VERDICT launch %c: control stored, THE VALUE IS NOT THE EXPECTED ONE\n", 'A' + t);
 +		} else {
@@ -3297,7 +3323,7 @@ new file mode 100644
 +			break;
 +		}
 +	}
-+	printf("mi8gpu: step 23 ALU TABLE: control 0badf00d, then seed or seed + 0x111\n");
++	printf("mi8gpu: step 23 CONST TABLE: control 0badf00d, then c0.x or c0.x + 0x111\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
@@ -3308,9 +3334,11 @@ new file mode 100644
 +		} else if (ctl[t] != CS_WANT) {
 +			v = "the program did not store";
 +		} else if (loaded[t] == expected[t]) {
-+			v = ((plan[t].flags & CS_F_Q_NOALU) != 0) ? "COPY OK (alu off)" : "ALU OK (seed + 0x111)";
-+		} else if (loaded[t] == plan[t].seed) {
-+			v = "plain copy -- add.u had no effect";
++			v = ((plan[t].flags & CS_F_Q_NOALU) != 0) ? "CONST OK (alu off)" : "CONST + ALU OK";
++		} else if (loaded[t] == CS_CONST_SENTINEL || loaded[t] == (uint32_t)(CS_CONST_SENTINEL + CS_ALU_IMM)) {
++			v = "READ THE SENTINEL -- memory path, not const";
++		} else if (loaded[t] == CS_ALU_IMM) {
++			v = "c0.x read as zero -- const upload did not land";
 +		} else {
 +			v = "unexpected value";
 +		}
@@ -3328,9 +3356,9 @@ new file mode 100644
 +		if (ctl[0] != CS_WANT) {
 +			printf("mi8gpu: step 23 SUMMARY: even the control store failed; not comparable\n");
 +		} else if (n_ok == n_plan) {
-+			printf("mi8gpu: step 23 SUMMARY: THE ALU RAN ON EVERY LAUNCH; the nop controls copied\n");
++			printf("mi8gpu: step 23 SUMMARY: THE SP READS CP-UPLOADED CONSTANTS; the nop controls copied\n");
 +		} else {
-+			printf("mi8gpu: step 23 SUMMARY: the two pairs did not separate; add.u is not load-bearing as built\n");
++			printf("mi8gpu: step 23 SUMMARY: the const path did not separate the two pairs\n");
 +		}
 +	}
 +	cs_hole_sensor();
