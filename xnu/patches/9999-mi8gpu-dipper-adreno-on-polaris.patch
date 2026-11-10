@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5765 @@
+@@ -0,0 +1,5848 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2571,6 +2571,19 @@ new file mode 100644
 +#define CS_F_Q_UAV	0x8u	/* the old UAV CP_LOAD_STATE6, aimed at block 0xd again */
 +#define CS_F_Q_SIZE	0x10u	/* SP_CS_INSTR_SIZE back to 32, i.e. counted in dwords */
 +#define CS_F_Q_REGS	0x20u	/* SP_CS_CNTL_0's FULLREGFOOTPRINT back to 2 */
++/*
++ * B39: B38 answered the question it was built to ask, and not the way anyone
++ * expected. The same state and the same dispatch store 0badf00d when they are
++ * submitted as two rings, and do not store it when they share one -- so the
++ * split is load-bearing and the per-field rings below it were confounded by it.
++ *
++ * So the question changes. It is no longer "which state field matters" but
++ * "what does the boundary between the two rings supply". Three candidates, one
++ * packet each, all of them things the reference driver already does.
++ */
++#define CS_F_Q_WFI	0x40u	/* CP_WAIT_FOR_IDLE between the state and the dispatch */
++#define CS_F_Q_MODE	0x80u	/* CP_SET_MODE(1) at the head: whether the CP defers state */
++#define CS_F_Q_MARK	0x100u	/* RM6_COMPUTE ahead of the state, where fd6 puts it */
 +#define CS_WANT		0x0badf00du
 +
 +/*
@@ -2714,6 +2727,29 @@ new file mode 100644
 +		CS_PUT((uint32_t)(m_ >> 32));						\
 +		CS_PUT(CS_MARKER(tag, ph));						\
 +	} while (0)
++	/*
++	 * B39: the two packets the reference driver puts in front of the compute state,
++	 * neither of which this probe has ever emitted.
++	 *
++	 * fd6_emit_cs_state() opens with CP_SET_MODE(1) and says why: "we want
++	 * CP_SET_DRAW_STATE to execute immediately, otherwise we need to emit consts as
++	 * draw state groups" -- the PROG group has to execute before the const loads
++	 * rather than be deferred until CP_EXEC_CS. If a6xx defers context state to the
++	 * dispatch by default, that alone would explain B38: in the split ring the
++	 * deferred state is applied when the ring retires, and in the combined ring the
++	 * dispatch arrives before it.
++	 *
++	 * The marker is the other half. fd6_launch_grid() calls set_render_mode(RM6_
++	 * COMPUTE) *before* emitting the state; this probe has always set it after.
++	 */
++	if ((flags & CS_F_Q_MODE) != 0) {
++		CS_PUT(pkt7(0x63u, 1u));		/* CP_SET_MODE */
++		CS_PUT(1u);				/* state groups execute immediately */
++	}
++	if ((flags & CS_F_Q_MARK) != 0) {
++		CS_PUT(pkt7(0x65u, 1u));		/* CP_SET_MARKER */
++		CS_PUT(8u);				/* RM6_COMPUTE, ahead of the state */
++	}
 +	if (state) {
 +		for (uint32_t i = 0; i < (uint32_t)(sizeof(cs_ncr) / sizeof(cs_ncr[0])); i++) {
 +			CS_PUT(pkt4(cs_ncr[i].reg, 1u));
@@ -2775,10 +2811,21 @@ new file mode 100644
 +		CS_PUT(0x0a9b4u); CS_PUT((uint32_t)sp_base);
 +		CS_PUT(0x0a9b5u); CS_PUT((uint32_t)(sp_base >> 32));
 +	}
++	if ((flags & CS_F_Q_WFI) != 0) {
++		/*
++		 * The cheapest of the three: if the split's whole contribution is that the CP
++		 * drains between the state writes and the dispatch, one wait reproduces it
++		 * inside a single ring. This is the packet ring A already ends with, moved to
++		 * where the boundary would be.
++		 */
++		CS_PUT(pkt7(0x26u, 0u));		/* CP_WAIT_FOR_IDLE */
++	}
 +	CS_MARK(0);				/* everything above executed */
 +	if (exec) {
-+		CS_PUT(pkt7(0x65u, 1u));		/* CP_SET_MARKER */
-+		CS_PUT(8u);				/* RM6_COMPUTE, per a6xx_marker in adreno_pm4.xml */
++		if ((flags & CS_F_Q_MARK) == 0) {	/* B39: a head-marker ring already set it */
++			CS_PUT(pkt7(0x65u, 1u));	/* CP_SET_MARKER */
++			CS_PUT(8u);			/* RM6_COMPUTE, per a6xx_marker in adreno_pm4.xml */
++		}
 +		/*
 +		 * The grid: one group of eight invocations. NDRANGE_1 is local times
 +		 * groups (fd6: localsize_x * num_groups[0]) and NDRANGE_0's local
@@ -3062,26 +3109,36 @@ new file mode 100644
 +	 * a ring that leaves its word empty names the change that mattered.
 +	 *
 +	 * Ring A is the control: B37's proven shape (state alone, then a dispatch
-+	 * alone) and the readback between them. B is that dispatch. C-F each carry a
-+	 * full state ring, so a quirk cannot leak into the next ring's reading.
++	 * alone) and the readback between them. B is that dispatch. C is B38's result
++	 * repeated on purpose -- the same two things in one ring, which must fail.
++	 * D-G each add exactly one packet to C's ring, so the first of them that
++	 * stores names what the boundary was supplying.
++	 *
++	 * H is a closing control and it is not decoration. If C's failure leaves the SP
++	 * in a state that nothing afterwards can use, D-G would all be silent for a
++	 * reason that has nothing to do with their packets -- and H, a plain dispatch
++	 * ring of the kind that has stored in every build since B37, is what tells the
++	 * two apart.
 +	 */
 +	static const struct {
 +		uint32_t flags;
 +		uint32_t tag;
 +		const char *what;
-+	} plan[6] = {
++	} plan[8] = {
 +		{ CS_F_STATE,	0u, "CONTROL: the state alone, as B37 ran it (no dispatch)" },
 +		{ CS_F_EXEC,	1u, "CONTROL: the dispatch alone on that state -- B37's passing ring" },
-+		{ CS_F_STATE | CS_F_EXEC,		2u, "state and dispatch in ONE ring (B37 split them)" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_UAV,	3u, "one ring, with the old UAV load at block 0xd again" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_SIZE,	4u, "one ring, with SP_CS_INSTR_SIZE back to 32" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_REGS,	5u, "one ring, with SP_CS_CNTL_0's footprint back to 2" },
++		{ CS_F_STATE | CS_F_EXEC,		2u, "ONE ring, plain: B38's failing ring, repeated" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_WFI,	3u, "one ring, with CP_WAIT_FOR_IDLE before the dispatch" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_MODE,	4u, "one ring, with CP_SET_MODE(1) at the head" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_MARK,	5u, "one ring, with RM6_COMPUTE set before the state" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_WFI | CS_F_Q_MODE, 6u, "one ring, with the wait and CP_SET_MODE(1) both" },
++		{ CS_F_EXEC,	7u, "CLOSING CONTROL: the dispatch alone again, after all of it" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
-+	bool faulted[6] = { false, false, false, false, false, false };
-+	int reached[6] = { 0, 0, 0, 0, 0, 0 };
-+	uint32_t stored[6] = { 0, 0, 0, 0, 0, 0 };
++	bool faulted[8] = { false, false, false, false, false, false, false, false };
++	int reached[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++	uint32_t stored[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 +	uint32_t t, n_stored = 0;
 +
 +	printf("mi8gpu: step 23: a shader, on a core whose SECVID_TRUST_CNTL reads %#x (%s)\n",
@@ -3120,11 +3177,11 @@ new file mode 100644
 +		arrived = *result;
 +		/* the first two rings are the control and always behave the same way */
 +		if (t == 0) {
-+			printf("mi8gpu: step 23 launch %c: result %#010x (must be 0: no dispatch), fence %#010x, CB1 FSR %#010x -> %#010x\n",
++			printf("mi8gpu: step 23 launch %c: result 0x%08x (must be 0: no dispatch), fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x\n",
 +			    'A' + t, arrived, *fence, fsr_before, fsr_after);
 +		} else {
 +			stored[t] = arrived;
-+			printf("mi8gpu: step 23 launch %c: result %#010x%s, fence %#010x, CB1 FSR %#010x -> %#010x, FSYNR0 %#010x, FAR %#llx%08x\n",
++			printf("mi8gpu: step 23 launch %c: result 0x%08x%s, fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x, FSYNR0 0x%08x, FAR 0x%llx%08x\n",
 +			    'A' + t, arrived, arrived == CS_WANT ? " (THE STORE LANDED)" : "", *fence,
 +			    fsr_before, fsr_after, rd(cb + CB_FSYNR0),
 +			    (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
@@ -3174,7 +3231,7 @@ new file mode 100644
 +	 * The attribution table. A ring is only a reading if it reached its last
 +	 * marker; otherwise its result word says nothing and is printed as a dash.
 +	 */
-+	printf("mi8gpu: step 23 ATTRIBUTION: %s\n", "B37's shape vs one quirk put back at a time");
++	printf("mi8gpu: step 23 ATTRIBUTION: %s\n", "B37's split, vs one packet added to the ring that fails");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
@@ -3189,13 +3246,39 @@ new file mode 100644
 +		}
 +		printf("mi8gpu: step 23   %c  %-62s  %s\n", 'A' + t, plan[t].what, v);
 +	}
-+	if (n_stored == n_plan - 1u) {
-+		printf("mi8gpu: step 23 SUMMARY: ALL SIX RINGS STORE. None of B37's three state changes was load-bearing on its own, and the ring split is not either -- so what B37 fixed was the state as a set: the SP needs the whole thing consistent, and any single reverted field is tolerated as long as the rest is right\n");
-+	} else if (reached[1] != 3 || stored[1] != CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: THE CONTROL DID NOT STORE. B37's passing ring is not reproducible in this build, so nothing below it can be attributed -- compare this ring against ring-mi8gpu-B37.txt before reading the table\n");
++	/*
++	 * B39: two controls now, not one, and they fail in different ways.
++	 *
++	 * B must store, or this build does not reproduce B37 and there is nothing to
++	 * ask. C must NOT store, or it does not reproduce B38 -- and if C stores, the
++	 * hypothesis this build is built on is gone. H must store, or C's failure has
++	 * poisoned everything after it and D-G are silent for a reason of their own.
++	 * Only then does the first of D-G that stores mean what it appears to mean.
++	 */
++	if (reached[1] != 3 || stored[1] != CS_WANT) {
++		printf("mi8gpu: step 23 SUMMARY: THE CONTROL DID NOT STORE. B37's passing ring is not reproducible in this build, so nothing below it can be read -- compare ring B against ring-mi8gpu-B37.txt first\n");
++	} else if (reached[2] == 3 && stored[2] == CS_WANT) {
++		printf("mi8gpu: step 23 SUMMARY: B38 DID NOT REPRODUCE. The plain one-ring launch stored this time, so B38's silence was not the boundary doing something, and nothing below ring C can be read\n");
++	} else if (reached[7] != 3 || stored[7] != CS_WANT) {
++		printf("mi8gpu: step 23 SUMMARY: THE CLOSING CONTROL DID NOT STORE. A plain dispatch ring after the one-ring launches is silent, and that ring has stored in every build since B37 -- so ring C's failure damaged something that outlives it, and D-G may be read only as \"no evidence\"\n");
 +	} else {
-+		printf("mi8gpu: step 23 SUMMARY: ATTRIBUTION ABOVE IS VALID -- ring B reproduced B37 and each ring below it differs by exactly one field. Read the table: the ring that stops storing names the field the SP needs\n");
++		int w = -1;
++
++		for (t = 3; t < 7u; t++) {
++			if (reached[t] == 3 && stored[t] == CS_WANT) {
++				w = (int)t;
++				break;
++			}
++		}
++		if (w < 0) {
++			printf("mi8gpu: step 23 SUMMARY: NOT ANY OF THE THREE. The split stores where one ring does not, and neither a wait, nor CP_SET_MODE(1), nor an earlier RM6_COMPUTE buys it back -- so the boundary supplies something none of those packets does, and the split has to stay\n");
++		} else {
++			printf("mi8gpu: step 23 SUMMARY: %c IS THE ONE THAT RESTORED THE STORE -- \"%s\". One packet in the same ring buys back what the second ring was buying, and that is what the real launch carries\n",
++			    'A' + w, plan[w].what);
++		}
 +	}
++	printf("mi8gpu: step 23 SUMMARY: %u of %u rings stored 0badf00d into their own word\n",
++	    n_stored, n_plan - 1u);
 +	/*
 +	 * Last, and only now is it worth anything: every ring above stores into a
 +	 * mapped page, so none of them faults and the CP is still healthy. B37
