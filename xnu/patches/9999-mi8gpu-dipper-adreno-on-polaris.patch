@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5925 @@
+@@ -0,0 +1,5951 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2526,7 +2526,7 @@ new file mode 100644
 + * turned out to be aimed at the shader instruction block -- see cs_launch.
 + * There is one CP_LOAD_STATE6 now, for the program.
 + */
-+#define CS_PROGRAM_WORDS	32u
++#define CS_PROGRAM_WORDS	64u	/* B49: two 128-byte instruction groups */
 +#define CS_PROGRAM_OFF		0x100u
 +#define CS_UAV_OFF		0x200u
 +#define CS_RESULT_OFF		0x300u
@@ -2602,59 +2602,76 @@ new file mode 100644
 +#define CS_F_Q_NOALU	0x800u	/* B47: patch the add.u back to a nop in this ring */
 +#define CS_ALU_IMM	0x111u	/* add.u r1.y, r1.y, 0x111 */
 +#define CS_ALU_IDX	8u	/* instruction slot of the add.u (dwords 16,17) */
++#define CS_ALU2_IMM	0x222u	/* B49: the second group's add.u immediate */
++#define CS_ALU2_IDX	16u	/* B49: slot of the second group's add.u */
++#define CS_GROUPS	2u	/* B49: instrlen / NUM_UNIT, 128-byte groups */
 +#define CS_WANT		0x0badf00du
 +#define CS_SEED_OFF	0x340u	/* result + 0x40: B48 sentinel, NOT read by the shader */
 +#define CS_CONST_SENTINEL 0xdeadbeefu	/* B48: memory value, deliberately != c0.x */
 +static uint32_t cs_const_value;	/* B48: CP_LOAD_STATE6_FRAG uploads this as c0.x */
 +
 +/*
-+ * B48: the parameter now comes from the const RAM the real driver uses.
++ * B49: the program is now TWO 128-byte instruction groups.
 + *
-+ * B47 proved ldg -> add.u -> stg, but the seed was planted by CP_MEM_WRITE
-+ * straight into global memory. fd6_launch_grid() instead calls
-+ * fd6_emit_cs_user_consts(), whose a6xx.cc:emit_const() emits
-+ * CP_LOAD_STATE6_FRAG with ST6_CONSTANTS / SS6_DIRECT / SB6_CS_SHADER /
-+ * NUM_UNIT=1 and one vec4 of inline dwords. The shader reads c0.x.
++ * 5b.28 named the remaining gap precisely: cs_launch() has emitted the
++ * indirect ST6_SHADER / SB6_CS_SHADER load since B37, so what is missing is
++ * not the packet but the program -- 32 dwords of hand-written minimum ir3,
++ * where a real fd6_launch_grid() would install an ir3-compiled shader with
++ * pvtmem / constlen / instrlen management and more than one fetch group.
 + *
-+ * This program is B47's with exactly ONE instruction replaced:
++ * fd6_program.cc:fd6_emit_shader() and computerator/a6xx.cc:cs_program_emit()
++ * both set CP_LOAD_STATE6's NUM_UNIT = MIN2(instrlen, instr_cache_size),
++ * and instrlen is counted in 128-byte groups (ir3_shader.h). So this rung
++ * moves three things that are ONE variable -- the program length:
 + *
-+ *   ldg.u32 r1.y, g[r2.x+0x40], 1  ->  mov.u32u32 r1.y, c0.x
-+ *                                       0x00000000 0x202cc005
++ *   CS_PROGRAM_WORDS   32 -> 64           (two groups, 0x100..0x200)
++ *   SP_CS_INSTR_SIZE   1  -> 2
++ *   CP_LOAD_STATE6     0x00760000 -> 0x00b60000   (NUM_UNIT 1 -> 2)
 + *
-+ * The cat1 mov-const word is derived from ir3-cat1.xml (#cat1-const-src,
-+ * DST_TYPE/SRC_TYPE u32=3, pattern bits53-54="01") and validated bit for bit
-+ * against two real compiled shaders' mov.u32u32 r11.x/r11.y, c0.z/c0.w.
-+ * All 15 other instruction words are byte-identical to B47.
++ * Group 1 is B48's slots 0..10 byte-for-byte; only slot 11's `end` becomes a
++ * nop. Group 2 carries an add.u (+0x222) and a stg to result[4], then `end`
++ * at slot 31. result[4] is deliberately a NEW target that only group 2 can
++ * write: a zero there says the SP never fetched past the 128-byte boundary,
++ * even if result[2] (group 1) is correct. 教训 38/42: make the subject write
++ * its own constant; do not infer execution from a word group 1 already wrote.
 + *
-+ * Two state changes necessarily accompany the new source:
-+ *   SP_CS_CONST_CONFIG 0x100 -> 0x101 (CONSTLEN=4 vec4, ENABLED), the exact
-+ *     value in Mesa's crash.log:7010 for a real compute shader;
-+ *   a 7-dword CP_LOAD_STATE6_FRAG const packet after RM6_COMPUTE, whose
-+ *     header 0x00744000 is derived from adreno_pm4.xml's CP_LOAD_STATE6
-+ *     domain and cross-checked by reproducing B37's 0x00760000 shader packet.
-+ *
-+ * The old CP_MEM_WRITE stays, but now writes 0xdeadbeef instead of the const
-+ * value. If the shader were still reading memory, result[2] would be
-+ * 0xdeadbeef + 0x111 and could never match. cp-seed also remains a
-+ * ring-health instrument. r0..r2 only: FULLREGFOOTPRINT stays 3.
++ * Both add.u are derived from ir3-cat2.xml, both stg from ir3-cat6.xml, and
++ * the NUM_UNIT field from adreno_pm4.xml -- each reproduction checked against
++ * B37/B45/B47's already-running binaries before this program was generated.
 + */
 +static const uint32_t cs_program[CS_PROGRAM_WORDS] = {
 +	0xfeed0001u, 0x204cc008u,	/* mov.u32u32 r2.x, <result address> (patched) */
 +	0x00000000u, 0x204cc009u,	/* mov.u32u32 r2.y, 0 */
 +	0x0badf00du, 0x204cc004u,	/* mov.u32u32 r1.x, 0x0badf00d (control) */
 +	0x00000000u, 0x00000000u,	/* nop: delay slot */
-+	0x00000000u, 0x202cc005u,	/* mov.u32u32 r1.y, c0.x  (B48: THE ONE CHANGE) */
-+	0x00000000u, 0x00000000u,	/* nop: latency (kept from B47) */
-+	0x00000000u, 0x00000000u,	/* nop: latency (kept from B47) */
-+	0x00000000u, 0x00000000u,	/* nop: latency (kept from B47) */
-+	0x21110005u, 0x52100005u,	/* add.u r1.y, r1.y, 0x111 (sy) */
++	0x00000000u, 0x202cc005u,	/* mov.u32u32 r1.y, c0.x  (B48, unchanged) */
++	0x00000000u, 0x00000000u,	/* nop: latency */
++	0x00000000u, 0x00000000u,	/* nop: latency */
++	0x00000000u, 0x00000000u,	/* nop: latency */
++	0x21110005u, 0x52100005u,	/* add.u r1.y, r1.y, 0x111 (sy)   [group 1] */
 +	0x01800008u, 0xc0c61100u,	/* stg.u32 g[r2.x+0], r1.x, 1 (control) */
-+	0x0180000au, 0xd0c61108u,	/* stg.u32 g[r2.x+8], r1.y, 1 (sy) */
-+	0x00000000u, 0x03000000u,	/* end */
-+	0x00000000u, 0x00000000u,	/* nop */
-+	0x00000000u, 0x00000000u,	/* nop */
-+	0x00000000u, 0x00000000u,	/* nop */
-+	0x00000000u, 0x00000000u,	/* nop */
++	0x0180000au, 0xd0c61108u,	/* stg.u32 g[r2.x+8], r1.y, 1 (sy)  -> result[2] */
++	0x00000000u, 0x00000000u,	/* B49: the old `end` is gone; fetch must continue into group 2 */
++	0x00000000u, 0x00000000u,	/* nop (group 1 tail, byte-identical to B48) */
++	0x00000000u, 0x00000000u,	/* nop (group 1 tail, byte-identical to B48) */
++	0x00000000u, 0x00000000u,	/* nop (group 1 tail, byte-identical to B48) */
++	0x00000000u, 0x00000000u,	/* nop (group 1 tail, byte-identical to B48) */
++	0x22220005u, 0x52100005u,	/* add.u r1.y, r1.y, 0x222 (sy)   [group 2] THE BOUNDARY */
++	0x0180000au, 0xd0c61110u,	/* stg.u32 g[r2.x+0x10], r1.y, 1 (sy) -> result[4] */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x00000000u,	/* nop (group 2) */
++	0x00000000u, 0x03000000u,	/* end (group 2, slot 31) */
 +};
 +
 +/*
@@ -2820,9 +2837,11 @@ new file mode 100644
 +		 */
 +		CS_PUT(0x0a9b0u);
 +		CS_PUT(((flags & CS_F_Q_REGS) != 0) ? 0x80100100u : 0x80100180u);
-+		/* SP_CS_INSTR_SIZE is in 128-byte instruction groups: 32 dwords is one. */
++		/* B49: instrlen is in 128-byte groups, so 64 dwords is TWO.
++		 * fd6_emit_shader() uses MIN2(instrlen, instr_cache_size) as
++		 * CP_LOAD_STATE6's NUM_UNIT, so both values move together. */
 +		CS_PUT(0x0a9bcu);
-+		CS_PUT(((flags & CS_F_Q_SIZE) != 0) ? 32u : 1u);
++		CS_PUT(((flags & CS_F_Q_SIZE) != 0) ? 32u : CS_GROUPS);
 +		CS_PUT(0x0a9b3u); CS_PUT(0u);		/* SP_CS_PROGRAM_COUNTER_OFFSET */
 +		CS_PUT(0x0a9b4u); CS_PUT((uint32_t)sp_base);
 +		CS_PUT(0x0a9b5u); CS_PUT((uint32_t)(sp_base >> 32));
@@ -2831,9 +2850,11 @@ new file mode 100644
 +		CS_PUT(0x0a9b8u); CS_PUT((uint32_t)(pvt_iova >> 32));
 +		CS_PUT(0x0a9b9u); CS_PUT(0u);		/* SP_CS_PVT_MEM_SIZE: total 0 */
 +		CS_PUT(0x0a9bdu); CS_PUT(0u);		/* SP_CS_PVT_MEM_STACK_OFFSET */
-+		/* the program, as an indirect state block: ST6_SHADER/INDIRECT/SB6_CS_SHADER/1 */
++		/* B49: ST6_SHADER / SS6_INDIRECT / SB6_CS_SHADER / NUM_UNIT 2.
++		 * 0x00b60000 is derived from adreno_pm4.xml's CP_LOAD_STATE6
++		 * domain; NUM_UNIT 1 reproduces B37's 0x00760000 exactly. */
 +		CS_PUT(pkt7(0x34u, 3u));
-+		CS_PUT(0x00760000u);
++		CS_PUT(0x00b60000u);
 +		CS_PUT((uint32_t)program_iova);
 +		CS_PUT((uint32_t)(program_iova >> 32));
 +		if ((flags & CS_F_Q_UAV) != 0) {
@@ -3197,18 +3218,15 @@ new file mode 100644
 +	const uint64_t base = g3d_regions[2].address;
 +	uint32_t *shader = (uint32_t *)((vm_offset_t)memptrs + CS_PROGRAM_OFF);
 +	/*
-+	 * B48: is the real driver's const parameter path alive?
++	 * B49: does the SP fetch past the first 128-byte instruction group?
 +	 *
-+	 * Only the data source changed: emit_const()'s CP_LOAD_STATE6_FRAG puts
-+	 * this ring's value into c0.x, and slot 4 is mov.u32u32 r1.y, c0.x.
-+	 * The A/B instrument from B47 is unchanged: A and D patch the add.u back
-+	 * to nops (they must return c0.x unchanged), B and C keep it (c0.x+0x111).
-+	 * Four different uploads, all four rings INVated, one shared cleared target.
-+	 *
-+	 * cp-seed is now a SENTINEL (0xdeadbeef), deliberately different from
-+	 * every const value: it proves the CP still writes and the ring is not out
-+	 * of phase, while making it impossible for a memory read to masquerade
-+	 * as a successful const read.
++	 * result[2] is B48's group-1 store; result[4] can ONLY be written by the
++	 * second group's stg. The two add.u slots (8 and 16) are patched back to
++	 * nops together on A/D, so both stores must then return c0.x unchanged;
++	 * on B/C both run, so result[2] = c0.x + 0x111 and result[4] = c0.x +
++	 * 0x111 + 0x222. Four different uploads, all INVated, one shared cleared
++	 * target, 0xdeadbeef sentinel at cp-seed. A stale line, a baked immediate
++	 * or a group-1-only fetch cannot follow four values into a NEW word.
 +	 */
 +	static const struct {
 +		uint32_t flags;
@@ -3216,10 +3234,10 @@ new file mode 100644
 +		uint32_t constval;
 +		const char *what;
 +	} plan[4] = {
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU, 0u, 0x5eedc0deu, "CONST 1: add.u off, c0.x must come back unchanged" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  1u, 0xa5a5c3c3u, "CONST 2: expect c0.x + 0x111" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  2u, 0x1badb002u, "CONST 3: a third different upload" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU,  3u, 0x2f00d123u, "CONST 4: closing control, add.u off again" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU, 0u, 0x5eedc0deu, "GROUPS 1: both add.u off, both stores must copy c0.x" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  1u, 0xa5a5c3c3u, "GROUPS 2: expect +0x111 in group 1, +0x333 in group 2" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  2u, 0x1badb002u, "GROUPS 3: a third different upload" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOALU,  3u, 0x2f00d123u, "GROUPS 4: closing control, both add.u off again" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
@@ -3227,10 +3245,12 @@ new file mode 100644
 +	int reached[4] = { 0, 0, 0, 0 };
 +	uint32_t ctl[4] = { 0, 0, 0, 0 };
 +	uint32_t loaded[4] = { 0, 0, 0, 0 };
++	uint32_t loaded2[4] = { 0, 0, 0, 0 };
 +	uint32_t expected[4] = { 0, 0, 0, 0 };
++	uint32_t expected2[4] = { 0, 0, 0, 0 };
 +	uint32_t t;
 +
-+	printf("mi8gpu: step 23: a shader that reads a const, SECVID_TRUST_CNTL %#x (%s)\n",
++	printf("mi8gpu: step 23: a shader that spans two instruction groups, SECVID_TRUST_CNTL %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE");
 +	for (t = 0; t < n_plan; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
@@ -3248,12 +3268,16 @@ new file mode 100644
 +		memcpy(shader, cs_program, sizeof(cs_program));
 +		shader[0] = (uint32_t)(base + CS_RESULT_OFF);
 +		if ((plan[t].flags & CS_F_Q_NOALU) != 0) {
-+			/* the A/B control: put exactly the add.u slot back to a nop */
++			/* the A/B control: put BOTH add.u slots back to a nop */
 +			shader[2u * CS_ALU_IDX] = 0;
 +			shader[2u * CS_ALU_IDX + 1u] = 0;
++			shader[2u * CS_ALU2_IDX] = 0;
++			shader[2u * CS_ALU2_IDX + 1u] = 0;
 +		}
 +		expected[t] = ((plan[t].flags & CS_F_Q_NOALU) != 0)
 +		    ? plan[t].constval : (uint32_t)(plan[t].constval + CS_ALU_IMM);
++		expected2[t] = ((plan[t].flags & CS_F_Q_NOALU) != 0)
++		    ? plan[t].constval : (uint32_t)(plan[t].constval + CS_ALU_IMM + CS_ALU2_IMM);
 +		to_memory((vm_offset_t)memptrs, 0x1000);
 +		cs_const_value = plan[t].constval;
 +		printf("mi8gpu: step 23 launch %c: %s (const 0x%08x, sentinel 0x%08x)\n",
@@ -3270,15 +3294,17 @@ new file mode 100644
 +		fsr_after = rd(cb + CB_FSR);
 +		ctl[t] = result[0];
 +		loaded[t] = result[2];
++		loaded2[t] = result[4];
 +		/* the instrument's own instrument: did the CP write the sentinel? */
 +		uint32_t seed_seen = *(volatile uint32_t *)((vm_offset_t)memptrs + CS_SEED_OFF);
 +		/* the B38-onward shape, so the judge's result/fence/FSR regex still fits */
 +		printf("mi8gpu: step 23 launch %c: result 0x%08x, fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x\n",
 +		    'A' + t, ctl[t], *fence, fsr_before, fsr_after);
-+		printf("mi8gpu: step 23 launch %c: computed 0x%08x, const 0x%08x, expected 0x%08x, cp-seed 0x%08x, inv %u, alu %u\n",
-+		    'A' + t, loaded[t], plan[t].constval, expected[t], seed_seen,
++		printf("mi8gpu: step 23 launch %c: computed 0x%08x, computed2 0x%08x, const 0x%08x, expected 0x%08x, expected2 0x%08x, cp-seed 0x%08x, inv %u, alu %u, groups %u\n",
++		    'A' + t, loaded[t], loaded2[t], plan[t].constval, expected[t], expected2[t], seed_seen,
 +		    ((plan[t].flags & CS_F_Q_INV) != 0) ? 1u : 0u,
-+		    ((plan[t].flags & CS_F_Q_NOALU) != 0) ? 0u : 1u);
++		    ((plan[t].flags & CS_F_Q_NOALU) != 0) ? 0u : 1u,
++		    (uint32_t)CS_GROUPS);
 +		printf("mi8gpu: step 23 launch %c: FSYNR0 0x%08x, FAR 0x%llx%08x\n", 'A' + t,
 +		    rd(cb + CB_FSYNR0), (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
 +		if (*fence != (0xf00d0000u | (0x41u + plan[t].tag))) {
@@ -3305,11 +3331,10 @@ new file mode 100644
 +			faulted[t] = true;
 +			printf("mi8gpu: step 23 VERDICT launch %c: the bank faulted (%#010x -> %#010x)\n", 'A' + t,
 +			    fsr_before, fsr_after);
++		} else if (ctl[t] == CS_WANT && loaded[t] == expected[t] && loaded2[t] == expected2[t]) {
++			printf("mi8gpu: step 23 VERDICT launch %c: BOTH GROUPS STORED THE EXPECTED VALUE\n", 'A' + t);
 +		} else if (ctl[t] == CS_WANT && loaded[t] == expected[t]) {
-+			printf("mi8gpu: step 23 VERDICT launch %c: %s\n", 'A' + t,
-+			    ((plan[t].flags & CS_F_Q_NOALU) != 0)
-+			    ? "C0.X CAME BACK UNCHANGED, ADD.U WAS PATCHED OUT"
-+			    : "ADD.U RAN, RESULT IS C0.X + 0x111");
++			printf("mi8gpu: step 23 VERDICT launch %c: GROUP 1 STORED, GROUP 2 DID NOT\n", 'A' + t);
 +		} else if (ctl[t] == CS_WANT) {
 +			printf("mi8gpu: step 23 VERDICT launch %c: control stored, THE VALUE IS NOT THE EXPECTED ONE\n", 'A' + t);
 +		} else {
@@ -3323,7 +3348,7 @@ new file mode 100644
 +			break;
 +		}
 +	}
-+	printf("mi8gpu: step 23 CONST TABLE: control 0badf00d, then c0.x or c0.x + 0x111\n");
++	printf("mi8gpu: step 23 GROUP TABLE: control 0badf00d, group 1 c0.x(+0x111), group 2 c0.x(+0x333)\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
@@ -3333,32 +3358,33 @@ new file mode 100644
 +			v = "the bank faulted";
 +		} else if (ctl[t] != CS_WANT) {
 +			v = "the program did not store";
-+		} else if (loaded[t] == expected[t]) {
-+			v = ((plan[t].flags & CS_F_Q_NOALU) != 0) ? "CONST OK (alu off)" : "CONST + ALU OK";
-+		} else if (loaded[t] == CS_CONST_SENTINEL || loaded[t] == (uint32_t)(CS_CONST_SENTINEL + CS_ALU_IMM)) {
++		} else if (loaded[t] == expected[t] && loaded2[t] == expected2[t]) {
++			v = ((plan[t].flags & CS_F_Q_NOALU) != 0) ? "GROUP 1 + 2 OK (alu off)" : "GROUP 1 + 2 + ALU OK";
++		} else if (loaded[t] == expected[t] && loaded2[t] == 0) {
++			v = "GROUP 2 DID NOT RUN -- fetch stopped at 128 bytes";
++		} else if (loaded2[t] == CS_CONST_SENTINEL || loaded2[t] == (uint32_t)(CS_CONST_SENTINEL + CS_ALU_IMM + CS_ALU2_IMM)) {
 +			v = "READ THE SENTINEL -- memory path, not const";
-+		} else if (loaded[t] == CS_ALU_IMM) {
-+			v = "c0.x read as zero -- const upload did not land";
 +		} else {
 +			v = "unexpected value";
 +		}
-+		printf("mi8gpu: step 23   %c  %-46s  %s\n", 'A' + t, plan[t].what, v);
++		printf("mi8gpu: step 23   %c  %-52s  %s\n", 'A' + t, plan[t].what, v);
 +	}
 +	{
 +		uint32_t n_ok = 0;
 +
 +		for (t = 0; t < n_plan; t++) {
-+			if (reached[t] == 3 && !faulted[t] && ctl[t] == CS_WANT && loaded[t] == expected[t]) {
++			if (reached[t] == 3 && !faulted[t] && ctl[t] == CS_WANT
++			    && loaded[t] == expected[t] && loaded2[t] == expected2[t]) {
 +				n_ok++;
 +			}
 +		}
-+		printf("mi8gpu: step 23 SUMMARY: %u of %u launches produced the expected value\n", n_ok, n_plan);
++		printf("mi8gpu: step 23 SUMMARY: %u of %u launches produced the expected value in both groups\n", n_ok, n_plan);
 +		if (ctl[0] != CS_WANT) {
 +			printf("mi8gpu: step 23 SUMMARY: even the control store failed; not comparable\n");
 +		} else if (n_ok == n_plan) {
-+			printf("mi8gpu: step 23 SUMMARY: THE SP READS CP-UPLOADED CONSTANTS; the nop controls copied\n");
++			printf("mi8gpu: step 23 SUMMARY: THE SP CROSSED THE 128-BYTE INSTRUCTION-GROUP BOUNDARY; the nop controls copied\n");
 +		} else {
-+			printf("mi8gpu: step 23 SUMMARY: the const path did not separate the two pairs\n");
++			printf("mi8gpu: step 23 SUMMARY: the two-group program did not separate the pairs\n");
 +		}
 +	}
 +	cs_hole_sensor();
