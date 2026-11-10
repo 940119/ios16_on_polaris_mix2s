@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5851 @@
+@@ -0,0 +1,5866 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2584,6 +2584,20 @@ new file mode 100644
 +#define CS_F_Q_WFI	0x40u	/* CP_WAIT_FOR_IDLE between the state and the dispatch */
 +#define CS_F_Q_MODE	0x80u	/* CP_SET_MODE(1) at the head: whether the CP defers state */
 +#define CS_F_Q_MARK	0x100u	/* RM6_COMPUTE ahead of the state, where fd6 puts it */
++/*
++ * B41: B40 showed that a one-ring launch leaves the SP unable to store for the
++ * rest of the boot, and that reloading the state does not bring it back. Whatever
++ * it breaks, it is not the context registers -- or not only them.
++ *
++ * The reference driver has a comment that names a mechanism this probe has never
++ * used. fd6_launch_grid() works around a fetch-length bug by setting the FS
++ * instruction length and then doing "a dummy event to roll the context", because
++ * the core reads the wrong register context without it. If a6xx keeps two register
++ * contexts and only rolls them at an event, then a split ring rolls one at its ring
++ * end while a combined ring never does -- which is exactly the difference B38-B40
++ * measured. The event is FD_LABEL, DEBUG_LABEL 0x3f on a6xx, one dword.
++ */
++#define CS_F_Q_ROLL	0x200u	/* CP_EVENT_WRITE(DEBUG_LABEL): roll the register context */
 +#define CS_WANT		0x0badf00du
 +
 +/*
@@ -2810,6 +2824,14 @@ new file mode 100644
 +		CS_PUT(pkt7(0x5cu, 4u));
 +		CS_PUT(0x0a9b4u); CS_PUT((uint32_t)sp_base);
 +		CS_PUT(0x0a9b5u); CS_PUT((uint32_t)(sp_base >> 32));
++	}
++	if ((flags & CS_F_Q_ROLL) != 0) {
++		/*
++		 * One dword is the whole packet: plain events need no address and no
++		 * value (info.needs_seqno is false for DEBUG_LABEL, so Mesa emits len 1).
++		 */
++		CS_PUT(pkt7(0x46u, 1u));		/* CP_EVENT_WRITE */
++		CS_PUT(0x3fu);				/* DEBUG_LABEL, per adreno_pm4.xml */
 +	}
 +	if ((flags & CS_F_Q_WFI) != 0) {
 +		/*
@@ -3108,43 +3130,33 @@ new file mode 100644
 +	 * each quirk gets its own ring and its own result word, two dwords apart, and
 +	 * a ring that leaves its word empty names the change that mattered.
 +	 *
-+	 * A is the control and B is B37's passing ring. C is the one-ring launch that
-+	 * B38 and B39 both found silent.
++	 * B40 answered the recovery question and closed a door: after a one-ring launch,
++	 * a state ring and a dispatch ring are both silent, twice over. So the damage
++	 * outlives the state, and the method changes with it -- only the FIRST combined
++	 * ring of a boot can be read, because that ring is the one that ends the boot's
++	 * usefulness.
 +	 *
-+	 * B39 then found something B38 could not: a plain dispatch ring, H, also came
-+	 * back empty -- in the same boot where the same shape stored at B. That admits
-+	 * exactly two readings and they are not the same finding:
-+	 *
-+	 *   (i)  C damages the SP, and the damage outlives the state, so every later
-+	 *        dispatch in this boot is silent whatever it carries; or
-+	 *   (ii) C merely leaves a state that the next dispatch cannot use, and H
-+	 *        inherited it from G rather than being the victim of anything.
-+	 *
-+	 * D and E settle it: D reloads the state from nothing, E dispatches on it. If
-+	 * E stores, (ii) is the answer -- the damage is state-level and a reload clears
-+	 * it, which makes every future variant testable in one boot. F and G repeat the
-+	 * pair, because one recovery is a reading and two is a mechanism. H is last and
-+	 * is the only interesting combined ring left: all three packets at once.
++	 * So there is exactly one candidate here, and it is worth a boot on its own:
++	 * the context-roll event. D and E then say whether the boot survived, and F
++	 * puts the plain one-ring launch last, where it can still show the poison.
 +	 */
 +	static const struct {
 +		uint32_t flags;
 +		uint32_t tag;
 +		const char *what;
-+	} plan[8] = {
++	} plan[6] = {
 +		{ CS_F_STATE,	0u, "CONTROL: the state alone, as B37 ran it (no dispatch)" },
 +		{ CS_F_EXEC,	1u, "CONTROL: the dispatch alone on that state -- B37's passing ring" },
-+		{ CS_F_STATE | CS_F_EXEC,		2u, "ONE ring, plain: the ring that kills the store" },
-+		{ CS_F_STATE,	3u, "RECOVERY 1: the state alone again, after the one-ring launch" },
-+		{ CS_F_EXEC,	4u, "RECOVERY 1: the dispatch alone -- does the store come back?" },
-+		{ CS_F_STATE,	5u, "RECOVERY 2: the state alone again" },
-+		{ CS_F_EXEC,	6u, "RECOVERY 2: the dispatch alone -- a second time, or never" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_WFI | CS_F_Q_MODE | CS_F_Q_MARK, 7u, "LAST: one ring with the wait, CP_SET_MODE(1) and the early RM6_COMPUTE" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_ROLL,	2u, "ONE ring, with a context-roll event between the state and the dispatch" },
++		{ CS_F_STATE,	3u, "AFTER: the state alone, if the ring above left the SP able to store" },
++		{ CS_F_EXEC,	4u, "AFTER: the dispatch alone -- the baseline shape, after the roll" },
++		{ CS_F_STATE | CS_F_EXEC,		5u, "LAST: one ring with nothing added, to see the poison again" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
-+	bool faulted[8] = { false, false, false, false, false, false, false, false };
-+	int reached[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-+	uint32_t stored[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++	bool faulted[6] = { false, false, false, false, false, false };
++	int reached[6] = { 0, 0, 0, 0, 0, 0 };
++	uint32_t stored[6] = { 0, 0, 0, 0, 0, 0 };
 +	uint32_t t, n_stored = 0;
 +
 +	printf("mi8gpu: step 23: a shader, on a core whose SECVID_TRUST_CNTL reads %#x (%s)\n",
@@ -3254,32 +3266,35 @@ new file mode 100644
 +	}
 +	/*
 +	/*
-+	 * B40: the one question left is whether C damages the SP or only the state.
++	 * B41: two readings, and only one of them is about the roll.
 +	 *
-+	 * Every line below is short on purpose. B39's verdict was cut off mid-sentence
-+	 * in the log ring -- 'may be read only ' and then the next printf -- so a
-+	 * message longer than about 210 bytes does not survive to be read (教训 3/4/9/11).
++	 * If ring C stores, the one-ring launch was never impossible -- it was missing
++	 * the context roll the second ring was silently providing, and a real driver
++	 * has to emit it (Mesa does, for a different reason, and says so in a comment).
++	 * If it does not, then either the roll is not the mechanism, or a one-ring
++	 * launch cannot be made to work by adding packets at all.
++	 *
++	 * Every message stays under about 210 bytes: B39's verdict was cut off in the
++	 * log ring mid-sentence, and a sentence that is not printed cannot be read.
 +	 */
 +	if (reached[1] != 3 || stored[1] != CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: THE CONTROL DID NOT STORE -- this build does not reproduce B37, so nothing below it can be read\n");
++		printf("mi8gpu: step 23 SUMMARY: THE CONTROL DID NOT STORE -- B37 is not reproduced, nothing below it can be read\n");
 +	} else if (reached[2] == 3 && stored[2] == CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: DID NOT REPRODUCE -- the plain one-ring launch stored, so the premise of this build is gone\n");
-+	} else if (reached[4] == 3 && stored[4] == CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: THE STORE COMES BACK. A state ring after the one-ring launch re-arms the dispatch\n");
-+		if (reached[6] == 3 && stored[6] == CS_WANT) {
-+			printf("mi8gpu: step 23 SUMMARY: and it comes back twice, so what C damages is state-level and a reload clears it\n");
-+		} else {
-+			printf("mi8gpu: step 23 SUMMARY: but only once -- the second state ring did not re-arm it again\n");
++		printf("mi8gpu: step 23 SUMMARY: THE ROLL IS THE MISSING PIECE. One ring stores once it rolls the context\n");
++		if (reached[4] == 3 && stored[4] == CS_WANT) {
++			printf("mi8gpu: step 23 SUMMARY: the boot also survived, so the roll does not poison anything\n");
 +		}
-+		if (reached[7] == 3 && stored[7] == CS_WANT) {
-+			printf("mi8gpu: step 23 SUMMARY: and one ring carrying the wait, CP_SET_MODE(1) and the early RM6_COMPUTE does store\n");
-+		} else {
-+			printf("mi8gpu: step 23 SUMMARY: but all three packets in one ring still do not, so the split stays for now\n");
++		if (reached[5] == 3 && stored[5] != CS_WANT) {
++			printf("mi8gpu: step 23 SUMMARY: and the same ring without the roll still fails, in this very boot\n");
 +		}
 +	} else {
-+		printf("mi8gpu: step 23 SUMMARY: THE STORE DOES NOT COME BACK. A state ring and a dispatch ring after C stay silent\n");
-+		printf("mi8gpu: step 23 SUMMARY: so the damage outlives the state -- the SP's own program or instruction cache --\n");
-+		printf("mi8gpu: step 23 SUMMARY: and every combined-ring variant needs its own boot to be read at all\n");
++		printf("mi8gpu: step 23 SUMMARY: THE ROLL DOES NOT DO IT. One ring with a context roll between state and dispatch\n");
++		printf("mi8gpu: step 23 SUMMARY: is still silent, so two register contexts are not the explanation either\n");
++		if (reached[4] == 3 && stored[4] == WANT) {
++			printf("mi8gpu: step 23 SUMMARY: the boot did survive, so this ring did not poison -- the silence is its own\n");
++		} else if (reached[4] == 3) {
++			printf("mi8gpu: step 23 SUMMARY: and the boot did not survive either, as B40 predicts\n");
++		}
 +	}
 +	printf("mi8gpu: step 23 SUMMARY: %u of %u rings stored 0badf00d\n", n_stored, n_plan - 1u);
 +	/*
