@@ -2716,7 +2716,7 @@ new file mode 100644
 +	0x00000000u, 0x204cc009u,	/* tail: mov.u32u32 r2.y, 0 */
 +	0x0badf00du, 0x204cc004u,	/* tail: mov.u32u32 r1.x, 0x0badf00d (control) */
 +	0x00000000u, 0x00000000u,	/* tail: nop latency */
-+	0x01800008u, 0xd0c61100u,	/* B60b: tail: stg.u32 g[r2.x+0], r1.x, 1 (sy) -> result[0] */
++	0x00000000u, 0x00000000u,	/* nop: B60c moved the control store to slot 30 */
 +	0x00000010u, 0x202cc005u,	/* tail: mov.u32u32 r1.y, c4.x (B59 const num 16) */
 +	0x00000000u, 0x00000000u,	/* tail: nop latency */
 +	0x00000000u, 0x00000000u,	/* tail: nop latency */
@@ -2728,7 +2728,7 @@ new file mode 100644
 +	0x00000000u, 0x00000000u,	/* B50 latency 2/3 */
 +	0x00000000u, 0x00000000u,	/* B50 latency 3/3 */
 +	0x0180000au, 0xd0c61110u,	/* tail: stg.u32 g[r2.x+0x10], r1.y, 1 (sy) -> result[4] */
-+	0x00000000u, 0x00000000u,	/* nop */
++	0x01800008u, 0xd0c61100u,	/* B60c: stg.u32 g[r2.x+0], r1.x, 1 (sy) -> result[0], 19 slots after the ldl */
 +	0x00000000u, 0x03000000u,	/* end (slot 31) */
 +};
 +
@@ -3553,7 +3553,7 @@ new file mode 100644
 +			break;
 +		}
 +	}
-+	printf("mi8gpu: step 23 WHOLE1 TABLE: 12 real compiled instructions verbatim from Mesa's own dump, 2 nop placeholders (stgb, end), 15-slot judge tail, 64 dwords / 2 groups, no private path, control 0badf00d, c4.x/(+0x222) invariants\n");
++	printf("mi8gpu: step 23 WHOLE1 TABLE: 12 real compiled instructions verbatim from Mesa's own dump, 2 nop placeholders (stgb, end), 15-slot judge tail + closing control store, 64 dwords / 2 groups, no private path, control 0badf00d, c4.x/(+0x222) invariants\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
