@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6091 @@
+@@ -0,0 +1,6105 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -3319,7 +3319,7 @@ new file mode 100644
 +	const uint32_t pvt_words = g3d_regions[G3D_R_PVTMEM].size / 4u;
 +	uint32_t t;
 +
-+	printf("mi8gpu: step 23: a shader whose private writes are located, SECVID_TRUST_CNTL %#x (%s)\n",
++	printf("mi8gpu: step 23: a shader whose private writes are enumerated, SECVID_TRUST_CNTL %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE");
 +	for (t = 0; t < n_plan; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
@@ -3399,6 +3399,9 @@ new file mode 100644
 +		/* B55b: up to four non-zero dwords that are NOT c0.x + 0x222, so a
 +		 * region holding something else can be named without another boot. */
 +		uint32_t pvt_strays = 0, pvt_stray_off[4], pvt_stray_val[4];
++		/* B56: the hit offsets themselves. first/last alone cannot separate a
++		 * 4+4 split from any other set with the same ends. */
++		uint32_t pvt_noff = 0, pvt_off[32];
 +
 +		for (uint32_t k = 0; k < pvt_words; k++) {
 +			uint32_t v = pvt_mem[k];
@@ -3412,6 +3415,10 @@ new file mode 100644
 +					pvt_first = k * 4u;
 +				}
 +				pvt_last = k * 4u;
++				if (pvt_noff < 32u) {
++					pvt_off[pvt_noff] = k * 4u;
++				}
++				pvt_noff++;
 +				pvt_hits++;
 +			} else if (pvt_strays < 4u) {
 +				pvt_stray_off[pvt_strays] = k * 4u;
@@ -3439,6 +3446,13 @@ new file mode 100644
 +		for (uint32_t k = 0; k < pvt_strays; k++) {
 +			printf("mi8gpu: step 23 launch %c: pvt-nz at 0x%x is 0x%08x\n",
 +			    'A' + t, pvt_stray_off[k], pvt_stray_val[k]);
++		}
++		/* B56: one line per hit. pvt-hits above says how many there really
++		 * were, so if the dump is ever cut short the count disagrees with the
++		 * lines and the judge says so instead of reading a truncated set. */
++		for (uint32_t k = 0; k < pvt_noff && k < 32u; k++) {
++			printf("mi8gpu: step 23 launch %c: pvt-hit[%u] 0x%x\n",
++			    'A' + t, k, pvt_off[k]);
 +		}
 +		printf("mi8gpu: step 23 launch %c: FSYNR0 0x%08x, FAR 0x%llx%08x\n", 'A' + t,
 +		    rd(cb + CB_FSYNR0), (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
@@ -3486,7 +3500,7 @@ new file mode 100644
 +			break;
 +		}
 +	}
-+	printf("mi8gpu: step 23 PVT3 TABLE: control 0badf00d, invariants c0.x/(+0x222), 256 KB region cleared before and scanned after every launch, pvt rings result[6] = c0.x+0x222, nop controls pvt-nz 0\n");
++	printf("mi8gpu: step 23 PVT4 TABLE: control 0badf00d, invariants c0.x/(+0x222), 256 KB cleared before and scanned after every launch, every hit offset printed as pvt-hit[k], pvt rings result[6] = c0.x+0x222, nop controls pvt-nz 0\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
