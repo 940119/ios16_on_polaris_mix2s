@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6112 @@
+@@ -0,0 +1,6135 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2679,7 +2679,7 @@ new file mode 100644
 +	0x00000000u, 0x204cc009u,	/* mov.u32u32 r2.y, 0 */
 +	0x0badf00du, 0x204cc004u,	/* mov.u32u32 r1.x, 0x0badf00d (control) */
 +	0x00000000u, 0x00000000u,	/* nop: delay slot */
-+	0x00000000u, 0x202cc005u,	/* mov.u32u32 r1.y, c0.x */
++	0x00000010u, 0x202cc005u,	/* B59: mov.u32u32 r1.y, c4.x (const num 16) */
 +	0x00000000u, 0x00000000u,	/* nop: latency */
 +	0x00000000u, 0x00000000u,	/* nop: latency */
 +	0x00000002u, 0x01000000u,	/* B51: REAL compiled cat0 jump +2 -> slot 9, skips slot 8 */
@@ -2755,7 +2755,7 @@ new file mode 100644
 +static const struct cs_word cs_ctx[] = {
 +	{ 0x0ab00, 0x00000005 },	/* SP_MODE_CNTL: ISAMMODE_GL, constant demotion */
 +	{ 0x0bb08, 0x000000ff },	/* SP_UPDATE_CNTL: all eight bits, as fd6 sets them */
-+	{ 0x0b987, 0x00000101 },	/* SP_CS_CONST_CONFIG: CONSTLEN=4 vec4, enabled */
++	{ 0x0b987, 0x00000102 },	/* B59: SP_CS_CONST_CONFIG: CONSTLEN=8 vec4, enabled */
 +	{ 0x0a9bb, 0x00000100 },	/* SP_CS_CONFIG: enabled, nuav 0 (the stg uses no descriptor) */
 +	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: 1 KB shared, const ram 128 */
 +	{ 0x0b997, 0x00fcfcfc },	/* SP_CS_CONST_CONFIG_0: every constid INVALID */
@@ -2963,21 +2963,43 @@ new file mode 100644
 +			CS_PUT(8u);			/* RM6_COMPUTE, per a6xx_marker in adreno_pm4.xml */
 +		}
 +		/*
-+		 * B48: a6xx.cc:emit_const()'s exact shape, one vec4 at c0.
-+		 * dword0 = CP_LOAD_STATE6_0(dst_off 0, ST6_CONSTANTS, SS6_DIRECT,
-+		 * SB6_CS_SHADER, NUM_UNIT 1) = 0x00744000. The 64-bit EXT_SRC_ADDR
-+		 * slot is still present (zeros) even for DIRECT; pkt7 cnt counts only
-+		 * these 7 payload dwords (教训 32). Derived from adreno_pm4.xml's
-+		 * CP_LOAD_STATE6 domain, cross-checked against B37's 0x00760000.
++		 * B59: explicit constlen management. a6xx.cc:162 does
++		 *   constlen = align(v->constlen, 4) -> SP_CS_CONST_CONFIG,
++		 * and a6xx.xml:4621-4625 has CONSTLEN shr=2, so five vec4 of real
++		 * constants need 8 vec4 -> field 2 -> 0x102 | ENABLED (0x100).
++		 * SP_CS_CNTL_1's constantrammode stays CONSTLEN_128 (5 <= 128).
++		 * a6xx.cc:304-325 emit_const(): dst_off = regid/4,
++		 * num_unit = DIV_ROUND_UP(sizedwords,4) = 5, cnt = 3+20 = 23;
++		 * dword0 0x01744000 is B48's 0x00744000 with NUM_UNIT 1 -> 5.
++		 *
++		 * The shader reads c4.x (const num 16), NOT c0.x. c0.x is a fixed
++		 * decoy: if the first vec4 were still being read, all four rings
++		 * would return deadbeef and the judge's invariants would fail.
 +		 */
-+		CS_PUT(pkt7(0x34u, 7u));		/* CP_LOAD_STATE6_FRAG */
-+		CS_PUT(0x00744000u);
++		CS_PUT(pkt7(0x34u, 23u));		/* CP_LOAD_STATE6_FRAG */
++		CS_PUT(0x01744000u);
 +		CS_PUT(0u);				/* EXT_SRC_ADDR lo */
 +		CS_PUT(0u);				/* EXT_SRC_ADDR hi */
-+		CS_PUT(cs_const_value);		/* c0.x */
-+		CS_PUT(0u);				/* c0.y */
-+		CS_PUT(0u);				/* c0.z */
-+		CS_PUT(0u);				/* c0.w */
++		CS_PUT(CS_CONST_SENTINEL);		/* c0.x  <- fixed decoy */
++		CS_PUT(0u);		/* c0.y */
++		CS_PUT(0u);		/* c0.z */
++		CS_PUT(0u);		/* c0.w */
++		CS_PUT(0u);		/* c1.x */
++		CS_PUT(0u);		/* c1.y */
++		CS_PUT(0u);		/* c1.z */
++		CS_PUT(0u);		/* c1.w */
++		CS_PUT(0u);		/* c2.x */
++		CS_PUT(0u);		/* c2.y */
++		CS_PUT(0u);		/* c2.z */
++		CS_PUT(0u);		/* c2.w */
++		CS_PUT(0u);		/* c3.x */
++		CS_PUT(0u);		/* c3.y */
++		CS_PUT(0u);		/* c3.z */
++		CS_PUT(0u);		/* c3.w */
++		CS_PUT(cs_const_value);		/* c4.x  <- c4.x, the per-ring value */
++		CS_PUT(0u);		/* c4.y */
++		CS_PUT(0u);		/* c4.z */
++		CS_PUT(0u);		/* c4.w */
 +		/*
 +		 * B57: the grid is one group of SIXTEEN invocations. NDRANGE_1 is
 +		 * local times groups (fd6: localsize_x * num_groups[0]), and
@@ -3326,7 +3348,7 @@ new file mode 100644
 +	const uint32_t pvt_words = g3d_regions[G3D_R_PVTMEM].size / 4u;
 +	uint32_t t;
 +
-+	printf("mi8gpu: step 23: a shader with sixteen private writers, SECVID_TRUST_CNTL %#x (%s)\n",
++	printf("mi8gpu: step 23: a shader reading its constant from the fifth vec4, SECVID_TRUST_CNTL %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE");
 +	for (t = 0; t < n_plan; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
@@ -3501,13 +3523,14 @@ new file mode 100644
 +		}
 +		if (t == 0 && reached[0] == 3) {
 +			cs_state_readback();
++			printf("mi8gpu: step 23 READBACK SP_CS_CONST_CONFIG reg 0x0b987: the CPU reads 0x%08x\n", rd(gpu3d + 4u * 0x0b987u));
 +		}
 +		if (!drained) {
 +			printf("mi8gpu: step 23: the CP stopped at launch %c; the rest is not attempted\n", 'A' + t);
 +			break;
 +		}
 +	}
-+	printf("mi8gpu: step 23 PVT5 TABLE: control 0badf00d, invariants c0.x/(+0x222), one group of 16 invocations (local 16x1x1, global 16), 16 hit offsets as pvt-hit[k], pvt rings result[6] = c0.x+0x222, nop controls pvt-nz 0\n");
++	printf("mi8gpu: step 23 CONST1 TABLE: explicit constlen 8 vec4 (SP_CS_CONST_CONFIG 0x102), 5-unit const upload, c0.x decoy deadbeef, c4.x per-ring, invariants c0.x/(+0x222), 16 pvt offsets, nop controls pvt-nz 0\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
