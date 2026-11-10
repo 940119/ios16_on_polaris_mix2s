@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6162 @@
+@@ -0,0 +1,6361 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -1158,9 +1158,14 @@ new file mode 100644
 +	 * g3d_smmu_setup() reuses the existing L3 table, and it stops well
 +	 * short of CS_HOLE_IOVA 0x10100000. 256 KB holds 4 SPs x 64 KB. */
 +	{ "pvtmem", 0x10011000ull, 0x40000, 0 },
++	/* B70: the render target B70a resolves into. Its own 16 KB region so the
++	 * CPU prefill / invalidate pair is region-local and none of the memptrs
++	 * offsets move; 0x10051000 is after pvtmem and far short of CS_HOLE_IOVA. */
++	{ "rt", 0x10051000ull, 0x4000, 0 },
 +};
 +#define G3D_REGIONS ((uint32_t)(sizeof(g3d_regions) / sizeof(g3d_regions[0])))
 +#define G3D_R_PVTMEM	4u	/* B54: index of "pvtmem"; [0]/[1]/[2] keep their meaning */
++#define G3D_R_RT	5u	/* B70: index of "rt" */
 +#define G3D_SQE_FILE_SKIP       4u
 +#define PTE_AP_UNPRIV           (1ull << 6)     /* AP[1]: the 3D core's accesses are not privileged (EXP-0108: permission fault at FAR 0x10000000) */
 +
@@ -2626,6 +2631,20 @@ new file mode 100644
 +#define CS_GROUPS	2u	/* B49: instrlen / NUM_UNIT, 128-byte groups */
 +#define CS_WANT		0x0badf00du
 +#define CS_SEED_OFF	0x340u	/* result + 0x40: B48 sentinel, NOT read by the shader */
++/*
++ * B70: the render target. 32x32 RGBA8, and the only thing the render backend
++ * has ever been asked to write. The region exists so the CPU prefill and the
++ * invalidate that follows the GPU are a pair over the same bytes -- lesson 44:
++ * cache maintenance has to move with the data.
++ */
++#define RS_W		32u
++#define RS_H		32u
++#define RS_PITCH	(RS_W * 4u)			/* 128 B */
++#define RS_DWORDS	(RS_W * RS_H)			/* 1024 dwords = 4 KB */
++#define RS_TARGET_OFF	0u			/* inside the "rt" region */
++#define RS_FILL		0xcdcdcdcdu			/* what the CPU leaves behind */
++#define RS_TAG		4u			/* markers: 0..3 are the plans' */
++#define RS_MARK(ph)	(0xc1de0000u | ((uint32_t)(ph) << 8) | (0x41u + RS_TAG))
 +#define CS_CONST_SENTINEL 0xdeadbeefu	/* B48: memory value, deliberately != c0.x */
 +static uint32_t cs_const_value;	/* B48: CP_LOAD_STATE6_FRAG uploads this as c0.x */
 +
@@ -2783,6 +2802,30 @@ new file mode 100644
 +	{ 0x0a9b1, 0x00000001 },	/* SP_CS_CNTL_1: 1 KB shared, const ram 128 */
 +	{ 0x0b997, 0x00fcfcfc },	/* SP_CS_CONST_CONFIG_0: every constid INVALID */
 +	{ 0x0b998, 0x000002fc },	/* SP_CS_WGE_CNTL: THREAD128, no linear local id */
++};
++
++/*
++ * B70: the destination description, in the order the resolve engine wants it.
++ * Only the address is runtime, so it is emitted by rs_launch() before this
++ * table rather than living here. Values verified against
++ * registers/adreno/a6xx.xml (offsets) and a6xx_enums.xml (formats).
++ *
++ * RB_RESOLVE_SYSTEM_BUFFER_PITCH is shr=6 in the XML -- the field holds bytes
++ * per row divided by 64, so 128 B of pitch is written as 2. RB_RESOLVE_CNTL_3
++ * (the bin size) is deliberately absent: Turnip's own resolve-into-sysmem path
++ * (event_blit_run) does not touch it, and its value comes from tiling->tile0,
++ * which is per-format and per-arch. A guessed bin size in place of a linear
++ * target is a worse first rung than no bin size at all.
++ */
++static const struct cs_word rs_ctx[] = {
++	{ 0x88d7, 0x00001800u },	/* SYSTEM_BUFFER_INFO: FMT6_8_8_8_8_UNORM (0x30) << 7, TILE6_LINEAR */
++	{ 0x88da, 0x00000002u },	/* SYSTEM_BUFFER_PITCH: 128 B >> 6 -- the field is shr=6 */
++	{ 0x88db, 0x00000000u },	/* SYSTEM_BUFFER_ARRAY_PITCH: one layer */
++	{ 0x88d5, 0x00000000u },	/* GMEM_BUFFER_INFO: SAMPLES = 0 (1x) */
++	{ 0x88d6, 0x00000000u },	/* GMEM_BUFFER_BASE: offset 0 inside GMEM, 4 KB units */
++	{ 0x88d0, 0x00000000u },	/* CNTL_0: YUV plane 0 */
++	{ 0x88d1, 0x00000000u },	/* CNTL_1: rect top-left (0,0) */
++	{ 0x88d2, 0x001f001fu },	/* CNTL_2: rect bottom-right (31,31), inclusive */
 +};
 +
 +/*
@@ -3601,6 +3644,156 @@ new file mode 100644
 +	cs_hole_sensor();
 +}
 +
++/*
++ * B70: one ring against the RB resolve engine.
++ *
++ * The packets are all things this driver already emits elsewhere: a type-4
++ * register write per field (pkt4, the same shape cs_ncr uses), CP_WAIT_FOR_IDLE,
++ * CP_EVENT_WRITE, and a CACHE_FLUSH_TS fence whose last dword the driver
++ * supplies -- that fence is also what pushes the core's caches to DRAM, without
++ * which a store can sit in the core and never reach the memory the CPU reads
++ * (B34, and the reason a resolve needs it too).
++ *
++ * Order matters and follows Turnip's clear_gmem_attachment + event_blit_run:
++ * the destination first, then RB_RESOLVE_OPERATION, then the clear colour when
++ * there is one, then CCU_RESOLVE. Two events with a WAIT_FOR_IDLE between them
++ * when the clear is on, so the clear has retired before the store reads GMEM.
++ */
++static bool
++rs_launch(uint32_t phase, const char *what, bool do_clear)
++{
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++	uint32_t w = cp_wptr & 8191u;
++	const uint64_t fence_iova = g3d_regions[2].address + CS_FENCE_OFF;
++	const uint64_t rt_iova = g3d_regions[G3D_R_RT].address + RS_TARGET_OFF;
++
++#define RS_PUT(v)	(ring[w++ & 8191u] = (uint32_t)(v))
++	RS_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE */
++	/* the one runtime value: where the resolve lands */
++	RS_PUT(pkt4(0x88d8u, 1u));
++	RS_PUT((uint32_t)rt_iova);
++	RS_PUT(pkt4(0x88d9u, 1u));
++	RS_PUT((uint32_t)(rt_iova >> 32));
++	for (uint32_t i = 0; i < (uint32_t)(sizeof(rs_ctx) / sizeof(rs_ctx[0])); i++) {
++		RS_PUT(pkt4(rs_ctx[i].reg, 1u));
++		RS_PUT(rs_ctx[i].value);
++	}
++	if (do_clear) {
++		RS_PUT(pkt4(0x88e3u, 1u));
++		RS_PUT(0x000000f2u);			/* TYPE=CLEAR(2) | CLEAR_MASK 0xf | BUFFER_ID 0 */
++		RS_PUT(pkt4(0x88dfu, 1u));
++		RS_PUT(0x80402010u);			/* the colour RS2 must find */
++		RS_PUT(pkt4(0x88e0u, 1u));
++		RS_PUT(0x80c0a050u);
++		RS_PUT(pkt4(0x88e1u, 1u));
++		RS_PUT(0x80010203u);
++		RS_PUT(pkt4(0x88e2u, 1u));
++		RS_PUT(0x80f0e0d0u);
++		RS_PUT(pkt7(0x46u, 1u));		/* CP_EVENT_WRITE */
++		RS_PUT(0x0000001eu);			/* CCU_RESOLVE: the clear retires */
++		RS_PUT(pkt7(0x26u, 0u));		/* CP_WAIT_FOR_IDLE: GMEM holds it */
++	}
++	RS_PUT(pkt4(0x88e3u, 1u));
++	RS_PUT(0x000000f0u);				/* TYPE=STORE(0) | CLEAR_MASK 0xf */
++	RS_PUT(pkt7(0x46u, 1u));			/* CP_EVENT_WRITE */
++	RS_PUT(0x0000001eu);				/* CCU_RESOLVE: GMEM -> our buffer */
++	RS_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE */
++	RS_PUT(pkt7(0x46u, 4u));			/* CP_EVENT_WRITE */
++	RS_PUT(0x04u);					/* EVENT_CACHE_FLUSH_TS */
++	RS_PUT((uint32_t)fence_iova);
++	RS_PUT((uint32_t)(fence_iova >> 32));
++	RS_PUT(0xf00d0000u | (0x51u + phase));		/* the value the driver supplies */
++	RS_PUT(pkt7(CP_MEM_WRITE_OPCODE, 3u));		/* the last marker: the ring ran out */
++	RS_PUT((uint32_t)(g3d_regions[2].address + CS_MARKER_OFF + 4u * (3u * RS_TAG + 2u)));
++	RS_PUT((uint32_t)((g3d_regions[2].address + CS_MARKER_OFF + 4u * (3u * RS_TAG + 2u)) >> 32));
++	RS_PUT(RS_MARK(2));
++#undef RS_PUT
++	{
++		const uint32_t target_wptr = w & 8191u;
++
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, target_wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (uint32_t i = 0; i < 20000; i++) {
++			if (rd(gpu3d + 4 * 0x0806) == target_wptr) {
++				break;
++			}
++			sleep_us(10);
++		}
++		cp_wptr = target_wptr;
++		printf("mi8gpu: step 24: %s: RB_RPTR %u WPTR %u, FSR %#010x\n", what,
++		    rd(gpu3d + 4 * 0x0806), target_wptr, rd(gpu3d + 4 * 0x0220));
++		return rd(gpu3d + 4 * 0x0806) == target_wptr;
++	}
++}
++
++/*
++ * B70a: two phases against one target, so one boot answers both questions.
++ *
++ *   RS1  TYPE=STORE only. The CPU fills the target with 0xcdcdcdcd first, so
++ *        "GMEM reached our buffer" is visible without knowing GMEM's contents.
++ *   RS2  TYPE=CLEAR(0x80402010, ...) then STORE. 0xcd is still the pattern
++ *        outside the rectangle, so three outcomes are distinguishable:
++ *          the whole target still 0xcd      -> the resolve path did not run
++ *          the whole target is the colour   -> the rectangle did not clip
++ *          inside is the colour, outside 0xcd -> the engine obeyed both
++ *
++ * What is NOT here on purpose: RB_CCU_CNTL. See the header.
++ */
++static void
++rs_probe(void)
++{
++	uint32_t *rt = (uint32_t *)g3d_regions[G3D_R_RT].memory;
++	const uint32_t bytes = g3d_regions[G3D_R_RT].size;
++	uint32_t changed, exact, i;
++	bool drained;
++
++	printf("mi8gpu: step 24: the render backend writes a buffer we own, RB resolve, %ux%u RGBA8, no shader\n",
++	    (unsigned)RS_W, (unsigned)RS_H);
++	printf("mi8gpu: step 24 RS TABLE: eleven resolve registers and CCU_RESOLVE 0x1e, linear RGBA8, GMEM offset 0, %u bytes, TYPE=STORE then TYPE=CLEAR\n",
++	    (unsigned)RT_BYTES);
++
++	/* RS1: the CPU leaves a pattern the GPU has to destroy */
++	for (i = 0; i < bytes / 4u; i++) {
++		rt[i] = RS_FILL;
++	}
++	to_memory(g3d_regions[G3D_R_RT].memory, bytes);
++	drained = rs_launch(0u, "RS1 STORE", false);
++	from_memory(g3d_regions[G3D_R_RT].memory, bytes);
++	changed = 0;
++	for (i = 0; i < RS_DWORDS; i++) {
++		if (rt[i] != RS_FILL) {
++			changed++;
++		}
++	}
++	printf("mi8gpu: step 24 RS1: %u of %u dwords differ from the CPU pattern, first %#010x %#010x, drained %u\n",
++	    changed, (unsigned)RS_DWORDS, rt[0], rt[RS_DWORDS - 1u], drained ? 1u : 0u);
++
++	/* RS2: the same path, with a clear in front of it */
++	for (i = 0; i < bytes / 4u; i++) {
++		rt[i] = RS_FILL;
++	}
++	to_memory(g3d_regions[G3D_R_RT].memory, bytes);
++	drained = rs_launch(1u, "RS2 CLEAR", true);
++	from_memory(g3d_regions[G3D_R_RT].memory, bytes);
++	exact = 0;
++	for (i = 0; i < RS_DWORDS; i++) {
++		if (rt[i] == COLOR[0]) {
++			exact++;
++		}
++	}
++	printf("mi8gpu: step 24 RS2: %u of %u dwords are %#010x, last %#010x, just past the rect %#010x, drained %u\n",
++	    exact, (unsigned)RS_DWORDS, COLOR[0], rt[RS_DWORDS - 1u], rt[RS_DWORDS], drained ? 1u : 0u);
++	printf("mi8gpu: step 24 VERDICT: %s\n",
++	    (exact == RS_DWORDS && rt[RS_DWORDS] == RS_FILL)
++	    ? "THE RESOLVE ENGINE WROTE THE COLOUR WE ASKED FOR, AND STOPPED AT THE RECTANGLE"
++	    : (exact == 0 && rt[0] == RS_FILL)
++	    ? "NOTHING LANDED -- the path did not run; RB_CCU_CNTL is the next single variable"
++	    : (exact == RS_DWORDS)
++	    ? "THE COLOUR LANDED EVERYWHERE -- the rectangle did not clip; CNTL_2 is the next variable"
++	    : "PARTIAL -- count the dwords above: the rectangle or the pitch is off");
++}
++
 +static void
 +gpu_zap_and_command(void)
 +{
@@ -3657,6 +3850,12 @@ new file mode 100644
 +	if (ok && gmu_last_step >= 23) {
 +		cp_wptr = wptr;
 +		cs_probe();
++		wptr = cp_wptr;
++	}
++	/* B70: the render backend, right after compute has proved the ring works */
++	if (ok && gmu_last_step >= 23) {
++		cp_wptr = wptr;
++		rs_probe();
 +		wptr = cp_wptr;
 +	}
 +	if (ok && gmu_last_step >= 22 && memptrs[2] == 0xc0ffee21 && memptrs[3] == 0x0badf00d) {
