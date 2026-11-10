@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6135 @@
+@@ -0,0 +1,6162 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2614,6 +2614,7 @@ new file mode 100644
 +#define CS_F_Q_NOALU	0x800u	/* B47: patch the add.u back to a nop in this ring */
 +#define CS_F_Q_NOJUMP	0x1000u	/* B51: patch slot 7's compiled jump back to a nop */
 +#define CS_F_Q_NOPVT	0x2000u	/* B53: patch the ten private-path slots back to nops */
++#define CS_F_Q_WHOLE	0x4000u	/* B60: real compiled body, no private path (expected3 = 0, no slot patched) */
 +#define CS_PVT_FIRST	21u	/* B53: slot of the stp */
 +#define CS_PVT_LAST	30u	/* B53: slot of the stg to result[6] */
 +#define CS_JUMP_IDX	7u	/* B51: slot of the real compiled cat0 jump */
@@ -2629,6 +2630,28 @@ new file mode 100644
 +static uint32_t cs_const_value;	/* B48: CP_LOAD_STATE6_FRAG uploads this as c0.x */
 +
 +/*
++ * B60: the whole compiled body. The private path is GONE.
++ *
++ * 32 slots: the result address, then Mesa's twelve instructions verbatim
++ * (log slots 0..11 = dwords 0..23, all inside the 128-byte dump at
++ * compute-a540.log:434-437), nops where the log had stgb (a buffer
++ * descriptor, B61) and its end, the B59 judge tail, one nop, and end at
++ * slot 31. Nothing about length or state moved: CS_PROGRAM_WORDS is still
++ * 64, CS_GROUPS / SP_CS_INSTR_SIZE / NUM_UNIT are still 2, and the const
++ * segment is still B59's five-vec4 upload with c4.x live and c0.x the
++ * deadbeef decoy. Every ring carries CS_F_Q_WHOLE, so result[6] is neither
++ * written nor compared -- there is no private path left to write it.
++ *
++ * The two stl/ldl are the shared-memory ops B52 PROVED
++ * (IR3_BARRIER_SHARED_R), at bytes 0..60 of the wave. They are not the
++ * private path: B52's stl round trip passed with pvtmem SIZE=0 while
++ * B53's stp at the same address produced nothing. r0.x is the local
++ * invocation id the hardware preloads (the log's own shader reads it at
++ * slot 1 with no preceding load), and the grid is 16x1x1, so the offsets
++ * stay inside 64 bytes.
++ *
++ * --- the B53 note that built the program this one replaces ---
++ *
 + * B53: private memory (stp -> ldp -> stg) with ZERO state changes.
 + *
 + * B52 proved a real compiled local-memory round trip runs on this minimal
@@ -2676,37 +2699,37 @@ new file mode 100644
 + */
 +static const uint32_t cs_program[CS_PROGRAM_WORDS] = {
 +	0xfeed0001u, 0x204cc008u,	/* mov.u32u32 r2.x, <result address> (patched) */
-+	0x00000000u, 0x204cc009u,	/* mov.u32u32 r2.y, 0 */
-+	0x0badf00du, 0x204cc004u,	/* mov.u32u32 r1.x, 0x0badf00d (control) */
-+	0x00000000u, 0x00000000u,	/* nop: delay slot */
-+	0x00000010u, 0x202cc005u,	/* B59: mov.u32u32 r1.y, c4.x (const num 16) */
-+	0x00000000u, 0x00000000u,	/* nop: latency */
-+	0x00000000u, 0x00000000u,	/* nop: latency */
-+	0x00000002u, 0x01000000u,	/* B51: REAL compiled cat0 jump +2 -> slot 9, skips slot 8 */
-+	0x21110005u, 0x52100005u,	/* add.u r1.y, r1.y, 0x111 (sy)   [group 1] */
-+	0x01800008u, 0xc0c61100u,	/* stg.u32 g[r2.x+0], r1.x, 1 (control) */
-+	0x0180000au, 0xd0c61108u,	/* stg.u32 g[r2.x+8], r1.y, 1 (sy)  -> result[2] */
-+	0x00000000u, 0x00000000u,	/* nop (B49 removed the old end here) */
-+	0x00000000u, 0x00000000u,	/* nop (group 1 tail) */
-+	0x00000000u, 0x00000000u,	/* nop (group 1 tail) */
-+	0x00000000u, 0x00000000u,	/* nop (group 1 tail) */
-+	0x00000000u, 0x00000000u,	/* nop (group 1 tail) */
-+	0x22220005u, 0x52100005u,	/* add.u r1.y, r1.y, 0x222 (sy)   [group 2] */
-+	0x00000000u, 0x00000000u,	/* B50 LATENCY SLOT 1/3 -- the ONE change */
-+	0x00000000u, 0x00000000u,	/* B50 LATENCY SLOT 2/3 -- the ONE change */
-+	0x00000000u, 0x00000000u,	/* B50 LATENCY SLOT 3/3 -- the ONE change */
-+	0x0180000au, 0xd0c61110u,	/* stg.u32 g[r2.x+0x10], r1.y, 1 (sy) -> result[4] (moved from slot 17) */
-+	0x0180000au, 0xc1461300u,	/* B53: stp.u32 p[r2.y], r1.y, 1 (OPC 4 -> 5) */
-+	0x00000000u, 0x00000000u,	/* nop: the compiled (rpt4)nop delay 1/5 */
-+	0x00000000u, 0x00000000u,	/* nop: the compiled (rpt4)nop delay 2/5 */
-+	0x00000000u, 0x00000000u,	/* nop: the compiled (rpt4)nop delay 3/5 */
-+	0x00000000u, 0x00000000u,	/* nop: the compiled (rpt4)nop delay 4/5 */
-+	0x00000000u, 0x00000000u,	/* nop: the compiled (rpt4)nop delay 5/5 */
-+	0x01824001u, 0xc0860000u,	/* B53: ldp.u32 r0.x, p[r2.y], 1 (OPC 1 -> 2) */
-+	0x00000000u, 0x00001000u,	/* B52: REAL compiled (ss)nop -- cat0 SS (ir3-cat0.xml:41), post-load sync */
-+	0x00000000u, 0x00000000u,	/* nop: one more latency slot before the consumer */
-+	0x01800000u, 0xd0c61118u,	/* B52: stg.u32 g[r2.x+0x18], r0.x, 1 (sy) -> result[6] */
-+	0x00000000u, 0x03000000u,	/* end (slot 31, unchanged from B49) */
++	0x00000000u, 0x20554001u,	/* real 0: mov.s32s32 r0.y, 0 */
++	0x20020000u, 0x46d00000u,	/* real 1: shl.b r0.x, r0.x, 2 */
++	0x00000001u, 0x20554002u,	/* real 2: mov.s32s32 r0.z, 1 */
++	0x00000000u, 0x00000000u,	/* real 3: nop */
++	0x00000001u, 0x20154003u,	/* real 4: mov.s32s32 r0.w, r0.y */
++	0x00010000u, 0x42300000u,	/* real 5: add.s r0.x, r0.x, r0.y */
++	0x00000001u, 0x20154004u,	/* real 6: mov.s32s32 r1.x, r0.y */
++	0x01800002u, 0xc1060300u,	/* real 7: stl.u32 l[r0.y], r0.y, 1 */
++	0x00000000u, 0x00000400u,	/* real 8: (rpt4)nop */
++	0x01800004u, 0xc1060100u,	/* real 9: stl.u32 l[r0.x], r0.z, 1 */
++	0x01804001u, 0xc0460000u,	/* real 10: ldl.u32 r0.x, l[r0.y], 1 */
++	0x00000000u, 0x00001000u,	/* real 11: (ss)nop */
++	0x00000000u, 0x00000000u,	/* real 12 was stgb.untyped -- needs a descriptor, B61 */
++	0x00000000u, 0x00000000u,	/* real 13 was end -- the judge tail must run */
++	0x00000000u, 0x204cc009u,	/* tail: mov.u32u32 r2.y, 0 */
++	0x0badf00du, 0x204cc004u,	/* tail: mov.u32u32 r1.x, 0x0badf00d (control) */
++	0x00000000u, 0x00000000u,	/* tail: nop latency */
++	0x01800008u, 0xc0c61100u,	/* tail: stg.u32 g[r2.x+0], r1.x, 1 -> result[0] */
++	0x00000010u, 0x202cc005u,	/* tail: mov.u32u32 r1.y, c4.x (B59 const num 16) */
++	0x00000000u, 0x00000000u,	/* tail: nop latency */
++	0x00000000u, 0x00000000u,	/* tail: nop latency */
++	0x0180000au, 0xd0c61108u,	/* tail: stg.u32 g[r2.x+8], r1.y, 1 (sy) -> result[2] */
++	0x00000000u, 0x00000000u,	/* B50 latency 1/3 */
++	0x00000000u, 0x00000000u,	/* B50 latency 2/3 */
++	0x22220005u, 0x52100005u,	/* tail: add.u r1.y, r1.y, 0x222 (sy) */
++	0x00000000u, 0x00000000u,	/* B50 latency 1/3 */
++	0x00000000u, 0x00000000u,	/* B50 latency 2/3 */
++	0x00000000u, 0x00000000u,	/* B50 latency 3/3 */
++	0x0180000au, 0xd0c61110u,	/* tail: stg.u32 g[r2.x+0x10], r1.y, 1 (sy) -> result[4] */
++	0x00000000u, 0x00000000u,	/* nop */
++	0x00000000u, 0x03000000u,	/* end (slot 31) */
 +};
 +
 +/*
@@ -3325,10 +3348,10 @@ new file mode 100644
 +		uint32_t constval;
 +		const char *what;
 +	} plan[4] = {
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOPVT, 0u, 0x5eedc0deu, "PVT 1: nop control, result[6] must stay zero" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  1u, 0xa5a5c3c3u, "PVT 2: stp/ldp round trip must return c0.x+0x222" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,                  2u, 0x1badb002u, "PVT 3: a third different upload, same private path" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_NOPVT,  3u, 0x2f00d123u, "PVT 4: closing nop control, result[6] zero again" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_WHOLE, 0u, 0x5eedc0deu, "WHOLE 1: the real compiled body must store the control and c4.x" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_WHOLE, 1u, 0xa5a5c3c3u, "WHOLE 2: second upload through the same real body" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_WHOLE, 2u, 0x1badb002u, "WHOLE 3: third upload, same body" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV | CS_F_Q_WHOLE, 3u, 0x2f00d123u, "WHOLE 4: closing upload, same body" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
@@ -3348,7 +3371,7 @@ new file mode 100644
 +	const uint32_t pvt_words = g3d_regions[G3D_R_PVTMEM].size / 4u;
 +	uint32_t t;
 +
-+	printf("mi8gpu: step 23: a shader reading its constant from the fifth vec4, SECVID_TRUST_CNTL %#x (%s)\n",
++	printf("mi8gpu: step 23: a shader whose body is real compiled code, SECVID_TRUST_CNTL %#x (%s)\n",
 +	    rd(gpu3d + 4 * 0xf400), gpu_nonsecure ? "out of secure mode" : "STILL SECURE");
 +	for (t = 0; t < n_plan; t++) {
 +		volatile uint32_t *result = (volatile uint32_t *)((vm_offset_t)memptrs + CS_RESULT_OFF);
@@ -3386,7 +3409,7 @@ new file mode 100644
 +		 * result[4] are invariants. The ONLY variable is the private path. */
 +		expected[t] = plan[t].constval;
 +		expected2[t] = (uint32_t)(plan[t].constval + CS_ALU2_IMM);
-+		expected3[t] = ((plan[t].flags & CS_F_Q_NOPVT) != 0)
++		expected3[t] = ((plan[t].flags & (CS_F_Q_NOPVT | CS_F_Q_WHOLE)) != 0)
 +		    ? 0u : (uint32_t)(plan[t].constval + CS_ALU2_IMM);
 +		to_memory((vm_offset_t)memptrs, 0x1000);
 +		/* B54: the pvt clear above is a CPU write like any other. Without this
@@ -3467,7 +3490,7 @@ new file mode 100644
 +		    'A' + t, loaded[t], loaded2[t], loaded3[t], plan[t].constval,
 +		    expected[t], expected2[t], expected3[t], seed_seen, pvt_raw,
 +		    ((plan[t].flags & CS_F_Q_INV) != 0) ? 1u : 0u,
-+		    ((plan[t].flags & CS_F_Q_NOPVT) == 0) ? 1u : 0u,
++		    ((plan[t].flags & (CS_F_Q_NOPVT | CS_F_Q_WHOLE)) == 0) ? 1u : 0u,
 +		    (uint32_t)CS_GROUPS);
 +		printf("mi8gpu: step 23 launch %c: pvt-hits %u, pvt-first 0x%x, pvt-last 0x%x, pvt-nz %u\n",
 +		    'A' + t, pvt_hits, pvt_first, pvt_last, pvt_nz);
@@ -3530,7 +3553,7 @@ new file mode 100644
 +			break;
 +		}
 +	}
-+	printf("mi8gpu: step 23 CONST1 TABLE: explicit constlen 8 vec4 (SP_CS_CONST_CONFIG 0x102), 5-unit const upload, c0.x decoy deadbeef, c4.x per-ring, invariants c0.x/(+0x222), 16 pvt offsets, nop controls pvt-nz 0\n");
++	printf("mi8gpu: step 23 WHOLE1 TABLE: 12 real compiled instructions verbatim from Mesa's own dump, 2 nop placeholders (stgb, end), 15-slot judge tail, 64 dwords / 2 groups, no private path, control 0badf00d, c4.x/(+0x222) invariants\n");
 +	for (t = 0; t < n_plan; t++) {
 +		const char *v;
 +
@@ -3540,6 +3563,9 @@ new file mode 100644
 +			v = "the bank faulted";
 +		} else if (ctl[t] != CS_WANT) {
 +			v = "the program did not store";
++		} else if ((plan[t].flags & CS_F_Q_WHOLE) != 0
++		    && loaded[t] == expected[t] && loaded2[t] == expected2[t]) {
++			v = "WHOLE BODY OK (real code ran; control, c4.x and +0x222 stored)";
 +		} else if (loaded[t] == expected[t] && loaded2[t] == expected2[t]
 +		    && loaded3[t] == expected3[t]) {
 +			v = ((plan[t].flags & CS_F_Q_NOPVT) != 0) ? "PVT3 NOP CONTROL OK (region stayed empty)" : "PVT3 ROUND TRIP OK (result[6] == c0.x + 0x222)";
@@ -3558,7 +3584,8 @@ new file mode 100644
 +		for (t = 0; t < n_plan; t++) {
 +			if (reached[t] == 3 && !faulted[t] && ctl[t] == CS_WANT
 +			    && loaded[t] == expected[t] && loaded2[t] == expected2[t]
-+			    && loaded3[t] == expected3[t]) {
++			    && ((plan[t].flags & CS_F_Q_WHOLE) != 0
++			        || loaded3[t] == expected3[t])) {
 +				n_ok++;
 +			}
 +		}
@@ -3566,9 +3593,9 @@ new file mode 100644
 +		if (ctl[0] != CS_WANT) {
 +			printf("mi8gpu: step 23 SUMMARY: even the control store failed; not comparable\n");
 +		} else if (n_ok == n_plan) {
-+			printf("mi8gpu: step 23 SUMMARY: PRIVATE WRITES LOCATED IN THE REGION -- result[6] followed c0.x on every pvt ring, the scan found c0.x+0x222 at pvt-first, and the nop controls left the 256 KB empty\n");
++			printf("mi8gpu: step 23 SUMMARY: THE REAL COMPILED BODY RAN -- four uploads through Mesa's own 12-instruction stream, and the judge tail still stored the control, c4.x and c4.x+0x222\n");
 +		} else {
-+			printf("mi8gpu: step 23 SUMMARY: the private-memory program did not separate the pairs\n");
++			printf("mi8gpu: step 23 SUMMARY: the real compiled body did not reproduce the judge tail's three stores\n");
 +		}
 +	}
 +	cs_hole_sensor();
