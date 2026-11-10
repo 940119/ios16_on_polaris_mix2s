@@ -2716,7 +2716,7 @@ new file mode 100644
 +	0x00000000u, 0x204cc009u,	/* tail: mov.u32u32 r2.y, 0 */
 +	0x0badf00du, 0x204cc004u,	/* tail: mov.u32u32 r1.x, 0x0badf00d (control) */
 +	0x00000000u, 0x00000000u,	/* tail: nop latency */
-+	0x01800008u, 0xc0c61100u,	/* tail: stg.u32 g[r2.x+0], r1.x, 1 -> result[0] */
++	0x01800008u, 0xd0c61100u,	/* B60b: tail: stg.u32 g[r2.x+0], r1.x, 1 (sy) -> result[0] */
 +	0x00000010u, 0x202cc005u,	/* tail: mov.u32u32 r1.y, c4.x (B59 const num 16) */
 +	0x00000000u, 0x00000000u,	/* tail: nop latency */
 +	0x00000000u, 0x00000000u,	/* tail: nop latency */
