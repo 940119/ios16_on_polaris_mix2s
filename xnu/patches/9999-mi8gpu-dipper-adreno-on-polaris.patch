@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5868 @@
+@@ -0,0 +1,5887 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2598,6 +2598,7 @@ new file mode 100644
 + * measured. The event is FD_LABEL, DEBUG_LABEL 0x3f on a6xx, one dword.
 + */
 +#define CS_F_Q_ROLL	0x200u	/* CP_EVENT_WRITE(DEBUG_LABEL): roll the register context */
++#define CS_F_Q_INV	0x400u	/* CACHE_INVALIDATE between the seed write and CP_EXEC_CS */
 +#define CS_WANT		0x0badf00du
 +#define CS_SEED_OFF	0x340u	/* result + 0x40: the ldg reads here */
 +static uint32_t cs_seed_value;	/* B45: CP_MEM_WRITE puts this in the ring */
@@ -2877,6 +2878,18 @@ new file mode 100644
 +		CS_PUT((uint32_t)s_);
 +		CS_PUT((uint32_t)(s_ >> 32));
 +		CS_PUT(cs_seed_value);
++	}
++	if ((flags & CS_F_Q_INV) != 0) {
++		/*
++		 * B46: 0x31 is A6XX's CACHE_INVALIDATE, documented in adreno_pm4.xml as
++		 * "Invalidates UCHE". fd_gpu_event.h says FD_CACHE_INVALIDATE has
++		 * needs_seqno = false, so fd6_event_write() emits CP_EVENT_WRITE with
++		 * ONE dword and no address -- exactly DEBUG_LABEL's shape. It must sit
++		 * after the CP_MEM_WRITE that planted the seed and before CP_EXEC_CS,
++		 * or the shader's ldg keeps hitting the previous launch's cache line.
++		 */
++		CS_PUT(pkt7(0x46u, 1u));		/* CP_EVENT_WRITE */
++		CS_PUT(0x31u);				/* CACHE_INVALIDATE */
 +	}
 +	CS_MARK(0);				/* everything above executed */
 +	if (exec) {
@@ -3169,8 +3182,14 @@ new file mode 100644
 +	 * 0badf00d, and result[2] must equal that launch's seed. If the control
 +	 * holds and the reading follows two different seeds, the SP read memory.
 +	 *
++	 * B46: B45 showed the load itself works but only ONCE -- the second launch
++	 * read the first launch's seed even though cp-seed proved the CP had written
++	 * a new one. So the missing piece is UCHE invalidation. Rings B and C emit
++	 * CACHE_INVALIDATE (0x31) after the seed write; A and D do not, so D is a
++	 * control that must go stale if the invalidate is what makes it visible.
++	 *
 +	 * The instrument B43 fixed is kept: one shared target, cleared before every
-+	 * launch. B44's t == 0 "no dispatch control" shortcut is gone -- all three
++	 * launch. B44's t == 0 "no dispatch control" shortcut is gone -- all four
 +	 * rings are full one-ring launches and are judged identically.
 +	 */
 +	static const struct {
@@ -3178,17 +3197,18 @@ new file mode 100644
 +		uint32_t tag;
 +		uint32_t seed;
 +		const char *what;
-+	} plan[3] = {
-+		{ CS_F_STATE | CS_F_EXEC, 0u, 0x5eedc0deu, "SEED 1: read 0x5eedc0de and store it" },
-+		{ CS_F_STATE | CS_F_EXEC, 1u, 0xa5a5c3c3u, "SEED 2: a different value, same program" },
-+		{ CS_F_STATE | CS_F_EXEC, 2u, 0x5eedc0deu, "CLOSING: seed 1 again, must come back" },
++	} plan[4] = {
++		{ CS_F_STATE | CS_F_EXEC,			0u, 0x5eedc0deu, "NO-INV 1: first launch, cold cache" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,	1u, 0xa5a5c3c3u, "INV 2: UCHE invalidated after the seed write" },
++		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_INV,	2u, 0x1badb002u, "INV 3: a third, different seed" },
++		{ CS_F_STATE | CS_F_EXEC,			3u, 0x2f00d123u, "NO-INV 4: expect the third value stale" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
-+	bool faulted[3] = { false, false, false };
-+	int reached[3] = { 0, 0, 0 };
-+	uint32_t ctl[3] = { 0, 0, 0 };
-+	uint32_t loaded[3] = { 0, 0, 0 };
++	bool faulted[4] = { false, false, false, false };
++	int reached[4] = { 0, 0, 0, 0 };
++	uint32_t ctl[4] = { 0, 0, 0, 0 };
++	uint32_t loaded[4] = { 0, 0, 0, 0 };
 +	uint32_t t;
 +
 +	printf("mi8gpu: step 23: a shader that loads, SECVID_TRUST_CNTL %#x (%s)\n",
@@ -3229,8 +3249,9 @@ new file mode 100644
 +		/* the B38-onward shape, so the judge's result/fence/FSR regex still fits */
 +		printf("mi8gpu: step 23 launch %c: result 0x%08x, fence 0x%08x, CB1 FSR 0x%08x -> 0x%08x\n",
 +		    'A' + t, ctl[t], *fence, fsr_before, fsr_after);
-+		printf("mi8gpu: step 23 launch %c: loaded 0x%08x, seed 0x%08x, cp-seed 0x%08x\n",
-+		    'A' + t, loaded[t], plan[t].seed, seed_seen);
++		printf("mi8gpu: step 23 launch %c: loaded 0x%08x, seed 0x%08x, cp-seed 0x%08x, inv %u\n",
++		    'A' + t, loaded[t], plan[t].seed, seed_seen,
++		    ((plan[t].flags & CS_F_Q_INV) != 0) ? 1u : 0u);
 +		printf("mi8gpu: step 23 launch %c: FSYNR0 0x%08x, FAR 0x%llx%08x\n", 'A' + t,
 +		    rd(cb + CB_FSYNR0), (uint64_t)rd(cb + CB_FAR_LO + 4), rd(cb + CB_FAR_LO));
 +		if (*fence != (0xf00d0000u | (0x41u + plan[t].tag))) {
@@ -3296,12 +3317,10 @@ new file mode 100644
 +			}
 +		}
 +		printf("mi8gpu: step 23 SUMMARY: %u of %u launches read their seed and stored it\n", n_ok, n_plan);
-+		if (n_ok == n_plan) {
-+			printf("mi8gpu: step 23 SUMMARY: THE SP LOADS FROM GLOBAL MEMORY. Load path is live.\n");
-+		} else if (ctl[0] == CS_WANT) {
-+			printf("mi8gpu: step 23 SUMMARY: control store works, so the load is the missing half\n");
-+		} else {
++		if (ctl[0] != CS_WANT) {
 +			printf("mi8gpu: step 23 SUMMARY: even the control store failed; not comparable\n");
++		} else {
++			printf("mi8gpu: step 23 SUMMARY: INV rings must follow; NO-INV rings must go stale\n");
 +		}
 +	}
 +	cs_hole_sensor();
