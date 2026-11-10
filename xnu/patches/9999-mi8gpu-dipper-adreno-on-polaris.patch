@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,5866 @@
+@@ -0,0 +1,5868 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -3130,15 +3130,21 @@ new file mode 100644
 +	 * each quirk gets its own ring and its own result word, two dwords apart, and
 +	 * a ring that leaves its word empty names the change that mattered.
 +	 *
-+	 * B40 answered the recovery question and closed a door: after a one-ring launch,
-+	 * a state ring and a dispatch ring are both silent, twice over. So the damage
-+	 * outlives the state, and the method changes with it -- only the FIRST combined
-+	 * ring of a boot can be read, because that ring is the one that ends the boot's
-+	 * usefulness.
++	 * B42 is not a new mechanism. It is the control that four rounds never had.
 +	 *
-+	 * So there is exactly one candidate here, and it is worth a boot on its own:
-+	 * the context-roll event. D and E then say whether the boot survived, and F
-+	 * puts the plain one-ring launch last, where it can still show the poison.
++	 * B37, B38, B39, B40 and B41 all stored exactly one ring: ring B, and ring B is
++	 * always the FIRST dispatch of its boot. Every dispatch after it was silent,
++	 * whatever shape it had. Two readings fit that pattern equally well, and every
++	 * build so far assumed the interesting one:
++	 *
++	 *   (a) the shape matters -- one ring cannot launch, the split can; or
++	 *   (b) the order matters -- only the first CP_EXEC_CS of a boot runs, and the
++	 *       shape was never the variable at all.
++	 *
++	 * B38 called C's silence "the ring". B39 and B40 then called everything after
++	 * it "poison". Both were inferred from rings that were not first. Nobody ever
++	 * ran two plain dispatches back to back -- that is this build, and it costs no
++	 * new packet: A state, then the same dispatch ring four times.
 +	 */
 +	static const struct {
 +		uint32_t flags;
@@ -3147,10 +3153,10 @@ new file mode 100644
 +	} plan[6] = {
 +		{ CS_F_STATE,	0u, "CONTROL: the state alone, as B37 ran it (no dispatch)" },
 +		{ CS_F_EXEC,	1u, "CONTROL: the dispatch alone on that state -- B37's passing ring" },
-+		{ CS_F_STATE | CS_F_EXEC | CS_F_Q_ROLL,	2u, "ONE ring, with a context-roll event between the state and the dispatch" },
-+		{ CS_F_STATE,	3u, "AFTER: the state alone, if the ring above left the SP able to store" },
-+		{ CS_F_EXEC,	4u, "AFTER: the dispatch alone -- the baseline shape, after the roll" },
-+		{ CS_F_STATE | CS_F_EXEC,		5u, "LAST: one ring with nothing added, to see the poison again" },
++		{ CS_F_EXEC,	2u, "DISPATCH 2: the very same ring again, nothing in between" },
++		{ CS_F_EXEC,	3u, "DISPATCH 3: and again" },
++		{ CS_F_STATE,	4u, "the state written once more" },
++		{ CS_F_EXEC,	5u, "DISPATCH 4: on freshly written state" },
 +	};
 +	const uint32_t n_plan = (uint32_t)(sizeof(plan) / sizeof(plan[0]));
 +	vm_offset_t cb = smmu_cb(G3D_CTX);
@@ -3266,35 +3272,31 @@ new file mode 100644
 +	}
 +	/*
 +	/*
-+	 * B41: two readings, and only one of them is about the roll.
++	 * B42: one question, and it decides how five earlier rounds are read.
 +	 *
-+	 * If ring C stores, the one-ring launch was never impossible -- it was missing
-+	 * the context roll the second ring was silently providing, and a real driver
-+	 * has to emit it (Mesa does, for a different reason, and says so in a comment).
-+	 * If it does not, then either the roll is not the mechanism, or a one-ring
-+	 * launch cannot be made to work by adding packets at all.
-+	 *
-+	 * Every message stays under about 210 bytes: B39's verdict was cut off in the
-+	 * log ring mid-sentence, and a sentence that is not printed cannot be read.
++	 * If the second plain dispatch stores, dispatch order was never the variable,
++	 * the one-ring reading stands, and B39/B40's poison is real. If it does not,
++	 * then ring B is the only ring in any of these builds that was ever first --
++	 * and every conclusion drawn from C onwards has to be thrown away.
 +	 */
 +	if (reached[1] != 3 || stored[1] != CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: THE CONTROL DID NOT STORE -- B37 is not reproduced, nothing below it can be read\n");
++		printf("mi8gpu: step 23 SUMMARY: THE FIRST DISPATCH DID NOT STORE -- nothing below it means anything\n");
 +	} else if (reached[2] == 3 && stored[2] == CS_WANT) {
-+		printf("mi8gpu: step 23 SUMMARY: THE ROLL IS THE MISSING PIECE. One ring stores once it rolls the context\n");
-+		if (reached[4] == 3 && stored[4] == CS_WANT) {
-+			printf("mi8gpu: step 23 SUMMARY: the boot also survived, so the roll does not poison anything\n");
-+		}
-+		if (reached[5] == 3 && stored[5] != CS_WANT) {
-+			printf("mi8gpu: step 23 SUMMARY: and the same ring without the roll still fails, in this very boot\n");
++		printf("mi8gpu: step 23 SUMMARY: A SECOND DISPATCH STORES. Dispatch order is not the confound\n");
++		if (reached[3] == 3 && stored[3] == CS_WANT) {
++			printf("mi8gpu: step 23 SUMMARY: and a third, so repeated dispatch works in this boot\n");
++		} else {
++			printf("mi8gpu: step 23 SUMMARY: but a third does not, so exactly two is itself a puzzle\n");
 +		}
 +	} else {
-+		printf("mi8gpu: step 23 SUMMARY: THE ROLL DOES NOT DO IT. One ring with a context roll between state and dispatch\n");
-+		printf("mi8gpu: step 23 SUMMARY: is still silent, so two register contexts are not the explanation either\n");
-+		if (reached[4] == 3 && stored[4] == CS_WANT) {
-+			printf("mi8gpu: step 23 SUMMARY: the boot did survive, so this ring did not poison -- the silence is its own\n");
-+		} else if (reached[4] == 3) {
-+			printf("mi8gpu: step 23 SUMMARY: and the boot did not survive either, as B40 predicts\n");
-+		}
++		printf("mi8gpu: step 23 SUMMARY: ONLY THE FIRST DISPATCH OF A BOOT STORES. Ring B is the only ring in\n");
++		printf("mi8gpu: step 23 SUMMARY: B37-B41 that was ever first, so C onwards measured the order and not\n");
++		printf("mi8gpu: step 23 SUMMARY: the shape. The one-ring reading and the poison both have to be redone\n");
++	}
++	if (reached[5] == 3 && stored[5] == CS_WANT) {
++		printf("mi8gpu: step 23 SUMMARY: dispatch 4, on freshly written state, does store\n");
++	} else if (reached[5] == 3) {
++		printf("mi8gpu: step 23 SUMMARY: dispatch 4, on freshly written state, is silent too\n");
 +	}
 +	printf("mi8gpu: step 23 SUMMARY: %u of %u rings stored 0badf00d\n", n_stored, n_plan - 1u);
 +	/*
