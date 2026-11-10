@@ -3290,7 +3290,7 @@ new file mode 100644
 +	} else {
 +		printf("mi8gpu: step 23 SUMMARY: THE ROLL DOES NOT DO IT. One ring with a context roll between state and dispatch\n");
 +		printf("mi8gpu: step 23 SUMMARY: is still silent, so two register contexts are not the explanation either\n");
-+		if (reached[4] == 3 && stored[4] == WANT) {
++		if (reached[4] == 3 && stored[4] == CS_WANT) {
 +			printf("mi8gpu: step 23 SUMMARY: the boot did survive, so this ring did not poison -- the silence is its own\n");
 +		} else if (reached[4] == 3) {
 +			printf("mi8gpu: step 23 SUMMARY: and the boot did not survive either, as B40 predicts\n");
