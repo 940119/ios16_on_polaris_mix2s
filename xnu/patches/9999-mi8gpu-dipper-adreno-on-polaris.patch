@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7171 @@
+@@ -0,0 +1,7174 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4578,21 +4578,24 @@ new file mode 100644
 +	ccu_cpu = rd(gpu3d + 4 * 0x8e07u);
 +	eco_cp = *(volatile uint32_t *)(slots + 4u * BL_ECO_IDX);
 +	eco_cpu = rd(gpu3d + 4 * 0x8e04u);
-+	printf("mi8gpu: step 26 B85 TABLE: same 114 dwords, destination is 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL (960,0), source pattern varies in BOTH axes, 11 CP_REG_TO_MEM reads\n");
++	/* B86: the SAME 114 dwords. The only new variable is a C-linkage call into the C++ SweetSurface TU; the probe returns a magic and touches no IOKit object, so a negative can only be "the link failed". */
++	printf("mi8gpu: step 27 BRIDGE: C TU reached the C++ SweetSurface TU, magic %#010x (want %#010x)\n",
++	    mi8_surface_bridge_probe(), 0x53555246u);
++	printf("mi8gpu: step 26 B86 TABLE: same 114 dwords, 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL (960,0), 2D BS_PIX pattern, 11 CP_REG_TO_MEM reads, C->C++ bridge probe\n");
 +	for (i = 0; i < BL_NREG; i++) {
 +		cpv = *(volatile uint32_t *)(slots + 4u * i);
 +		cpu = rd(gpu3d + 4 * bl_regs[i]);
 +		if (i < 8u && cpv == bl_want[i]) {
 +			landed++;
 +		}
-+		printf("mi8gpu: step 26 B85 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
++		printf("mi8gpu: step 26 B86 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
 +		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
 +		    (cpv == bl_want[i]) ? "MATCH" : "differs");
 +	}
-+	printf("mi8gpu: step 26 B85 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
++	printf("mi8gpu: step 26 B86 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
 +	    landed, control, 0x80100180u,
 +	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
-+	printf("mi8gpu: step 26 B85 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
++	printf("mi8gpu: step 26 B86 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
 +	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
 +	    (ccu_cpu == ccu_cp) ? "CCU PRE-IMAGE CPU==CP" : "CCU PRE-IMAGE BLIND");
 +}
@@ -12257,7 +12260,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,59 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12287,6 +12290,14 @@ new file mode 100644
 +
 +void mi8_adreno_init(void);     /* boot-arg mi8gpu=N; default off */
 +
++/* B86: the C -> C++ link probe. Defined in bsd/dev/mi8_surface_bridge.cpp,
++ * a C++ translation unit that includes NO iokit header and touches NO IOKit
++ * object. mi8_adreno.c is a C TU and must NEVER include SweetSurface.h:
++ * that header declares `class SweetSurface : public OSObject` (lesson 86).
++ * An extern "C" declaration on the C side is the whole bridge; the magic
++ * returned by the C++ side proves the linker resolved it. */
++extern uint32_t mi8_surface_bridge_probe(void);
++
 +/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
 + * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
 + * C99's implicit-int declaration clashes with the bool definition below
@@ -12309,14 +12320,35 @@ new file mode 100644
 +bool mi8_gpu_recover(void);
 +void mi8_gpu_stop(void);
 +#endif /* _BSD_DEV_MI8GPU_SWEET_H_ */
+diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/mi8_surface_bridge.cpp
+@@ -0,0 +1,15 @@
++/*
++ * B86 cross-language link probe.
++ *
++ * bsd/dev/mi8_adreno.c is compiled as C; SweetSurface.h declares a C++ class
++ * and cannot be included from it. This file is compiled as C++ and exports a
++ * C-linkage symbol, which is the minimal bridge between the two. It does NOT
++ * include any iokit header and does NOT allocate or call any IOKit object:
++ * B86 answers exactly one question -- can the C driver link to and call a
++ * C++ translation unit? Real surface creation is B87 onwards.
++ */
++extern "C" uint32_t
++mi8_surface_bridge_probe(void)
++{
++	return 0x53555246u;	/* "SURF" */
++}
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -116,6 +116,7 @@
+@@ -116,6 +116,8 @@
  bsd/dev/polaris_touch_i2c.c		standard
  bsd/dev/polaris_gpu_diag.c		standard
  bsd/dev/polaris_gpu.c			standard
 +bsd/dev/mi8_adreno.c			standard
++bsd/dev/mi8_surface_bridge.cpp	standard
  bsd/dev/polaris_wifi.c			standard
  bsd/dev/polaris_qmp.c			standard
  bsd/dev/polaris_modem.c			standard
