@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7124 @@
+@@ -0,0 +1,7125 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4415,21 +4415,22 @@ new file mode 100644
 +	}
 +	B_PUT(pkt7(0x2cu, 1u));			/* CP_BLIT */
 +	B_PUT(3u);					/* BLIT_OP_SCALE */
-+	/* B79 part 2, kept alone in B81: adreno_pm4.xml:517 says the 2D
-+	 * blit writes THROUGH the CCU cache in the PS stage. B77/B78
-+	 * flushed only UCHE, so a blit that worked could still be invisible
-+	 * to a CPU read -- and B80 proved this clean is load-bearing. Clean
-+	 * color, invalidate color, invalidate UCHE. 10 dwords. */
++	/* B79 part 2, trimmed in B82: adreno_pm4.xml:517 says the 2D blit
++	 * writes THROUGH the CCU cache in the PS stage. B77/B78 flushed only
++	 * UCHE, so a blit that worked could still be invisible to a CPU read;
++	 * B80 proved this block is the load-bearing half and B81 proved PRE
++	 * contributes nothing. What remains is the clean itself. 6 dwords. */
 +	B_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE */
 +	B_PUT(pkt7(0x46u, 4u));			/* CP_EVENT_WRITE FLUSH_COLOR_TS */
 +	B_PUT(0x1du);
 +	B_PUT((uint32_t)(ev_iova + 8u));
 +	B_PUT((uint32_t)((ev_iova + 8u) >> 32));
 +	B_PUT(0xb79cc03u);
-+	B_PUT(pkt7(0x46u, 1u));			/* CP_EVENT_WRITE INV_COLOR */
-+	B_PUT(0x19u);
-+	B_PUT(pkt7(0x46u, 1u));			/* CP_EVENT_WRITE CACHE_INVALIDATE */
-+	B_PUT(0x31u);
++	/* B82: the two invalidates are gone, the clean stays. B80 proved this
++	 * block is load-bearing; B81 proved PRE is decoration. What is left is
++	 * WFI + FLUSH_COLOR_TS only: wait for the 2D blit to retire, then clean
++	 * the colour CCU so the next CPU read sees the pixels.
++	 * 4 dwords removed: statement 118 -> 114, WPTR 954 -> 950. */
 +	B_TICK(4);
 +	B_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE: let the blit retire */
 +	B_TICK(5);
@@ -4531,21 +4532,21 @@ new file mode 100644
 +	ccu_cpu = rd(gpu3d + 4 * 0x8e07u);
 +	eco_cp = *(volatile uint32_t *)(slots + 4u * BL_ECO_IDX);
 +	eco_cpu = rd(gpu3d + 4 * 0x8e04u);
-+	printf("mi8gpu: step 26 B81 TABLE: PRE removed, POST kept, 118 dwords, 11 CP_REG_TO_MEM reads, 8 A2D + control + RB_CCU_CNTL pre-image + RB_DBG_ECO_CNTL\n");
++	printf("mi8gpu: step 26 B82 TABLE: PRE gone, POST trimmed to WFI + FLUSH_COLOR_TS, 114 dwords, 11 CP_REG_TO_MEM reads, 8 A2D + control + RB_CCU_CNTL pre-image + RB_DBG_ECO_CNTL\n");
 +	for (i = 0; i < BL_NREG; i++) {
 +		cpv = *(volatile uint32_t *)(slots + 4u * i);
 +		cpu = rd(gpu3d + 4 * bl_regs[i]);
 +		if (i < 8u && cpv == bl_want[i]) {
 +			landed++;
 +		}
-+		printf("mi8gpu: step 26 B81 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
++		printf("mi8gpu: step 26 B82 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
 +		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
 +		    (cpv == bl_want[i]) ? "MATCH" : "differs");
 +	}
-+	printf("mi8gpu: step 26 B81 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
++	printf("mi8gpu: step 26 B82 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
 +	    landed, control, 0x80100180u,
 +	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
-+	printf("mi8gpu: step 26 B81 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
++	printf("mi8gpu: step 26 B82 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
 +	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
 +	    (ccu_cpu == ccu_cp) ? "CCU PRE-IMAGE CPU==CP" : "CCU PRE-IMAGE BLIND");
 +}
