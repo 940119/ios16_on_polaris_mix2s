@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6568 @@
+@@ -0,0 +1,6627 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2655,6 +2655,12 @@ new file mode 100644
 +#define RS_CAL_CTL	0x0a9b0u			/* SP_CS_CNTL_0: the positive control */
 +#define RS_CAL_VA	0x0000000au
 +#define RS_CAL_VB	0x0000000bu
++/* B73: the guard between the CP and the RB block. turnip never writes these, so
++ * nothing in this port has ever read them; the window match is a mask,
++ * (addr & ~MASK_LEN) == BASE_ADDR, which is why the mask is printed too. */
++#define PRT_CNTL	0x084fu			/* ACCESS_PROT_EN[0], FAULT_ON_VIOL_EN[1] */
++#define PRT_BASE	0x0850u			/* CP_PROTECT[0..31], one dword each */
++#define PRT_STATUS	0x0824u			/* ADDR[17:0], VIOL[22], HALTED[21], READ[20] */
 +#define CS_CONST_SENTINEL 0xdeadbeefu	/* B48: memory value, deliberately != c0.x */
 +static uint32_t cs_const_value;	/* B48: CP_LOAD_STATE6_FRAG uploads this as c0.x */
 +
@@ -3921,6 +3927,58 @@ new file mode 100644
 + *
 + * What is NOT here on purpose: RB_CCU_CNTL. See the header.
 + */
++/*
++ * B73: reads only. rs_launch already leaves two marks of how far the CP got --
++ * a fence written by CP_EVENT_WRITE(CACHE_FLUSH_TS) and a marker written by
++ * CP_MEM_WRITE as the last packet of RS3 -- and nobody has ever read them back.
++ * If the marker is there the CP executed the whole statement and its silence is
++ * the engine's; if the fence is not, it stopped inside RS1. CP_PROTECT is read
++ * too: it is the one gate the CPU's MMIO path bypasses, and the one thing on
++ * this path that has never been looked at.
++ */
++static void
++rs_protect(void)
++{
++	const vm_offset_t base = (vm_offset_t)g3d_regions[2].memory;
++	uint32_t cntl, status, i, live = 0, covers = 0;
++	uint32_t fence, mark;
++
++	from_memory(base + CS_FENCE_OFF, 4u);
++	from_memory(base + CS_MARKER_OFF + 4u * (3u * RS_TAG + 2u), 4u);
++	fence = *(volatile uint32_t *)(base + CS_FENCE_OFF);
++	mark = *(volatile uint32_t *)(base + CS_MARKER_OFF + 4u * (3u * RS_TAG + 2u));
++	printf("mi8gpu: step 24 AFTER: fence %#010x (want %#010x), marker %#010x (want %#010x)\n",
++	    fence, 0xf00d0000u | 0x53u, mark, RS_MARK(2u));
++
++	cntl = rd(gpu3d + 4 * PRT_CNTL);
++	printf("mi8gpu: step 24 PROT CNTL %#010x: EN %u, FAULT_ON_VIOL %u, LAST_SPAN_INF %u\n",
++	    cntl, cntl & 1u, (cntl >> 1) & 1u, (cntl >> 3) & 1u);
++
++	for (i = 0; i < 32u; i++) {
++		const uint32_t v = rd(gpu3d + 4 * (PRT_BASE + i));
++		const uint32_t wbase = v & 0x3ffffu;
++		const uint32_t mask = (v >> 18) & 0x1fffu;
++
++		if (v == 0u) {
++			continue;
++		}
++		live++;
++		if ((RS_CAL_B & ~mask) == wbase) {
++			covers++;
++		}
++		printf("mi8gpu: step 24 PROT[%u] %#010x: base %#07x mask %#05x read %u%s\n",
++		    i, v, wbase, mask, (v >> 31) & 1u,
++		    ((RS_CAL_B & ~mask) == wbase) ? " COVERS 0x88d1" : "");
++	}
++	printf("mi8gpu: step 24 PROT: %u of 32 windows are set, %u of them cover %#07x\n",
++	    live, covers, RS_CAL_B);
++
++	status = rd(gpu3d + 4 * PRT_STATUS);
++	printf("mi8gpu: step 24 PROT STATUS %#010x: addr %#07x viol %u halted %u read %u\n",
++	    status, status & 0x3fffu, (status >> 22) & 1u, (status >> 21) & 1u,
++	    (status >> 20) & 1u);
++}
++
 +static void
 +rs_probe(void)
 +{
@@ -3989,6 +4047,7 @@ new file mode 100644
 +	}
 +	rs_state_readback();
 +	rs_calibrate();
++	rs_protect();
 +	printf("mi8gpu: step 24 VERDICT: %s\n",
 +	    (changed3 > 0 && rs3_clipped)
 +	    ? "BIN GEOMETRY WAS THE GATE: with CNTL_3 non-zero the render backend wrote our buffer"
@@ -3997,7 +4056,7 @@ new file mode 100644
 +	    : (rs2_exact == RS_DWORDS && rs2_clipped)
 +	    ? "THE RESOLVE ENGINE WROTE THE COLOUR WE ASKED FOR, AND STOPPED AT THE RECTANGLE"
 +	    : (rs2_exact == 0 && rs2_clipped)
-+	    ? "STILL NOTHING with bin 32x32 -- read the five CAL lines before naming a variable"
++	    ? "STILL NOTHING with bin 32x32 -- read the AFTER and PROT lines first"
 +	    : "PARTIAL -- count the dwords above: the rectangle or the pitch is off");
 +}
 +
