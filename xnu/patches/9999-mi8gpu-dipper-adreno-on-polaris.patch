@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7174 @@
+@@ -0,0 +1,7175 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4581,21 +4581,22 @@ new file mode 100644
 +	/* B86: the SAME 114 dwords. The only new variable is a C-linkage call into the C++ SweetSurface TU; the probe returns a magic and touches no IOKit object, so a negative can only be "the link failed". */
 +	printf("mi8gpu: step 27 BRIDGE: C TU reached the C++ SweetSurface TU, magic %#010x (want %#010x)\n",
 +	    mi8_surface_bridge_probe(), 0x53555246u);
-+	printf("mi8gpu: step 26 B86 TABLE: same 114 dwords, 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL (960,0), 2D BS_PIX pattern, 11 CP_REG_TO_MEM reads, C->C++ bridge probe\n");
++	/* B87a: the emitted statement is still byte-identical. The bridge now takes the ADDRESS of the real sweet_surface_create_physical (C++ mangled) without calling it, so include reachability + symbol resolution are proven with no early-IOKit runtime risk. */
++	printf("mi8gpu: step 26 B87a TABLE: same 114 dwords, 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL (960,0), 2D BS_PIX pattern, 11 CP_REG_TO_MEM reads, bridge resolves the real SweetSurface symbol\n");
 +	for (i = 0; i < BL_NREG; i++) {
 +		cpv = *(volatile uint32_t *)(slots + 4u * i);
 +		cpu = rd(gpu3d + 4 * bl_regs[i]);
 +		if (i < 8u && cpv == bl_want[i]) {
 +			landed++;
 +		}
-+		printf("mi8gpu: step 26 B86 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
++		printf("mi8gpu: step 26 B87a REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
 +		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
 +		    (cpv == bl_want[i]) ? "MATCH" : "differs");
 +	}
-+	printf("mi8gpu: step 26 B86 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
++	printf("mi8gpu: step 26 B87a READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
 +	    landed, control, 0x80100180u,
 +	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
-+	printf("mi8gpu: step 26 B86 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
++	printf("mi8gpu: step 26 B87a CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
 +	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
 +	    (ccu_cpu == ccu_cp) ? "CCU PRE-IMAGE CPU==CP" : "CCU PRE-IMAGE BLIND");
 +}
@@ -12324,26 +12325,33 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,27 @@
 +/*
-+ * B86 cross-language link probe.
++ * B87a cross-language link probe (V2a + V2b).
 + *
 + * bsd/dev/mi8_adreno.c is compiled as C; SweetSurface.h declares a C++ class
 + * and cannot be included from it. This file is compiled as C++ and exports a
-+ * C-linkage symbol, which is the minimal bridge between the two. It does NOT
-+ * include any iokit header and does NOT allocate or call any IOKit object:
-+ * B86 answers exactly one question -- can the C driver link to and call a
-+ * C++ translation unit? Real surface creation is B87 onwards.
++ * C-linkage symbol, which is the minimal bridge between the two.
 + *
-+ * The kernel builds C++ with -nostdinc, so NO implicit <stdint.h> exists here.
-+ * Use the built-in `unsigned int` (32-bit on arm64, same ABI as uint32_t)
-+ * rather than uint32_t: run 43100196574 failed with
-+ * "mi8_surface_bridge.cpp:11:12: error: unknown type name 'uint32_t'".
++ * The kernel builds C++ with -nostdinc and there is NO -I for the xnu source
++ * root, so <iokit/Kernel/arm/SweetSurface.h> cannot be found. A relative
++ * include works: bsd/dev/ -> ../../ -> xnu/. B86's build log proved the
++ * header is reachable that way, and -DARM64_BOARD_CONFIG_SWEET makes the
++ * `#if defined(SWEET)` branch in the header live.
++ *
++ * We take the ADDRESS of sweet_surface_create_physical but NEVER call it:
++ * that proves the C++ mangling matches and the linker can resolve the symbol,
++ * with zero dependency on kernel_task / IOLockAlloc / OSTypeAlloc being ready.
++ * B87b is where the call itself is made.
 + */
++#include "../../iokit/Kernel/arm/SweetSurface.h"
++
 +extern "C" unsigned int
 +mi8_surface_bridge_probe(void)
 +{
-+	return 0x53555246u;	/* "SURF" */
++	SweetSurface *(*volatile fn)(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t) =
++	    &sweet_surface_create_physical;
++	return fn != nullptr ? 0x53555246u : 0x0badf00du; /* "SURF" / "BADF00D" */
 +}
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
