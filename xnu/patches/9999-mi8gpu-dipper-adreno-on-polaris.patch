@@ -12296,7 +12296,7 @@ new file mode 100644
 + * that header declares `class SweetSurface : public OSObject` (lesson 86).
 + * An extern "C" declaration on the C side is the whole bridge; the magic
 + * returned by the C++ side proves the linker resolved it. */
-+extern uint32_t mi8_surface_bridge_probe(void);
++extern unsigned int mi8_surface_bridge_probe(void);
 +
 +/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
 + * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
@@ -12324,7 +12324,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,20 @@
 +/*
 + * B86 cross-language link probe.
 + *
@@ -12334,8 +12334,13 @@ new file mode 100644
 + * include any iokit header and does NOT allocate or call any IOKit object:
 + * B86 answers exactly one question -- can the C driver link to and call a
 + * C++ translation unit? Real surface creation is B87 onwards.
++ *
++ * The kernel builds C++ with -nostdinc, so NO implicit <stdint.h> exists here.
++ * Use the built-in `unsigned int` (32-bit on arm64, same ABI as uint32_t)
++ * rather than uint32_t: run 43100196574 failed with
++ * "mi8_surface_bridge.cpp:11:12: error: unknown type name 'uint32_t'".
 + */
-+extern "C" uint32_t
++extern "C" unsigned int
 +mi8_surface_bridge_probe(void)
 +{
 +	return 0x53555246u;	/* "SURF" */
