@@ -2697,7 +2697,7 @@ new file mode 100644
 +#define BS_SRC_MAX      ((BS_W - 1u) << 8)              /* 16.8 fixed point */
 +#define G3D_R_BLITSRC   6u
 +#define G3D_R_BLITDST   7u
-+#define G3D_R_SCAN      9u	/* B83: the 1088 x 64 display-shaped destination */
++#define G3D_R_SCAN      8u	/* B83: the 1088 x 64 display-shaped destination */
 +
 +/* ---- B79 / step 26: A2D + CCU state readback ---- */
 +#define BL_RB_OFF       0x780u      /* memptrs, after B77's clock at 0x740 */
