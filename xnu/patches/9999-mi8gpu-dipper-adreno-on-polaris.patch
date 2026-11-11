@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7139 @@
+@@ -0,0 +1,7132 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4432,20 +4432,13 @@ new file mode 100644
 +	}
 +	B_PUT(pkt7(0x2cu, 1u));			/* CP_BLIT */
 +	B_PUT(3u);					/* BLIT_OP_SCALE */
-+	/* B79 part 2: adreno_pm4.xml:517 says the 2D blit writes THROUGH
-+	 * the CCU cache in the PS stage. B77/B78 flushed only UCHE, so a
-+	 * blit that worked could still be invisible to a CPU read. Clean
-+	 * color, invalidate color, invalidate UCHE. 10 dwords. */
-+	B_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE */
-+	B_PUT(pkt7(0x46u, 4u));			/* CP_EVENT_WRITE FLUSH_COLOR_TS */
-+	B_PUT(0x1du);
-+	B_PUT((uint32_t)(ev_iova + 8u));
-+	B_PUT((uint32_t)((ev_iova + 8u) >> 32));
-+	B_PUT(0xb79cc03u);
-+	B_PUT(pkt7(0x46u, 1u));			/* CP_EVENT_WRITE INV_COLOR */
-+	B_PUT(0x19u);
-+	B_PUT(pkt7(0x46u, 1u));			/* CP_EVENT_WRITE CACHE_INVALIDATE */
-+	B_PUT(0x31u);
++	/* B80: the only change from B79 is that this block is GONE.
++	 * B79 closed 4b with the full reference sequence; this rung asks
++	 * whether the POST flush (WFI + FLUSH_COLOR_TS + INV_COLOR +
++	 * CACHE_INVALIDATE, 10 dwords) is load-bearing. If DST falls back
++	 * to 0/4096, the engine was ALWAYS working and B77/B78 were blinded
++	 * by dirty CCU lines rather than by a silent engine.
++	 * 0 dwords: statement 137 -> 127, WPTR 973 -> 963. */
 +	B_TICK(4);
 +	B_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE: let the blit retire */
 +	B_TICK(5);
@@ -4531,8 +4524,8 @@ new file mode 100644
 +/*
 + * B79: zero packets. Eleven CP_REG_TO_MEM slots, CPU MMIO side by side.
 + * The ninth is B71's control; the last two are the CCU registers the
-+ * reference setup writes. ECO's BIT(24) was already set by the init
-+ * table, so QCTDD04536579's blit-time RMW is not the missing variable.
++ * reference setup writes. B80 keeps all eleven so the PRE state it
++ * still leaves behind (0x8e07 = 0x1) is checked in the same ring.
 + */
 +static void
 +bl_readback(void)
@@ -4546,21 +4539,21 @@ new file mode 100644
 +	ccu_cpu = rd(gpu3d + 4 * 0x8e07u);
 +	eco_cp = *(volatile uint32_t *)(slots + 4u * BL_ECO_IDX);
 +	eco_cpu = rd(gpu3d + 4 * 0x8e04u);
-+	printf("mi8gpu: step 26 B79 TABLE: 11 CP_REG_TO_MEM reads, 8 A2D + control + RB_CCU_CNTL + RB_DBG_ECO_CNTL, Mesa A630 CCU setup\n");
++	printf("mi8gpu: step 26 B80 TABLE: POST flush removed, PRE kept, 127 dwords, 11 CP_REG_TO_MEM reads, 8 A2D + control + RB_CCU_CNTL + RB_DBG_ECO_CNTL\n");
 +	for (i = 0; i < BL_NREG; i++) {
 +		cpv = *(volatile uint32_t *)(slots + 4u * i);
 +		cpu = rd(gpu3d + 4 * bl_regs[i]);
 +		if (i < 8u && cpv == bl_want[i]) {
 +			landed++;
 +		}
-+		printf("mi8gpu: step 26 B79 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
++		printf("mi8gpu: step 26 B80 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
 +		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
 +		    (cpv == bl_want[i]) ? "MATCH" : "differs");
 +	}
-+	printf("mi8gpu: step 26 B79 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
++	printf("mi8gpu: step 26 B80 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
 +	    landed, control, 0x80100180u,
 +	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
-+	printf("mi8gpu: step 26 B79 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (want %#010x), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
++	printf("mi8gpu: step 26 B80 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (want %#010x), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
 +	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
 +	    (ccu_cp == B79_CCU_CNTL && ccu_cpu == ccu_cp) ? "CCU STATE LANDED" : "CCU STATE BLIND");
 +}
