@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7297 @@
+@@ -0,0 +1,7311 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2681,9 +2681,9 @@ new file mode 100644
 + * panel's own 4320-byte row is 67.5 * 64 and cannot be expressed at all. */
 +#define BD_SCAN_W       1088u
 +#define BD_SCAN_H       64u
-+#define BD_X0           960u                            /* rect at the right edge */
-+#define BD_PITCH        (BD_SCAN_W * 4u)                /* 4352 B */
-+#define BD_STRIDE       (BD_PITCH / 4u)                 /* 1088 dwords a row */
++#define BD_X0           0u                              /* B89: the surface's own origin */
++#define BD_PITCH        1024u                           /* B89: 16 * 64, one surface row */
++#define BD_STRIDE       (BD_PITCH / 4u)                 /* 256 dwords a row */
 +#define BS_TOTAL        (BD_W * BD_H)                   /* 4096 dwords in the rect */
 +/* B85: a colour that varies in BOTH axes. BS_ROW(y) varied only with the
 + * row, so the 4096-item DST check could not see the horizontal scale at
@@ -4334,17 +4334,17 @@ new file mode 100644
 +bl_probe(void)
 +{
 +	volatile uint32_t *src = (volatile uint32_t *)g3d_regions[G3D_R_BLITSRC].memory;
-+	volatile uint32_t *dst = (volatile uint32_t *)g3d_regions[G3D_R_SCAN].memory;
++	volatile uint32_t *dst = (volatile uint32_t *)g3d_regions[G3D_R_SURF].memory;
 +	volatile uint32_t *memptrs = (volatile uint32_t *)g3d_regions[2].memory;
 +	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
 +	const uint64_t src_iova = g3d_regions[G3D_R_BLITSRC].address;
-+	const uint64_t dst_iova = g3d_regions[G3D_R_SCAN].address;
++	const uint64_t dst_iova = g3d_regions[G3D_R_SURF].address;
 +	const uint64_t clock_iova = g3d_regions[2].address + BS_CLOCK_OFF;
 +	const uint64_t fence_iova = g3d_regions[2].address + BS_FENCE_OFF;
 +	const uint64_t mark_iova = g3d_regions[2].address + BS_MARK_OFF;
 +	const uint64_t rb_iova = g3d_regions[2].address + BL_RB_OFF;
 +	const uint64_t ev_iova = g3d_regions[2].address + B79_EV_OFF;
-+	const uint32_t dst_words = g3d_regions[G3D_R_SCAN].size / 4u;
++	const uint32_t dst_words = g3d_regions[G3D_R_SURF].size / 4u;
 +	uint32_t w = cp_wptr & 8191u;
 +	uint32_t i, ok_rows = 0, matched = 0, guard = 0, last = 0, drained;
 +
@@ -4393,7 +4393,7 @@ new file mode 100644
 +		memptrs[(B79_EV_OFF >> 2) + i] = 0;
 +	}
 +	to_memory(g3d_regions[G3D_R_BLITSRC].memory, g3d_regions[G3D_R_BLITSRC].size);
-+	to_memory(g3d_regions[G3D_R_SCAN].memory, g3d_regions[G3D_R_SCAN].size);
++	to_memory(g3d_regions[G3D_R_SURF].memory, g3d_regions[G3D_R_SURF].size);
 +	to_memory((vm_offset_t)memptrs, 0x1000);
 +	printf("mi8gpu: step 25 SRC: %u of %u rows start with BS_PIX(0,y), first %#010x last %#010x\n",
 +	    ok_rows, (unsigned)BS_H, src[0], src[(BS_H - 1u) * (BS_PITCH / 4u)]);
@@ -4510,7 +4510,7 @@ new file mode 100644
 +		    rd(smmu_cb(G3D_CTX) + CB_FSR), drained);
 +	}
 +	sleep_us(1000);
-+	from_memory(g3d_regions[G3D_R_SCAN].memory, g3d_regions[G3D_R_SCAN].size);
++	from_memory(g3d_regions[G3D_R_SURF].memory, g3d_regions[G3D_R_SURF].size);
 +	from_memory((vm_offset_t)memptrs, 0x1000);
 +
 +	/* the verdict is RECOMPUTED here, not taken from a kernel sentence */
@@ -4598,7 +4598,7 @@ new file mode 100644
 +	volatile uint32_t *s;
 +	uint64_t pa, atos_pa = 0;
 +	unsigned long long va;
-+	uint32_t i, fwd = 0, rev = 0, span = 0;
++	uint32_t i, fwd = 0, rev = 0, span = 0, pix = 0;
 +
 +	if (kva == 0) {
 +		printf("mi8gpu: step 29 SURF: the %s region was never allocated\n", g3d_regions[G3D_R_SURF].name);
@@ -4621,6 +4621,20 @@ new file mode 100644
 +		printf("mi8gpu: step 29 SURF IOVA: the SMMU does not translate %#llx\n",
 +		    g3d_regions[G3D_R_SURF].address);
 +	}
++	/* B89: the GPU's own pixels, read through the surface's own mapping.
++	 * The blit wrote BS_PIX(x/2, y/2) into this buffer, so four points inside
++	 * the 64 x 64 rect must read back that pattern HERE. B88 tied the two CPU
++	 * views together; this says the bytes the GPU put in are visible through
++	 * the SweetSurface mapping. Read BEFORE the marker writes below, which
++	 * overwrite rows 0 and 0 again. */
++	from_memory((vm_offset_t)s, 64u * 1024u);
++	for (i = 0; i < 4; i++) {
++		uint32_t gx = (i & 1u) * 32u, gy = (i >> 1) * 32u;
++		uint32_t want = 0x5a000000u | ((gy / 2u) << 8) | (gx / 2u + 1u);
++
++		pix += s[gy * 256u + gx] == want;
++	}
++	printf("mi8gpu: step 29 SURF PIXELS: %u of 4 dwords read through the surface are BS_PIX(x/2,y/2)\n", pix);
 +	/* direction 1: write through the region's kernel mapping, read through the surface */
 +	for (i = 0; i < 64; i++) {
 +		k[i] = 0x5ea10000u | i;
@@ -4700,21 +4714,21 @@ new file mode 100644
 +	printf("mi8gpu: step 27 BRIDGE: C TU reached the C++ SweetSurface TU, magic %#010x (want %#010x)\n",
 +	    mi8_surface_bridge_probe(), 0x53555246u);
 +	/* B88: the emitted statement is still byte-identical. The bridge now CALLS the real IOKit path in five stages; every PRE/POST pair is printed so a panic names its own stage (lesson 67). */
-+	printf("mi8gpu: step 26 B88 TABLE: same 114 dwords, 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL (960,0), 2D BS_PIX pattern, 11 CP_REG_TO_MEM reads, staged early-IOKit surface create + driver-owned surface at its own IOVA\n");
++	printf("mi8gpu: step 26 B89 TABLE: same 114 dwords, 256 x 128 at pitch 16, GRAS_A2D_DEST_TL (0,0), 2D BS_PIX pattern, 11 CP_REG_TO_MEM reads, THE DESTINATION IS THE DRIVER-OWNED SURFACE\n");
 +	for (i = 0; i < BL_NREG; i++) {
 +		cpv = *(volatile uint32_t *)(slots + 4u * i);
 +		cpu = rd(gpu3d + 4 * bl_regs[i]);
 +		if (i < 8u && cpv == bl_want[i]) {
 +			landed++;
 +		}
-+		printf("mi8gpu: step 26 B88 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
++		printf("mi8gpu: step 26 B89 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
 +		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
 +		    (cpv == bl_want[i]) ? "MATCH" : "differs");
 +	}
-+	printf("mi8gpu: step 26 B88 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
++	printf("mi8gpu: step 26 B89 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
 +	    landed, control, 0x80100180u,
 +	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
-+	printf("mi8gpu: step 26 B88 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
++	printf("mi8gpu: step 26 B89 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
 +	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
 +	    (ccu_cpu == ccu_cp) ? "CCU PRE-IMAGE CPU==CP" : "CCU PRE-IMAGE BLIND");
 +
