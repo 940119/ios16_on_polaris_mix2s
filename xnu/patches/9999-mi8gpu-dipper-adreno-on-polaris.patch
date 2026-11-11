@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6735 @@
+@@ -0,0 +1,6767 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -3667,8 +3667,26 @@ new file mode 100644
 +			printf("mi8gpu: step 23 SUMMARY: the real compiled body did not reproduce the judge tail's three stores\n");
 +		}
 +	}
-+	cs_hole_sensor();
++
++	/*
++	 * B75: this sensor IS a deliberate page fault -- CP_MEM_WRITE to 0x10100000
++	 * with no PTE under it -- and its own comment says what that costs: "a write
++	 * that faults may leave the CP waiting for a completion that never comes".
++	 * It is last inside step 23, but step 24 is submitted to the SAME CP in the
++	 * SAME boot, so "last" was never last. B74 measured the consequence: all
++	 * three arms executed zero clock ticks, RS3 stalled 16 words short, and the
++	 * bare CP_MEM_WRITE after them never landed -- the engine was already parked
++	 * before the resolve stream was written. The calibration it buys (B35: an
++	 * unmapped access does fault, FSR 0x400 -> 0x402) is in the record, so it is
++	 * skipped when step 24 needs a live CP.
++	 */
++	if (gmu_last_step < 24) {
++		cs_hole_sensor();
++	} else {
++		printf("mi8gpu: step 23 HOLE SENSOR: SKIPPED -- a write that faults parks the CP, and step 24 runs after it in the same boot (B74)\n");
++	}
 +}
++
 +
 +/*
 + * B70: one ring against the RB resolve engine.
@@ -3761,7 +3779,7 @@ new file mode 100644
 +		cp_wptr = target_wptr;
 +		/* the line the B70-B73 judge already reads, unchanged */
 +		printf("mi8gpu: step 24: %s: RB_RPTR %u WPTR %u, FSR %#010x\n", what,
-+		    rd(gpu3d + 4 * 0x0806), target_wptr, rd(gpu3d + 4 * 0x0220));
++		    rd(gpu3d + 4 * 0x0806), target_wptr, rd(smmu_cb(G3D_CTX) + CB_FSR));
 +		/* B74: what step 23 waits for and rs_launch never did */
 +		printf("mi8gpu: step 24 IDLE %s: RBBM_STATUS %#010x INT_0_STATUS %#010x\n", what,
 +		    rd(gpu3d + 4 * 0x0210), rd(gpu3d + 4 * 0x0201));
@@ -4096,7 +4114,21 @@ new file mode 100644
 +	    (unsigned)RS_W, (unsigned)RS_H);
 +	printf("mi8gpu: step 24 RS TABLE: eleven resolve registers and CCU_RESOLVE 0x1e, linear RGBA8, GMEM offset 0, %u bytes, TYPE=STORE then TYPE=CLEAR\n",
 +	    (unsigned)(RS_DWORDS * 4u));
++
 +	rs_clock_clear();
++	/*
++	 * B75: CB_FSR is sticky and already holds 0x400 at boot, so rs_launch's FSR
++	 * column would read the same whether or not this stream faulted. Clear it
++	 * and say what was cleared -- exactly what the hole sensor does before it
++	 * arms itself -- so the column means "did THIS stream fault".
++	 */
++	{
++		uint32_t fsr = rd(smmu_cb(G3D_CTX) + CB_FSR);
++
++		wr(smmu_cb(G3D_CTX) + CB_FSR, fsr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("mi8gpu: step 24 FSR: cleared %#010x before the three streams\n", fsr);
++	}
 +
 +	/* arm 1: B73's stream exactly, opening CP_WAIT_FOR_IDLE kept, ticks added */
 +	for (i = 0; i < bytes / 4u; i++) {
