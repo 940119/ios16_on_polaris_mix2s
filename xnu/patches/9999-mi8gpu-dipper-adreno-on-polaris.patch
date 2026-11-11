@@ -12608,3 +12608,78 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	/*
  	 * Measured before the USB arm, not after it. Build 0100 wedged the boot
  	 * inside sweet_usb_probe() and this probe never ran, which cost a whole
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -65,6 +65,10 @@
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++/* D1: the persistent ring is reached through printf(); IOLog does not.
++ * IOKit headers do not declare it, and C++ has no implicit declarations. */
++extern "C" int printf(const char *, ...);
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -79,6 +83,7 @@
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
++#define SWEET_FB_SWAP_REPORT            64      /* D1: frames per ring line */
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+@@ -193,6 +198,12 @@
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
++	/* D1: the three swap-chain counters the ring reports. Each is
++	 * incremented exactly where the corresponding transition happens,
++	 * so their difference names WHERE a frame was lost. */
++	uint32_t      fSwapSetup;     /* a record was accepted into fPending */
++	uint32_t      fSwapConsumed;  /* the vsync path took it out of fPending */
++	uint32_t      fSwapShown;     /* the pixels reached the panel */
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+@@ -706,6 +717,7 @@
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
++			fb->fSwapConsumed++;
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+@@ -896,6 +908,7 @@
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	fSwapSetup++;
+ 	IOLockUnlock(fLock);
+ 	++sweet_fb_swap_count;
+ 	/*
+@@ -1306,6 +1319,23 @@
+ 		}
+ 		s->release();
+ 	}
++	/*
++	 * D1: the swap chain's health signature, into the persistent ring.
++	 *
++	 * printf() -- not IOLog() -- because on SWEET printf writes the ring
++	 * synchronously (mi8gpu_sweet.h:24), and the ring is the only place a
++	 * reboot can be read back from. One line per SWEET_FB_SWAP_REPORT frames
++	 * keeps a 4 MB ring from being flooded: a mostly idle screen produces a
++	 * few dozen frames a minute.
++	 *
++	 * setup == consumed == shown is the healthy case. shown may lag consumed
++	 * by one while a copy is in flight, and the judge tolerates exactly that
++	 * (HANDOFF-MI8GPU-D1.md §4.3).
++	 */
++	if ((++fSwapShown % SWEET_FB_SWAP_REPORT) == 0) {
++		printf("mi8gpu: swap setup %u consumed %u shown %u blits %llu\n",
++		    fSwapSetup, fSwapConsumed, fSwapShown, fBlitsTotal);
++	}
+ }
+ 
+ bool
