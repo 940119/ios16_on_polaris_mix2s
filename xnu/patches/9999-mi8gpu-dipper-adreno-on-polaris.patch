@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7159 @@
+@@ -0,0 +1,7165 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2693,6 +2693,12 @@ new file mode 100644
 +#define BS_DST_PITCH    (BD_PITCH >> 6)                 /* shr=6 */
 +#define BS_BLIT_CNTL    0x00f03000u /* COLOR_FORMAT<<8 | MASK<<20, ROTATE_0, IFMT=R2D_UNORM8 */
 +#define BS_OUTPUT_INFO  0x0000f180u /* COLOR_FORMAT<<3 | MASK<<12, OUTPUT_IFMT_2D_FLOAT */
++/* B84: the rectangle's ORIGIN. Until now the statement wrote this
++ * register as a literal 0, so B83's 1024-wide spill was the hardware
++ * reading BR.x as "right edge measured from 0". turnip's r2d_coords()
++ * always emits TL and BR as a pair (tu_clear_blit.cc:294) and never
++ * shifts the destination base, so TL is the only way to move the rect. */
++#define BS_DEST_TL      ((BD_X0) | (0u << 16))
 +#define BS_DEST_BR      ((BD_X0 + BD_W - 1u) | ((BD_H - 1u) << 16))
 +#define BS_SRC_MAX      ((BS_W - 1u) << 8)              /* 16.8 fixed point */
 +#define G3D_R_BLITSRC   6u
@@ -4421,7 +4427,7 @@ new file mode 100644
 +	B_PUT(pkt4(0xacc0u, 1u));			/* SP_A2D_OUTPUT_INFO, A6XX offset */
 +	B_PUT(BS_OUTPUT_INFO);
 +	B_PUT(pkt4(0x8405u, 2u));			/* GRAS_A2D_DEST_TL / DEST_BR */
-+	B_PUT(0u);
++	B_PUT(BS_DEST_TL);			/* B84: (960,0) -- was a literal 0 */
 +	B_PUT(BS_DEST_BR);
 +	B_PUT(pkt4(0x8401u, 4u));			/* SRC_XMIN/XMAX/YMIN/YMAX, 16.8 */
 +	B_PUT(0u);
@@ -4566,21 +4572,21 @@ new file mode 100644
 +	ccu_cpu = rd(gpu3d + 4 * 0x8e07u);
 +	eco_cp = *(volatile uint32_t *)(slots + 4u * BL_ECO_IDX);
 +	eco_cpu = rd(gpu3d + 4 * 0x8e04u);
-+	printf("mi8gpu: step 26 B83 TABLE: same 114 dwords, destination is 1088 x 64 at pitch 68, rect at x 960, 11 CP_REG_TO_MEM reads\n");
++	printf("mi8gpu: step 26 B84 TABLE: same 114 dwords, destination is 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL is now (960,0), 11 CP_REG_TO_MEM reads\n");
 +	for (i = 0; i < BL_NREG; i++) {
 +		cpv = *(volatile uint32_t *)(slots + 4u * i);
 +		cpu = rd(gpu3d + 4 * bl_regs[i]);
 +		if (i < 8u && cpv == bl_want[i]) {
 +			landed++;
 +		}
-+		printf("mi8gpu: step 26 B83 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
++		printf("mi8gpu: step 26 B84 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
 +		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
 +		    (cpv == bl_want[i]) ? "MATCH" : "differs");
 +	}
-+	printf("mi8gpu: step 26 B83 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
++	printf("mi8gpu: step 26 B84 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
 +	    landed, control, 0x80100180u,
 +	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
-+	printf("mi8gpu: step 26 B83 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
++	printf("mi8gpu: step 26 B84 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
 +	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
 +	    (ccu_cpu == ccu_cp) ? "CCU PRE-IMAGE CPU==CP" : "CCU PRE-IMAGE BLIND");
 +}
