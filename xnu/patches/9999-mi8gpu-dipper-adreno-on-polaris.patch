@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7165 @@
+@@ -0,0 +1,7171 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2678,7 +2678,12 @@ new file mode 100644
 +#define BD_PITCH        (BD_SCAN_W * 4u)                /* 4352 B */
 +#define BD_STRIDE       (BD_PITCH / 4u)                 /* 1088 dwords a row */
 +#define BS_TOTAL        (BD_W * BD_H)                   /* 4096 dwords in the rect */
-+#define BS_ROW(y)       (0x5a000000u | ((uint32_t)(y) << 8) | 0xa5u)
++/* B85: a colour that varies in BOTH axes. BS_ROW(y) varied only with the
++ * row, so the 4096-item DST check could not see the horizontal scale at
++ * all -- B83's real 32x scale passed it. Every dst pixel must now equal
++ * BS_PIX(x/2, y/2), and a scale of anything but 2 leaves only x=0 right. */
++#define BS_PIX(x, y)    (0x5a000000u | ((uint32_t)(y) << 8) | ((uint32_t)(x) + 1u))
++#define BS_ROW(y)       BS_PIX(0u, y)          /* first pixel of row y */
 +#define BS_FILL         0xcdcdcdcdu
 +#define BS_FENCE_OFF    0x720u      /* memptrs, past the step-24 clock at 0x680 */
 +#define BS_MARK_OFF     0x724u
@@ -4360,9 +4365,9 @@ new file mode 100644
 +	}
 +	for (uint32_t y = 0; y < BS_H; y++) {
 +		for (uint32_t x = 0; x < BS_W; x++) {
-+			src[y * (BS_PITCH / 4u) + x] = BS_ROW(y);
++			src[y * (BS_PITCH / 4u) + x] = BS_PIX(x, y);
 +		}
-+		if (src[y * (BS_PITCH / 4u)] == BS_ROW(y)) {
++		if (src[y * (BS_PITCH / 4u)] == BS_PIX(0u, y)) {
 +			ok_rows++;
 +		}
 +	}
@@ -4383,7 +4388,7 @@ new file mode 100644
 +	to_memory(g3d_regions[G3D_R_BLITSRC].memory, g3d_regions[G3D_R_BLITSRC].size);
 +	to_memory(g3d_regions[G3D_R_SCAN].memory, g3d_regions[G3D_R_SCAN].size);
 +	to_memory((vm_offset_t)memptrs, 0x1000);
-+	printf("mi8gpu: step 25 SRC: %u of %u rows carry their own colour, first %#010x last %#010x\n",
++	printf("mi8gpu: step 25 SRC: %u of %u rows start with BS_PIX(0,y), first %#010x last %#010x\n",
 +	    ok_rows, (unsigned)BS_H, src[0], src[(BS_H - 1u) * (BS_PITCH / 4u)]);
 +
 +#define B_PUT(v)	(ring[w++ & 8191u] = (uint32_t)(v))
@@ -4505,7 +4510,8 @@ new file mode 100644
 +	for (i = 0; i < BS_TOTAL; i++) {
 +		const uint32_t row = i / BD_W;
 +
-+		if (dst[row * BD_STRIDE + BD_X0 + (i % BD_W)] == BS_ROW(row / 2u)) {
++		if (dst[row * BD_STRIDE + BD_X0 + (i % BD_W)]
++		    == BS_PIX((i % BD_W) / 2u, row / 2u)) {
 +			matched++;
 +		}
 +	}
@@ -4572,21 +4578,21 @@ new file mode 100644
 +	ccu_cpu = rd(gpu3d + 4 * 0x8e07u);
 +	eco_cp = *(volatile uint32_t *)(slots + 4u * BL_ECO_IDX);
 +	eco_cpu = rd(gpu3d + 4 * 0x8e04u);
-+	printf("mi8gpu: step 26 B84 TABLE: same 114 dwords, destination is 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL is now (960,0), 11 CP_REG_TO_MEM reads\n");
++	printf("mi8gpu: step 26 B85 TABLE: same 114 dwords, destination is 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL (960,0), source pattern varies in BOTH axes, 11 CP_REG_TO_MEM reads\n");
 +	for (i = 0; i < BL_NREG; i++) {
 +		cpv = *(volatile uint32_t *)(slots + 4u * i);
 +		cpu = rd(gpu3d + 4 * bl_regs[i]);
 +		if (i < 8u && cpv == bl_want[i]) {
 +			landed++;
 +		}
-+		printf("mi8gpu: step 26 B84 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
++		printf("mi8gpu: step 26 B85 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
 +		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
 +		    (cpv == bl_want[i]) ? "MATCH" : "differs");
 +	}
-+	printf("mi8gpu: step 26 B84 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
++	printf("mi8gpu: step 26 B85 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
 +	    landed, control, 0x80100180u,
 +	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
-+	printf("mi8gpu: step 26 B84 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
++	printf("mi8gpu: step 26 B85 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
 +	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
 +	    (ccu_cpu == ccu_cp) ? "CCU PRE-IMAGE CPU==CP" : "CCU PRE-IMAGE BLIND");
 +}
