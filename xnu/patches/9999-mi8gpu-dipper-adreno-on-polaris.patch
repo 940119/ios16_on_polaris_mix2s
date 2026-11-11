@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7125 @@
+@@ -0,0 +1,7159 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -1164,6 +1164,12 @@ new file mode 100644
 +	{ "rt", 0x10051000ull, 0x4000, 0 },
 +	{ "blitsrc", 0x10055000ull, 0x4000, 0 },
 +	{ "blitdst", 0x10059000ull, 0x8000, 0 },
++	/* B83: a display-SHAPED destination. 1088 x 64 x 4 = 272 KB, so the row
++	 * pitch is 4352 B = 68 * 64 and RB_A2D_DEST_BUFFER_PITCH (shr=6) can
++	 * express it. The panel's own 1080-wide row (4320 B) cannot be written
++	 * by this field at all: 4320 / 64 = 67.5. 0x10061000 + 0x44000 ends at
++	 * 0x100A4FFF, well short of CS_HOLE_IOVA 0x10100000. */
++	{ "scan", 0x10061000ull, 0x44000, 0 },
 +};
 +#define G3D_REGIONS ((uint32_t)(sizeof(g3d_regions) / sizeof(g3d_regions[0])))
 +#define G3D_R_PVTMEM	4u	/* B54: index of "pvtmem"; [0]/[1]/[2] keep their meaning */
@@ -2663,7 +2669,14 @@ new file mode 100644
 +#define BS_PITCH        (BS_W * 4u)                     /* 128 B, a multiple of 64 */
 +#define BD_W            64u
 +#define BD_H            64u
-+#define BD_PITCH        (BD_W * 4u)                     /* 256 B */
++/* B83: the destination is a display-shaped surface now. 1088 wide so the
++ * 4352-byte row is 68 * 64 and the shr=6 pitch field can hold it; the
++ * panel's own 4320-byte row is 67.5 * 64 and cannot be expressed at all. */
++#define BD_SCAN_W       1088u
++#define BD_SCAN_H       64u
++#define BD_X0           960u                            /* rect at the right edge */
++#define BD_PITCH        (BD_SCAN_W * 4u)                /* 4352 B */
++#define BD_STRIDE       (BD_PITCH / 4u)                 /* 1088 dwords a row */
 +#define BS_TOTAL        (BD_W * BD_H)                   /* 4096 dwords in the rect */
 +#define BS_ROW(y)       (0x5a000000u | ((uint32_t)(y) << 8) | 0xa5u)
 +#define BS_FILL         0xcdcdcdcdu
@@ -2680,10 +2693,11 @@ new file mode 100644
 +#define BS_DST_PITCH    (BD_PITCH >> 6)                 /* shr=6 */
 +#define BS_BLIT_CNTL    0x00f03000u /* COLOR_FORMAT<<8 | MASK<<20, ROTATE_0, IFMT=R2D_UNORM8 */
 +#define BS_OUTPUT_INFO  0x0000f180u /* COLOR_FORMAT<<3 | MASK<<12, OUTPUT_IFMT_2D_FLOAT */
-+#define BS_DEST_BR      ((BD_W - 1u) | ((BD_H - 1u) << 16))
++#define BS_DEST_BR      ((BD_X0 + BD_W - 1u) | ((BD_H - 1u) << 16))
 +#define BS_SRC_MAX      ((BS_W - 1u) << 8)              /* 16.8 fixed point */
 +#define G3D_R_BLITSRC   6u
 +#define G3D_R_BLITDST   7u
++#define G3D_R_SCAN      9u	/* B83: the 1088 x 64 display-shaped destination */
 +
 +/* ---- B79 / step 26: A2D + CCU state readback ---- */
 +#define BL_RB_OFF       0x780u      /* memptrs, after B77's clock at 0x740 */
@@ -2701,7 +2715,7 @@ new file mode 100644
 +	0xacc0u, 0xb4c0u, 0xb4c4u, 0x0a9b0u, 0x8e07u, 0x8e04u,
 +};
 +static const uint32_t bl_want[BL_NREG] = {
-+	0x00f03000u, 0x003f003fu, 0x00f03000u, 0x00000004u, 0x00000030u,
++	BS_BLIT_CNTL, BS_DEST_BR, BS_BLIT_CNTL, BS_DST_PITCH, BS_DST_INFO,
 +	0x0000f180u, 0x00500030u, 0x00000400u, 0x80100180u,
 +	B79_CCU_CNTL, B79_ECO_WANT,
 +};
@@ -4302,17 +4316,17 @@ new file mode 100644
 +bl_probe(void)
 +{
 +	volatile uint32_t *src = (volatile uint32_t *)g3d_regions[G3D_R_BLITSRC].memory;
-+	volatile uint32_t *dst = (volatile uint32_t *)g3d_regions[G3D_R_BLITDST].memory;
++	volatile uint32_t *dst = (volatile uint32_t *)g3d_regions[G3D_R_SCAN].memory;
 +	volatile uint32_t *memptrs = (volatile uint32_t *)g3d_regions[2].memory;
 +	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
 +	const uint64_t src_iova = g3d_regions[G3D_R_BLITSRC].address;
-+	const uint64_t dst_iova = g3d_regions[G3D_R_BLITDST].address;
++	const uint64_t dst_iova = g3d_regions[G3D_R_SCAN].address;
 +	const uint64_t clock_iova = g3d_regions[2].address + BS_CLOCK_OFF;
 +	const uint64_t fence_iova = g3d_regions[2].address + BS_FENCE_OFF;
 +	const uint64_t mark_iova = g3d_regions[2].address + BS_MARK_OFF;
 +	const uint64_t rb_iova = g3d_regions[2].address + BL_RB_OFF;
 +	const uint64_t ev_iova = g3d_regions[2].address + B79_EV_OFF;
-+	const uint32_t dst_words = g3d_regions[G3D_R_BLITDST].size / 4u;
++	const uint32_t dst_words = g3d_regions[G3D_R_SCAN].size / 4u;
 +	uint32_t w = cp_wptr & 8191u;
 +	uint32_t i, ok_rows = 0, matched = 0, guard = 0, last = 0, drained;
 +
@@ -4320,6 +4334,19 @@ new file mode 100644
 +	printf("mi8gpu: step 25 REGS: BLT %#010x OUT %#010x SRCINFO %#010x SRCPITCH %#010x DSTPITCH %#010x SIZE %#010x BR %#010x SRCMAX %#010x\n",
 +	    BS_BLIT_CNTL, BS_OUTPUT_INFO, BS_SRC_INFO, BS_SRC_PITCH,
 +	    BS_DST_PITCH, BS_SRC_SIZE, BS_DEST_BR, BS_SRC_MAX);
++	{
++		PE_Video pv;
++
++		memset(&pv, 0, sizeof(pv));
++		if (PE_current_console(&pv) == 0) {
++			printf("mi8gpu: step 25 PANEL: base %#llx row %lu w %lu h %lu depth %lu, fmt %.8s, row/64 %lu rem %lu\n",
++			    (unsigned long long)pv.v_baseAddr, pv.v_rowBytes, pv.v_width,
++			    pv.v_height, pv.v_depth, pv.v_pixelFormat,
++			    pv.v_rowBytes / 64u, pv.v_rowBytes % 64u);
++		} else {
++			printf("mi8gpu: step 25 PANEL: PE_current_console refused\n");
++		}
++	}
 +
 +	/* CPU owns both buffers before the statement: fill, then the pattern. */
 +	for (i = 0; i < g3d_regions[G3D_R_BLITSRC].size / 4u; i++) {
@@ -4348,7 +4375,7 @@ new file mode 100644
 +		memptrs[(B79_EV_OFF >> 2) + i] = 0;
 +	}
 +	to_memory(g3d_regions[G3D_R_BLITSRC].memory, g3d_regions[G3D_R_BLITSRC].size);
-+	to_memory(g3d_regions[G3D_R_BLITDST].memory, g3d_regions[G3D_R_BLITDST].size);
++	to_memory(g3d_regions[G3D_R_SCAN].memory, g3d_regions[G3D_R_SCAN].size);
 +	to_memory((vm_offset_t)memptrs, 0x1000);
 +	printf("mi8gpu: step 25 SRC: %u of %u rows carry their own colour, first %#010x last %#010x\n",
 +	    ok_rows, (unsigned)BS_H, src[0], src[(BS_H - 1u) * (BS_PITCH / 4u)]);
@@ -4465,18 +4492,23 @@ new file mode 100644
 +		    rd(smmu_cb(G3D_CTX) + CB_FSR), drained);
 +	}
 +	sleep_us(1000);
-+	from_memory(g3d_regions[G3D_R_BLITDST].memory, g3d_regions[G3D_R_BLITDST].size);
++	from_memory(g3d_regions[G3D_R_SCAN].memory, g3d_regions[G3D_R_SCAN].size);
 +	from_memory((vm_offset_t)memptrs, 0x1000);
 +
 +	/* the verdict is RECOMPUTED here, not taken from a kernel sentence */
 +	for (i = 0; i < BS_TOTAL; i++) {
 +		const uint32_t row = i / BD_W;
 +
-+		if (dst[row * (BD_PITCH / 4u) + (i % BD_W)] == BS_ROW(row / 2u)) {
++		if (dst[row * BD_STRIDE + BD_X0 + (i % BD_W)] == BS_ROW(row / 2u)) {
 +			matched++;
 +		}
 +	}
-+	for (i = BS_TOTAL; i < dst_words; i++) {
++	for (i = 0; i < dst_words; i++) {
++		const uint32_t gy = i / BD_STRIDE, gx = i % BD_STRIDE;
++
++		if (gy < BD_H && gx >= BD_X0 && gx < BD_X0 + BD_W) {
++			continue;
++		}
 +		if (dst[i] == BS_FILL) {
 +			guard++;
 +		}
@@ -4491,11 +4523,13 @@ new file mode 100644
 +	    memptrs[(BS_CLOCK_OFF >> 2) + 2u], memptrs[(BS_CLOCK_OFF >> 2) + 3u],
 +	    memptrs[(BS_CLOCK_OFF >> 2) + 4u], memptrs[(BS_CLOCK_OFF >> 2) + 5u], last);
 +	printf("mi8gpu: step 25 DST: %u of %u dwords match the 2x mapping, first %#010x last %#010x, drained %u\n",
-+	    matched, (unsigned)BS_TOTAL, dst[0], dst[BS_TOTAL - 1u], drained);
++	    matched, (unsigned)BS_TOTAL, dst[BD_X0],
++	    dst[(BD_H - 1u) * BD_STRIDE + BD_X0 + BD_W - 1u], drained);
 +	printf("mi8gpu: step 25 GUARD: %u of %u dwords outside the rect still hold %#010x\n",
 +	    guard, dst_words - (unsigned)BS_TOTAL, BS_FILL);
 +	printf("mi8gpu: step 25 ROWS: r0 %#010x r1 %#010x r2 %#010x r3 %#010x\n",
-+	    dst[0], dst[BD_W], dst[2u * BD_W], dst[3u * BD_W]);
++	    dst[BD_X0], dst[BD_STRIDE + BD_X0], dst[2u * BD_STRIDE + BD_X0],
++	    dst[3u * BD_STRIDE + BD_X0]);
 +	printf("mi8gpu: step 25 AFTER: fence %#010x (want %#010x), marker %#010x (want %#010x)\n",
 +	    memptrs[BS_FENCE_OFF >> 2], BS_FENCE,
 +	    memptrs[BS_MARK_OFF >> 2], BS_MARK);
@@ -4532,21 +4566,21 @@ new file mode 100644
 +	ccu_cpu = rd(gpu3d + 4 * 0x8e07u);
 +	eco_cp = *(volatile uint32_t *)(slots + 4u * BL_ECO_IDX);
 +	eco_cpu = rd(gpu3d + 4 * 0x8e04u);
-+	printf("mi8gpu: step 26 B82 TABLE: PRE gone, POST trimmed to WFI + FLUSH_COLOR_TS, 114 dwords, 11 CP_REG_TO_MEM reads, 8 A2D + control + RB_CCU_CNTL pre-image + RB_DBG_ECO_CNTL\n");
++	printf("mi8gpu: step 26 B83 TABLE: same 114 dwords, destination is 1088 x 64 at pitch 68, rect at x 960, 11 CP_REG_TO_MEM reads\n");
 +	for (i = 0; i < BL_NREG; i++) {
 +		cpv = *(volatile uint32_t *)(slots + 4u * i);
 +		cpu = rd(gpu3d + 4 * bl_regs[i]);
 +		if (i < 8u && cpv == bl_want[i]) {
 +			landed++;
 +		}
-+		printf("mi8gpu: step 26 B82 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
++		printf("mi8gpu: step 26 B83 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
 +		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
 +		    (cpv == bl_want[i]) ? "MATCH" : "differs");
 +	}
-+	printf("mi8gpu: step 26 B82 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
++	printf("mi8gpu: step 26 B83 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
 +	    landed, control, 0x80100180u,
 +	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
-+	printf("mi8gpu: step 26 B82 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
++	printf("mi8gpu: step 26 B83 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
 +	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
 +	    (ccu_cpu == ccu_cp) ? "CCU PRE-IMAGE CPU==CP" : "CCU PRE-IMAGE BLIND");
 +}
