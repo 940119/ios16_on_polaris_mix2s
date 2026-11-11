@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6627 @@
+@@ -0,0 +1,6735 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2648,6 +2648,16 @@ new file mode 100644
 +#define RS_MARK(ph)	(0xc1de0000u | ((uint32_t)(ph) << 8) | (0x41u + RS_TAG))
 +#define RS_CNTL3	0x00000201u		/* B70b: BINW 32>>5 (0:5), BINH 32>>4 (8:14) */
 +#define RS_RB_OFF	0x640u			/* where CP_REG_TO_MEM drops the resolve readback */
++
++/* B74: the packet clock. RS_CLOCK_STRIDE dwords per arm, RS_CLOCK_ARMS arms of
++* real work plus one spare arm for the after-control. The value carries its own
++* index, so a slot that was never written and a slot written with somebody
++* else's value are different readings. */
++#define RS_CLOCK_OFF		0x680u			/* memptrs page, past the CAL slot at 0x660 */
++#define RS_CLOCK_N		6u			/* ticks 1..6; the closing marker is separate */
++#define RS_CLOCK_STRIDE		8u
++#define RS_CLOCK_ARMS		3u
++#define RS_CLOCK(n)		(0xd0d00000u | (uint32_t)(n))	/* tick n -> 0xd0d0000n */
 +/* B71: the calibration probes. All five are C macros generated from the very
 + * constants this script asserts on, so the C and the model cannot drift. */
 +#define RS_CAL_A	0x88d0u			/* RB_RESOLVE_CNTL_0: YUV plane, harmless */
@@ -3676,15 +3686,37 @@ new file mode 100644
 + * when the clear is on, so the clear has retired before the store reads GMEM.
 + */
 +static bool
-+rs_launch(uint32_t phase, const char *what, bool do_clear, bool do_cntl3)
++rs_launch(uint32_t phase, const char *what, bool drop_lead)
 +{
 +	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
 +	uint32_t w = cp_wptr & 8191u;
 +	const uint64_t fence_iova = g3d_regions[2].address + CS_FENCE_OFF;
 +	const uint64_t rt_iova = g3d_regions[G3D_R_RT].address + RS_TARGET_OFF;
++	const uint64_t clock_iova = g3d_regions[2].address + RS_CLOCK_OFF + 4u * (uint64_t)RS_CLOCK_STRIDE * (uint64_t)phase;
 +
 +#define RS_PUT(v)	(ring[w++ & 8191u] = (uint32_t)(v))
-+	RS_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE */
++/*
++* B74: one clock tick. CP_MEM_WRITE with cnt 3 -- address lo, address hi and one
++* data dword -- is the packet step 23's own markers use and it writes a dword
++* the CPU reads back directly, so the tick cannot be lost the way a CP-side
++* instrument can. Each tick is 4 dwords, and the value names its own index.
++*/
++#define RS_TICK(n)	do {							\
++		const uint64_t c_ = clock_iova + 4u * ((uint32_t)(n) - 1u);	\
++										\
++		RS_PUT(pkt7(CP_MEM_WRITE_OPCODE, 3u));				\
++		RS_PUT((uint32_t)c_);							\
++		RS_PUT((uint32_t)(c_ >> 32));					\
++		RS_PUT(RS_CLOCK(n));							\
++	} while (0)
++	/* tick 1: the very first packet of this stream. If it is missing, the CP
++	 * does not execute this stream at all and no packet in it is to blame. */
++	RS_TICK(1);
++	if (!drop_lead) {
++		/* B74's suspect: the only packet step 23 never puts first. */
++		RS_PUT(pkt7(0x26u, 0u));				/* CP_WAIT_FOR_IDLE */
++	}
++	RS_TICK(2);
 +	/* the one runtime value: where the resolve lands */
 +	RS_PUT(pkt4(0x88d8u, 1u));
 +	RS_PUT((uint32_t)rt_iova);
@@ -3694,41 +3726,25 @@ new file mode 100644
 +		RS_PUT(pkt4(rs_ctx[i].reg, 1u));
 +		RS_PUT(rs_ctx[i].value);
 +	}
-+	if (do_cntl3) {
-+		/* B70b: the ONE new variable -- bin geometry, zero at reset, and a
-+		 * resolve has nothing to walk without it. See the header. */
-+		RS_PUT(pkt4(0x88d3u, 1u));
-+		RS_PUT(RS_CNTL3);
-+	}
-+	if (do_clear) {
-+		RS_PUT(pkt4(0x88e3u, 1u));
-+		RS_PUT(0x000000f2u);			/* TYPE=CLEAR(2) | CLEAR_MASK 0xf | BUFFER_ID 0 */
-+		RS_PUT(pkt4(0x88dfu, 1u));
-+		RS_PUT(0x80402010u);			/* the colour RS2 must find */
-+		RS_PUT(pkt4(0x88e0u, 1u));
-+		RS_PUT(0x80c0a050u);
-+		RS_PUT(pkt4(0x88e1u, 1u));
-+		RS_PUT(0x80010203u);
-+		RS_PUT(pkt4(0x88e2u, 1u));
-+		RS_PUT(0x80f0e0d0u);
-+		RS_PUT(pkt7(0x46u, 1u));		/* CP_EVENT_WRITE */
-+		RS_PUT(0x0000001eu);			/* CCU_RESOLVE: the clear retires */
-+		RS_PUT(pkt7(0x26u, 0u));		/* CP_WAIT_FOR_IDLE: GMEM holds it */
-+	}
++	RS_TICK(3);
 +	RS_PUT(pkt4(0x88e3u, 1u));
 +	RS_PUT(0x000000f0u);				/* TYPE=STORE(0) | CLEAR_MASK 0xf */
 +	RS_PUT(pkt7(0x46u, 1u));			/* CP_EVENT_WRITE */
 +	RS_PUT(0x0000001eu);				/* CCU_RESOLVE: GMEM -> our buffer */
++	RS_TICK(4);
 +	RS_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE */
++	RS_TICK(5);
 +	RS_PUT(pkt7(0x46u, 4u));			/* CP_EVENT_WRITE */
 +	RS_PUT(0x04u);					/* EVENT_CACHE_FLUSH_TS */
 +	RS_PUT((uint32_t)fence_iova);
 +	RS_PUT((uint32_t)(fence_iova >> 32));
-+	RS_PUT(0xf00d0000u | (0x51u + phase));		/* the value the driver supplies */
-+	RS_PUT(pkt7(CP_MEM_WRITE_OPCODE, 3u));		/* the last marker: the ring ran out */
++	RS_PUT(0xf00d0000u | (0x51u + phase));	/* the value the driver supplies */
++	RS_TICK(6);
++	RS_PUT(pkt7(CP_MEM_WRITE_OPCODE, 3u));	/* the last marker: the ring ran out */
 +	RS_PUT((uint32_t)(g3d_regions[2].address + CS_MARKER_OFF + 4u * (3u * RS_TAG + 2u)));
 +	RS_PUT((uint32_t)((g3d_regions[2].address + CS_MARKER_OFF + 4u * (3u * RS_TAG + 2u)) >> 32));
 +	RS_PUT(RS_MARK(2));
++#undef RS_TICK
 +#undef RS_PUT
 +	{
 +		const uint32_t target_wptr = w & 8191u;
@@ -3743,8 +3759,12 @@ new file mode 100644
 +			sleep_us(10);
 +		}
 +		cp_wptr = target_wptr;
++		/* the line the B70-B73 judge already reads, unchanged */
 +		printf("mi8gpu: step 24: %s: RB_RPTR %u WPTR %u, FSR %#010x\n", what,
 +		    rd(gpu3d + 4 * 0x0806), target_wptr, rd(gpu3d + 4 * 0x0220));
++		/* B74: what step 23 waits for and rs_launch never did */
++		printf("mi8gpu: step 24 IDLE %s: RBBM_STATUS %#010x INT_0_STATUS %#010x\n", what,
++		    rd(gpu3d + 4 * 0x0210), rd(gpu3d + 4 * 0x0201));
 +		return rd(gpu3d + 4 * 0x0806) == target_wptr;
 +	}
 +}
@@ -3979,6 +3999,89 @@ new file mode 100644
 +	    (status >> 20) & 1u);
 +}
 +
++/*
++* B74: the clock, read from the CPU. Nothing here emits a packet.
++*/
++static void
++rs_clock_clear(void)
++{
++	vm_offset_t base = (vm_offset_t)g3d_regions[2].memory + RS_CLOCK_OFF;
++	const uint32_t words = RS_CLOCK_STRIDE * (RS_CLOCK_ARMS + 1u);
++
++	for (uint32_t i = 0; i < words; i++) {
++		*(volatile uint32_t *)(base + 4u * i) = 0;
++	}
++	to_memory(base, 4u * words);
++	printf("mi8gpu: step 24 CLOCK: %u arms of %u ticks zeroed at offset %#x, one CP_MEM_WRITE per tick\n",
++	    RS_CLOCK_ARMS + 1u, RS_CLOCK_N, RS_CLOCK_OFF);
++}
++
++static void
++rs_clock_report(uint32_t phase, const char *what)
++{
++	vm_offset_t base = (vm_offset_t)g3d_regions[2].memory + RS_CLOCK_OFF
++	    + 4u * (vm_offset_t)RS_CLOCK_STRIDE * phase;
++	uint32_t last = 0;
++
++	from_memory(base, 4u * RS_CLOCK_N);
++	for (uint32_t i = 0; i < RS_CLOCK_N; i++) {
++		if (*(volatile uint32_t *)(base + 4u * i) == RS_CLOCK(i + 1u)) {
++			last = i + 1u;
++		}
++	}
++	printf("mi8gpu: step 24 CLOCK %s: %08x %08x %08x %08x %08x %08x\n", what,
++	    *(volatile uint32_t *)(base + 0u), *(volatile uint32_t *)(base + 4u),
++	    *(volatile uint32_t *)(base + 8u), *(volatile uint32_t *)(base + 12u),
++	    *(volatile uint32_t *)(base + 16u), *(volatile uint32_t *)(base + 20u));
++	printf("mi8gpu: step 24 CLOCK %s: highest tick that ran %u of %u%s\n", what, last, RS_CLOCK_N,
++	    last == RS_CLOCK_N
++	    ? " (the whole stream executed)"
++	    : " (the CP stopped before the next tick)");
++}
++
++/*
++* B74: the last question the three arms cannot answer. If a bare CP_MEM_WRITE
++* submitted on its own, after everything, still does not land, the CP is wedged
++* for good and every later step in this boot is meaningless. If it does land,
++* the wedge is per-stream and the ring drains back to a usable state.
++*/
++static void
++rs_after_control(void)
++{
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++	vm_offset_t slot = (vm_offset_t)g3d_regions[2].memory + RS_CLOCK_OFF
++	    + 4u * (vm_offset_t)RS_CLOCK_STRIDE * RS_CLOCK_ARMS;
++	const uint64_t iova = g3d_regions[2].address + RS_CLOCK_OFF
++	    + 4u * (uint64_t)RS_CLOCK_STRIDE * (uint64_t)RS_CLOCK_ARMS;
++	uint32_t w = cp_wptr & 8191u;
++	uint32_t target, got;
++
++	*(volatile uint32_t *)slot = 0;
++	to_memory(slot, 4u);
++	ring[w++ & 8191u] = pkt7(CP_MEM_WRITE_OPCODE, 3u);
++	ring[w++ & 8191u] = (uint32_t)iova;
++	ring[w++ & 8191u] = (uint32_t)(iova >> 32);
++	ring[w++ & 8191u] = RS_CLOCK(1u);
++	target = w & 8191u;
++	to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++	wr(gpu3d + 4 * 0x0807, target);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < 20000; i++) {
++		if (rd(gpu3d + 4 * 0x0806) == target) {
++			break;
++		}
++		sleep_us(10);
++	}
++	cp_wptr = target;
++	from_memory(slot, 4u);
++	got = *(volatile uint32_t *)slot;
++	printf("mi8gpu: step 24 AFTER-CTL: one bare CP_MEM_WRITE after step 24, RB_RPTR %u WPTR %u, slot %#010x (%s)\n",
++	    rd(gpu3d + 4 * 0x0806), target, got,
++	    got == RS_CLOCK(1u)
++	    ? "LANDED, the CP still executes"
++	    : "did NOT land, the CP is wedged for good");
++}
++
 +static void
 +rs_probe(void)
 +{
@@ -3993,13 +4096,14 @@ new file mode 100644
 +	    (unsigned)RS_W, (unsigned)RS_H);
 +	printf("mi8gpu: step 24 RS TABLE: eleven resolve registers and CCU_RESOLVE 0x1e, linear RGBA8, GMEM offset 0, %u bytes, TYPE=STORE then TYPE=CLEAR\n",
 +	    (unsigned)(RS_DWORDS * 4u));
++	rs_clock_clear();
 +
-+	/* RS1: the CPU leaves a pattern the GPU has to destroy */
++	/* arm 1: B73's stream exactly, opening CP_WAIT_FOR_IDLE kept, ticks added */
 +	for (i = 0; i < bytes / 4u; i++) {
 +		rt[i] = RS_FILL;
 +	}
 +	to_memory(g3d_regions[G3D_R_RT].memory, bytes);
-+	drained = rs_launch(0u, "RS1 STORE", false, false);
++	drained = rs_launch(0u, "RS1 STORE", false);
 +	from_memory(g3d_regions[G3D_R_RT].memory, bytes);
 +	changed = 0;
 +	for (i = 0; i < RS_DWORDS; i++) {
@@ -4009,13 +4113,14 @@ new file mode 100644
 +	}
 +	printf("mi8gpu: step 24 RS1: %u of %u dwords differ from the CPU pattern, first %#010x %#010x, drained %u\n",
 +	    changed, (unsigned)RS_DWORDS, rt[0], rt[RS_DWORDS - 1u], drained ? 1u : 0u);
++	rs_clock_report(0u, "RS1 STORE");
 +
-+	/* RS2: the same path, with a clear in front of it */
++	/* arm 2: unchanged from B73 -- the same STORE with a clear in front of it */
 +	for (i = 0; i < bytes / 4u; i++) {
 +		rt[i] = RS_FILL;
 +	}
 +	to_memory(g3d_regions[G3D_R_RT].memory, bytes);
-+	drained = rs_launch(1u, "RS2 CLEAR", true, false);
++	drained = rs_launch(1u, "RS2 CLEAR", false);
 +	from_memory(g3d_regions[G3D_R_RT].memory, bytes);
 +	exact = 0;
 +	for (i = 0; i < RS_DWORDS; i++) {
@@ -4027,36 +4132,39 @@ new file mode 100644
 +	    exact, (unsigned)RS_DWORDS, RS_COLOR0, rt[RS_DWORDS - 1u], rt[RS_DWORDS], drained ? 1u : 0u);
 +	rs2_exact = exact;
 +	rs2_clipped = (rt[RS_DWORDS] == RS_FILL);
-+	{
-+		/* RS3: the same STORE as RS1, with bin geometry as the only addition */
-+		for (i = 0; i < bytes / 4u; i++) {
-+			rt[i] = RS_FILL;
-+		}
-+		to_memory(g3d_regions[G3D_R_RT].memory, bytes);
-+		drained = rs_launch(2u, "RS3 BIN32", false, true);
-+		from_memory(g3d_regions[G3D_R_RT].memory, bytes);
-+		changed3 = 0;
-+		for (i = 0; i < RS_DWORDS; i++) {
-+			if (rt[i] != RS_FILL) {
-+				changed3++;
-+			}
-+		}
-+		rs3_clipped = (rt[RS_DWORDS] == RS_FILL);
-+		printf("mi8gpu: step 24 RS3: %u of %u dwords differ from the CPU pattern, first %#010x, past the rect %#010x, drained %u\n",
-+		    changed3, (unsigned)RS_DWORDS, rt[0], rt[RS_DWORDS], drained ? 1u : 0u);
++	rs_clock_report(1u, "RS2 CLEAR");
++
++	/* arm 3: arm 1 minus the opening CP_WAIT_FOR_IDLE -- ONE variable */
++	for (i = 0; i < bytes / 4u; i++) {
++		rt[i] = RS_FILL;
 +	}
++	to_memory(g3d_regions[G3D_R_RT].memory, bytes);
++	drained = rs_launch(2u, "RS3 NOWAIT", true);
++	from_memory(g3d_regions[G3D_R_RT].memory, bytes);
++	changed3 = 0;
++	for (i = 0; i < RS_DWORDS; i++) {
++		if (rt[i] != RS_FILL) {
++			changed3++;
++		}
++	}
++	rs3_clipped = (rt[RS_DWORDS] == RS_FILL);
++	printf("mi8gpu: step 24 RS3: %u of %u dwords differ from the CPU pattern, first %#010x, past the rect %#010x, drained %u\n",
++	    changed3, (unsigned)RS_DWORDS, rt[0], rt[RS_DWORDS], drained ? 1u : 0u);
++	rs_clock_report(2u, "RS3 NOWAIT");
++
++	rs_after_control();
 +	rs_state_readback();
 +	rs_calibrate();
 +	rs_protect();
 +	printf("mi8gpu: step 24 VERDICT: %s\n",
 +	    (changed3 > 0 && rs3_clipped)
-+	    ? "BIN GEOMETRY WAS THE GATE: with CNTL_3 non-zero the render backend wrote our buffer"
++	    ? "WITHOUT THE OPENING WAIT THE RESOLVE WROTE THE BUFFER, AND STOPPED AT THE RECTANGLE"
 +	    : (changed3 > 0)
-+	    ? "CNTL_3 MADE IT WRITE, but past the rectangle -- the bin walk does not follow CNTL_2"
++	    ? "WITHOUT THE OPENING WAIT IT WROTE, but past the rectangle"
 +	    : (rs2_exact == RS_DWORDS && rs2_clipped)
-+	    ? "THE RESOLVE ENGINE WROTE THE COLOUR WE ASKED FOR, AND STOPPED AT THE RECTANGLE"
++	    ? "THE RESOLVE WROTE THE COLOUR WE ASKED FOR AND STOPPED AT THE RECTANGLE"
 +	    : (rs2_exact == 0 && rs2_clipped)
-+	    ? "STILL NOTHING with bin 32x32 -- read the AFTER and PROT lines first"
++	    ? "STILL NOTHING -- the CLOCK lines say how far each stream got"
 +	    : "PARTIAL -- count the dwords above: the rectangle or the pitch is off");
 +}
 +
