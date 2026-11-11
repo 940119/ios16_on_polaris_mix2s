@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6767 @@
+@@ -0,0 +1,6790 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -3702,6 +3702,10 @@ new file mode 100644
 + * the destination first, then RB_RESOLVE_OPERATION, then the clear colour when
 + * there is one, then CCU_RESOLVE. Two events with a WAIT_FOR_IDLE between them
 + * when the clear is on, so the clear has retired before the store reads GMEM.
++ *
++ * B76 finally implements that sentence for RS2: B75 proved the STORE path but
++ * wrote zeros, because the four clear-colour registers were never written and
++ * OPERATION stayed TYPE=STORE(0). RS1/RS3 are untouched (the control arms).
 + */
 +static bool
 +rs_launch(uint32_t phase, const char *what, bool drop_lead)
@@ -3745,6 +3749,23 @@ new file mode 100644
 +		RS_PUT(rs_ctx[i].value);
 +	}
 +	RS_TICK(3);
++	if (phase == 1u) {
++		/* B76: the clear arm now really clears. B75's comment promised the
++		 * clear colour and a second event, but neither was ever emitted.
++		 * turnip writes RB_RESOLVE_CLEAR_COLOR_DW0..3 as ONE pkt4 and then
++		 * BLIT_EVENT_CLEAR(2); for RGBA8 only DW0 carries the pixel, so the
++		 * other three dwords are zero. BUFFER_ID is 0 for a colour target. */
++		RS_PUT(pkt4(0x88dfu, 4u));		/* CLEAR_COLOR_DW0..3 */
++		RS_PUT(RS_COLOR0);
++		RS_PUT(0u);
++		RS_PUT(0u);
++		RS_PUT(0u);
++		RS_PUT(pkt4(0x88e3u, 1u));
++		RS_PUT(0x000000f2u);			/* TYPE=CLEAR(2) | CLEAR_MASK 0xf */
++		RS_PUT(pkt7(0x46u, 1u));		/* CP_EVENT_WRITE */
++		RS_PUT(0x0000001eu);			/* CCU_RESOLVE: clear GMEM */
++		RS_PUT(pkt7(0x26u, 0u));		/* CP_WAIT_FOR_IDLE */
++	}
 +	RS_PUT(pkt4(0x88e3u, 1u));
 +	RS_PUT(0x000000f0u);				/* TYPE=STORE(0) | CLEAR_MASK 0xf */
 +	RS_PUT(pkt7(0x46u, 1u));			/* CP_EVENT_WRITE */
@@ -4114,6 +4135,8 @@ new file mode 100644
 +	    (unsigned)RS_W, (unsigned)RS_H);
 +	printf("mi8gpu: step 24 RS TABLE: eleven resolve registers and CCU_RESOLVE 0x1e, linear RGBA8, GMEM offset 0, %u bytes, TYPE=STORE then TYPE=CLEAR\n",
 +	    (unsigned)(RS_DWORDS * 4u));
++	printf("mi8gpu: step 24 B76: RS2 writes RB_RESOLVE_CLEAR_COLOR_DW0..3, "
++	    "TYPE=CLEAR(2) then TYPE=STORE(0), one WAIT_FOR_IDLE between them\n");
 +
 +	rs_clock_clear();
 +	/*
