@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7214 @@
+@@ -0,0 +1,7297 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -1170,10 +1170,17 @@ new file mode 100644
 +	 * by this field at all: 4320 / 64 = 67.5. 0x10061000 + 0x44000 ends at
 +	 * 0x100A4FFF, well short of CS_HOLE_IOVA 0x10100000. */
 +	{ "scan", 0x10061000ull, 0x44000, 0 },
++	/* B88: a driver-OWNED buffer that is also a SweetSurface. 256 x 128 at
++	 * row 1024 B (16 * 64, so RB_A2D_DEST_BUFFER_PITCH can express it) =
++	 * 128 KB. It gets its own 2 MB window (0x10800000 -> L2 index 132) so it
++	 * cannot share an L3 table with anything a later rung might move; the
++	 * pool holds 14 L3 tables and this is the third. */
++	{ "surf", 0x10800000ull, 0x20000, 0 },
 +};
 +#define G3D_REGIONS ((uint32_t)(sizeof(g3d_regions) / sizeof(g3d_regions[0])))
 +#define G3D_R_PVTMEM	4u	/* B54: index of "pvtmem"; [0]/[1]/[2] keep their meaning */
 +#define G3D_R_RT	5u	/* B70: index of "rt" */
++#define G3D_R_SURF	9u	/* B88: the driver-owned surface buffer */
 +/* B77: 0x10055000 and 0x10059000 are in the same 2 MB window as
 + * memptrs, so g3d_smmu_setup() reuses its L3 table; both stop far
 + * short of CS_HOLE_IOVA 0x10100000. */
@@ -4566,6 +4573,81 @@ new file mode 100644
 + * PRE-IMAGE here: whatever it reads is the value B79's write left, or
 + * the hardware reset value if that write was a no-op.
 + */
++/* B88: is a driver-owned buffer both an SMMU target and a SweetSurface?
++ *
++ * The "surf" region above is ordinary kernel-contiguous memory that the SMMU
++ * already maps (its ATOS verification ran in g3d_smmu_setup with the rest of
++ * the regions, so the IOVA half of this rung costs no new code). What is new
++ * here is that the SAME physical pages are wrapped in a SweetSurface and then
++ * read back through the surface's own write-combined mapping.
++ *
++ * Why it matters: until B87 the only surface the driver held was the panel's
++ * memory, reachable by the GPU because "screen" is a region with a fixed phys.
++ * Mesa and the swap skeleton need the opposite -- allocate, map, wrap -- so a
++ * negative here is a blocker, not a curiosity.
++ *
++ * Called once, next to mi8_okit_probe(): that is the one place already proven
++ * safe for early-IOKit calls (B87b created a surface there and returned).
++ * No GPU packet is added; WPTR stays 950.
++ */
++static void
++mi8_surf_alias_probe(void)
++{
++	vm_offset_t kva = g3d_regions[G3D_R_SURF].memory;
++	volatile uint32_t *k = (volatile uint32_t *)kva;
++	volatile uint32_t *s;
++	uint64_t pa, atos_pa = 0;
++	unsigned long long va;
++	uint32_t i, fwd = 0, rev = 0, span = 0;
++
++	if (kva == 0) {
++		printf("mi8gpu: step 29 SURF: the %s region was never allocated\n", g3d_regions[G3D_R_SURF].name);
++		return;
++	}
++	pa = kvtophys(kva);
++	va = mi8_surface_bridge_create(pa, 256u, 128u, 1024u, 0x42475241u);
++	if (va == 0) {
++		printf("mi8gpu: step 29 SURF: no surface for phys %#llx (create or map failed)\n", (unsigned long long)pa);
++		return;
++	}
++	s = (volatile uint32_t *)va;
++	printf("mi8gpu: step 29 SURF: driver-owned %s at phys %#llx, surface kernelAddress %#llx\n",
++	    g3d_regions[G3D_R_SURF].name, (unsigned long long)pa, va);
++	if (smmu_translate_in(G3D_CTX, g3d_regions[G3D_R_SURF].address, &atos_pa) == SMMU_TRANSLATED) {
++		printf("mi8gpu: step 29 SURF IOVA: the 3D core sees %#llx as %#llx (%s)\n",
++		    g3d_regions[G3D_R_SURF].address, (unsigned long long)atos_pa,
++		    atos_pa == pa ? "the surface's own pages" : "DIFFERENT PAGES");
++	} else {
++		printf("mi8gpu: step 29 SURF IOVA: the SMMU does not translate %#llx\n",
++		    g3d_regions[G3D_R_SURF].address);
++	}
++	/* direction 1: write through the region's kernel mapping, read through the surface */
++	for (i = 0; i < 64; i++) {
++		k[i] = 0x5ea10000u | i;
++	}
++	to_memory(kva, 256);
++	for (i = 0; i < 64; i++) {
++		fwd += s[i] == (0x5ea10000u | i);
++	}
++	/* direction 2: write through the surface's write-combined mapping, read through the region */
++	for (i = 0; i < 64; i++) {
++		s[128 + i] = 0x5ea20000u | i;
++	}
++	to_memory((vm_offset_t)&s[128], 256);
++	from_memory(kva + 512, 256);
++	for (i = 0; i < 64; i++) {
++		rev += k[128 + i] == (0x5ea20000u | i);
++	}
++	printf("mi8gpu: step 29 SURF ALIAS: region->surface %u of 64, surface->region %u of 64 dwords agree\n", fwd, rev);
++	/* a partial mapping would pass the two 256-byte windows above, so sample
++	 * one dword in every one of 32 rows spread across the whole 128 KB */
++	for (i = 0; i < 32; i++) {
++		uint32_t off = i * 1024u;
++		span += s[off] == k[off];
++	}
++	printf("mi8gpu: step 29 SURF SPAN: %u of 32 sampled rows are the same bytes in both mappings\n", span);
++}
++
 +/* B87b: staged early-IOKit probe. Every stage prints PRE, calls ONE C++
 + * function, prints POST. If the kernel panics, the last PRE line in the
 + * persistent ring names the stage (lesson 67).
@@ -4617,22 +4699,22 @@ new file mode 100644
 +	/* B86: the SAME 114 dwords. The only new variable is a C-linkage call into the C++ SweetSurface TU; the probe returns a magic and touches no IOKit object, so a negative can only be "the link failed". */
 +	printf("mi8gpu: step 27 BRIDGE: C TU reached the C++ SweetSurface TU, magic %#010x (want %#010x)\n",
 +	    mi8_surface_bridge_probe(), 0x53555246u);
-+	/* B87b: the emitted statement is still byte-identical. The bridge now CALLS the real IOKit path in five stages; every PRE/POST pair is printed so a panic names its own stage (lesson 67). */
-+	printf("mi8gpu: step 26 B87b TABLE: same 114 dwords, 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL (960,0), 2D BS_PIX pattern, 11 CP_REG_TO_MEM reads, staged early-IOKit surface create\n");
++	/* B88: the emitted statement is still byte-identical. The bridge now CALLS the real IOKit path in five stages; every PRE/POST pair is printed so a panic names its own stage (lesson 67). */
++	printf("mi8gpu: step 26 B88 TABLE: same 114 dwords, 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL (960,0), 2D BS_PIX pattern, 11 CP_REG_TO_MEM reads, staged early-IOKit surface create + driver-owned surface at its own IOVA\n");
 +	for (i = 0; i < BL_NREG; i++) {
 +		cpv = *(volatile uint32_t *)(slots + 4u * i);
 +		cpu = rd(gpu3d + 4 * bl_regs[i]);
 +		if (i < 8u && cpv == bl_want[i]) {
 +			landed++;
 +		}
-+		printf("mi8gpu: step 26 B87b REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
++		printf("mi8gpu: step 26 B88 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
 +		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
 +		    (cpv == bl_want[i]) ? "MATCH" : "differs");
 +	}
-+	printf("mi8gpu: step 26 B87b READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
++	printf("mi8gpu: step 26 B88 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
 +	    landed, control, 0x80100180u,
 +	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
-+	printf("mi8gpu: step 26 B87b CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
++	printf("mi8gpu: step 26 B88 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
 +	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
 +	    (ccu_cpu == ccu_cp) ? "CCU PRE-IMAGE CPU==CP" : "CCU PRE-IMAGE BLIND");
 +
@@ -6441,6 +6523,7 @@ new file mode 100644
 +				if (gpu_set && gmu_last_step >= 21) {
 +					gpu_zap_and_command();
 +					mi8_okit_probe();
++					mi8_surf_alias_probe();
 +				}
 +				gmu_oob_clear(OOB_GPU_SET_ACK);
 +				gmu_oob_clear(OOB_BOOT_SLUMBER_ACK);
@@ -12300,7 +12383,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,71 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12342,6 +12425,13 @@ new file mode 100644
 +extern uint64_t mi8_surface_bridge_stage(unsigned int stage, uint64_t phys,
 +    unsigned int width, unsigned int height, unsigned int row,
 +    unsigned int format);
++/* B88: wrap a driver-OWNED buffer's physical pages in a SweetSurface and
++ * return its kernel address (0 on failure). The SMMU side of the same pages
++ * is mapped by the "surf" region, so this is the allocate -> map -> wrap
++ * path Mesa needs, not the panel's fixed-phys special case. */
++extern unsigned long long mi8_surface_bridge_create(unsigned long long phys,
++    unsigned int width, unsigned int height, unsigned int row,
++    unsigned int format);
 +
 +/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
 + * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
@@ -12369,7 +12459,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,103 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12445,6 +12535,33 @@ new file mode 100644
 +	default:
 +		return 0;
 +	}
++}
++
++/*
++ * B88: wrap a caller-supplied physical address in a SweetSurface.
++ *
++ * B87b's stages wrap the panel's fixed framebuffer phys -- memory the GPU can
++ * already reach because "screen" is a driver region. This entry point is the
++ * other direction: the driver allocates kernel-contiguous pages, maps them
++ * into the SMMU at an IOVA of its own, and then asks for a surface over the
++ * same pages. That is the shape Mesa uses (IOSurface as a render target), so
++ * only the return value of kernelAddress() is interesting here.
++ *
++ * Returns 0 if the create or the lazy write-combined mapping failed. The
++ * surface is left published in the id table on purpose: a one-shot experiment
++ * image reboots, and releasing it here would free pages the SMMU still maps.
++ */
++extern "C" unsigned long long
++mi8_surface_bridge_create(unsigned long long phys, unsigned int width,
++    unsigned int height, unsigned int row, unsigned int format)
++{
++	SweetSurface *s = sweet_surface_create_physical(phys, width, height,
++	    row, format);
++
++	if (s == nullptr) {
++		return 0;
++	}
++	return (unsigned long long)s->kernelAddress();
 +}
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
