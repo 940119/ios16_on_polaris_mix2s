@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,6555 @@
+@@ -0,0 +1,6568 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -3835,29 +3835,41 @@ new file mode 100644
 +	const uint64_t rb = g3d_regions[2].address + RS_RB_OFF + 0x20u;
 +	volatile uint32_t *slot = (volatile uint32_t *)((vm_offset_t)g3d_regions[2].memory
 +	    + RS_RB_OFF + 0x20u);
-+	uint32_t back;
++	uint32_t a0, a2, az, landed;
 +
-+	/* A: an MMIO write, read straight back. Nothing is in flight. */
++	/* A0: the block answered in B71; ask again, so this boot carries its own
++	 * control and a change in A0 alone would already be news. */
 +	wr(gpu3d + 4 * RS_CAL_A, RS_CAL_VA);
 +	__asm__ volatile ("dsb sy" ::: "memory");
-+	back = rd(gpu3d + 4 * RS_CAL_A);
-+	printf("mi8gpu: step 24 CAL A: the CPU wrote %#010x to %#07x, reads back %#010x\n",
-+	    RS_CAL_VA, RS_CAL_A, back);
++	a0 = rd(gpu3d + 4 * RS_CAL_A);
++	printf("mi8gpu: step 24 CAL A0: CPU %#07x <- %#010x, reads %#010x\n",
++	    RS_CAL_A, RS_CAL_VA, a0);
 +
-+	/* B and C share one ring, so a single drain answers both. */
-+	wr(gpu3d + 4 * RS_CAL_B, 0u);
++	/* A2: A could only prove 0x88d0 writable. Until 0x88d1 is proven writable,
++	 * "the CP wrote and nothing landed" and "no write can ever land" are the
++	 * same picture -- which is exactly the mistake B71 was built to avoid. */
++	wr(gpu3d + 4 * RS_CAL_B, RS_CAL_VB);
 +	__asm__ volatile ("dsb sy" ::: "memory");
++	a2 = rd(gpu3d + 4 * RS_CAL_B);
++	wr(gpu3d + 4 * RS_CAL_B, 0u);		/* B must be seen as a change */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	az = rd(gpu3d + 4 * RS_CAL_B);
++	printf("mi8gpu: step 24 CAL A2: CPU %#07x <- %#010x, reads %#010x, zeroed reads %#010x\n",
++	    RS_CAL_B, RS_CAL_VB, a2, az);
++
++	/* C1, the type-4, C2. Same register, same packet, order is the only
++	 * difference -- so any difference between C1 and C2 is the type-4's doing. */
 +	slot[0] = 0;
 +	slot[1] = 0;
 +	to_memory((vm_offset_t)slot, 8u);
-+	ring[w++ & 8191u] = pkt4(RS_CAL_B, 1u);		/* B: the write */
-+	ring[w++ & 8191u] = RS_CAL_VB;
-+	ring[w++ & 8191u] = pkt7(0x3eu, 3u);		/* C: control register */
++	ring[w++ & 8191u] = pkt7(0x3eu, 3u);		/* C1: control, before */
 +	ring[w++ & 8191u] = RS_CAL_CTL & 0x3ffffu;
 +	ring[w++ & 8191u] = (uint32_t)rb;
 +	ring[w++ & 8191u] = 0u;
-+	ring[w++ & 8191u] = pkt7(0x3eu, 3u);		/* C: the register B just wrote */
-+	ring[w++ & 8191u] = RS_CAL_B & 0x3ffffu;
++	ring[w++ & 8191u] = pkt4(RS_CAL_B, 1u);		/* B: the packet under test */
++	ring[w++ & 8191u] = RS_CAL_VB;
++	ring[w++ & 8191u] = pkt7(0x3eu, 3u);		/* C2: control, after */
++	ring[w++ & 8191u] = RS_CAL_CTL & 0x3ffffu;
 +	ring[w++ & 8191u] = (uint32_t)(rb + 4u);
 +	ring[w++ & 8191u] = 0u;
 +	{
@@ -3874,22 +3886,23 @@ new file mode 100644
 +		}
 +		cp_wptr = target_wptr;
 +		if (rd(gpu3d + 4 * 0x0806) != target_wptr) {
-+			printf("mi8gpu: step 24 CAL: the CP did not drain the calibration ring; B and C are unmeasured\n");
++			printf("mi8gpu: step 24 CAL: the CP did not drain the calibration ring; nothing below is evidence\n");
 +			wr(gpu3d + 4 * RS_CAL_A, 0u);
++			wr(gpu3d + 4 * RS_CAL_B, 0u);
 +			__asm__ volatile ("dsb sy" ::: "memory");
 +			return;
 +		}
 +	}
 +	sleep_us(1000);
 +	from_memory((vm_offset_t)slot, 8u);
++	landed = rd(gpu3d + 4 * RS_CAL_B);
++	printf("mi8gpu: step 24 CAL B: after pkt4 %#07x <- %#010x the CPU reads %#010x\n",
++	    RS_CAL_B, RS_CAL_VB, landed);
++	printf("mi8gpu: step 24 CAL C1: control %#07x BEFORE the pkt4 reads %#010x\n",
++	    RS_CAL_CTL, slot[0]);
++	printf("mi8gpu: step 24 CAL C2: control %#07x AFTER the pkt4 reads %#010x\n",
++	    RS_CAL_CTL, slot[1]);
 +
-+	back = rd(gpu3d + 4 * RS_CAL_B);
-+	printf("mi8gpu: step 24 CAL B: the CP wrote %#010x to %#07x by pkt4, the CPU reads %#010x\n",
-+	    RS_CAL_VB, RS_CAL_B, back);
-+	printf("mi8gpu: step 24 CAL C: CP_REG_TO_MEM %#07x wrote %#010x, control %#07x wrote %#010x\n",
-+	    RS_CAL_B, slot[1], RS_CAL_CTL, slot[0]);
-+
-+	/* leave the block as it was found: neither probe register is read again */
 +	wr(gpu3d + 4 * RS_CAL_A, 0u);
 +	wr(gpu3d + 4 * RS_CAL_B, 0u);
 +	__asm__ volatile ("dsb sy" ::: "memory");
@@ -3984,7 +3997,7 @@ new file mode 100644
 +	    : (rs2_exact == RS_DWORDS && rs2_clipped)
 +	    ? "THE RESOLVE ENGINE WROTE THE COLOUR WE ASKED FOR, AND STOPPED AT THE RECTANGLE"
 +	    : (rs2_exact == 0 && rs2_clipped)
-+	    ? "STILL NOTHING with bin 32x32 -- read the three CAL lines before naming a variable"
++	    ? "STILL NOTHING with bin 32x32 -- read the five CAL lines before naming a variable"
 +	    : "PARTIAL -- count the dwords above: the rectangle or the pitch is off");
 +}
 +
