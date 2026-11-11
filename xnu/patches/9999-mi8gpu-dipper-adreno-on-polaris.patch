@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7076 @@
+@@ -0,0 +1,7139 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -2685,23 +2685,30 @@ new file mode 100644
 +#define G3D_R_BLITSRC   6u
 +#define G3D_R_BLITDST   7u
 +
-+/* ---- B78 / step 26: read the A2D state back, zero new state ---- */
++/* ---- B79 / step 26: A2D + CCU state readback ---- */
 +#define BL_RB_OFF       0x780u      /* memptrs, after B77's clock at 0x740 */
-+#define BL_NREG         9u         /* eight A2D registers + one control */
-+/* All eight expected values are non-zero, so zero cannot be mistaken for
-+ * a successful write. 0x0a9b0 is B71's positive control: B77's own ring
-+ * reads 0x80100180 through CP_REG_TO_MEM both before and after a type-4. */
++#define BL_NREG         11u        /* 8 A2D + control + RB_CCU_CNTL + RB_DBG_ECO_CNTL */
++#define BL_CTRL_IDX     8u
++#define BL_CCU_IDX      9u
++#define BL_ECO_IDX      10u
++#define B79_EV_OFF      0x7c0u     /* four scratch dwords for CCU FLUSH_TS events */
++#define B79_CCU_CNTL    0x00000001u /* sysmem: offsets 0, both caches FULL, fast-clear off */
++#define B79_ECO_WANT    0x04100000u /* our init table; BIT(24) is already set */
++/* Eight A2D values are non-zero; 0x0a9b0 is B71's positive control.
++ * The two B79 rows read the CCU registers the new setup touches. */
 +static const uint32_t bl_regs[BL_NREG] = {
 +	0x8400u, 0x8406u, 0x8c00u, 0x8c1au, 0x8c17u,
-+	0xacc0u, 0xb4c0u, 0xb4c4u, 0x0a9b0u,
++	0xacc0u, 0xb4c0u, 0xb4c4u, 0x0a9b0u, 0x8e07u, 0x8e04u,
 +};
 +static const uint32_t bl_want[BL_NREG] = {
 +	0x00f03000u, 0x003f003fu, 0x00f03000u, 0x00000004u, 0x00000030u,
 +	0x0000f180u, 0x00500030u, 0x00000400u, 0x80100180u,
++	B79_CCU_CNTL, B79_ECO_WANT,
 +};
 +static const char *const bl_names[BL_NREG] = {
 +	"GRAS_BLT", "DEST_BR", "RB_BLT", "DST_PITCH", "DST_INFO",
 +	"OUT_INFO", "SRC_INFO", "SRC_PITCH", "CONTROL",
++	"CCU_CNTL", "ECO_CNTL",
 +};
 +
 +
@@ -4304,6 +4311,7 @@ new file mode 100644
 +	const uint64_t fence_iova = g3d_regions[2].address + BS_FENCE_OFF;
 +	const uint64_t mark_iova = g3d_regions[2].address + BS_MARK_OFF;
 +	const uint64_t rb_iova = g3d_regions[2].address + BL_RB_OFF;
++	const uint64_t ev_iova = g3d_regions[2].address + B79_EV_OFF;
 +	const uint32_t dst_words = g3d_regions[G3D_R_BLITDST].size / 4u;
 +	uint32_t w = cp_wptr & 8191u;
 +	uint32_t i, ok_rows = 0, matched = 0, guard = 0, last = 0, drained;
@@ -4336,6 +4344,9 @@ new file mode 100644
 +	for (i = 0; i < BL_NREG; i++) {
 +		memptrs[(BL_RB_OFF >> 2) + i] = 0;
 +	}
++	for (i = 0; i < 4u; i++) {
++		memptrs[(B79_EV_OFF >> 2) + i] = 0;
++	}
 +	to_memory(g3d_regions[G3D_R_BLITSRC].memory, g3d_regions[G3D_R_BLITSRC].size);
 +	to_memory(g3d_regions[G3D_R_BLITDST].memory, g3d_regions[G3D_R_BLITDST].size);
 +	to_memory((vm_offset_t)memptrs, 0x1000);
@@ -4353,6 +4364,31 @@ new file mode 100644
 +	} while (0)
 +	/* tick 1 first: B74 proved a leading WFI is the one packet to suspect. */
 +	B_TICK(1);
++	/* B79 part 1: Mesa's A630 emit_setup() (fd6_blitter.cc:275-287).
++	 * Four CCU events, then CP_SET_MARKER(RM6_BLIT2DSCALE=12), then
++	 * CP_WAIT_FOR_IDLE + pkt4(RB_CCU_CNTL 0x8e07,1) for sysmem bypass.
++	 * A6XX event numbers: freedreno_gpu_event.h + adreno_pm4.xml:82-96.
++	 * FLUSH_*_TS carry addr_lo/addr_hi/value; INVALIDATE_* are one dword.
++	 * 19 dwords. B77's own 64-dword statement is untouched. */
++	B_PUT(pkt7(0x46u, 4u));			/* CP_EVENT_WRITE FLUSH_COLOR_TS */
++	B_PUT(0x1du);
++	B_PUT((uint32_t)ev_iova);
++	B_PUT((uint32_t)(ev_iova >> 32));
++	B_PUT(0xb79cc01u);
++	B_PUT(pkt7(0x46u, 4u));			/* CP_EVENT_WRITE FLUSH_DEPTH_TS */
++	B_PUT(0x1cu);
++	B_PUT((uint32_t)(ev_iova + 4u));
++	B_PUT((uint32_t)((ev_iova + 4u) >> 32));
++	B_PUT(0xb79cc02u);
++	B_PUT(pkt7(0x46u, 1u));			/* CP_EVENT_WRITE INV_COLOR */
++	B_PUT(0x19u);
++	B_PUT(pkt7(0x46u, 1u));			/* CP_EVENT_WRITE INV_DEPTH */
++	B_PUT(0x18u);
++	B_PUT(pkt7(0x65u, 1u));			/* CP_SET_MARKER */
++	B_PUT(12u);					/* RM6_BLIT2DSCALE */
++	B_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE */
++	B_PUT(pkt4(0x8e07u, 1u));			/* RB_CCU_CNTL */
++	B_PUT(B79_CCU_CNTL);
 +	B_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE, not the first packet */
 +	B_TICK(2);
 +	B_PUT(pkt4(0xb4c0u, 5u));			/* TPL1_A2D_SRC_TEXTURE_INFO..PITCH */
@@ -4385,7 +4421,7 @@ new file mode 100644
 +	B_TICK(3);
 +	/* B78: read the A2D state back BEFORE the blit, while the type-4 writes
 +	 * are still live. CP_REG_TO_MEM is the packet B71/B73 calibrated; CNT 0
-+	 * is one dword. Nine packets, 36 dwords, no state changed by them. */
++	 * is one dword. Eleven packets, 44 dwords, no state changed by them. */
 +	for (i = 0; i < BL_NREG; i++) {
 +		const uint32_t d_ = (uint32_t)(rb_iova + 4u * i);
 +
@@ -4396,6 +4432,20 @@ new file mode 100644
 +	}
 +	B_PUT(pkt7(0x2cu, 1u));			/* CP_BLIT */
 +	B_PUT(3u);					/* BLIT_OP_SCALE */
++	/* B79 part 2: adreno_pm4.xml:517 says the 2D blit writes THROUGH
++	 * the CCU cache in the PS stage. B77/B78 flushed only UCHE, so a
++	 * blit that worked could still be invisible to a CPU read. Clean
++	 * color, invalidate color, invalidate UCHE. 10 dwords. */
++	B_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE */
++	B_PUT(pkt7(0x46u, 4u));			/* CP_EVENT_WRITE FLUSH_COLOR_TS */
++	B_PUT(0x1du);
++	B_PUT((uint32_t)(ev_iova + 8u));
++	B_PUT((uint32_t)((ev_iova + 8u) >> 32));
++	B_PUT(0xb79cc03u);
++	B_PUT(pkt7(0x46u, 1u));			/* CP_EVENT_WRITE INV_COLOR */
++	B_PUT(0x19u);
++	B_PUT(pkt7(0x46u, 1u));			/* CP_EVENT_WRITE CACHE_INVALIDATE */
++	B_PUT(0x31u);
 +	B_TICK(4);
 +	B_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE: let the blit retire */
 +	B_TICK(5);
@@ -4478,28 +4528,41 @@ new file mode 100644
 + * A silent engine with all eight values on the core is a different
 + * failure from a silent engine whose type-4 writes never arrived.
 + */
++/*
++ * B79: zero packets. Eleven CP_REG_TO_MEM slots, CPU MMIO side by side.
++ * The ninth is B71's control; the last two are the CCU registers the
++ * reference setup writes. ECO's BIT(24) was already set by the init
++ * table, so QCTDD04536579's blit-time RMW is not the missing variable.
++ */
 +static void
 +bl_readback(void)
 +{
 +	vm_offset_t slots = (vm_offset_t)g3d_regions[2].memory + BL_RB_OFF;
-+	uint32_t landed = 0, i, cpv, cpu, control;
++	uint32_t landed = 0, i, cpv, cpu, control, ccu_cp, ccu_cpu, eco_cp, eco_cpu;
 +
 +	from_memory(slots, 4u * BL_NREG);
-+	control = *(volatile uint32_t *)(slots + 4u * (BL_NREG - 1u));
-+	printf("mi8gpu: step 26 B78 TABLE: CP_REG_TO_MEM reads 8 A2D regs before CP_BLIT, one control, no new state\n");
++	control = *(volatile uint32_t *)(slots + 4u * BL_CTRL_IDX);
++	ccu_cp = *(volatile uint32_t *)(slots + 4u * BL_CCU_IDX);
++	ccu_cpu = rd(gpu3d + 4 * 0x8e07u);
++	eco_cp = *(volatile uint32_t *)(slots + 4u * BL_ECO_IDX);
++	eco_cpu = rd(gpu3d + 4 * 0x8e04u);
++	printf("mi8gpu: step 26 B79 TABLE: 11 CP_REG_TO_MEM reads, 8 A2D + control + RB_CCU_CNTL + RB_DBG_ECO_CNTL, Mesa A630 CCU setup\n");
 +	for (i = 0; i < BL_NREG; i++) {
 +		cpv = *(volatile uint32_t *)(slots + 4u * i);
 +		cpu = rd(gpu3d + 4 * bl_regs[i]);
-+		if (i + 1u < BL_NREG && cpv == bl_want[i]) {
++		if (i < 8u && cpv == bl_want[i]) {
 +			landed++;
 +		}
-+		printf("mi8gpu: step 26 B78 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
++		printf("mi8gpu: step 26 B79 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
 +		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
 +		    (cpv == bl_want[i]) ? "MATCH" : "differs");
 +	}
-+	printf("mi8gpu: step 26 B78 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
++	printf("mi8gpu: step 26 B79 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
 +	    landed, control, 0x80100180u,
 +	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
++	printf("mi8gpu: step 26 B79 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (want %#010x), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
++	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
++	    (ccu_cp == B79_CCU_CNTL && ccu_cpu == ccu_cp) ? "CCU STATE LANDED" : "CCU STATE BLIND");
 +}
 +
 +static void
