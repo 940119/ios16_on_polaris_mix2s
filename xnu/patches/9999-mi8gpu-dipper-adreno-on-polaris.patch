@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7175 @@
+@@ -0,0 +1,7214 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4566,6 +4566,42 @@ new file mode 100644
 + * PRE-IMAGE here: whatever it reads is the value B79's write left, or
 + * the hardware reset value if that write was a no-op.
 + */
++/* B87b: staged early-IOKit probe. Every stage prints PRE, calls ONE C++
++ * function, prints POST. If the kernel panics, the last PRE line in the
++ * persistent ring names the stage (lesson 67).
++ *
++ * Called from two places, runs once (the static flag):
++ *   - the end of bl_readback(): the normal path, AFTER every GPU line, so a
++ *     panic cannot cost the DST/GUARD/readback/CCU regression evidence;
++ *   - right after gpu_zap_and_command(): the bail-out path, so a GPU failure
++ *     (zap not authenticated, core still secure) cannot mask the V2c answer.
++ * Geometry is the panel's own (SweetFramebuffer.cpp:218), not a new variable:
++ * 0x9d400000 / 1080 / 2160 / 4320 / 'BGRA'. */
++static void
++mi8_okit_probe(void)
++{
++	static int done;
++	static const char *const stage_name[5] = {
++		"IOLockAlloc", "kernel_task", "IOBufferMemoryDescriptor",
++		"sweet_surface_create_physical", "kernelAddress"
++	};
++
++	if (done) {
++		return;
++	}
++	done = 1;
++	for (uint32_t st = 1; st <= 5; st++) {
++		uint64_t rc;
++
++		printf("mi8gpu: step 28 IOKIT stage %u PRE: %s\n",
++		    st, stage_name[st - 1]);
++		rc = mi8_surface_bridge_stage(st, G3D_FB_PHYS, 1080u, 2160u,
++		    4320u, 0x42475241u);
++		printf("mi8gpu: step 28 IOKIT stage %u POST: %#llx\n",
++		    st, (unsigned long long)rc);
++	}
++}
++
 +static void
 +bl_readback(void)
 +{
@@ -4581,24 +4617,26 @@ new file mode 100644
 +	/* B86: the SAME 114 dwords. The only new variable is a C-linkage call into the C++ SweetSurface TU; the probe returns a magic and touches no IOKit object, so a negative can only be "the link failed". */
 +	printf("mi8gpu: step 27 BRIDGE: C TU reached the C++ SweetSurface TU, magic %#010x (want %#010x)\n",
 +	    mi8_surface_bridge_probe(), 0x53555246u);
-+	/* B87a: the emitted statement is still byte-identical. The bridge now takes the ADDRESS of the real sweet_surface_create_physical (C++ mangled) without calling it, so include reachability + symbol resolution are proven with no early-IOKit runtime risk. */
-+	printf("mi8gpu: step 26 B87a TABLE: same 114 dwords, 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL (960,0), 2D BS_PIX pattern, 11 CP_REG_TO_MEM reads, bridge resolves the real SweetSurface symbol\n");
++	/* B87b: the emitted statement is still byte-identical. The bridge now CALLS the real IOKit path in five stages; every PRE/POST pair is printed so a panic names its own stage (lesson 67). */
++	printf("mi8gpu: step 26 B87b TABLE: same 114 dwords, 1088 x 64 at pitch 68, GRAS_A2D_DEST_TL (960,0), 2D BS_PIX pattern, 11 CP_REG_TO_MEM reads, staged early-IOKit surface create\n");
 +	for (i = 0; i < BL_NREG; i++) {
 +		cpv = *(volatile uint32_t *)(slots + 4u * i);
 +		cpu = rd(gpu3d + 4 * bl_regs[i]);
 +		if (i < 8u && cpv == bl_want[i]) {
 +			landed++;
 +		}
-+		printf("mi8gpu: step 26 B87a REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
++		printf("mi8gpu: step 26 B87b REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
 +		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
 +		    (cpv == bl_want[i]) ? "MATCH" : "differs");
 +	}
-+	printf("mi8gpu: step 26 B87a READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
++	printf("mi8gpu: step 26 B87b READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
 +	    landed, control, 0x80100180u,
 +	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
-+	printf("mi8gpu: step 26 B87a CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
++	printf("mi8gpu: step 26 B87b CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
 +	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
 +	    (ccu_cpu == ccu_cp) ? "CCU PRE-IMAGE CPU==CP" : "CCU PRE-IMAGE BLIND");
++
++	mi8_okit_probe();
 +}
 +
 +static void
@@ -6402,6 +6440,7 @@ new file mode 100644
 +				}
 +				if (gpu_set && gmu_last_step >= 21) {
 +					gpu_zap_and_command();
++					mi8_okit_probe();
 +				}
 +				gmu_oob_clear(OOB_GPU_SET_ACK);
 +				gmu_oob_clear(OOB_BOOT_SLUMBER_ACK);
@@ -12261,7 +12300,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,64 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12298,6 +12337,11 @@ new file mode 100644
 + * An extern "C" declaration on the C side is the whole bridge; the magic
 + * returned by the C++ side proves the linker resolved it. */
 +extern unsigned int mi8_surface_bridge_probe(void);
++/* B87b: staged early-IOKit probe. Each call does exactly ONE thing, so the
++ * PRE/POST pair printed by the C driver names the stage on a panic. */
++extern uint64_t mi8_surface_bridge_stage(unsigned int stage, uint64_t phys,
++    unsigned int width, unsigned int height, unsigned int row,
++    unsigned int format);
 +
 +/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
 + * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
@@ -12325,26 +12369,35 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,76 @@
 +/*
-+ * B87a cross-language link probe (V2a + V2b).
++ * B87b staged early-IOKit probe (V2c).
 + *
-+ * bsd/dev/mi8_adreno.c is compiled as C; SweetSurface.h declares a C++ class
-+ * and cannot be included from it. This file is compiled as C++ and exports a
-+ * C-linkage symbol, which is the minimal bridge between the two.
++ * History: B86 proved a C TU can call a self-contained C++ TU. B87a proved
++ * this TU can include the REAL iokit/Kernel/arm/SweetSurface.h (relative
++ * path -- the -I list has NO xnu source root) and resolve the C++-mangled
++ * sweet_surface_create_physical symbol WITHOUT calling it.
 + *
-+ * The kernel builds C++ with -nostdinc and there is NO -I for the xnu source
-+ * root, so <iokit/Kernel/arm/SweetSurface.h> cannot be found. A relative
-+ * include works: bsd/dev/ -> ../../ -> xnu/. B86's build log proved the
-+ * header is reachable that way, and -DARM64_BOARD_CONFIG_SWEET makes the
-+ * `#if defined(SWEET)` branch in the header live.
++ * B87b finally CALLS the IOKit path. Because the driver runs from the
++ * sweet_ufs mount path while SweetFramebuffer publishes only after
++ * IOService::start(), early-IOKit readiness is a genuine unknown and a
++ * call may panic before the ring is written. So the work is split into five
++ * stages: the C driver prints PRE, calls ONE stage, prints POST. If the
++ * kernel dies, the last PRE line in the persistent ring names the stage
++ * (lesson 67). All stages are after the GPU evidence in the C driver.
 + *
-+ * We take the ADDRESS of sweet_surface_create_physical but NEVER call it:
-+ * that proves the C++ mangling matches and the linker can resolve the symbol,
-+ * with zero dependency on kernel_task / IOLockAlloc / OSTypeAlloc being ready.
-+ * B87b is where the call itself is made.
++ * Include set is the same one SweetSurface.cpp uses, so every symbol below
++ * is known-visible under -nostdinc + EXPORT_HDRS.
 + */
 +#include "../../iokit/Kernel/arm/SweetSurface.h"
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/system.h>
++#include <kern/task.h>
++#include <sys/proc.h>
++
++static SweetSurface *g_stage_surface = nullptr;
 +
 +extern "C" unsigned int
 +mi8_surface_bridge_probe(void)
@@ -12352,6 +12405,46 @@ new file mode 100644
 +	SweetSurface *(*volatile fn)(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t) =
 +	    &sweet_surface_create_physical;
 +	return fn != nullptr ? 0x53555246u : 0x0badf00du; /* "SURF" / "BADF00D" */
++}
++
++extern "C" uint64_t
++mi8_surface_bridge_stage(unsigned int stage, uint64_t phys,
++    unsigned int width, unsigned int height, unsigned int row,
++    unsigned int format)
++{
++	switch (stage) {
++	case 1: {	/* IOKit lock runtime */
++		IOLock *l = IOLockAlloc();
++		if (l == nullptr) {
++			return 0;
++		}
++		IOLockFree(l);
++		return 1;
++	}
++	case 2:		/* kernel_task must already be assigned */
++		return kernel_task != nullptr ? 1 : 0;
++	case 3: {	/* IOBufferMemoryDescriptor allocation */
++		IOBufferMemoryDescriptor *b =
++		    IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		        kIODirectionInOut | kIOMemoryKernelUserShared,
++		        page_size, page_size);
++		if (b == nullptr) {
++			return 0;
++		}
++		b->release();
++		return 1;
++	}
++	case 4:		/* the real surface create + publish */
++		g_stage_surface = sweet_surface_create_physical(phys, width, height,
++		    row, format);
++		return g_stage_surface == nullptr ? 0 :
++		    (uint64_t)g_stage_surface->id;
++	case 5:		/* lazy kernel mapping of the pixels */
++		return g_stage_surface == nullptr ? 0 :
++		    (uint64_t)g_stage_surface->kernelAddress();
++	default:
++		return 0;
++	}
 +}
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
