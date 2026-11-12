@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7338 @@
+@@ -0,0 +1,7348 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6560,6 +6560,16 @@ new file mode 100644
 +						int risroot = 0;
 +						int rrc = mi8_root_probe(rname, sizeof(rname), &rvid, &risroot);
 +
++						struct mi8_root_stat rs;
++						int srs = mi8_root_stat_probe(&rs);
++
++						printf("mi8gpu: step 33 ROOT FS: rc %d, bsize %llu, blocks %llu, bfree %llu, files %llu, ffree %llu, fstype %c%c%c%c, missing rc %d
++",
++						    srs, rs.f_bsize, rs.f_blocks, rs.f_bfree, rs.f_files,
++						    rs.f_ffree,
++						    (char)(rs.f_type_ok & 0xff), (char)((rs.f_type_ok >> 8) & 0xff),
++						    (char)((rs.f_type_ok >> 16) & 0xff), (char)((rs.f_type_ok >> 24) & 0xff),
++						    rs.missing_rc);
 +						printf("mi8gpu: step 32 ROOT: vnode_lookup root rc %d, rootvnode %s, v_id %#llx, name %s\n",
 +						    rrc, risroot ? "set" : "NULL", rvid, rname);
 +						printf("mi8gpu: step 31 GPU IOCTL: GET_PARAM(CHIP_ID) rc %d -> %#llx (want %#llx), GET_PARAM(GPU_MODEL) rc %d -> %#llx (want %#llx), unknown param rc %d (want -2)\n",
@@ -12424,7 +12434,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,91 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12481,6 +12491,18 @@ new file mode 100644
 + * name buffer on success; the driver prints the result into the ring. */
 +extern int mi8_root_probe(char *sbuf, unsigned int slen, unsigned long long *vid,
 +    int *isroot);
++/* 5-b2: read-only statfs of the mounted root plus a lookup that must miss. */
++struct mi8_root_stat {
++	unsigned long long f_bsize;
++	unsigned long long f_iosize;
++	unsigned long long f_blocks;
++	unsigned long long f_bfree;
++	unsigned long long f_files;
++	unsigned long long f_ffree;
++	int               f_type_ok;
++	int               missing_rc;
++};
++extern int mi8_root_stat_probe(struct mi8_root_stat *out);
 +
 +/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
 + * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
@@ -12508,7 +12530,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,262 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12652,6 +12674,63 @@ new file mode 100644
 + *
 + * Returns 0 and fills sbuf with the vnode's name when the lookup succeeds.
 + */
++/*
++ * 5-b2: is that mount a REAL, readable volume?
++ *
++ * A root vnode can exist while the volume behind it is not yet usable for
++ * anything but lookups. statfs answers "is there a filesystem here with
++ * blocks and inodes", and a lookup of a path that must not exist tells us
++ * whether a miss comes back as ENOENT (normal) or as something else (a
++ * half-built mount). Both are read-only: nothing is created here.
++ */
++struct mi8_root_stat {
++	unsigned long long f_bsize;
++	unsigned long long f_iosize;
++	unsigned long long f_blocks;
++	unsigned long long f_bfree;
++	unsigned long long f_files;
++	unsigned long long f_ffree;
++	int               f_type_ok;   /* the fstypename's first four bytes */
++	int               missing_rc;  /* vnode_lookup of a path that must not exist */
++};
++
++extern "C" int
++mi8_root_stat_probe(struct mi8_root_stat *out)
++{
++	struct vfsstatfs sb;
++	vnode_t vp = NULL;
++	int err;
++
++	if (out == NULL) {
++		return -1;
++	}
++	bzero(out, sizeof(*out));
++	if (rootvnode == NULL || rootvnode->v_mount == NULL) {
++		return -2;
++	}
++	err = vfs_statfs(rootvnode->v_mount, &sb);
++	if (err != 0) {
++		return err;
++	}
++	out->f_bsize = sb.f_bsize;
++	out->f_iosize = sb.f_iosize;
++	out->f_blocks = sb.f_blocks;
++	out->f_bfree = sb.f_bfree;
++	out->f_files = sb.f_files;
++	out->f_ffree = sb.f_ffree;
++	out->f_type_ok = (int)(((unsigned int)(unsigned char)sb.f_fstypename[0])
++	    | ((unsigned int)(unsigned char)sb.f_fstypename[1] << 8)
++	    | ((unsigned int)(unsigned char)sb.f_fstypename[2] << 16)
++	    | ((unsigned int)(unsigned char)sb.f_fstypename[3] << 24));
++	/* must fail: this path cannot exist on a stock root */
++	err = vnode_lookup("/mi8gpu_probe_does_not_exist", 0, &vp, vfs_context_current());
++	out->missing_rc = err;
++	if (vp != NULL) {
++		vnode_put(vp);
++	}
++	return 0;
++}
++
 +extern "C" int
 +mi8_root_probe(char *sbuf, unsigned int slen, unsigned long long *vid,
 +    int *isroot)
