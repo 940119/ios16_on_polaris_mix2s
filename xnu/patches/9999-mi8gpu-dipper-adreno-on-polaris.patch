@@ -12628,7 +12628,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  #define SWEET_FB_SWAP_REC_SIZE          0x46c
 +#define SWEET_FB_SWAP_REPORT            64      /* D1: frames per ring line */
 +#define SWEET_FB_WAIT_REPORT            8       /* D2: barboardd calls per ring line */
-+#define SWEET_FB_WAIT_SPINS             20      /* D2: ms a barrier may block */
++#define SWEET_FB_WAIT_MS                50      /* D2: ms a barrier may block (>2 vsync + blit) */
  #define SWEET_FB_LAYERS                 4
  #define SWEET_FB_NOTIFY_TYPES           8
  #define SWEET_FB_NOTIFY_VSYNC           5
@@ -12694,7 +12694,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  }
  
  bool
-@@ -1453,7 +1487,43 @@
+@@ -1453,7 +1487,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
@@ -12718,10 +12718,18 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		 * gave up", which a silent return would hide.
 +		 */
 +		uint32_t start = fFB->fSwapShown;
-+		uint32_t spins = 0;
-+		while (fFB->fSwapShown == start && spins < SWEET_FB_WAIT_SPINS) {
++		uint64_t deadline = 0;
++		uint32_t waited = 0;
++		/*
++		 * A spin COUNT is not a time budget. IOSleep(1) on this kernel has a
++		 * 10 ms granularity (HZ=100), so 20 iterations can be anywhere from a
++		 * few microseconds to 200 ms -- the first D2 run timed out 182 of 209
++		 * calls with spins pinned at the cap. Use a real deadline instead.
++		 */
++		clock_interval_to_deadline(SWEET_FB_WAIT_MS, kMillisecondScale, &deadline);
++		while (fFB->fSwapShown == start && mach_absolute_time() < deadline) {
 +			IOSleep(1);
-+			spins++;
++			waited++;
 +		}
 +		if (fFB->fSwapShown == start) {
 +			fWaitTimeouts++;
@@ -12730,9 +12738,9 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		out[1] = fFB->fSwapSetup;
 +		outCount = 2;
 +		if ((fWaitCalls++ % SWEET_FB_WAIT_REPORT) == 0) {
-+			printf("mi8gpu: swap wait calls %u shown %u setup %u timeouts %u spins %u\n",
-+			    fWaitCalls, fFB->fSwapShown, fFB->fSwapSetup,
-+			    fWaitTimeouts, spins);
++			printf("mi8gpu: swap wait calls %u shown %u consumed %u setup %u timeouts %u slept %u\n",
++			    fWaitCalls, fFB->fSwapShown, fFB->fSwapConsumed, fFB->fSwapSetup,
++			    fWaitTimeouts, waited);
 +		}
 +		break;
 +	}
