@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7345 @@
+@@ -0,0 +1,7362 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6563,6 +6563,23 @@ new file mode 100644
 +						struct mi8_root_stat rs;
 +						int srs = mi8_root_stat_probe(&rs);
 +
++						/*
++						 * 5-b3: create a NEW file, write 24 bytes, read it back.
++						 * O_EXCL is the safety: it can only create, never touch an
++						 * existing inode, and stops the chain on any failure.
++						 */
++						static const char wtext[] = "mi8gpu: kernel wrote this";
++						char rback[64];
++						int wcrc = -1, wwrc = -1, wrrc = -1;
++						int wrc = mi8_root_write_probe("/mi8gpu_probe.txt", wtext,
++						    sizeof(wtext) - 1, &wcrc, &wwrc, &wrrc, rback, sizeof(rback));
++
++						if (wrc == 0 && wrrc >= 0) {
++							rback[sizeof(rback) - 1] = 0;
++						}
++						printf("mi8gpu: step 34 ROOT WRITE: rc %d, create %d, write %d, read %d, back %s\n",
++						    wrc, wcrc, wwrc, wrrc,
++						    (wrc == 0 && wrrc == 0) ? rback : "(none)");
 +						printf("mi8gpu: step 33 ROOT FS: rc %d, bsize %llu, blocks %llu, bfree %llu, files %llu, ffree %llu, fstype %#010x, missing rc %d\n",
 +						    srs, rs.f_bsize, rs.f_blocks, rs.f_bfree, rs.f_files,
 +						    rs.f_ffree, (unsigned int)rs.f_type_ok,
@@ -12431,7 +12448,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,97 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12500,6 +12517,12 @@ new file mode 100644
 +	int               missing_rc;
 +};
 +extern int mi8_root_stat_probe(struct mi8_root_stat *out);
++/* 5-b3: create a NEW file on the root volume, write one string, read it back.
++ * create_rc/write_rc/read_rc carry the three errno values (read_rc is the
++ * residual count on success, which must be 0). */
++extern int mi8_root_write_probe(const char *path, const char *text,
++    unsigned int len, int *create_rc, int *write_rc, int *read_rc, char *rbuf,
++    unsigned int rblen);
 +
 +/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
 + * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
@@ -12527,7 +12550,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,326 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12559,6 +12582,9 @@ new file mode 100644
 +#include <sys/namei.h>
 +#include <sys/mount.h>
 +#include <sys/vfs_context.h>
++#include <sys/uio.h>
++#include <sys/fcntl.h>
++#include <sys/kauth.h>
 +
 +static SweetSurface *g_stage_surface = nullptr;
 +
@@ -12690,6 +12716,64 @@ new file mode 100644
 +	int               f_type_ok;   /* the fstypename's first four bytes */
 +	int               missing_rc;  /* vnode_lookup of a path that must not exist */
 +};
++
++/*
++ * 5-b3: can the kernel CREATE a file on that volume?
++ *
++ * This is the last question of the injection channel: 5-b1 proved the root
++ * vnode exists, 5-b2 proved the volume is a real readable hfs with 2.6 GB
++ * free and that a missing path answers ENOENT. If a create succeeds, a
++ * userland binary can in principle be placed here by the kernel itself.
++ *
++ * Safety, in order:
++ *   - O_CREAT|O_EXCL: it can only ever create a NEW file, never touch an
++ *     existing inode, and it fails with EEXIST if the name is taken;
++ *   - the name is ours alone (mi8gpu_probe.txt at the root);
++ *   - the payload is 24 bytes and is read back immediately, so a silent
++ *     short write is caught in the same rung;
++ *   - any failure stops the chain (write only runs if create returned 0).
++ *
++ * vnode_open()+vn_rdwr() are the supported wrappers in this tree; the
++ * nameidata/NDINIT form of vn_open() is avoided on purpose.
++ */
++extern "C" int
++mi8_root_write_probe(const char *path, const char *text, unsigned int len,
++    int *create_rc, int *write_rc, int *read_rc, char *rbuf,
++    unsigned int rblen)
++{
++	vnode_t vp = NULL;
++	int resid = 0;
++	int err;
++
++	if (create_rc == NULL || write_rc == NULL || read_rc == NULL) {
++		return -1;
++	}
++	*create_rc = *write_rc = *read_rc = -1;
++	err = vnode_open(path, O_CREAT | O_EXCL | O_WRONLY, 0644, 0, &vp,
++	    vfs_context_current());
++	*create_rc = err;
++	if (err != 0 || vp == NULL) {
++		return err != 0 ? err : -2;
++	}
++	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)text, (int)len, 0, UIO_SYSSPACE,
++	    0, NOCRED, &resid, NULL);
++	*write_rc = err == 0 ? resid : err;
++	vnode_close(vp, FWRITE, vfs_context_current());
++	vp = NULL;
++
++	/* read it back: a create that silently wrote nothing is not a channel */
++	err = vnode_open(path, O_RDONLY, 0, 0, &vp, vfs_context_current());
++	*read_rc = err;
++	if (err != 0 || vp == NULL) {
++		return err != 0 ? err : -3;
++	}
++	resid = 0;
++	err = vn_rdwr(UIO_READ, vp, rbuf, (int)rblen, 0, UIO_SYSSPACE, 0, NOCRED,
++	    &resid, NULL);
++	*read_rc = err == 0 ? resid : err;
++	vnode_close(vp, FREAD, vfs_context_current());
++	return 0;
++}
 +
 +extern "C" int
 +mi8_root_stat_probe(struct mi8_root_stat *out)
