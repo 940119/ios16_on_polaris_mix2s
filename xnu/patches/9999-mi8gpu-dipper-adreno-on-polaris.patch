@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7362 @@
+@@ -0,0 +1,7385 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6577,6 +6577,29 @@ new file mode 100644
 +						if (wrc == 0 && wrrc >= 0) {
 +							rback[sizeof(rback) - 1] = 0;
 +						}
++						/*
++						 * 5-c0: the root's shape. One read-only lookup per path --
++						 * everything about executing a userland binary depends on
++						 * which of these exist, and guessing costs a device round.
++						 */
++						{
++							static const char *const probe_paths[] = {
++								"/System/Library/LaunchDaemons",
++								"/Library/LaunchDaemons",
++								"/sbin/launchd",
++								"/usr/lib/dyld",
++								"/usr/bin",
++								"/bin/sh",
++								"/etc/rc",
++								"/private/etc"
++							};
++							unsigned int pi;
++							for (pi = 0; pi < sizeof(probe_paths) / sizeof(probe_paths[0]); pi++) {
++								printf("mi8gpu: step 35 PATH %s rc %d
++",
++								    probe_paths[pi], mi8_path_probe(probe_paths[pi]));
++							}
++						}
 +						printf("mi8gpu: step 34 ROOT WRITE: rc %d, create %d, write %d, read %d, back %s\n",
 +						    wrc, wcrc, wwrc, wrrc,
 +						    (wrc == 0 && wrrc == 0) ? rback : "(none)");
@@ -12448,7 +12471,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,99 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12523,6 +12546,8 @@ new file mode 100644
 +extern int mi8_root_write_probe(const char *path, const char *text,
 +    unsigned int len, int *create_rc, int *write_rc, int *read_rc, char *rbuf,
 +    unsigned int rblen);
++/* 5-c0: vnode_lookup() one path; returns 0 if it exists, 2 (ENOENT) if not. */
++extern int mi8_path_probe(const char *path);
 +
 +/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
 + * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
@@ -12550,7 +12575,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,365 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12736,6 +12761,31 @@ new file mode 100644
 + * vnode_open()+vn_rdwr() are the supported wrappers in this tree; the
 + * nameidata/NDINIT form of vn_open() is avoided on purpose.
 + */
++/*
++ * 5-c0: which paths exist on this iOS root?
++ *
++ * Everything about "how does a userland binary get executed here" depends on
++ * the layout: whether there is a /System/Library/LaunchDaemons for a job, a
++ * /usr/bin for a tool, an /etc/rc, a dyld at /usr/lib/dyld. Guessing any of
++ * these costs a device round, and guessing wrong can put a file somewhere that
++ * is never read. One read-only lookup per path turns all of it into fact.
++ */
++extern "C" int
++mi8_path_probe(const char *path)
++{
++	vnode_t vp = NULL;
++	int err;
++
++	if (path == NULL) {
++		return -1;
++	}
++	err = vnode_lookup(path, 0, &vp, vfs_context_current());
++	if (vp != NULL) {
++		vnode_put(vp);
++	}
++	return err;
++}
++
 +extern "C" int
 +mi8_root_write_probe(const char *path, const char *text, unsigned int len,
 +    int *create_rc, int *write_rc, int *read_rc, char *rbuf,
