@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7347 @@
+@@ -0,0 +1,7345 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6563,11 +6563,9 @@ new file mode 100644
 +						struct mi8_root_stat rs;
 +						int srs = mi8_root_stat_probe(&rs);
 +
-+						printf("mi8gpu: step 33 ROOT FS: rc %d, bsize %llu, blocks %llu, bfree %llu, files %llu, ffree %llu, fstype %c%c%c%c, missing rc %d\n",
++						printf("mi8gpu: step 33 ROOT FS: rc %d, bsize %llu, blocks %llu, bfree %llu, files %llu, ffree %llu, fstype %#010x, missing rc %d\n",
 +						    srs, rs.f_bsize, rs.f_blocks, rs.f_bfree, rs.f_files,
-+						    rs.f_ffree,
-+						    (char)(rs.f_type_ok & 0xff), (char)((rs.f_type_ok >> 8) & 0xff),
-+						    (char)((rs.f_type_ok >> 16) & 0xff), (char)((rs.f_type_ok >> 24) & 0xff),
++						    rs.f_ffree, (unsigned int)rs.f_type_ok,
 +						    rs.missing_rc);
 +						printf("mi8gpu: step 32 ROOT: vnode_lookup root rc %d, rootvnode %s, v_id %#llx, name %s\n",
 +						    rrc, risroot ? "set" : "NULL", rvid, rname);
