@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7383 @@
+@@ -0,0 +1,7415 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6571,7 +6571,7 @@ new file mode 100644
 +						static const char wtext[] = "mi8gpu: kernel wrote this";
 +						char rback[64];
 +						int wcrc = -1, wwrc = -1, wrrc = -1;
-+						int wrc = mi8_root_write_probe("/mi8gpu_probe2.txt", wtext,
++						int wrc = mi8_root_write_probe("/mi8gpu_probe3.txt", wtext,
 +						    sizeof(wtext) - 1, &wcrc, &wwrc, &wrrc, rback, sizeof(rback));
 +
 +						if (wrc == 0 && wrrc >= 0) {
@@ -6582,6 +6582,38 @@ new file mode 100644
 +						 * everything about executing a userland binary depends on
 +						 * which of these exist, and guessing costs a device round.
 +						 */
++						/*
++						 * 5-c1: hand launchd a job. The plist is ONE line of XML with
++						 * no double quotes, so it survives every layer of string
++						 * escaping between here and the C source. It runs an EXISTING
++						 * binary (/usr/bin/touch) instead of a binary of ours, so
++						 * this rung needs no cross compiler: if the flag file shows
++						 * up on a LATER boot, launchd read the plist and executed it.
++						 */
++						{
++							static const char plist[] =
++							    "<?xml version=1.0 encoding=UTF-8?>"
++							    "<plist version=1.0><dict>"
++							    "<key>Label</key><string>com.mi8gpu.probe</string>"
++							    "<key>ProgramArguments</key><array>"
++							    "<string>/usr/bin/touch</string>"
++							    "<string>/mi8gpu_launched.txt</string>"
++							    "</array><key>RunAtLoad</key><true/>"
++							    "</dict></plist>";
++							int pcrc = -1, pwrc = -1, prrc = -1;
++							char pback[64];
++							int prc = mi8_root_write_probe(
++							    "/System/Library/LaunchDaemons/com.mi8gpu.probe.plist",
++							    plist, sizeof(plist) - 1, &pcrc, &pwrc, &prrc,
++							    pback, sizeof(pback));
++
++							printf("mi8gpu: step 36 PLIST: rc %d, create %d, write %d, read %d, len %u%c",
++							    prc, pcrc, pwrc, prrc, (unsigned)(sizeof(plist) - 1), 10);
++							printf("mi8gpu: step 36 TOUCH rc %d%c",
++							    mi8_path_probe("/usr/bin/touch"), 10);
++							printf("mi8gpu: step 36 FLAG rc %d (2 = not yet, 0 = launchd ran it)%c",
++							    mi8_path_probe("/mi8gpu_launched.txt"), 10);
++						}
 +						{
 +							static const char *const probe_paths[] = {
 +								"/System/Library/LaunchDaemons",
