@@ -6560,7 +6560,7 @@ new file mode 100644
 +						int risroot = 0;
 +						int rrc = mi8_root_probe(rname, sizeof(rname), &rvid, &risroot);
 +
-+						printf("mi8gpu: step 32 ROOT: vnode_lookup("/") rc %d, rootvnode %s, v_id %#llx, name "%s"\n",
++						printf("mi8gpu: step 32 ROOT: vnode_lookup root rc %d, rootvnode %s, v_id %#llx, name %s\n",
 +						    rrc, risroot ? "set" : "NULL", rvid, rname);
 +						printf("mi8gpu: step 31 GPU IOCTL: GET_PARAM(CHIP_ID) rc %d -> %#llx (want %#llx), GET_PARAM(GPU_MODEL) rc %d -> %#llx (want %#llx), unknown param rc %d (want -2)\n",
 +						    rcc, chip, 0x06030000ull, rcm, model, 0x0603ull, rcb);
@@ -12508,7 +12508,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,205 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12536,6 +12536,7 @@ new file mode 100644
 +#include <kern/task.h>
 +#include <sys/proc.h>
 +#include <sys/vnode.h>
++#include <sys/vnode_internal.h>  /* rootvnode and struct vnode's fields */
 +#include <sys/namei.h>
 +#include <sys/mount.h>
 +#include <sys/vfs_context.h>
