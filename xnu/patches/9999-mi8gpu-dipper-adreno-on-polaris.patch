@@ -12643,7 +12643,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	bool          fConsolePaused;
  	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
  	bool          fDirty;
-@@ -706,6 +717,7 @@
+@@ -218,6 +229,7 @@
+ 	mach_port_t         fPort;
+ 	io_user_reference_t fFunc[SWEET_FB_NOTIFY_TYPES];
+ 	io_user_reference_t fRefcon[SWEET_FB_NOTIFY_TYPES];
++	uint32_t            fWaitCalls;   /* D2: kSweetFBSwapWait calls, for the ring */
+ 
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -706,6 +718,7 @@
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
  			fb->fDirty = false;
@@ -12651,7 +12659,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  	}
  	IOLockUnlock(fb->fLock);
-@@ -896,6 +908,7 @@
+@@ -896,6 +909,7 @@
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -12659,7 +12667,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockUnlock(fLock);
  	++sweet_fb_swap_count;
  	/*
-@@ -1306,6 +1319,23 @@
+@@ -1306,6 +1320,23 @@
  		}
  		s->release();
  	}
@@ -12683,3 +12691,32 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  }
  
  bool
+@@ -1454,6 +1485,28 @@
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
++		/*
++		 * D2: report how many frames have actually reached the panel.
++		 *
++		 * redwood fills this hole with shownSwap()/wantsTicks(): the client
++		 * asks whether its frame is up and paces itself on the answer. Until
++		 * now this selector returned 0, so the answer was always "no".
++		 *
++		 * Deliberately NOT a blocking wait. A wait channel here would have
++		 * to be woken from the vsync timer, and a single missed wake hangs
++		 * the compositor -- a black screen with no evidence in the ring. The
++		 * monotonic count is enough for the client to pace and gives the ring
++		 * a second, independent observation of the same chain.
++		 */
++		out[0] = fFB->fSwapShown;
++		out[1] = fFB->fSwapSetup;
++		outCount = 2;
++		if ((fWaitCalls++ % SWEET_FB_SWAP_REPORT) == 0) {
++			printf("mi8gpu: swap wait calls %u shown %u setup %u consumed %u\n",
++			    fWaitCalls, fFB->fSwapShown, fFB->fSwapSetup,
++			    fFB->fSwapConsumed);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
