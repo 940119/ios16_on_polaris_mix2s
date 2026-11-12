@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7327 @@
+@@ -0,0 +1,7338 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6551,6 +6551,17 @@ new file mode 100644
 +						int rcm = mi8_gpu_ioctl(0u, 0x03u, &model);
 +						int rcb = mi8_gpu_ioctl(0u, 0x7fu, &bad);
 +
++						/*
++						 * 5-b1: is the iOS root volume reachable from the kernel at
++						 * driver-init time? Read-only -- see mi8_root_probe().
++						 */
++						char rname[64];
++						unsigned long long rvid = 0;
++						int risroot = 0;
++						int rrc = mi8_root_probe(rname, sizeof(rname), &rvid, &risroot);
++
++						printf("mi8gpu: step 32 ROOT: vnode_lookup("/") rc %d, rootvnode %s, v_id %#llx, name "%s"\n",
++						    rrc, risroot ? "set" : "NULL", rvid, rname);
 +						printf("mi8gpu: step 31 GPU IOCTL: GET_PARAM(CHIP_ID) rc %d -> %#llx (want %#llx), GET_PARAM(GPU_MODEL) rc %d -> %#llx (want %#llx), unknown param rc %d (want -2)\n",
 +						    rcc, chip, 0x06030000ull, rcm, model, 0x0603ull, rcb);
 +					}
@@ -12413,7 +12424,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,79 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12466,6 +12477,10 @@ new file mode 100644
 + * answer; the command numbering is described where it is implemented. */
 +extern int mi8_gpu_ioctl(unsigned int cmd, unsigned long long arg,
 +    unsigned long long *out);
++/* 5-b1: read-only probe of the mounted iOS root. Returns 0 and fills the
++ * name buffer on success; the driver prints the result into the ring. */
++extern int mi8_root_probe(char *sbuf, unsigned int slen, unsigned long long *vid,
++    int *isroot);
 +
 +/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
 + * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
@@ -12493,7 +12508,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,204 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12520,6 +12535,10 @@ new file mode 100644
 +#include <IOKit/system.h>
 +#include <kern/task.h>
 +#include <sys/proc.h>
++#include <sys/vnode.h>
++#include <sys/namei.h>
++#include <sys/mount.h>
++#include <sys/vfs_context.h>
 +
 +static SweetSurface *g_stage_surface = nullptr;
 +
@@ -12618,6 +12637,58 @@ new file mode 100644
 +#define MI8_MSM_PARAM_GPU_MODEL  0x03u
 +#define MI8_A630_CHIP_ID         0x06030000ull
 +#define MI8_A630_GPU_MODEL       0x0603ull
++
++/*
++ * 5-b1: can the kernel see the iOS root volume at driver-init time?
++ *
++ * Read-only on purpose. The root volume is HFS+ directly on `userdata`, so
++ * TWRP cannot put a file there; the only remaining injection channel would be
++ * the kernel itself writing through this mount. Before risking a write, this
++ * proves the mount is reachable at all -- and the honest possibility is that
++ * it is NOT: mi8_adreno_init() runs inside the sweet_ufs mount path, so
++ * rootvnode may not be set yet. A negative here kills the whole channel and
++ * saves every later step, which is exactly why it is the first thing to ask.
++ *
++ * Returns 0 and fills sbuf with the vnode's name when the lookup succeeds.
++ */
++extern "C" int
++mi8_root_probe(char *sbuf, unsigned int slen, unsigned long long *vid,
++    int *isroot)
++{
++	vnode_t vp = NULL;
++	int err;
++
++	if (sbuf == NULL || slen == 0) {
++		return -1;
++	}
++	sbuf[0] = 0;
++	if (vid != NULL) {
++		*vid = 0;
++	}
++	if (isroot != NULL) {
++		*isroot = rootvnode != NULL ? 1 : 0;
++	}
++	err = vnode_lookup("/", 0, &vp, vfs_context_current());
++	if (err != 0 || vp == NULL) {
++		return err != 0 ? err : -2;
++	}
++	const char *nm = vnode_getname(vp);
++	if (nm != NULL) {
++		unsigned int i = 0;
++
++		while (i + 1 < slen && nm[i] != 0) {
++			sbuf[i] = nm[i];
++			i++;
++		}
++		sbuf[i] = 0;
++		vnode_putname(nm);
++	}
++	if (vid != NULL) {
++		*vid = (unsigned long long)vp->v_id;
++	}
++	vnode_put(vp);
++	return 0;
++}
 +
 +extern "C" int
 +mi8_gpu_ioctl(unsigned int cmd, unsigned long long arg, unsigned long long *out)
