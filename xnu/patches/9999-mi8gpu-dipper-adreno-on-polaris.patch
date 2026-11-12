@@ -12848,7 +12848,7 @@ new file mode 100644
 +	static const char plist[] =
 +	    "<?xml version='1.0' encoding='UTF-8'?>"
 +	    "<plist version=1.0><dict>"
-+	    "<key>Label</key><string>com.mi8gpu.probe4</string>"
++	    "<key>Label</key><string>com.mi8gpu.probe5</string>"
 +	    "<key>ProgramArguments</key><array>"
 +	    "<string>/mi8gpu_probe</string>"
 +	    "</array><key>RunAtLoad</key><true/>"
@@ -12865,7 +12865,7 @@ new file mode 100644
 +	    (const char *)mi8gpu_probe_bin, mi8gpu_probe_bin_len,
 +	    &c1, &w1, &r1, scratch, sizeof(scratch));
 +	*plist_rc = mi8_root_write_probe(
-+	    "/System/Library/LaunchDaemons/com.mi8gpu.probe4.plist",
++	    "/Library/LaunchDaemons/com.mi8gpu.probe5.plist",
 +	    plist, sizeof(plist) - 1, &c2, &w2, &r2, scratch, sizeof(scratch));
 +	/*
 +	 * A create of 17 (EEXIST) means an earlier run left the file there. That
