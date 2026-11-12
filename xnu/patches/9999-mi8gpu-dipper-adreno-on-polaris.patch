@@ -12622,15 +12622,17 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -79,6 +83,7 @@
+@@ -79,6 +83,9 @@
  };
  
  #define SWEET_FB_SWAP_REC_SIZE          0x46c
 +#define SWEET_FB_SWAP_REPORT            64      /* D1: frames per ring line */
++#define SWEET_FB_WAIT_REPORT            8       /* D2: barboardd calls per ring line */
++#define SWEET_FB_WAIT_SPINS             20      /* D2: ms a barrier may block */
  #define SWEET_FB_LAYERS                 4
  #define SWEET_FB_NOTIFY_TYPES           8
  #define SWEET_FB_NOTIFY_VSYNC           5
-@@ -193,6 +198,12 @@
+@@ -193,6 +200,12 @@
  	IOLock       *fLock;            /* swaps and client list */
  	OSArray      *fClients;
  	uint32_t      fSwapID;
@@ -12643,15 +12645,16 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	bool          fConsolePaused;
  	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
  	bool          fDirty;
-@@ -218,6 +229,7 @@
+@@ -218,6 +231,8 @@
  	mach_port_t         fPort;
  	io_user_reference_t fFunc[SWEET_FB_NOTIFY_TYPES];
  	io_user_reference_t fRefcon[SWEET_FB_NOTIFY_TYPES];
-+	uint32_t            fWaitCalls;   /* D2: kSweetFBSwapWait calls, for the ring */
++	uint32_t            fWaitCalls;    /* D2: kSweetFBSwapWait calls */
++	uint32_t            fWaitTimeouts; /* ... of which gave up at the cap */
  
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-@@ -706,6 +718,7 @@
+@@ -706,6 +721,7 @@
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
  			fb->fDirty = false;
@@ -12659,7 +12662,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  	}
  	IOLockUnlock(fb->fLock);
-@@ -896,6 +909,7 @@
+@@ -896,6 +912,7 @@
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -12667,7 +12670,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockUnlock(fLock);
  	++sweet_fb_swap_count;
  	/*
-@@ -1306,6 +1320,23 @@
+@@ -1306,6 +1323,23 @@
  		}
  		s->release();
  	}
@@ -12691,32 +12694,48 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  }
  
  bool
-@@ -1454,6 +1485,28 @@
+@@ -1453,7 +1487,43 @@
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
- 	case kSweetFBSwapWait:
+-	case kSweetFBSwapWait:
++	case kSweetFBSwapWait: {
 +		/*
-+		 * D2: report how many frames have actually reached the panel.
++		 * D2: a BOUNDED barrier, not a value.
 +		 *
-+		 * redwood fills this hole with shownSwap()/wantsTicks(): the client
-+		 * asks whether its frame is up and paces itself on the answer. Until
-+		 * now this selector returned 0, so the answer was always "no".
++		 * The ring showed backboardd calling this selector as
++		 * `sel 6 in 3/0 out 0/0` -- no output buffer at all, so returning a
++		 * number reaches nobody. What the client wants is "tell me when the
++		 * frame I just queued is on the panel", which in redwood is
++		 * shownSwap() driven from the vsync timer.
 +		 *
-+		 * Deliberately NOT a blocking wait. A wait channel here would have
-+		 * to be woken from the vsync timer, and a single missed wake hangs
-+		 * the compositor -- a black screen with no evidence in the ring. The
-+		 * monotonic count is enough for the client to pace and gives the ring
-+		 * a second, independent observation of the same chain.
++		 * We wait for at least one more shown frame, at most
++		 * SWEET_FB_WAIT_SPINS milliseconds, and then answer regardless. A real
++		 * wait channel would have to be woken from the vsync timer, and one
++		 * missed wake hangs the compositor with a black screen and no evidence;
++		 * a bounded IOSleep loop cannot hang anything. The timeout counter in
++		 * the ring is what separates "the panel keeps up" from "every wait
++		 * gave up", which a silent return would hide.
 +		 */
++		uint32_t start = fFB->fSwapShown;
++		uint32_t spins = 0;
++		while (fFB->fSwapShown == start && spins < SWEET_FB_WAIT_SPINS) {
++			IOSleep(1);
++			spins++;
++		}
++		if (fFB->fSwapShown == start) {
++			fWaitTimeouts++;
++		}
 +		out[0] = fFB->fSwapShown;
 +		out[1] = fFB->fSwapSetup;
 +		outCount = 2;
-+		if ((fWaitCalls++ % SWEET_FB_SWAP_REPORT) == 0) {
-+			printf("mi8gpu: swap wait calls %u shown %u setup %u consumed %u\n",
++		if ((fWaitCalls++ % SWEET_FB_WAIT_REPORT) == 0) {
++			printf("mi8gpu: swap wait calls %u shown %u setup %u timeouts %u spins %u\n",
 +			    fWaitCalls, fFB->fSwapShown, fFB->fSwapSetup,
-+			    fFB->fSwapConsumed);
++			    fWaitTimeouts, spins);
 +		}
 +		break;
++	}
  	default:
  		break;
  	}
