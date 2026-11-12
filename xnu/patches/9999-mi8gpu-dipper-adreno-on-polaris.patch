@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7415 @@
+@@ -0,0 +1,7425 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6609,8 +6609,18 @@ new file mode 100644
 +
 +							printf("mi8gpu: step 36 PLIST: rc %d, create %d, write %d, read %d, len %u%c",
 +							    prc, pcrc, pwrc, prrc, (unsigned)(sizeof(plist) - 1), 10);
-+							printf("mi8gpu: step 36 TOUCH rc %d%c",
-+							    mi8_path_probe("/usr/bin/touch"), 10);
++							{
++								static const char *const cand[] = {
++									"/usr/bin/true", "/usr/bin/false", "/bin/cat",
++									"/usr/bin/killall", "/usr/bin/mkdir",
++									"/usr/bin/echo", "/usr/bin/ln", "/bin/ln"
++								};
++								unsigned int ci;
++								for (ci = 0; ci < sizeof(cand) / sizeof(cand[0]); ci++) {
++									printf("mi8gpu: step 36 BIN %s rc %d%c",
++									    cand[ci], mi8_path_probe(cand[ci]), 10);
++								}
++							}
 +							printf("mi8gpu: step 36 FLAG rc %d (2 = not yet, 0 = launchd ran it)%c",
 +							    mi8_path_probe("/mi8gpu_launched.txt"), 10);
 +						}
@@ -12605,7 +12615,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,383 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12824,6 +12834,7 @@ new file mode 100644
 +	vnode_t vp = NULL;
 +	int resid = 0;
 +	int err;
++	int n;
 +
 +	if (create_rc == NULL || write_rc == NULL || read_rc == NULL) {
 +		return -1;
@@ -12856,13 +12867,30 @@ new file mode 100644
 +		return err != 0 ? err : -3;
 +	}
 +	/*
-+	 * Read back EXACTLY len bytes, not rblen. Asking for more than the file
-+	 * holds leaves a non-zero residual, which is not a failure -- the first
-+	 * run reported read 39 for a 25-byte file (64 - 25) and the judge read
-+	 * that as "the data did not come back". residual must mean something.
++	 * Read back min(len, rblen - 1) bytes.
++	 *
++	 * Two opposite mistakes have already been made here, so both bounds are
++	 * spelled out:
++	 *   - asking for rblen when the file is shorter leaves a residual, which
++	 *     is normal ("read 39" for a 25-byte file) and must not read as a
++	 *     failure;
++	 *   - asking for len when the CALLER's buffer is shorter OVERFLOWS the
++	 *     kernel stack. The 306-byte launchd plist went into char[64] and
++	 *     panicked the machine with "Kernel stack memory corrupt" --
++	 *     stack_protector catching what was already a clobbered frame.
++	 * So: n = min(len, rblen - 1), never more than the caller can hold.
 +	 */
++	n = (int)rblen - 1;
++	if (n > (int)len) {
++		n = (int)len;
++	}
++	if (n <= 0) {
++		*read_rc = -4;
++		vnode_close(vp, 0, vfs_context_current());
++		return 0;
++	}
 +	resid = 0;
-+	err = vn_rdwr(UIO_READ, vp, rbuf, (int)len, 0, UIO_SYSSPACE, 0, NOCRED,
++	err = vn_rdwr(UIO_READ, vp, rbuf, n, 0, UIO_SYSSPACE, 0, NOCRED,
 +	    &resid, NULL);
 +	*read_rc = err == 0 ? resid : err;
 +	vnode_close(vp, 0, vfs_context_current());
