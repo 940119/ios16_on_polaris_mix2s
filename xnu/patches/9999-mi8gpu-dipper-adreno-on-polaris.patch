@@ -6546,10 +6546,10 @@ new file mode 100644
 +						 * makes every later Mesa query wrong, which is why this
 +						 * is worth a rung before any shim exists.
 +						 */
-+						unsigned long long chip = 0, model = 0;
++						unsigned long long chip = 0, model = 0, bad = 0;
 +						int rcc = mi8_gpu_ioctl(0u, 0x02u, &chip);
 +						int rcm = mi8_gpu_ioctl(0u, 0x03u, &model);
-+						int rcb = mi8_gpu_ioctl(0u, 0x7fu, &model);
++						int rcb = mi8_gpu_ioctl(0u, 0x7fu, &bad);
 +
 +						printf("mi8gpu: step 31 GPU IOCTL: GET_PARAM(CHIP_ID) rc %d -> %#llx (want %#llx), GET_PARAM(GPU_MODEL) rc %d -> %#llx (want %#llx), unknown param rc %d (want -2)\n",
 +						    rcc, chip, 0x06030000ull, rcm, model, 0x0603ull, rcb);
