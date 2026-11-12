@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7477 @@
+@@ -0,0 +1,7482 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6680,7 +6680,12 @@ new file mode 100644
 +								"/var/log/system.log",
 +								"/private/var/log/com.apple.launchd/launchd.log",
 +								"/private/var/log/asl/StoreData",
-+								"/private/var/log/DiagnosticMessages/StoreData"
++								"/private/var/log/DiagnosticMessages/StoreData",
++								"/Library/LaunchDaemons/com.mi8gpu.probe5.plist",
++								"/private/var/log/syslog",
++								"/private/var/run/syslog",
++								"/private/var/db/diagnostics/StoreData",
++								"/private/var/mobile/Library/Logs/system.log"
 +							};
 +							unsigned int li, ci2;
 +							char lbuf[129];
