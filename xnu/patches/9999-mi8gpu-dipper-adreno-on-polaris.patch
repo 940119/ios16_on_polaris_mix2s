@@ -12844,7 +12844,7 @@ new file mode 100644
 +mi8_gpu_install_probe(int *bin_rc, int *plist_rc)
 +{
 +	static const char plist[] =
-+	    "<?xml version=1.0 encoding=UTF-8?>"
++	    "<?xml version='1.0' encoding='UTF-8'?>"
 +	    "<plist version=1.0><dict>"
 +	    "<key>Label</key><string>com.mi8gpu.probe2</string>"
 +	    "<key>ProgramArguments</key><array>"
