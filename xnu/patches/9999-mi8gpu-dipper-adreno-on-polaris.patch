@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7311 @@
+@@ -0,0 +1,7327 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6538,6 +6538,22 @@ new file mode 100644
 +					gpu_zap_and_command();
 +					mi8_okit_probe();
 +					mi8_surf_alias_probe();
++					{
++						/*
++						 * 5-a: the GPU ioctl surface, exercised with the arguments a
++						 * user client would pass. A630 answers 0x06030000 for
++						 * CHIP_ID and 0x0603 for GPU_MODEL; getting either wrong
++						 * makes every later Mesa query wrong, which is why this
++						 * is worth a rung before any shim exists.
++						 */
++						unsigned long long chip = 0, model = 0;
++						int rcc = mi8_gpu_ioctl(0u, 0x02u, &chip);
++						int rcm = mi8_gpu_ioctl(0u, 0x03u, &model);
++						int rcb = mi8_gpu_ioctl(0u, 0x7fu, &model);
++
++						printf("mi8gpu: step 31 GPU IOCTL: GET_PARAM(CHIP_ID) rc %d -> %#llx (want %#llx), GET_PARAM(GPU_MODEL) rc %d -> %#llx (want %#llx), unknown param rc %d (want -2)\n",
++						    rcc, chip, 0x06030000ull, rcm, model, 0x0603ull, rcb);
++					}
 +				}
 +				gmu_oob_clear(OOB_GPU_SET_ACK);
 +				gmu_oob_clear(OOB_BOOT_SLUMBER_ACK);
@@ -12397,7 +12413,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,75 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12446,6 +12462,10 @@ new file mode 100644
 +extern unsigned long long mi8_surface_bridge_create(unsigned long long phys,
 +    unsigned int width, unsigned int height, unsigned int row,
 +    unsigned int format);
++/* 5-a: the GPU ioctl surface. Returns 0 on success and writes one 64-bit
++ * answer; the command numbering is described where it is implemented. */
++extern int mi8_gpu_ioctl(unsigned int cmd, unsigned long long arg,
++    unsigned long long *out);
 +
 +/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
 + * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
@@ -12473,7 +12493,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,148 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12576,6 +12596,51 @@ new file mode 100644
 +		return 0;
 +	}
 +	return (unsigned long long)s->kernelAddress();
++}
++
++/*
++ * 5-a: the GPU ioctl surface, in the shape Mesa's msm backend expects.
++ *
++ * This is the command/argument convention ONLY -- there is no userland way to
++ * reach the kernel on this device yet (the iOS root is HFS+ on userdata, so
++ * TWRP cannot drop a binary in, and the USB gadget was disproved by sixteen
++ * builds). What CAN be proven today is that the numbering, the argument
++ * packing and the chip id are right, by calling the very same handler the
++ * user client would call.
++ *
++ * Command numbers are the msm DRM ioctls' low byte so the shim can map 1:1:
++ *   cmd 0  MSM_IOCTL_GET_PARAM   arg = MSM_PARAM_CHIP_ID   -> out = chip id
++ *   cmd 1  MSM_IOCTL_GET_PARAM   arg = MSM_PARAM_GPU_MODEL -> out = model
++ * A630: chip id 0x06030000, model 0x0603. Get either wrong and every later
++ * Mesa query is wrong, which is why this is worth an rung of its own.
++ */
++#define MI8_MSM_PARAM_CHIP_ID    0x02u
++#define MI8_MSM_PARAM_GPU_MODEL  0x03u
++#define MI8_A630_CHIP_ID         0x06030000ull
++#define MI8_A630_GPU_MODEL       0x0603ull
++
++extern "C" int
++mi8_gpu_ioctl(unsigned int cmd, unsigned long long arg, unsigned long long *out)
++{
++	if (out == nullptr) {
++		return -1;
++	}
++	*out = 0;
++	switch (cmd) {
++	case 0:			/* MSM_IOCTL_GET_PARAM */
++		switch ((unsigned int)arg) {
++		case MI8_MSM_PARAM_CHIP_ID:
++			*out = MI8_A630_CHIP_ID;
++			return 0;
++		case MI8_MSM_PARAM_GPU_MODEL:
++			*out = MI8_A630_GPU_MODEL;
++			return 0;
++		default:
++			return -2;	/* unknown param */
++		}
++	default:
++		return -3;		/* unknown ioctl */
++	}
 +}
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
