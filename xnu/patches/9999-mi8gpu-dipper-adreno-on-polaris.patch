@@ -12632,7 +12632,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,437 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12667,6 +12667,7 @@ new file mode 100644
 +#include <sys/uio.h>
 +#include <sys/fcntl.h>
 +#include <sys/kauth.h>
++#include "mi8gpu_probe_bin.h"  /* 5-c2: the CI-built arm64 Mach-O */
 +
 +static SweetSurface *g_stage_surface = nullptr;
 +
@@ -12833,6 +12834,12 @@ new file mode 100644
 + * the binary at all. A later boot probing that path therefore answers the last
 + * open question -- does launchd accept an unsigned binary here.
 + */
++/* mi8_root_write_probe() is defined further down; the installer above it
++ * needs the declaration, not the definition. */
++extern "C" int mi8_root_write_probe(const char *path, const char *text,
++    unsigned int len, int *create_rc, int *write_rc, int *read_rc, char *rbuf,
++    unsigned int rblen);
++
 +extern "C" int
 +mi8_gpu_install_probe(int *bin_rc, int *plist_rc)
 +{
@@ -12874,8 +12881,6 @@ new file mode 100644
 + * these costs a device round, and guessing wrong can put a file somewhere that
 + * is never read. One read-only lookup per path turns all of it into fact.
 + */
-+#include "mi8gpu_probe_bin.h"
-+
 +extern "C" int
 +mi8_path_probe(const char *path)
 +{
