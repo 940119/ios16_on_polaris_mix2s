@@ -12550,7 +12550,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,334 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12758,7 +12758,15 @@ new file mode 100644
 +	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)text, (int)len, 0, UIO_SYSSPACE,
 +	    0, NOCRED, &resid, NULL);
 +	*write_rc = err == 0 ? resid : err;
-+	vnode_close(vp, FWRITE, vfs_context_current());
++	/*
++	 * flags MUST be 0, not FWRITE. vnode_close() passes them to
++	 * vnode_rele_ext(), which DECREMENTS v_writecount for FWRITE -- and
++	 * vnode_open() never incremented it. Passing FWRITE there panics with
++	 * "vr_writecount_we = -1, v_writercount = 0" (seen twice on 0394,
++	 * both times before step 34 could print). The data is already in the
++	 * file by this point; this call only releases the vnode.
++	 */
++	vnode_close(vp, 0, vfs_context_current());
 +	vp = NULL;
 +
 +	/* read it back: a create that silently wrote nothing is not a channel */
@@ -12771,7 +12779,7 @@ new file mode 100644
 +	err = vn_rdwr(UIO_READ, vp, rbuf, (int)rblen, 0, UIO_SYSSPACE, 0, NOCRED,
 +	    &resid, NULL);
 +	*read_rc = err == 0 ? resid : err;
-+	vnode_close(vp, FREAD, vfs_context_current());
++	vnode_close(vp, 0, vfs_context_current());
 +	return 0;
 +}
 +
