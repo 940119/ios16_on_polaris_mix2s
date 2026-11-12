@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7440 @@
+@@ -0,0 +1,7442 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6594,7 +6594,7 @@ new file mode 100644
 +
 +							printf("mi8gpu: step 37 INSTALL: rc %d, binary rc %d, plist rc %d, flag rc %d (0 = launchd spawned it)%c",
 +							    irc, ibrc, iprc,
-+							    mi8_path_probe("/mi8gpu_launched.txt"), 10);
++							    mi8_path_probe("/private/var/mi8gpu_launched.txt"), 10);
 +						}
 +
 +						/*
@@ -6637,7 +6637,7 @@ new file mode 100644
 +								}
 +							}
 +							printf("mi8gpu: step 36 FLAG rc %d (2 = not yet, 0 = launchd ran it)%c",
-+							    mi8_path_probe("/mi8gpu_launched.txt"), 10);
++							    mi8_path_probe("/private/var/mi8gpu_launched.txt"), 10);
 +						}
 +						{
 +							static const char *const probe_paths[] = {
@@ -6648,7 +6648,9 @@ new file mode 100644
 +								"/usr/bin",
 +								"/bin/sh",
 +								"/etc/rc",
-+								"/private/etc"
++								"/private/etc",
++								"/private/var",
++								"/private/var/mi8gpu_launched.txt"
 +							};
 +							unsigned int pi;
 +							for (pi = 0; pi < sizeof(probe_paths) / sizeof(probe_paths[0]); pi++) {
@@ -12846,12 +12848,12 @@ new file mode 100644
 +	static const char plist[] =
 +	    "<?xml version='1.0' encoding='UTF-8'?>"
 +	    "<plist version=1.0><dict>"
-+	    "<key>Label</key><string>com.mi8gpu.probe3</string>"
++	    "<key>Label</key><string>com.mi8gpu.probe4</string>"
 +	    "<key>ProgramArguments</key><array>"
 +	    "<string>/mi8gpu_probe</string>"
 +	    "</array><key>RunAtLoad</key><true/>"
-+	    "<key>StandardErrorPath</key><string>/mi8gpu_launched.txt</string>"
-+	    "<key>StandardOutPath</key><string>/mi8gpu_stdout.txt</string>"
++	    "<key>StandardErrorPath</key><string>/private/var/mi8gpu_launched.txt</string>"
++	    "<key>StandardOutPath</key><string>/private/var/mi8gpu_stdout.txt</string>"
 +	    "</dict></plist>";
 +	int c1 = -1, w1 = -1, r1 = -1, c2 = -1, w2 = -1, r2 = -1;
 +	char scratch[64];
@@ -12863,7 +12865,7 @@ new file mode 100644
 +	    (const char *)mi8gpu_probe_bin, mi8gpu_probe_bin_len,
 +	    &c1, &w1, &r1, scratch, sizeof(scratch));
 +	*plist_rc = mi8_root_write_probe(
-+	    "/System/Library/LaunchDaemons/com.mi8gpu.probe3.plist",
++	    "/System/Library/LaunchDaemons/com.mi8gpu.probe4.plist",
 +	    plist, sizeof(plist) - 1, &c2, &w2, &r2, scratch, sizeof(scratch));
 +	/*
 +	 * A create of 17 (EEXIST) means an earlier run left the file there. That
