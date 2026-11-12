@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7442 @@
+@@ -0,0 +1,7477 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6668,6 +6668,41 @@ new file mode 100644
 +						    rrc, risroot ? "set" : "NULL", rvid, rname);
 +						printf("mi8gpu: step 31 GPU IOCTL: GET_PARAM(CHIP_ID) rc %d -> %#llx (want %#llx), GET_PARAM(GPU_MODEL) rc %d -> %#llx (want %#llx), unknown param rc %d (want -2)\n",
 +						    rcc, chip, 0x06030000ull, rcm, model, 0x0603ull, rcb);
++						/*
++						 * 5-c3: look for launchd's own complaint. We ALREADY have a read
++						 * channel (vn_rdwr), so "no way to read the refusal log" was a
++						 * premature conclusion. Bytes sanitized before %s (lesson 99).
++						 */
++						{
++							static const char *const logs[] = {
++								"/private/var/log/system.log",
++								"/private/var/log/launchd.log",
++								"/var/log/system.log",
++								"/private/var/log/com.apple.launchd/launchd.log",
++								"/private/var/log/asl/StoreData",
++								"/private/var/log/DiagnosticMessages/StoreData"
++							};
++							unsigned int li, ci2;
++							char lbuf[129];
++							for (li = 0; li < sizeof(logs) / sizeof(logs[0]); li++) {
++								int lrc = mi8_read_file(logs[li], lbuf, sizeof(lbuf));
++								if (lrc > 0) {
++									for (ci2 = 0; ci2 < (unsigned int)lrc; ci2++) {
++										unsigned char ch = (unsigned char)lbuf[ci2];
++										if (ch < 0x20 || ch > 0x7e) {
++											lbuf[ci2] = '.';
++										}
++									}
++									lbuf[lrc] = 0;
++									printf("mi8gpu: step 38 LOG %s %d B %s%c",
++									    logs[li], lrc, lbuf, 10);
++								} else {
++									printf("mi8gpu: step 38 LOG %s rc %d%c",
++									    logs[li], lrc, 10);
++								}
++							}
++						}
++
 +					}
 +				}
 +				gmu_oob_clear(OOB_GPU_SET_ACK);
@@ -12528,7 +12563,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,103 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12605,6 +12640,8 @@ new file mode 100644
 +    unsigned int rblen);
 +/* 5-c0: vnode_lookup() one path; returns 0 if it exists, 2 (ENOENT) if not. */
 +extern int mi8_path_probe(const char *path);
++/* 5-c3: read up to buflen-1 bytes; returns the byte count or a negative errno. */
++extern int mi8_read_file(const char *path, char *buf, unsigned int buflen);
 +/* 5-c2: write the CI-built Mach-O and its launchd plist. */
 +extern int mi8_gpu_install_probe(int *bin_rc, int *plist_rc);
 +
@@ -12634,7 +12671,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,437 @@
+@@ -0,0 +1,471 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12883,6 +12920,40 @@ new file mode 100644
 + * these costs a device round, and guessing wrong can put a file somewhere that
 + * is never read. One read-only lookup per path turns all of it into fact.
 + */
++/*
++ * 5-c3: READ a file from the iOS root into the ring.
++ *
++ * The 5-c2 verdict said "there is no read channel for launchd's refusal log".
++ * That was wrong: vnode_open() + vn_rdwr(UIO_READ) is exactly a read channel
++ * and we already use its write half for the plist. The bytes are sanitized by
++ * the caller before printing -- logs contain NULs and control bytes, and an
++ * unsanitized %s would eat the line terminator (lesson 99).
++ */
++extern "C" int
++mi8_read_file(const char *path, char *buf, unsigned int buflen)
++{
++	vnode_t vp = NULL;
++	int resid = 0;
++	int err;
++
++	if (path == NULL || buf == NULL || buflen < 2) {
++		return -1;
++	}
++	buf[0] = 0;
++	err = vnode_open(path, O_RDONLY, 0, 0, &vp, vfs_context_current());
++	if (err != 0 || vp == NULL) {
++		return err != 0 ? err : -2;
++	}
++	err = vn_rdwr(UIO_READ, vp, buf, (int)(buflen - 1), 0, UIO_SYSSPACE,
++	    0, NOCRED, &resid, NULL);
++	vnode_close(vp, 0, vfs_context_current());
++	buf[buflen - 1] = 0;
++	if (err != 0) {
++		return err;
++	}
++	return (int)(buflen - 1) - resid;   /* bytes actually read */
++}
++
 +extern "C" int
 +mi8_path_probe(const char *path)
 +{
