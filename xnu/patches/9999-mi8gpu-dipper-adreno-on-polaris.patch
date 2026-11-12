@@ -12530,7 +12530,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,265 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12697,7 +12697,7 @@ new file mode 100644
 +extern "C" int
 +mi8_root_stat_probe(struct mi8_root_stat *out)
 +{
-+	struct vfsstatfs sb;
++	struct vfsstatfs *sb;
 +	vnode_t vp = NULL;
 +	int err;
 +
@@ -12708,20 +12708,23 @@ new file mode 100644
 +	if (rootvnode == NULL || rootvnode->v_mount == NULL) {
 +		return -2;
 +	}
-+	err = vfs_statfs(rootvnode->v_mount, &sb);
-+	if (err != 0) {
-+		return err;
++	/* This XNU exposes vfs_statfs(mount_t) -> struct vfsstatfs *, not the
++	 * two-argument form: the compile error on the first attempt was
++	 * "no matching function ... incompatible pointer to integer". */
++	sb = vfs_statfs(rootvnode->v_mount);
++	if (sb == NULL) {
++		return -3;
 +	}
-+	out->f_bsize = sb.f_bsize;
-+	out->f_iosize = sb.f_iosize;
-+	out->f_blocks = sb.f_blocks;
-+	out->f_bfree = sb.f_bfree;
-+	out->f_files = sb.f_files;
-+	out->f_ffree = sb.f_ffree;
-+	out->f_type_ok = (int)(((unsigned int)(unsigned char)sb.f_fstypename[0])
-+	    | ((unsigned int)(unsigned char)sb.f_fstypename[1] << 8)
-+	    | ((unsigned int)(unsigned char)sb.f_fstypename[2] << 16)
-+	    | ((unsigned int)(unsigned char)sb.f_fstypename[3] << 24));
++	out->f_bsize = sb->f_bsize;
++	out->f_iosize = sb->f_iosize;
++	out->f_blocks = sb->f_blocks;
++	out->f_bfree = sb->f_bfree;
++	out->f_files = sb->f_files;
++	out->f_ffree = sb->f_ffree;
++	out->f_type_ok = (int)(((unsigned int)(unsigned char)sb->f_fstypename[0])
++	    | ((unsigned int)(unsigned char)sb->f_fstypename[1] << 8)
++	    | ((unsigned int)(unsigned char)sb->f_fstypename[2] << 16)
++	    | ((unsigned int)(unsigned char)sb->f_fstypename[3] << 24));
 +	/* must fail: this path cannot exist on a stock root */
 +	err = vnode_lookup("/mi8gpu_probe_does_not_exist", 0, &vp, vfs_context_current());
 +	out->missing_rc = err;
