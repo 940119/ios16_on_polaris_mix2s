@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7487 @@
+@@ -0,0 +1,7534 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6709,6 +6709,53 @@ new file mode 100644
 +								} else {
 +									printf("mi8gpu: step 38 LOG %s rc %d%c",
 +									    logs[li], lrc, 10);
++								}
++							}
++						}
++
++						/*
++						 * 5-c4: read the WHOLE system job plist, not just 128 B.
++						 * If any already-loaded job points at a file on a writable
++						 * volume, we could replace that file and reuse the existing
++						 * job -- no need to touch any Apple plist. Read-only survey.
++						 * Print in 120-byte chunks so no ring line gets too long.
++						 */
++						{
++							static const char *const dumps[] = {
++								"/System/Library/LaunchDaemons/com.apple.CommCenter.plist",
++								"/System/Library/LaunchDaemons/com.apple.SpringBoard.plist",
++								"/System/Library/LaunchDaemons/com.apple.backboardd.plist",
++								"/System/Library/LaunchDaemons/com.apple.configd.plist",
++								"/System/Library/LaunchDaemons/com.apple.syslogd.plist",
++								"/System/Library/LaunchDaemons/com.apple.securityd.plist",
++								"/System/Library/LaunchDaemons/com.apple.locationd.plist",
++								"/System/Library/LaunchDaemons/com.apple.mediaserverd.plist",
++								"/System/Library/LaunchDaemons/com.apple.apsd.plist",
++								"/System/Library/LaunchDaemons/com.apple.fseventsd.plist",
++								"/System/Library/LaunchDaemons/com.apple.mobile.lockdown.plist"
++							};
++							unsigned int di, doff, dk, dn;
++							char dbuf[1025];
++							char dline[129];
++							for (di = 0; di < sizeof(dumps) / sizeof(dumps[0]); di++) {
++								int drc = mi8_read_file(dumps[di], dbuf, sizeof(dbuf));
++								if (drc <= 0) {
++									printf("mi8gpu: step 39 DUMP %s rc %d%c",
++									    dumps[di], drc, 10);
++									continue;
++								}
++								for (doff = 0; doff < (unsigned int)drc; doff += 120) {
++									dn = (unsigned int)drc - doff;
++									if (dn > 120) {
++										dn = 120;
++									}
++									for (dk = 0; dk < dn; dk++) {
++										unsigned char ch = (unsigned char)dbuf[doff + dk];
++										dline[dk] = (ch >= 0x20 && ch <= 0x7e) ? (char)ch : '.';
++									}
++									dline[dn] = 0;
++									printf("mi8gpu: step 39 DUMP %s +%u %s%c",
++									    dumps[di], doff, dline, 10);
 +								}
 +							}
 +						}
