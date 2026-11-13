@@ -6589,11 +6589,11 @@ new file mode 100644
 +						 * SPAWNS the job -- a marker that needs no code in the binary.
 +						 */
 +						{
-+							int ibrc = -1, iprc = -1;
-+							int irc = mi8_gpu_install_probe(&ibrc, &iprc);
++							int ibrc = -1, iprc = -1, ivrc = -99;
++							int irc = mi8_gpu_install_probe(&ibrc, &iprc, &ivrc);
 +
-+							printf("mi8gpu: step 37 INSTALL: rc %d, binary rc %d, plist rc %d, flag rc %d (0 = launchd spawned it)%c",
-+							    irc, ibrc, iprc,
++							printf("mi8gpu: step 37 INSTALL: rc %d, binary rc %d, plist rc %d, verify rc %d (0 = all %u bytes match), flag rc %d%c",
++							    irc, ibrc, iprc, ivrc, mi8_probe_bin_size(),
 +							    mi8_path_probe("/private/var/mi8gpu_ps_out.txt"), 10);
 +						}
 +
@@ -12651,7 +12651,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,105 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12730,8 +12730,10 @@ new file mode 100644
 +extern int mi8_path_probe(const char *path);
 +/* 5-c3: read up to buflen-1 bytes; returns the byte count or a negative errno. */
 +extern int mi8_read_file(const char *path, char *buf, unsigned int buflen);
-+/* 5-c2: write the CI-built Mach-O and its launchd plist. */
-+extern int mi8_gpu_install_probe(int *bin_rc, int *plist_rc);
++/* 5-c2: write the CI-built Mach-O and its launchd plist; 5-c5 verifies it. */
++extern int mi8_gpu_install_probe(int *bin_rc, int *plist_rc, int *verify_rc);
++/* 5-c5: length of the embedded Mach-O, for the ring line. */
++extern unsigned int mi8_probe_bin_size(void);
 +
 +/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
 + * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
@@ -12759,7 +12761,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,490 @@
+@@ -0,0 +1,576 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12967,8 +12969,75 @@ new file mode 100644
 +    unsigned int len, int *create_rc, int *write_rc, int *read_rc, char *rbuf,
 +    unsigned int rblen);
 +
++/*
++ * 5-c5: compare a file on disk against a memory image, byte for byte.
++ *
++ * Until now the only content check was a 64-byte read-back of the plist and
++ * of a 25-byte string. The 32,920-byte Mach-O was "verified" by reading its
++ * FIRST 64 BYTES -- so a write that stopped halfway would still have looked
++ * like success. This walks the whole file in 512-byte chunks at explicit
++ * offsets and returns 0 only if every byte matches.
++ *
++ * Return: 0 all bytes match
++ *         -errno        open/read failure
++ *         -(1000 + off) short read at off
++ *         -(2000 + off) first mismatch at off
++ */
++/* The binary array is static to this TU; expose only its length. */
++extern "C" unsigned int
++mi8_probe_bin_size(void)
++{
++	return mi8gpu_probe_bin_len;
++}
++
 +extern "C" int
-+mi8_gpu_install_probe(int *bin_rc, int *plist_rc)
++mi8_verify_file(const char *path, const unsigned char *src, unsigned int len)
++{
++	vnode_t vp = NULL;
++	unsigned char buf[513];
++	unsigned int off = 0;
++	unsigned int i;
++	int err;
++	int resid;
++	int n;
++
++	if (path == NULL || src == NULL) {
++		return -1;
++	}
++	err = vnode_open(path, O_RDONLY, 0, 0, &vp, vfs_context_current());
++	if (err != 0 || vp == NULL) {
++		return err != 0 ? -err : -2;
++	}
++	while (off < len) {
++		n = (int)(len - off);
++		if (n > 512) {
++			n = 512;
++		}
++		resid = 0;
++		err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, n, (off_t)off,
++		    UIO_SYSSPACE, 0, NOCRED, &resid, NULL);
++		if (err != 0) {
++			vnode_close(vp, 0, vfs_context_current());
++			return -err;
++		}
++		if (resid != 0) {
++			vnode_close(vp, 0, vfs_context_current());
++			return -(1000 + (int)off);
++		}
++		for (i = 0; i < (unsigned int)n; i++) {
++			if (buf[i] != src[off + i]) {
++				vnode_close(vp, 0, vfs_context_current());
++				return -(2000 + (int)off + (int)i);
++			}
++		}
++		off += (unsigned int)n;
++	}
++	vnode_close(vp, 0, vfs_context_current());
++	return 0;
++}
++
++extern "C" int
++mi8_gpu_install_probe(int *bin_rc, int *plist_rc, int *verify_rc)
 +{
 +	static const char plist[] =
 +	    "<?xml version='1.0' encoding='UTF-8'?>"
@@ -12985,12 +13054,23 @@ new file mode 100644
 +	int c1 = -1, w1 = -1, r1 = -1, c2 = -1, w2 = -1, r2 = -1;
 +	char scratch[64];
 +
-+	if (bin_rc == NULL || plist_rc == NULL) {
++	if (bin_rc == NULL || plist_rc == NULL || verify_rc == NULL) {
 +		return -1;
 +	}
++	*verify_rc = -99;
 +	*bin_rc = mi8_root_write_probe("/mi8gpu_probe",
 +	    (const char *)mi8gpu_probe_bin, mi8gpu_probe_bin_len,
 +	    &c1, &w1, &r1, scratch, sizeof(scratch));
++	/*
++	 * c1/w1 are create_rc and the write RESIDUAL. A residual of 0 plus a
++	 * create of 0 (or 17 = already there from an earlier run) is the only
++	 * combination that says "the file should hold all the bytes"; the
++	 * byte-for-byte walk below is what actually proves it.
++	 */
++	if ((c1 == 0 || c1 == 17) && w1 == 0) {
++		*verify_rc = mi8_verify_file("/mi8gpu_probe", mi8gpu_probe_bin,
++		    mi8gpu_probe_bin_len);
++	}
 +	*plist_rc = mi8_root_write_probe(
 +	    "/System/Library/LaunchDaemons/com.mi8gpu.probe9.plist",
 +	    plist, sizeof(plist) - 1, &c2, &w2, &r2, scratch, sizeof(scratch));
@@ -13078,6 +13158,14 @@ new file mode 100644
 +
 +	if (create_rc == NULL || write_rc == NULL || read_rc == NULL) {
 +		return -1;
++	}
++	/*
++	 * len is cast to int for vn_rdwr; anything above INT_MAX would become a
++	 * negative length. No current caller does that (the largest payload is
++	 * the 32,920-byte Mach-O), but the contract has to say so.
++	 */
++	if (len > 0x7fffffffu) {
++		return -4;
 +	}
 +	*create_rc = *write_rc = *read_rc = -1;
 +	err = vnode_open(path, O_CREAT | O_EXCL | O_WRONLY, 0644, 0, &vp,
