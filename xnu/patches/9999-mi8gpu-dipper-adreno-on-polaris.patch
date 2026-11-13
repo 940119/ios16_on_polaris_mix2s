@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7565 @@
+@@ -0,0 +1,7589 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6791,6 +6791,30 @@ new file mode 100644
 +							    mi8_gpu_ioctl(0u, 2ull, NULL), 10);
 +						}
 +
++						/*
++						 * 5-c6: NULL/zero arguments at every exported bridge entry.
++						 * In kernel context a missing guard is a panic, not an errno, so
++						 * each of these must answer -1 instead of dereferencing.
++						 * mi8_root_write_probe used to lack the path/text check.
++						 */
++						{
++							int q1 = -1, q2 = -1, q3 = -1;
++							char t8[8];
++							int n1 = mi8_root_write_probe(NULL, "x", 1, &q1, &q2, &q3,
++							    t8, sizeof(t8));
++							int n2 = mi8_root_write_probe("/mi8gpu_nullguard", NULL, 1,
++							    &q1, &q2, &q3, t8, sizeof(t8));
++							int n3 = mi8_read_file(NULL, t8, sizeof(t8));
++							int n4 = mi8_read_file("/x", NULL, 8);
++							int n5 = mi8_read_file("/x", t8, 1);
++							int n6 = mi8_verify_file(NULL, (const unsigned char *)"x", 1);
++							int n7 = mi8_verify_file("/x", NULL, 1);
++							int n8 = mi8_path_probe(NULL);
++							int n9 = mi8_gpu_ioctl(0u, 2ull, NULL);
++							printf("mi8gpu: step 41 NULLGUARD %d %d %d %d %d %d %d %d %d (want all -1)%c",
++							    n1, n2, n3, n4, n5, n6, n7, n8, n9, 10);
++						}
++
 +					}
 +				}
 +				gmu_oob_clear(OOB_GPU_SET_ACK);
@@ -12762,7 +12786,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,598 @@
+@@ -0,0 +1,606 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -13180,6 +13204,14 @@ new file mode 100644
 +	int n;
 +
 +	if (create_rc == NULL || write_rc == NULL || read_rc == NULL) {
++		return -1;
++	}
++	/*
++	 * path/text were NOT checked here, so a NULL path reached vnode_open()
++	 * and would dereference it in kernel context (panic, not an errno).
++	 * text may only be NULL when len is 0.
++	 */
++	if (path == NULL || (text == NULL && len > 0)) {
 +		return -1;
 +	}
 +	/*
