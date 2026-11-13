@@ -6690,7 +6690,7 @@ new file mode 100644
 +								"/System/Library/Caches/com.apple.dyld/",
 +								"/System/Library/LaunchDaemons/com.apple.CommCenter.plist",
 +								"/System/Library/LaunchDaemons/com.apple.SpringBoard.plist",
-+								"/Library/LaunchDaemons/com.mi8gpu.probe7.plist"
++								"/System/Library/LaunchDaemons/com.mi8gpu.probe9.plist"
 +							};
 +							unsigned int li, ci2;
 +							char lbuf[129];
