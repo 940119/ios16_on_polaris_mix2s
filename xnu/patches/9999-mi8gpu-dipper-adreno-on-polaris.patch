@@ -12687,7 +12687,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,471 @@
+@@ -0,0 +1,477 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12957,15 +12957,21 @@ new file mode 100644
 +	}
 +	buf[0] = 0;
 +	err = vnode_open(path, O_RDONLY, 0, 0, &vp, vfs_context_current());
++	/*
++	 * NEVER return a positive errno here. The caller treats rc > 0 as "bytes
++	 * read", so ENOENT (2) used to be printed as "2 B .." -- six missing log
++	 * files were misread as six 2-byte empty logs, and that wrong reading went
++	 * into two handoff sections. Errors must be NEGATIVE.
++	 */
 +	if (err != 0 || vp == NULL) {
-+		return err != 0 ? err : -2;
++		return err != 0 ? -err : -2;
 +	}
 +	err = vn_rdwr(UIO_READ, vp, buf, (int)(buflen - 1), 0, UIO_SYSSPACE,
 +	    0, NOCRED, &resid, NULL);
 +	vnode_close(vp, 0, vfs_context_current());
 +	buf[buflen - 1] = 0;
 +	if (err != 0) {
-+		return err;
++		return -err;
 +	}
 +	return (int)(buflen - 1) - resid;   /* bytes actually read */
 +}
