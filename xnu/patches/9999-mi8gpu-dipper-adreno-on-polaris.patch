@@ -6592,7 +6592,7 @@ new file mode 100644
 +							int ibrc = -1, iprc = -1, ivrc = -99;
 +							int irc = mi8_gpu_install_probe(&ibrc, &iprc, &ivrc);
 +
-+							printf("mi8gpu: step 37 INSTALL: rc %d, binary rc %d, plist rc %d, verify rc %d (0 = all %u bytes match), flag rc %d%c",
++							printf("mi8gpu: step 37 INSTALL: rc %d, binary rc %d, plist rc %d, verify rc %d (0 = all %u bytes match; -99 = not attempted), flag rc %d%c",
 +							    irc, ibrc, iprc, ivrc, mi8_probe_bin_size(),
 +							    mi8_path_probe("/private/var/mi8gpu_ps_out.txt"), 10);
 +						}
@@ -12761,7 +12761,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,576 @@
+@@ -0,0 +1,585 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -13067,7 +13067,16 @@ new file mode 100644
 +	 * combination that says "the file should hold all the bytes"; the
 +	 * byte-for-byte walk below is what actually proves it.
 +	 */
-+	if ((c1 == 0 || c1 == 17) && w1 == 0) {
++	/*
++	 * Two cases deserve a full walk:
++	 *   c1 == 0  and residual 0  -- we just wrote it, prove it landed;
++	 *   c1 == 17 (EEXIST)        -- nothing was written THIS boot, so the file
++	 *                               on disk is from an earlier run and may be
++	 *                               the truncated/broken one. Skipping the
++	 *                               check here (the first version did) hides
++	 *                               exactly the failure we are looking for.
++	 */
++	if ((c1 == 0 && w1 == 0) || c1 == 17) {
 +		*verify_rc = mi8_verify_file("/mi8gpu_probe", mi8gpu_probe_bin,
 +		    mi8gpu_probe_bin_len);
 +	}
