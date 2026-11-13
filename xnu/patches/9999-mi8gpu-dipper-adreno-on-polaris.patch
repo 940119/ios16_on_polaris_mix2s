@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7495 @@
+@@ -0,0 +1,7487 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6684,21 +6684,13 @@ new file mode 100644
 +						 */
 +						{
 +							static const char *const logs[] = {
-+								"/Library/LaunchDaemons/com.mi8gpu.probe7.plist",
-+								"/System/Library/LaunchDaemons/com.apple.SpringBoard.plist",
-+								"/System/Library/LaunchDaemons/com.apple.backboardd.plist",
-+								"/System/Library/LaunchDaemons/com.apple.mobile.lockdown.plist",
-+								"/System/Library/LaunchDaemons/com.apple.syslogd.plist",
-+								"/System/Library/LaunchDaemons/com.apple.amfid.plist",
-+								"/System/Library/LaunchDaemons/com.apple.securityd.plist",
-+								"/System/Library/LaunchDaemons/com.apple.configd.plist",
-+								"/System/Library/LaunchDaemons/com.apple.locationd.plist",
++								"/System/Library/Caches/com.apple.xpcd/xpcd_cache.dylib",
++								"/System/Library/Caches/com.apple.xpcd/",
++								"/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64",
++								"/System/Library/Caches/com.apple.dyld/",
 +								"/System/Library/LaunchDaemons/com.apple.CommCenter.plist",
-+								"/System/Library/LaunchDaemons/com.apple.mediaserverd.plist",
-+								"/System/Library/LaunchDaemons/com.apple.apsd.plist",
-+								"/System/Library/LaunchDaemons/com.apple.fseventsd.plist",
-+								"/System/Library/LaunchDaemons/com.apple.launchd.plist",
-+								"/Library/LaunchDaemons/com.apple.SpringBoard.plist"
++								"/System/Library/LaunchDaemons/com.apple.SpringBoard.plist",
++								"/Library/LaunchDaemons/com.mi8gpu.probe7.plist"
 +							};
 +							unsigned int li, ci2;
 +							char lbuf[129];
