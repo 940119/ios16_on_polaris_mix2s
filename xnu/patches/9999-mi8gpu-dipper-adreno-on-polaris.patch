@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7482 @@
+@@ -0,0 +1,7491 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6628,7 +6628,16 @@ new file mode 100644
 +								static const char *const cand[] = {
 +									"/usr/bin/true", "/usr/bin/false", "/bin/cat",
 +									"/usr/bin/killall", "/usr/bin/mkdir",
-+									"/usr/bin/echo", "/usr/bin/ln", "/bin/ln"
++									"/usr/bin/echo", "/usr/bin/ln", "/bin/ln",
++									"/sbin/launchd", "/usr/libexec/xpcproxy",
++									"/usr/bin/id", "/usr/bin/env",
++									"/usr/bin/printenv", "/bin/ps",
++									"/usr/bin/whoami", "/usr/bin/uname",
++									"/usr/bin/date", "/usr/bin/log",
++									"/usr/libexec/amfid", "/usr/libexec/syslogd",
++									"/usr/bin/plutil", "/usr/bin/launchctl",
++									"/bin/launchctl", "/usr/libexec/xpcproxy",
++									"/usr/bin/ktrace", "/usr/bin/sleep"
 +								};
 +								unsigned int ci;
 +								for (ci = 0; ci < sizeof(cand) / sizeof(cand[0]); ci++) {
