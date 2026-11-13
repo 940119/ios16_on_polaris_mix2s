@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7493 @@
+@@ -0,0 +1,7495 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6684,19 +6684,21 @@ new file mode 100644
 +						 */
 +						{
 +							static const char *const logs[] = {
-+								"/private/var/log/system.log",
-+								"/private/var/log/launchd.log",
-+								"/var/log/system.log",
-+								"/private/var/log/com.apple.launchd/launchd.log",
-+								"/private/var/log/asl/StoreData",
-+								"/private/var/log/DiagnosticMessages/StoreData",
 +								"/Library/LaunchDaemons/com.mi8gpu.probe7.plist",
-+								"/private/var/mi8gpu_ps_out.txt",
-+								"/private/var/mi8gpu_ps_err.txt",
-+								"/private/var/log/syslog",
-+								"/private/var/run/syslog",
-+								"/private/var/db/diagnostics/StoreData",
-+								"/private/var/mobile/Library/Logs/system.log"
++								"/System/Library/LaunchDaemons/com.apple.SpringBoard.plist",
++								"/System/Library/LaunchDaemons/com.apple.backboardd.plist",
++								"/System/Library/LaunchDaemons/com.apple.mobile.lockdown.plist",
++								"/System/Library/LaunchDaemons/com.apple.syslogd.plist",
++								"/System/Library/LaunchDaemons/com.apple.amfid.plist",
++								"/System/Library/LaunchDaemons/com.apple.securityd.plist",
++								"/System/Library/LaunchDaemons/com.apple.configd.plist",
++								"/System/Library/LaunchDaemons/com.apple.locationd.plist",
++								"/System/Library/LaunchDaemons/com.apple.CommCenter.plist",
++								"/System/Library/LaunchDaemons/com.apple.mediaserverd.plist",
++								"/System/Library/LaunchDaemons/com.apple.apsd.plist",
++								"/System/Library/LaunchDaemons/com.apple.fseventsd.plist",
++								"/System/Library/LaunchDaemons/com.apple.launchd.plist",
++								"/Library/LaunchDaemons/com.apple.SpringBoard.plist"
 +							};
 +							unsigned int li, ci2;
 +							char lbuf[129];
