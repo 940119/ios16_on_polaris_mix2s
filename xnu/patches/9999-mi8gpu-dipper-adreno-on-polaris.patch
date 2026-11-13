@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7534 @@
+@@ -0,0 +1,7565 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6760,6 +6760,37 @@ new file mode 100644
 +							}
 +						}
 +
++						/*
++						 * 5-a2: ioctl parameter boundaries.
++						 * The handler narrows arg to unsigned int, so 0x100000002 used to
++						 * be answered as CHIP_ID. That is fixed; this table proves it and
++						 * proves the rest of the contract: unknown param -> -2, unknown
++						 * cmd -> -3, NULL out -> -1, and repeated calls are identical.
++						 */
++						{
++							static const unsigned int bcmd[] = {
++								0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 1u, 0xFFFFFFFFu
++							};
++							static const unsigned long long barg[] = {
++								2ull, 3ull, 0x7full, 0ull, 1ull, 4ull,
++								0xFFFFFFFFull, 0x100000002ull, 2ull, 2ull
++							};
++							static const int bwant[] = {
++								0, 0, -2, -2, -2, -2, -2, -2, -3, -3
++							};
++							unsigned int bi;
++							for (bi = 0; bi < sizeof(bcmd) / sizeof(bcmd[0]); bi++) {
++								unsigned long long o1 = 0, o2 = 0;
++								int r1 = mi8_gpu_ioctl(bcmd[bi], barg[bi], &o1);
++								int r2 = mi8_gpu_ioctl(bcmd[bi], barg[bi], &o2);
++								printf("mi8gpu: step 40 BOUND cmd %#x arg %#llx rc %d want %d out %#llx idem %d%c",
++								    bcmd[bi], barg[bi], r1, bwant[bi], o1,
++								    (r1 == r2 && o1 == o2) ? 1 : 0, 10);
++							}
++							printf("mi8gpu: step 40 NULL out rc %d want -1%c",
++							    mi8_gpu_ioctl(0u, 2ull, NULL), 10);
++						}
++
 +					}
 +				}
 +				gmu_oob_clear(OOB_GPU_SET_ACK);
@@ -12728,7 +12759,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,479 @@
+@@ -0,0 +1,490 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -13194,6 +13225,17 @@ new file mode 100644
 +	*out = 0;
 +	switch (cmd) {
 +	case 0:			/* MSM_IOCTL_GET_PARAM */
++		/*
++		 * Reject high bits BEFORE the narrowing cast. Without this,
++		 * (unsigned int)0x100000002ULL becomes 2 and a garbage argument is
++		 * answered as if it were CHIP_ID -- a caller passing a dirty value
++		 * would silently get the wrong datum. Found while writing the
++		 * boundary self-test (step 40); it was reachable in the shipped
++		 * 5-a path.
++		 */
++		if (arg > 0xffffffffull) {
++			return -2;
++		}
 +		switch ((unsigned int)arg) {
 +		case MI8_MSM_PARAM_CHIP_ID:
 +			*out = MI8_A630_CHIP_ID;
