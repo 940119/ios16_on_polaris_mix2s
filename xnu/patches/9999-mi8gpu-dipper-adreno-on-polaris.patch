@@ -12790,7 +12790,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,606 @@
+@@ -0,0 +1,614 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -13158,6 +13158,14 @@ new file mode 100644
 +	int err;
 +
 +	if (path == NULL || buf == NULL || buflen < 2) {
++		return -1;
++	}
++	/*
++	 * Same class of bug as the ioctl narrowing and the len guard: buflen is
++	 * cast to int for vn_rdwr, so anything above INT_MAX would become a
++	 * negative length. A caller cannot legitimately hold such a buffer.
++	 */
++	if (buflen > 0x7fffffffu) {
 +		return -1;
 +	}
 +	buf[0] = 0;
