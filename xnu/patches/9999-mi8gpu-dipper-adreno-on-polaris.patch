@@ -12675,7 +12675,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,110 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12759,6 +12759,10 @@ new file mode 100644
 +    int *plist_verify_rc);
 +/* 5-c5: length of the embedded Mach-O, for the ring line. */
 +extern unsigned int mi8_probe_bin_size(void);
++/* 5-c5: byte-for-byte compare of a file against an in-memory image.
++ * 0 = every byte matched; negative = errno / short read / first mismatch. */
++extern int mi8_verify_file(const char *path, const unsigned char *src,
++    unsigned int len);
 +
 +/* Forward declarations that lived in HackiOS's bsd/sys/redwood_input.h.
 + * mi8_gpu_done() is called at line ~2913 but defined at ~2940; without these,
