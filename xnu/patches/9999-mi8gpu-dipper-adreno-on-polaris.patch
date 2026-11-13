@@ -12681,7 +12681,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,477 @@
+@@ -0,0 +1,479 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12894,8 +12894,10 @@ new file mode 100644
 +{
 +	static const char plist[] =
 +	    "<?xml version='1.0' encoding='UTF-8'?>"
++	    "<!DOCTYPE plist PUBLIC '-//Apple//DTD PLIST 1.0//EN' "
++	    "'http://www.apple.com/DTDs/PropertyList-1.0.dtd'>"
 +	    "<plist version='1.0'><dict>"
-+	    "<key>Label</key><string>com.mi8gpu.probe8</string>"
++	    "<key>Label</key><string>com.mi8gpu.probe9</string>"
 +	    "<key>ProgramArguments</key><array>"
 +	    "<string>/bin/ps</string>"
 +	    "</array><key>RunAtLoad</key><true/>"
@@ -12912,7 +12914,7 @@ new file mode 100644
 +	    (const char *)mi8gpu_probe_bin, mi8gpu_probe_bin_len,
 +	    &c1, &w1, &r1, scratch, sizeof(scratch));
 +	*plist_rc = mi8_root_write_probe(
-+	    "/System/Library/LaunchDaemons/com.mi8gpu.probe8.plist",
++	    "/System/Library/LaunchDaemons/com.mi8gpu.probe9.plist",
 +	    plist, sizeof(plist) - 1, &c2, &w2, &r2, scratch, sizeof(scratch));
 +	/*
 +	 * A create of 17 (EEXIST) means an earlier run left the file there. That
