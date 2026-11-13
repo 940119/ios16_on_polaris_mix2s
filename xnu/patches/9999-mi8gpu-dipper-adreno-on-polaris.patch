@@ -6589,11 +6589,11 @@ new file mode 100644
 +						 * SPAWNS the job -- a marker that needs no code in the binary.
 +						 */
 +						{
-+							int ibrc = -1, iprc = -1, ivrc = -99;
-+							int irc = mi8_gpu_install_probe(&ibrc, &iprc, &ivrc);
++							int ibrc = -1, iprc = -1, ivrc = -99, pvrc = -99;
++							int irc = mi8_gpu_install_probe(&ibrc, &iprc, &ivrc, &pvrc);
 +
-+							printf("mi8gpu: step 37 INSTALL: rc %d, binary rc %d, plist rc %d, verify rc %d (0 = all %u bytes match; -99 = not attempted), flag rc %d%c",
-+							    irc, ibrc, iprc, ivrc, mi8_probe_bin_size(),
++							printf("mi8gpu: step 37 INSTALL: rc %d, bin rc %d, plist rc %d, macho verify %d, plist verify %d, flag rc %d%c",
++							    irc, ibrc, iprc, ivrc, pvrc,
 +							    mi8_path_probe("/private/var/mi8gpu_ps_out.txt"), 10);
 +						}
 +
@@ -6690,7 +6690,7 @@ new file mode 100644
 +								"/System/Library/Caches/com.apple.dyld/",
 +								"/System/Library/LaunchDaemons/com.apple.CommCenter.plist",
 +								"/System/Library/LaunchDaemons/com.apple.SpringBoard.plist",
-+								"/System/Library/LaunchDaemons/com.mi8gpu.probe9.plist"
++								"/System/Library/LaunchDaemons/com.mi8gpu.probe10.plist"
 +							};
 +							unsigned int li, ci2;
 +							char lbuf[129];
@@ -12651,7 +12651,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,106 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12731,7 +12731,8 @@ new file mode 100644
 +/* 5-c3: read up to buflen-1 bytes; returns the byte count or a negative errno. */
 +extern int mi8_read_file(const char *path, char *buf, unsigned int buflen);
 +/* 5-c2: write the CI-built Mach-O and its launchd plist; 5-c5 verifies it. */
-+extern int mi8_gpu_install_probe(int *bin_rc, int *plist_rc, int *verify_rc);
++extern int mi8_gpu_install_probe(int *bin_rc, int *plist_rc, int *verify_rc,
++    int *plist_verify_rc);
 +/* 5-c5: length of the embedded Mach-O, for the ring line. */
 +extern unsigned int mi8_probe_bin_size(void);
 +
@@ -12761,7 +12762,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,598 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -13037,14 +13038,15 @@ new file mode 100644
 +}
 +
 +extern "C" int
-+mi8_gpu_install_probe(int *bin_rc, int *plist_rc, int *verify_rc)
++mi8_gpu_install_probe(int *bin_rc, int *plist_rc, int *verify_rc,
++    int *plist_verify_rc)
 +{
 +	static const char plist[] =
 +	    "<?xml version='1.0' encoding='UTF-8'?>"
 +	    "<!DOCTYPE plist PUBLIC '-//Apple//DTD PLIST 1.0//EN' "
 +	    "'http://www.apple.com/DTDs/PropertyList-1.0.dtd'>"
 +	    "<plist version='1.0'><dict>"
-+	    "<key>Label</key><string>com.mi8gpu.probe9</string>"
++	    "<key>Label</key><string>com.mi8gpu.probe10</string>"
 +	    "<key>ProgramArguments</key><array>"
 +	    "<string>/bin/ps</string>"
 +	    "</array><key>RunAtLoad</key><true/>"
@@ -13054,10 +13056,12 @@ new file mode 100644
 +	int c1 = -1, w1 = -1, r1 = -1, c2 = -1, w2 = -1, r2 = -1;
 +	char scratch[64];
 +
-+	if (bin_rc == NULL || plist_rc == NULL || verify_rc == NULL) {
++	if (bin_rc == NULL || plist_rc == NULL || verify_rc == NULL ||
++	    plist_verify_rc == NULL) {
 +		return -1;
 +	}
 +	*verify_rc = -99;
++	*plist_verify_rc = -99;
 +	*bin_rc = mi8_root_write_probe("/mi8gpu_probe",
 +	    (const char *)mi8gpu_probe_bin, mi8gpu_probe_bin_len,
 +	    &c1, &w1, &r1, scratch, sizeof(scratch));
@@ -13081,8 +13085,18 @@ new file mode 100644
 +		    mi8gpu_probe_bin_len);
 +	}
 +	*plist_rc = mi8_root_write_probe(
-+	    "/System/Library/LaunchDaemons/com.mi8gpu.probe9.plist",
++	    "/System/Library/LaunchDaemons/com.mi8gpu.probe10.plist",
 +	    plist, sizeof(plist) - 1, &c2, &w2, &r2, scratch, sizeof(scratch));
++	/*
++	 * The plist uses a fresh name, so this is the OTHER branch: create_rc 0
++	 * and residual 0 (we just wrote it). Covering both branches in one boot
++	 * (Mach-O is EEXIST, plist is new) means neither stays dead code.
++	 */
++	if ((c2 == 0 && w2 == 0) || c2 == 17) {
++		*plist_verify_rc = mi8_verify_file(
++		    "/System/Library/LaunchDaemons/com.mi8gpu.probe10.plist",
++		    (const unsigned char *)plist, (unsigned int)(sizeof(plist) - 1));
++	}
 +	/*
 +	 * A create of 17 (EEXIST) means an earlier run left the file there. That
 +	 * is not a failure of this rung; report it as-is and let the judge decide.
