@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7622 @@
+@@ -0,0 +1,7643 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6848,6 +6848,27 @@ new file mode 100644
 +							    n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, 10);
 +						}
 +
++						/*
++						 * 5-c10 (plan C'): READ-ONLY probe of the physical pages
++						 * behind the driver-owned SweetSurface created by B88.
++						 * Gated by a NEW boot-arg; default behaviour unchanged.
++						 * Nothing is mapped into the SMMU here.
++						 */
++						{
++							unsigned int dop = 0;
++							PE_parse_boot_argn("mi8gpu_pages", &dop, sizeof(dop));
++							if (dop != 0) {
++								unsigned long long pas[16];
++								unsigned int bprow = 0;
++								unsigned int sid = mi8_surface_bridge_last_id();
++								int np = mi8_surface_bridge_pages(sid, pas, 16, &bprow);
++								printf("mi8gpu: step 44 PAGES id %u rc %d bpr %u first %#llx last %#llx%c",
++								    sid, np, bprow,
++								    np > 0 ? pas[0] : 0ull,
++								    np > 0 ? pas[np - 1] : 0ull, 10);
++							}
++						}
++
 +					}
 +				}
 +				gmu_oob_clear(OOB_GPU_SET_ACK);
@@ -12708,7 +12729,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,119 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -12757,6 +12778,15 @@ new file mode 100644
 +extern unsigned long long mi8_surface_bridge_create(unsigned long long phys,
 +    unsigned int width, unsigned int height, unsigned int row,
 +    unsigned int format);
++/* 5-c10 C': READ-ONLY export of a surface's physical pages.
++ * Given a surface id, walk its IOMemoryDescriptor page by page and write each
++ * page's physical address into out[]. Returns the number of pages, or a
++ * negative errno. Does NOT map anything into the SMMU and does NOT retain the
++ * surface past the call. This is the missing half of GPU-blit plan C'. */
++extern int mi8_surface_bridge_pages(unsigned int id, unsigned long long *out,
++    unsigned int max_pages, unsigned int *bytes_per_row_out);
++/* id of the most recent surface created by the bridge (for the probe). */
++extern unsigned int mi8_surface_bridge_last_id(void);
 +/* 5-a: the GPU ioctl surface. Returns 0 on success and writes one 64-bit
 + * answer; the command numbering is described where it is implemented. */
 +extern int mi8_gpu_ioctl(unsigned int cmd, unsigned long long arg,
@@ -12823,7 +12853,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,625 @@
+@@ -0,0 +1,678 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -12924,6 +12954,8 @@ new file mode 100644
 + * surface is left published in the id table on purpose: a one-shot experiment
 + * image reboots, and releasing it here would free pages the SMMU still maps.
 + */
++static uint32_t bridge_last_id;
++
 +extern "C" unsigned long long
 +mi8_surface_bridge_create(unsigned long long phys, unsigned int width,
 +    unsigned int height, unsigned int row, unsigned int format)
@@ -12934,7 +12966,58 @@ new file mode 100644
 +	if (s == nullptr) {
 +		return 0;
 +	}
++	bridge_last_id = s->id;
 +	return (unsigned long long)s->kernelAddress();
++}
++
++extern "C" unsigned int
++mi8_surface_bridge_last_id(void)
++{
++	return bridge_last_id;
++}
++
++/*
++ * 5-c10: read the physical pages behind an existing SweetSurface.
++ *
++ * SweetSurface::memory is an IOMemoryDescriptor. For the panel it is a single
++ * contiguous withPhysicalAddress(); for a compositor surface it is a
++ * scattered IOBufferMemoryDescriptor. getPhysicalSegment() walks both. We ask
++ * for one page at a time (4 KB offsets) so the result is a flat list of page
++ * addresses -- exactly what mi8_gpu_map() needs. NOTHING here maps, retains,
++ * or modifies the surface: this probe can only read.
++ */
++extern "C" int
++mi8_surface_bridge_pages(unsigned int id, unsigned long long *out,
++    unsigned int max_pages, unsigned int *bytes_per_row_out)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	IOByteCount len = 0;
++	unsigned int n = 0;
++
++	if (s == nullptr) {
++		return -2;		/* no such surface */
++	}
++	if (out == nullptr || max_pages == 0) {
++		s->release();
++		return -1;
++	}
++	if (s->memory == nullptr || s->allocSize == 0) {
++		s->release();
++		return -3;
++	}
++	if (bytes_per_row_out != nullptr) {
++		*bytes_per_row_out = s->bytesPerRow;
++	}
++	for (IOByteCount off = 0; off < s->allocSize && n < max_pages;
++	    off += page_size) {
++		addr64_t pa = s->memory->getPhysicalSegment(off, &len, 0);
++		if (pa == 0) {
++			break;
++		}
++		out[n++] = (unsigned long long)pa;
++	}
++	s->release();
++	return (int)n;
 +}
 +
 +/*
