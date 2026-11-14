@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7593 @@
+@@ -0,0 +1,7622 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4805,6 +4805,35 @@ new file mode 100644
 +		bl_probe();
 +		bl_readback();
 +		wptr = cp_wptr;
++	}
++	/*
++	 * 5-c9: repeated A2D submissions. Gated by a NEW boot-arg so the default
++	 * behaviour is byte-identical to the previous rung. NO display path is
++	 * touched here: the probe still writes only its own driver-owned buffer.
++	 */
++	{
++		uint32_t reps = 0;
++		PE_parse_boot_argn("mi8gpu_blitrep", &reps, sizeof(reps));
++		if (reps > 8) {
++			reps = 8;
++		}
++		if (ok && gmu_last_step >= 24 && reps > 0) {
++			uint32_t r;
++			printf("mi8gpu: step 43 REPEAT: %u extra A2D submissions\n", reps);
++			for (r = 0; r < reps; r++) {
++				uint32_t before_w = rd(gpu3d + 4 * 0x0807);
++				uint32_t before_r = rd(gpu3d + 4 * 0x0806);
++				cp_wptr = wptr;
++				bl_probe();
++				wptr = cp_wptr;
++				printf("mi8gpu: step 43 REP %u: WPTR %u -> %u, RPTR %u -> %u%s%c",
++				    r, before_w, rd(gpu3d + 4 * 0x0807),
++				    before_r, rd(gpu3d + 4 * 0x0806),
++				    rd(gpu3d + 4 * 0x0806) == rd(gpu3d + 4 * 0x0807)
++				        ? " DRAINED" : " RING-BEHIND", 10);
++			}
++			printf("mi8gpu: step 43 REPEAT DONE%c", 10);
++		}
 +	}
 +	if (ok && gmu_last_step >= 22 && memptrs[2] == 0xc0ffee21 && memptrs[3] == 0x0badf00d) {
 +		uint32_t passes = 1;
