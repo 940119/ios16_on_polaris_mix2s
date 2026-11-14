@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7643 @@
+@@ -0,0 +1,7694 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6866,6 +6866,57 @@ new file mode 100644
 +								    sid, np, bprow,
 +								    np > 0 ? pas[0] : 0ull,
 +								    np > 0 ? pas[np - 1] : 0ull, 10);
++							}
++						}
++						/*
++						 * 5-c11 (plan C"): FULL-PAGE mapping verification.
++						 * Kernel page_size is 16 KB, SMMU page tables are 4 KB,
++						 * so each exported surface page needs FOUR 4 KB entries.
++						 * mi8_gpu_selftest() only checked +0x800, so its 200/200
++						 * cannot prove the whole page is mapped.
++						 * DISPLAY PATH IS UNTOUCHED: driver-owned surf region only.
++						 */
++						{
++							unsigned int cprobe = 0;
++							PE_parse_boot_argn("mi8gpu_fullmap", &cprobe, sizeof(cprobe));
++							if (cprobe != 0) {
++								const uint64_t test_va = 0x30000000ull;
++								const uint32_t npages = 32;
++								volatile uint32_t *surf = (volatile uint32_t *)g3d_regions[G3D_R_SURF].memory;
++								uint32_t good = 0, bad = 0, j;
++								uint64_t pa0 = (uint64_t)kvtophys((vm_offset_t)surf);
++								for (j = 0; j < npages; j++) {
++									surf[j * 0x1000 / 4] = 0xc1100000u | j;
++								}
++								to_memory((vm_offset_t)surf, g3d_regions[G3D_R_SURF].size);
++								for (j = 0; j < npages; j++) {
++									if (!keep_map(test_va + (uint64_t)j * 0x1000,
++									    pa0 + (uint64_t)j * 0x1000, 0)) {
++										printf("mi8gpu: step 45 FULLMAP page %u: keep_map failed%c", j, 10);
++										break;
++									}
++								}
++								keep_tlb();
++								for (j = 0; j < npages; j++) {
++									uint32_t got = keep_peek(test_va + (uint64_t)j * 0x1000);
++									uint32_t want = 0xc1100000u | j;
++									if (got == want) {
++										good++;
++									} else {
++										bad++;
++										if (bad <= 4) {
++											printf("mi8gpu: step 45 FULLMAP page %u got %#x want %#x%c", j, got, want, 10);
++										}
++									}
++								}
++								printf("mi8gpu: step 45 FULLMAP %u of %u 4K pages mapped correctly, %u bad%c",
++								    good, npages, bad, 10);
++								for (j = 0; j < npages; j++) {
++									keep_map(test_va + (uint64_t)j * 0x1000, 0, 0);
++								}
++								keep_tlb();
++								printf("mi8gpu: step 45 FULLMAP after unmap, first page reads %#x (want 0xdeadbeef)%c",
++								    keep_peek(test_va), 10);
 +							}
 +						}
 +
