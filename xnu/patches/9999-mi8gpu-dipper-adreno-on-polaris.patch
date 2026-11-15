@@ -16892,7 +16892,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockUnlock(fLock);
  	++sweet_fb_swap_count;
  	/*
-@@ -971,6 +988,23 @@
+@@ -971,6 +988,22 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
@@ -16908,15 +16908,14 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			if (!geom_logged && PE_parse_boot_argn("mi8gpu_surfgeom", &geom,
 +			    sizeof(geom)) && geom != 0) {
 +				geom_logged = true;
-+				printf("mi8gpu: step 50 SURFGEOM id %u %ux%u bpr %u rem64 %u fmt %#x bpe %u
-+",
++				printf("mi8gpu: step 50 SURFGEOM id %u %ux%u bpr %u rem64 %u fmt %#x bpe %u\n",
 +				    s->id, s->width, s->height, s->bytesPerRow,
 +				    s->bytesPerRow % 64u, s->pixelFormat, s->bytesPerElement);
 +			}
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1251,7 +1285,7 @@
+@@ -1251,7 +1284,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -16925,7 +16924,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1301,7 @@
+@@ -1267,7 +1300,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -16934,7 +16933,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1317,7 @@
+@@ -1283,7 +1316,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -16943,7 +16942,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1305,6 +1339,23 @@
+@@ -1305,6 +1338,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -16967,7 +16966,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1504,51 @@
+@@ -1453,7 +1503,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
