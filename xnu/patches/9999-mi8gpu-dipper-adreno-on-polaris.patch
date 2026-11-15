@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7968 @@
+@@ -0,0 +1,7973 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4748,6 +4748,11 @@ new file mode 100644
 + * Nothing in the display path is touched: both mappings are private IOVA
 + * windows created and torn down inside this function.
 + */
++/* keep_map()/keep_tlb() are defined far below (the keep path); the probe is
++ * inserted before bl_readback(), so it needs its own declarations. */
++static bool keep_map(uint64_t va, uint64_t pa, uint64_t attributes);
++static void keep_tlb(void);
++
 +static void
 +bl_surfblit_probe(void)
 +{
