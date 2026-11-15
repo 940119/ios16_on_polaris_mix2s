@@ -4997,17 +4997,6 @@ new file mode 100644
 +		bl_readback();
 +		wptr = cp_wptr;
 +	}
-+	/* 5-c16 (D-1): a real surface's pages as the blit source. */
-+	{
-+		unsigned int csf = 0;
-+
-+		PE_parse_boot_argn("mi8gpu_surfblit", &csf, sizeof(csf));
-+		if (ok && gmu_last_step >= 24 && csf != 0) {
-+			cp_wptr = wptr;
-+			bl_surfblit_probe();
-+			wptr = cp_wptr;
-+		}
-+	}
 +	/*
 +	 * 5-c9: repeated A2D submissions. Gated by a NEW boot-arg so the default
 +	 * behaviour is byte-identical to the previous rung. NO display path is
@@ -6769,6 +6758,17 @@ new file mode 100644
 +					gpu_zap_and_command();
 +					mi8_okit_probe();
 +					mi8_surf_alias_probe();
++					/* 5-c16 (D-1): a real surface's pages as the blit source.
++					 * MUST run after mi8_surf_alias_probe(): it reads the surface
++					 * that call publishes, and an earlier insertion point saw id 0. */
++					{
++						unsigned int csf = 0;
++
++						PE_parse_boot_argn("mi8gpu_surfblit", &csf, sizeof(csf));
++						if (gpu_set && gmu_last_step >= 24 && csf != 0) {
++							bl_surfblit_probe();
++						}
++					}
 +					{
 +						/*
 +						 * 5-a: the GPU ioctl surface, exercised with the arguments a
