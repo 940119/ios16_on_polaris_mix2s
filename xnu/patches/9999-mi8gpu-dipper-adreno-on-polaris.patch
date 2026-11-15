@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8338 @@
+@@ -0,0 +1,8353 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -8147,10 +8147,25 @@ new file mode 100644
 +		}
 +	}
 +	if (gpu_kept) {
-+		uint32_t test = 0;
++		uint32_t test = 0, prime = 0;
 +
 +		if (PE_parse_boot_argn("mi8gpu_selftest", &test, sizeof(test)) && test) {
 +			mi8_gpu_selftest();
++		}
++		/*
++		 * 5-c21 (D-2b): this path stops at step 21, so bl_probe() -- gated on
++		 * gmu_last_step >= 24 -- would never run and the A2D state would stay
++		 * unproven. Run the B89 statement once here when asked, so that the
++		 * kept GPU is known to execute a 2D blit and bl_snapshot_valid
++		 * becomes 1, which is the gate mi8_gpu_blit_ready() enforces before
++		 * present() is allowed to submit anything.
++		 */
++		if (PE_parse_boot_argn("mi8gpu_a2dprime", &prime, sizeof(prime)) && prime) {
++			printf("mi8gpu: step 52 A2DPRIME: running the B89 statement inside the keep path%c", 10);
++			bl_probe();
++			bl_readback();
++			printf("mi8gpu: step 52 A2DPRIME done, snapshot_valid %u%c",
++			    bl_snapshot_valid, 10);
 +		}
 +		RedwoodGPUStart();
 +		return;
