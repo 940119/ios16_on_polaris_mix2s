@@ -7074,41 +7074,41 @@ new file mode 100644
 +								}
 +							}
 +						}
-+\t\t\t\t\t\t{
-+\t\t\t\t\t\t\tunsigned int cemit = 0;
-+\t\t\t\t\t\t\tPE_parse_boot_argn("mi8gpu_blitemit", &cemit, sizeof(cemit));
-+\t\t\t\t\t\t\tif (cemit != 0) {
-+\t\t\t\t\t\t\t\tuint32_t emitted[128];
-+\t\t\t\t\t\t\t\tuint32_t same = 0, bad = 0, k;
-+\t\t\t\t\t\t\t\tuint32_t n = mi8_blit_emit(emitted,
-+\t\t\t\t\t\t\t\t    g3d_regions[G3D_R_BLITSRC].address,
-+\t\t\t\t\t\t\t\t    g3d_regions[G3D_R_SURF].address,
-+\t\t\t\t\t\t\t\t    BS_W, BS_H, BS_PITCH, BD_W, BD_H,
-+\t\t\t\t\t\t\t\t    BD_PITCH, BD_X0, 0u,
-+\t\t\t\t\t\t\t\t    g3d_regions[2].address + BS_CLOCK_OFF,
-+\t\t\t\t\t\t\t\t    g3d_regions[2].address + BL_RB_OFF,
-+\t\t\t\t\t\t\t\t    g3d_regions[2].address + B79_EV_OFF,
-+\t\t\t\t\t\t\t\t    g3d_regions[2].address + BS_FENCE_OFF,
-+\t\t\t\t\t\t\t\t    g3d_regions[2].address + BS_MARK_OFF);
-+\t\t\t\t\t\t\t\tprintf("mi8gpu: step 47 BLITEMIT %u dwords emitted, snapshot %u, want 114%c",
-+\t\t\t\t\t\t\t\t    n, bl_snapshot_valid, 10);
-+\t\t\t\t\t\t\t\tif (n == 114u && bl_snapshot_valid) {
-+\t\t\t\t\t\t\t\t\tfor (k = 0; k < 114u; k++) {
-+\t\t\t\t\t\t\t\t\t\tif (emitted[k] == bl_snapshot[k]) {
-+\t\t\t\t\t\t\t\t\t\t\tsame++;
-+\t\t\t\t\t\t\t\t\t\t} else {
-+\t\t\t\t\t\t\t\t\t\t\tbad++;
-+\t\t\t\t\t\t\t\t\t\t\tif (bad <= 4) {
-+\t\t\t\t\t\t\t\t\t\t\t\tprintf("mi8gpu: step 47 BLITEMIT dword %u: emit %#x vs blit %#x%c",
-+\t\t\t\t\t\t\t\t\t\t\t\t    k, emitted[k], bl_snapshot[k], 10);
-+\t\t\t\t\t\t\t\t\t\t\t}
-+\t\t\t\t\t\t\t\t\t\t}
-+\t\t\t\t\t\t\t\t\t}
-+\t\t\t\t\t\t\t\t\tprintf("mi8gpu: step 47 BLITEMIT %u of 114 dwords identical, %u bad%c",
-+\t\t\t\t\t\t\t\t\t    same, bad, 10);
-+\t\t\t\t\t\t\t\t}
-+\t\t\t\t\t\t\t}
-+\t\t\t\t\t\t}
++						{
++							unsigned int cemit = 0;
++							PE_parse_boot_argn("mi8gpu_blitemit", &cemit, sizeof(cemit));
++							if (cemit != 0) {
++								uint32_t emitted[128];
++								uint32_t same = 0, bad = 0, k;
++								uint32_t n = mi8_blit_emit(emitted,
++								    g3d_regions[G3D_R_BLITSRC].address,
++								    g3d_regions[G3D_R_SURF].address,
++								    BS_W, BS_H, BS_PITCH, BD_W, BD_H,
++								    BD_PITCH, BD_X0, 0u,
++								    g3d_regions[2].address + BS_CLOCK_OFF,
++								    g3d_regions[2].address + BL_RB_OFF,
++								    g3d_regions[2].address + B79_EV_OFF,
++								    g3d_regions[2].address + BS_FENCE_OFF,
++								    g3d_regions[2].address + BS_MARK_OFF);
++								printf("mi8gpu: step 47 BLITEMIT %u dwords emitted, snapshot %u, want 114%c",
++								    n, bl_snapshot_valid, 10);
++								if (n == 114u && bl_snapshot_valid) {
++									for (k = 0; k < 114u; k++) {
++										if (emitted[k] == bl_snapshot[k]) {
++											same++;
++										} else {
++											bad++;
++											if (bad <= 4) {
++												printf("mi8gpu: step 47 BLITEMIT dword %u: emit %#x vs blit %#x%c",
++												    k, emitted[k], bl_snapshot[k], 10);
++											}
++										}
++									}
++									printf("mi8gpu: step 47 BLITEMIT %u of 114 dwords identical, %u bad%c",
++									    same, bad, 10);
++								}
++							}
++						}
 +
 +					}
 +				}
