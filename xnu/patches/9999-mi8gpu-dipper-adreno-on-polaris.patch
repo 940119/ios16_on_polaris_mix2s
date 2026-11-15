@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7884 @@
+@@ -0,0 +1,7809 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4503,99 +4503,24 @@ new file mode 100644
 +	printf("mi8gpu: step 25 SRC: %u of %u rows start with BS_PIX(0,y), first %#010x last %#010x\n",
 +	    ok_rows, (unsigned)BS_H, src[0], src[(BS_H - 1u) * (BS_PITCH / 4u)]);
 +
-+#define B_PUT(v)	(ring[w++ & 8191u] = (uint32_t)(v))
-+#define B_TICK(n)	do {							\
-+		const uint64_t c_ = clock_iova + 4u * ((uint32_t)(n) - 1u);	\
-+										\
-+		B_PUT(pkt7(CP_MEM_WRITE_OPCODE, 3u));				\
-+		B_PUT((uint32_t)c_);						\
-+		B_PUT((uint32_t)(c_ >> 32));					\
-+		B_PUT(BS_CLOCK(n));						\
-+	} while (0)
-+	/* tick 1 first: B74 proved a leading WFI is the one packet to suspect. */
-+	B_TICK(1);
-+	/* B81: the only change from B79 is that this block is GONE.
-+	 * B80 already proved POST is load-bearing; this rung asks whether the
-+	 * 19-dword PRE block is load-bearing at all, by deleting it from the
-+	 * CLOSED B79 sequence and keeping POST, the core and the readbacks.
-+	 * The footnote in adreno_pm4.xml:1832 says RM6_BLIT2DSCALE is a
-+	 * "no-op (at least on current sqe fw)", so the interesting part of
-+	 * PRE is the four CCU events and the pkt4(0x8e07,1) write.
-+	 * 19 dwords: statement 137 -> 118, WPTR 973 -> 954. */
-+	B_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE, not the first packet */
-+	B_TICK(2);
-+	B_PUT(pkt4(0xb4c0u, 5u));			/* TPL1_A2D_SRC_TEXTURE_INFO..PITCH */
-+	B_PUT(BS_SRC_INFO);
-+	B_PUT(BS_SRC_SIZE);
-+	B_PUT((uint32_t)src_iova);
-+	B_PUT((uint32_t)(src_iova >> 32));
-+	B_PUT(BS_SRC_PITCH);
-+	B_PUT(pkt4(0x8c17u, 4u));			/* RB_A2D_DEST_BUFFER_INFO..PITCH */
-+	B_PUT(BS_DST_INFO);
-+	B_PUT((uint32_t)dst_iova);
-+	B_PUT((uint32_t)(dst_iova >> 32));
-+	B_PUT(BS_DST_PITCH);
-+	B_PUT(pkt4(0x8c01u, 1u));			/* RB_A2D_PIXEL_CNTL: everything disabled */
-+	B_PUT(0u);
-+	B_PUT(pkt4(0x8c00u, 1u));			/* RB_A2D_BLT_CNTL */
-+	B_PUT(BS_BLIT_CNTL);
-+	B_PUT(pkt4(0x8400u, 1u));			/* GRAS_A2D_BLT_CNTL */
-+	B_PUT(BS_BLIT_CNTL);
-+	B_PUT(pkt4(0xacc0u, 1u));			/* SP_A2D_OUTPUT_INFO, A6XX offset */
-+	B_PUT(BS_OUTPUT_INFO);
-+	B_PUT(pkt4(0x8405u, 2u));			/* GRAS_A2D_DEST_TL / DEST_BR */
-+	B_PUT(BS_DEST_TL);			/* B84: (960,0) -- was a literal 0 */
-+	B_PUT(BS_DEST_BR);
-+	B_PUT(pkt4(0x8401u, 4u));			/* SRC_XMIN/XMAX/YMIN/YMAX, 16.8 */
-+	B_PUT(0u);
-+	B_PUT(BS_SRC_MAX);
-+	B_PUT(0u);
-+	B_PUT(BS_SRC_MAX);
-+	B_TICK(3);
-+	/* B78: read the A2D state back BEFORE the blit, while the type-4 writes
-+	 * are still live. CP_REG_TO_MEM is the packet B71/B73 calibrated; CNT 0
-+	 * is one dword. Eleven packets, 44 dwords, no state changed by them. */
-+	for (i = 0; i < BL_NREG; i++) {
-+		const uint32_t d_ = (uint32_t)(rb_iova + 4u * i);
++	/*
++	 * 5-c15: the 114-dword A2D statement now comes from
++	 * mi8_blit_emit(), the same function step 47 proved byte-identical
++	 * to the hand-written block it replaces (114 of 114 dwords, 0431).
++	 * The emitter fills a linear array; the copy below keeps the exact
++	 * ring[w++ & 8191u] wraparound the B_PUT macro had.
++	 */
++	{
++		uint32_t seq[128];
++		uint32_t nseq, k;
 +
-+		B_PUT(pkt7(0x3eu, 3u));			/* CP_REG_TO_MEM */
-+		B_PUT(bl_regs[i] & 0x3ffffu);
-+		B_PUT(d_);
-+		B_PUT(0u);
++		nseq = mi8_blit_emit(seq, src_iova, dst_iova, BS_W, BS_H,
++		    BS_PITCH, BD_W, BD_H, BD_PITCH, BD_X0, 0u, clock_iova,
++		    rb_iova, ev_iova, fence_iova, mark_iova);
++		for (k = 0; k < nseq; k++) {
++			ring[w++ & 8191u] = seq[k];
++		}
 +	}
-+	B_PUT(pkt7(0x2cu, 1u));			/* CP_BLIT */
-+	B_PUT(3u);					/* BLIT_OP_SCALE */
-+	/* B79 part 2, trimmed in B82: adreno_pm4.xml:517 says the 2D blit
-+	 * writes THROUGH the CCU cache in the PS stage. B77/B78 flushed only
-+	 * UCHE, so a blit that worked could still be invisible to a CPU read;
-+	 * B80 proved this block is the load-bearing half and B81 proved PRE
-+	 * contributes nothing. What remains is the clean itself. 6 dwords. */
-+	B_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE */
-+	B_PUT(pkt7(0x46u, 4u));			/* CP_EVENT_WRITE FLUSH_COLOR_TS */
-+	B_PUT(0x1du);
-+	B_PUT((uint32_t)(ev_iova + 8u));
-+	B_PUT((uint32_t)((ev_iova + 8u) >> 32));
-+	B_PUT(0xb79cc03u);
-+	/* B82: the two invalidates are gone, the clean stays. B80 proved this
-+	 * block is load-bearing; B81 proved PRE is decoration. What is left is
-+	 * WFI + FLUSH_COLOR_TS only: wait for the 2D blit to retire, then clean
-+	 * the colour CCU so the next CPU read sees the pixels.
-+	 * 4 dwords removed: statement 118 -> 114, WPTR 954 -> 950. */
-+	B_TICK(4);
-+	B_PUT(pkt7(0x26u, 0u));			/* CP_WAIT_FOR_IDLE: let the blit retire */
-+	B_TICK(5);
-+	B_PUT(pkt7(0x46u, 4u));			/* CP_EVENT_WRITE CACHE_FLUSH_TS */
-+	B_PUT(0x04u);
-+	B_PUT((uint32_t)fence_iova);
-+	B_PUT((uint32_t)(fence_iova >> 32));
-+	B_PUT(BS_FENCE);
-+	B_TICK(6);
-+	B_PUT(pkt7(CP_MEM_WRITE_OPCODE, 3u));	/* the last packet of the stream */
-+	B_PUT((uint32_t)mark_iova);
-+	B_PUT((uint32_t)(mark_iova >> 32));
-+	B_PUT(BS_MARK);
-+#undef B_TICK
-+#undef B_PUT
 +	/* 5-c14: read-only snapshot of the 114 dwords just emitted.
 +	 * No B_PUT is touched; this only copies ring[] into RAM. */
 +	if (w >= 114u) {
