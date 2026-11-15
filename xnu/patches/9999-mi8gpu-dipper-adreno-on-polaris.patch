@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7997 @@
+@@ -0,0 +1,8157 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4913,6 +4913,157 @@ new file mode 100644
 +	}
 +}
 +
++/*
++ * 5-c16c (D-1.5): a physically SCATTERED 128 KB source.
++ *
++ * kmem_alloc gives virtually contiguous, physically scattered pages. Mapping
++ * them one 4 KB at a time into a private IOVA is the same operation the
++ * compositor's surfaces would need. `runs` counts how many contiguous
++ * physical runs the allocation split into: if runs == 1 the test is no better
++ * than D-1, and the ring says so.
++ */
++static void
++bl_scatter_probe(void)
++{
++	const uint64_t src_va = 0x30400000ull;
++	const uint64_t dst_va = 0x30600000ull;
++	const uint32_t dw = 64u, dh = 64u;
++	const uint32_t spitch = 1024u, dpitch = 1024u;
++	vm_offset_t mem = 0, dstmem = 0;
++	uint64_t dst_pa, prev = 0, pa;
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++	volatile uint32_t *cpu, *dst_cpu;
++	uint32_t seq[128], nseq, w, i, k;
++	uint32_t mapped = 0, runs = 0, correct = 0, untouched = 0, wrong = 0;
++	uint32_t guard = 0, drained;
++
++	if (kmem_alloc(kernel_map, &mem, 0x20000, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("mi8gpu: step 49 SCATTER: no memory for the source%c", 10);
++		return;
++	}
++	if (kmem_alloc_contig(kernel_map, &dstmem, 0x20000, PAGE_MASK, 0, 0,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		kmem_free(kernel_map, mem, 0x20000);
++		printf("mi8gpu: step 49 SCATTER: no memory for the destination%c", 10);
++		return;
++	}
++	cpu = (volatile uint32_t *)mem;
++	dst_cpu = (volatile uint32_t *)dstmem;
++	dst_pa = (uint64_t)kvtophys(dstmem);
++
++	for (k = 0; k < 32u; k++) {
++		pa = (uint64_t)kvtophys(mem + (vm_offset_t)k * 0x1000u);
++		if (k == 0 || pa != prev + 0x1000ull) {
++			runs++;
++		}
++		prev = pa;
++		if (keep_map(src_va + (uint64_t)k * 0x1000ull, pa, 0)) {
++			mapped++;
++		}
++	}
++	for (k = 0; k < 32u; k++) {
++		if (keep_map(dst_va + (uint64_t)k * 0x1000ull,
++		    dst_pa + (uint64_t)k * 0x1000ull, 0)) {
++			mapped++;
++		}
++	}
++	keep_tlb();
++	printf("mi8gpu: step 49 SCATTER: %u of 64 pages mapped, source is %u contiguous run(s) over 128 KB%c",
++	    mapped, runs, 10);
++	if (mapped != 64u) {
++		goto out;
++	}
++
++	for (i = 0; i < 128u; i++) {
++		for (k = 0; k < 256u; k++) {
++			cpu[i * (spitch / 4u) + k] = 0x5a000000u | (i << 12) | k;
++		}
++	}
++	to_memory(mem, 0x20000);
++	for (i = 0; i < 0x20000u / 4u; i++) {
++		dst_cpu[i] = BS_FILL;
++	}
++	to_memory(dstmem, 0x20000);
++
++	w = cp_wptr & 8191u;
++	nseq = mi8_blit_emit(seq, src_va, dst_va, 32u, 32u, spitch, dw, dh, dpitch,
++	    0u, 0u,
++	    g3d_regions[2].address + BS_CLOCK_OFF,
++	    g3d_regions[2].address + BL_RB_OFF,
++	    g3d_regions[2].address + B79_EV_OFF,
++	    g3d_regions[2].address + BS_FENCE_OFF,
++	    g3d_regions[2].address + BS_MARK_OFF);
++	for (i = 0; i < nseq; i++) {
++		ring[w++ & 8191u] = seq[i];
++	}
++	{
++		const uint32_t target_wptr = w & 8191u;
++
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, target_wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (i = 0; i < 20000; i++) {
++			if (rd(gpu3d + 4 * 0x0806) == target_wptr) {
++				break;
++			}
++			sleep_us(10);
++		}
++		cp_wptr = target_wptr;
++		drained = (rd(gpu3d + 4 * 0x0806) == target_wptr) ? 1u : 0u;
++	}
++	sleep_us(1000);
++	from_memory(dstmem, 0x20000);
++
++	for (i = 0; i < dw * dh; i++) {
++		const uint32_t row = i / dw, col = i % dw;
++		uint32_t got = dst_cpu[row * (dpitch / 4u) + col];
++		uint32_t want = 0x5a000000u | ((row / 2u) << 12) | (col / 2u);
++
++		if (got == want) {
++			correct++;
++		} else if (got == BS_FILL) {
++			untouched++;
++		} else {
++			wrong++;
++		}
++	}
++	for (i = 0; i < 0x20000u / 4u; i++) {
++		const uint32_t gy = i / (dpitch / 4u), gx = i % (dpitch / 4u);
++
++		if (gy < dh && gx < dw) {
++			continue;
++		}
++		if (dst_cpu[i] == BS_FILL) {
++			guard++;
++		}
++	}
++	printf("mi8gpu: step 49 SCATTER: correct %u, untouched %u, wrong %u, guard %u, drained %u, FSR %#x%c",
++	    correct, untouched, wrong, guard, drained,
++	    rd(smmu_cb(G3D_CTX) + CB_FSR), 10);
++	printf("mi8gpu: step 49 SCATTER %s%c",
++	    (correct == dw * dh && wrong == 0u
++	        && guard == 0x20000u / 4u - dw * dh && drained == 1u && runs > 1u)
++	        ? "SCATTERED PAGES ARE A WORKING BLIT SOURCE"
++	        : (runs == 1u
++	            ? "NOT PROVEN: the allocation came back contiguous, so this says nothing new"
++	            : "the scattered source did NOT behave like a contiguous buffer"),
++	    10);
++
++out:
++	for (k = 0; k < 32u; k++) {
++		keep_map(src_va + (uint64_t)k * 0x1000ull, 0, 0);
++		keep_map(dst_va + (uint64_t)k * 0x1000ull, 0, 0);
++	}
++	keep_tlb();
++	if (mem != 0) {
++		kmem_free(kernel_map, mem, 0x20000);
++	}
++	if (dstmem != 0) {
++		kmem_free(kernel_map, dstmem, 0x20000);
++	}
++}
++
 +static void
 +bl_readback(void)
 +{
@@ -6791,6 +6942,15 @@ new file mode 100644
 +						PE_parse_boot_argn("mi8gpu_surfblit", &csf, sizeof(csf));
 +						if (gpu_set && gmu_last_step >= 24 && csf != 0) {
 +							bl_surfblit_probe();
++						}
++						/* 5-c16c (D-1.5): a physically scattered source. */
++						{
++							unsigned int csc = 0;
++
++							PE_parse_boot_argn("mi8gpu_scatter", &csc, sizeof(csc));
++							if (gpu_set && gmu_last_step >= 24 && csc != 0) {
++								bl_scatter_probe();
++							}
 +						}
 +					}
 +					{
