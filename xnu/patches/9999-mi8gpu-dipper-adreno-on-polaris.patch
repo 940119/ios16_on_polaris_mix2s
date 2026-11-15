@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8360 @@
+@@ -0,0 +1,8370 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4433,6 +4433,7 @@ new file mode 100644
 +}
 +
 +static uint32_t bl_snapshot[114];
++static uint32_t bl_snapshot_copied;
 +static uint32_t bl_snapshot_valid;
 +
 +/*
@@ -4552,7 +4553,7 @@ new file mode 100644
 +		for (i = 0; i < 114u; i++) {
 +			bl_snapshot[i] = ring[(w - 114u + i) & 8191u];
 +		}
-+		bl_snapshot_valid = 1;
++		bl_snapshot_copied = 1;
 +	}
 +	{
 +		const uint32_t target_wptr = w & 8191u;
@@ -4568,6 +4569,10 @@ new file mode 100644
 +		}
 +		cp_wptr = target_wptr;
 +		drained = (rd(gpu3d + 4 * 0x0806) == target_wptr) ? 1u : 0u;
++		/* 5-c23: "valid" must mean the CP ACTUALLY consumed the
++		 * statement. In the keep path a stale cp_wptr once left the
++		 * CP stopped mid-statement while this flag was already 1. */
++		bl_snapshot_valid = (drained && bl_snapshot_copied) ? 1u : 0u;
 +		printf("mi8gpu: step 25 A2D: RB_RPTR %u WPTR %u, FSR %#010x, drained %u\n",
 +		    rd(gpu3d + 4 * 0x0806), target_wptr,
 +		    rd(smmu_cb(G3D_CTX) + CB_FSR), drained);
@@ -8168,7 +8173,12 @@ new file mode 100644
 +		 * present() is allowed to submit anything.
 +		 */
 +		if (PE_parse_boot_argn("mi8gpu_a2dprime", &prime, sizeof(prime)) && prime) {
-+			printf("mi8gpu: step 52 A2DPRIME: running the B89 statement inside the keep path%c", 10);
++			/* The selftest advanced the ring through keep_ring_at and left
++			 * cp_wptr behind; writing at the stale offset and restoring
++			 * WPTR to it stops the CP mid-statement (measured, 0441). */
++			cp_wptr = rd(gpu3d + 4 * 0x0807) & 8191u;
++			printf("mi8gpu: step 52 A2DPRIME: running the B89 statement inside the keep path from %u%c",
++			    cp_wptr, 10);
 +			bl_probe();
 +			bl_readback();
 +			printf("mi8gpu: step 52 A2DPRIME done, snapshot_valid %u%c",
