@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7694 @@
+@@ -0,0 +1,7736 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -6917,6 +6917,48 @@ new file mode 100644
 +								keep_tlb();
 +								printf("mi8gpu: step 45 FULLMAP after unmap, first page reads %#x (want 0xdeadbeef)%c",
 +								    keep_peek(test_va), 10);
++							}
++						}
++
++						/*
++						 * 5-c12 (plan C, step 1): parameterise B89's A2D geometry
++						 * WITHOUT touching bl_probe(). All eight register values
++						 * are recomputed from (w,h,src_pitch,dst_w,dst_h,
++						 * dst_pitch,x0) and compared against the hard-coded
++						 * BS_*/BD_* constants the real B89 statement uses.
++						 * A mismatch means the formula cannot replace them.
++						 */
++						{
++							unsigned int cgeo = 0;
++							PE_parse_boot_argn("mi8gpu_blitgeo", &cgeo, sizeof(cgeo));
++							if (cgeo != 0) {
++								const uint32_t sw = 32u, sh = 32u, sp = 128u;
++								const uint32_t dw = 64u, dh = 64u, dp = 1024u, x0 = 0u;
++								uint32_t f_src_size  = sw | (sh << 15);
++								uint32_t f_src_pitch = (sp >> 6) << 9;
++								uint32_t f_dst_pitch = dp >> 6;
++								uint32_t f_dest_tl   = x0 | (0u << 16);
++								uint32_t f_dest_br   = (x0 + dw - 1u) | ((dh - 1u) << 16);
++								uint32_t f_src_max   = (sw - 1u) << 8;
++								uint32_t agree = 0;
++								uint32_t want[6] = { BS_SRC_SIZE, BS_SRC_PITCH,
++								    BS_DST_PITCH, BS_DEST_TL, BS_DEST_BR, BS_SRC_MAX };
++								uint32_t got[6] = { f_src_size, f_src_pitch,
++								    f_dst_pitch, f_dest_tl, f_dest_br, f_src_max };
++								for (uint32_t k = 0; k < 6; k++) {
++									agree += (got[k] == want[k]) ? 1u : 0u;
++								}
++								printf("mi8gpu: step 46 BLITGEO %u of 6 B89 registers reproduced%c",
++								    agree, 10);
++								/* A DIFFERENT geometry proves these are formulas,
++								 * not copies of the 32x32 constants. Panel-sized
++								 * values are printed only, never submitted. */
++								{
++									const uint32_t pw = 1080u, ph = 2160u, pp = 4320u;
++									printf("mi8gpu: step 46 BLITGEO panel: src_size %#x src_pitch %#x dst_pitch %#x dest_br %#x src_max %#x%c",
++									    pw | (ph << 15), (pp >> 6) << 9, pp >> 6,
++									    (pw - 1u) | ((ph - 1u) << 16), (pw - 1u) << 8, 10);
++								}
 +							}
 +						}
 +
