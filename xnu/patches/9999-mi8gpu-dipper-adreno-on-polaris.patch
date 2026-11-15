@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8301 @@
+@@ -0,0 +1,8338 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4435,6 +4435,31 @@ new file mode 100644
 +static uint32_t bl_snapshot[114];
 +static uint32_t bl_snapshot_valid;
 +
++/*
++ * 5-c20: "is the A2D path up?" -- true only after bl_probe() has run once
++ * (bl_snapshot_valid). present() calls into this file as soon as the
++ * framebuffer exists, long before that, and touching the ring or the page
++ * tables at that point is a kernel data abort.
++ */
++int
++mi8_gpu_blit_ready(void)
++{
++	/*
++	 * BOTH conditions are required, and the first one is what makes this
++	 * probe harmless in a --step image: after the ladder, teardown() runs
++	 * and mi8_keep is false, so present() (which runs OUTSIDE the ladder
++	 * window) must never touch the ring or the page tables. bl_snapshot_valid
++	 * alone was not enough: it stays 1 after teardown has freed them.
++	 */
++	if (!mi8_keep || gpu3d == 0 || g3d_tables == 0) {
++		return 0;
++	}
++	if (g3d_regions[1].memory == 0) {
++		return 0;
++	}
++	return bl_snapshot_valid ? 1 : 0;
++}
++
 +static void
 +bl_probe(void)
 +{
@@ -5097,6 +5122,18 @@ new file mode 100644
 +	if (w == 0 || h == 0 || w > MI8_BLIT_MAXW || h > MI8_BLIT_MAXH) {
 +		return -2;
 +	}
++	if (!mi8_gpu_blit_ready()) {
++		return -7;		/* the ladder has not reached step 24 yet */
++	}
++	{
++		const uint32_t rptr = rd(gpu3d + 4 * 0x0806);
++		const uint32_t used = (cp_wptr + 8192u - rptr) & 8191u;
++
++		if ((8192u - used) < 160u) {
++			return -8;	/* no room for 114 dwords + fence */
++		}
++	}
++
 +	if (src_pitch == 0 || (src_pitch % 64u) != 0) {
 +		/* RB_A2D_SRC_PITCH is PITCH[23:9] with shr=6: not expressible. */
 +		return -5;
@@ -13511,7 +13548,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,763 @@
+@@ -0,0 +1,768 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -13684,6 +13721,7 @@ new file mode 100644
 + * respect to the display: the destination is a private scratch buffer.
 + */
 +extern "C" void mi8_gpu_to_memory(void *start, unsigned long long size);
++extern "C" int mi8_gpu_blit_ready(void);
 +extern "C" int mi8_gpu_blit_surface_pages(const unsigned long long *pas4k,
 +    unsigned int npages, unsigned int src_pitch, unsigned int sx,
 +    unsigned int sy, unsigned int w, unsigned int h,
@@ -13713,6 +13751,10 @@ new file mode 100644
 +	out[0] = s->bytesPerRow;
 +	out[1] = ((s->bytesPerRow % 64u) == 0) ? 1u : 0u;
 +	out[2] = out[3] = out[4] = 0;
++	if (!mi8_gpu_blit_ready()) {
++		s->release();
++		return -7;		/* present() runs before step 24 */
++	}
 +	if (out[1] == 0 || s->memory == nullptr) {
 +		s->release();
 +		return -5;		/* not expressible by RB_A2D_SRC_PITCH */
@@ -17123,16 +17165,17 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockUnlock(fLock);
  	++sweet_fb_swap_count;
  	/*
-@@ -971,6 +990,45 @@
+@@ -971,6 +990,48 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
 +		}
 +		/*
-+		 * 5-c19 (D-2): ONE GPU blit out of this real surface, compared
-+		 * against the same rect read on the CPU. The screen still comes
-+		 * from the CPU path; the GPU writes only a private scratch.
-+		 * Runs once per boot, gated by its own boot-arg.
++		 * 5-c19/5-c20 (D-2): ONE GPU blit out of this real surface, compared
++		 * against the same rect read on the CPU. The screen still comes from
++		 * the CPU path; the GPU writes only a private scratch.
++		 * present() runs long before the ladder is up, so -7 means "not yet"
++		 * and the one-shot flag is NOT consumed.
 +		 */
 +		{
 +			static bool cmp_done;
@@ -17143,11 +17186,13 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +				unsigned long long c[8];
 +				int crc;
 +
-+				cmp_done = true;
 +				crc = mi8_surface_bridge_compare(s->id, (unsigned)sx,
 +				    (unsigned)sy, 64u, 64u, c);
-+				printf("mi8gpu: step 51 GPUCMP id %u rc %d bpr %llu align %llu match %llu of %llu drained %llu\n",
-+				    s->id, crc, c[0], c[1], c[2], c[3], c[4]);
++				if (crc != -7) {
++					cmp_done = true;
++					printf("mi8gpu: step 51 GPUCMP id %u rc %d bpr %llu align %llu match %llu of %llu drained %llu\n",
++					    s->id, crc, c[0], c[1], c[2], c[3], c[4]);
++				}
 +			}
 +		}
 +
@@ -17169,7 +17214,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1251,7 +1309,7 @@
+@@ -1251,7 +1312,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -17178,7 +17223,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1325,7 @@
+@@ -1267,7 +1328,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -17187,7 +17232,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1341,7 @@
+@@ -1283,7 +1344,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -17196,7 +17241,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1305,6 +1363,23 @@
+@@ -1305,6 +1366,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -17220,7 +17265,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1528,51 @@
+@@ -1453,7 +1531,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
