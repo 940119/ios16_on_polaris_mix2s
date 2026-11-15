@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7973 @@
+@@ -0,0 +1,7997 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4737,19 +4737,23 @@ new file mode 100644
 +}
 +
 +/*
-+ * 5-c16 (D-1): a real surface's scattered pages as the blit SOURCE.
++ * 5-c16b (D-1): a real surface's scattered pages as the blit SOURCE.
 + *
 + * The surface is the driver-owned one B88 created (256 x 128 at pitch 1024).
-+ * Its pages are exported by the bridge, mapped at 0x30000000 four KB at a
-+ * time, and a fresh contiguous 128 KB buffer is mapped at 0x30200000 as the
-+ * destination. The statement itself is mi8_blit_emit()'s -- the same one B89
-+ * proved -- so any failure here is about the PAGES, not about the packets.
++ * Its pages are exported by the bridge and mapped at 0x30000000 four KB at a
++ * time; a fresh contiguous 128 KB buffer is mapped at 0x30200000. Both
++ * windows are private to this function and torn down before it returns.
 + *
-+ * Nothing in the display path is touched: both mappings are private IOVA
-+ * windows created and torn down inside this function.
++ * The SOURCE is filled here, through the driver's own mapping of the same
++ * pages, with PAT(x,y) = 0x5a000000 | (y << 12) | x. That matters: the buffer
++ * already holds B89's scaled output at this point, so assuming a pattern
++ * would make a working blit look like a failure.
++ *
++ * The statement is mi8_blit_emit()'s, the same one B89 proved, so any
++ * difference here is about the PAGES, not about the packets.
 + */
-+/* keep_map()/keep_tlb() are defined far below (the keep path); the probe is
-+ * inserted before bl_readback(), so it needs its own declarations. */
++/* keep_map() / keep_tlb() are defined far below, in the keep path; this probe
++ * is inserted before bl_readback(), so it needs its own declarations. */
 +static bool keep_map(uint64_t va, uint64_t pa, uint64_t attributes);
 +static void keep_tlb(void);
 +
@@ -4759,24 +4763,24 @@ new file mode 100644
 +	const uint64_t src_va = 0x30000000ull;
 +	const uint64_t dst_va = 0x30200000ull;
 +	const uint32_t npages = 32u;
++	const uint32_t sw = 32u, sh = 32u;      /* window taken from the surface */
++	const uint32_t dw = 64u, dh = 64u;      /* 2x, exactly like B89 */
++	const uint32_t spitch = 1024u, dpitch = 1024u;
 +	unsigned long long pas[40];
 +	unsigned int bprow = 0, sid;
 +	vm_offset_t dstmem = 0;
 +	uint64_t dst_pa;
 +	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
 +	volatile uint32_t *dst_cpu;
++	volatile uint32_t *src_cpu = (volatile uint32_t *)g3d_regions[G3D_R_SURF].memory;
 +	uint32_t seq[128], nseq, w, i, k;
-+	uint32_t matched = 0, guard = 0, mapped = 0, drained;
++	uint32_t correct = 0, untouched = 0, wrong = 0, guard = 0, mapped = 0, drained;
 +	int np;
 +
 +	sid = mi8_surface_bridge_last_id();
 +	np = mi8_surface_bridge_pages(sid, pas, 40, &bprow);
-+	/*
-+	 * The kernel page size here is 16 KB (step 44 measured 7 x 0x4000
-+	 * between the first and last page), while the SMMU tables are 4 KB.
-+	 * So each exported page becomes FOUR PTE entries; 8 pages = 128 KB,
-+	 * which is exactly the 256 x 128 RGBA8 surface.
-+	 */
++	/* Kernel pages are 16 KB (step 44 measured 7 x 0x4000 between first and
++	 * last), SMMU entries are 4 KB: each exported page becomes four PTEs. */
 +	if (np < 8) {
 +		printf("mi8gpu: step 48 SURFBLIT: only %d pages from surface %u, need 8%c",
 +		    np, sid, 10);
@@ -4790,7 +4794,6 @@ new file mode 100644
 +	dst_pa = (uint64_t)kvtophys(dstmem);
 +	dst_cpu = (volatile uint32_t *)dstmem;
 +
-+	/* Source: the surface's own scattered 16 KB pages, split into 4 KB PTEs. */
 +	for (i = 0; i < (uint32_t)np; i++) {
 +		uint64_t pa = (uint64_t)pas[i];
 +
@@ -4801,7 +4804,6 @@ new file mode 100644
 +			}
 +		}
 +	}
-+	/* Destination: 32 contiguous 4 KB pages of our own. */
 +	for (k = 0; k < npages; k++) {
 +		if (keep_map(dst_va + (uint64_t)k * 0x1000ull,
 +		    dst_pa + (uint64_t)k * 0x1000ull, 0)) {
@@ -4815,14 +4817,21 @@ new file mode 100644
 +		goto out;
 +	}
 +
++	/* Known source: the surface's own 256 x 128 field, filled here. */
++	for (i = 0; i < 128u; i++) {
++		for (k = 0; k < 256u; k++) {
++			src_cpu[i * (spitch / 4u) + k] = 0x5a000000u | (i << 12) | k;
++		}
++	}
++	to_memory((vm_offset_t)src_cpu, 0x20000);
 +	for (i = 0; i < 0x20000u / 4u; i++) {
 +		dst_cpu[i] = BS_FILL;
 +	}
 +	to_memory(dstmem, 0x20000);
 +
 +	w = cp_wptr & 8191u;
-+	nseq = mi8_blit_emit(seq, src_va, dst_va, 32u, 32u, 1024u, 64u, 64u,
-+	    1024u, 0u, 0u,
++	nseq = mi8_blit_emit(seq, src_va, dst_va, sw, sh, spitch, dw, dh, dpitch,
++	    0u, 0u,
 +	    g3d_regions[2].address + BS_CLOCK_OFF,
 +	    g3d_regions[2].address + BL_RB_OFF,
 +	    g3d_regions[2].address + B79_EV_OFF,
@@ -4849,29 +4858,44 @@ new file mode 100644
 +	sleep_us(1000);
 +	from_memory(dstmem, 0x20000);
 +
-+	for (i = 0; i < 64u * 64u; i++) {
-+		const uint32_t row = i / 64u, col = i % 64u;
++	/* Two failure modes, counted apart. */
++	for (i = 0; i < dw * dh; i++) {
++		const uint32_t row = i / dw, col = i % dw;
++		uint32_t got = dst_cpu[row * (dpitch / 4u) + col];
++		uint32_t want = 0x5a000000u | ((row / 2u) << 12) | (col / 2u);
 +
-+		if (dst_cpu[row * 256u + col] == BS_PIX(col / 2u, row / 2u)) {
-+			matched++;
++		if (got == want) {
++			correct++;
++		} else if (got == BS_FILL) {
++			untouched++;
++		} else {
++			wrong++;
 +		}
 +	}
 +	for (i = 0; i < 0x20000u / 4u; i++) {
-+		const uint32_t gy = i / 256u, gx = i % 256u;
++		const uint32_t gy = i / (dpitch / 4u), gx = i % (dpitch / 4u);
 +
-+		if (gy < 64u && gx < 64u) {
++		if (gy < dh && gx < dw) {
 +			continue;
 +		}
 +		if (dst_cpu[i] == BS_FILL) {
 +			guard++;
 +		}
 +	}
-+	printf("mi8gpu: step 48 SURFBLIT: %u of 4096 scaled dwords match, %u of 28672 guard, drained %u%c",
-+	    matched, guard, drained, 10);
++	printf("mi8gpu: step 48 SURFBLIT: correct %u, untouched %u, wrong %u, guard %u, drained %u, FSR %#x%c",
++	    correct, untouched, wrong, guard, drained,
++	    rd(smmu_cb(G3D_CTX) + CB_FSR), 10);
++	printf("mi8gpu: step 48 SURFBLIT samples: rect %#x %#x %#x, want %#x %#x %#x, guard %#x%c",
++	    dst_cpu[0], dst_cpu[1], dst_cpu[2],
++	    0x5a000000u, 0x5a000001u, 0x5a000002u,
++	    dst_cpu[64], 10);
 +	printf("mi8gpu: step 48 SURFBLIT %s%c",
-+	    (matched == 4096u && guard == 28672u && drained == 1u)
++	    (correct == dw * dh && wrong == 0u
++	        && guard == 0x20000u / 4u - dw * dh && drained == 1u)
 +	        ? "A SURFACE'S OWN PAGES ARE A WORKING BLIT SOURCE"
-+	        : "the surface page path did NOT behave like a contiguous buffer",
++	        : (untouched == dw * dh
++	            ? "the blit wrote NOTHING into the destination"
++	            : "the blit wrote, but not the expected pixels"),
 +	    10);
 +
 +out:
@@ -6758,9 +6782,9 @@ new file mode 100644
 +					gpu_zap_and_command();
 +					mi8_okit_probe();
 +					mi8_surf_alias_probe();
-+					/* 5-c16 (D-1): a real surface's pages as the blit source.
-+					 * MUST run after mi8_surf_alias_probe(): it reads the surface
-+					 * that call publishes, and an earlier insertion point saw id 0. */
++					/* 5-c16b (D-1): a real surface's pages as the blit source.
++					 * MUST run after mi8_surf_alias_probe(), which publishes
++					 * the surface this reads (an earlier point saw id 0). */
 +					{
 +						unsigned int csf = 0;
 +
