@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8353 @@
+@@ -0,0 +1,8360 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4781,6 +4781,9 @@ new file mode 100644
 + * is inserted before bl_readback(), so it needs its own declarations. */
 +static bool keep_map(uint64_t va, uint64_t pa, uint64_t attributes);
 +static void keep_tlb(void);
++/* 5-c22: the keep path's ring pointer is defined far below; a tentative
++ * definition here lets the D-2 entry keep it in step with the hardware WPTR. */
++static uint32_t keep_ring_at;
 +
 +static void
 +bl_surfblit_probe(void)
@@ -5127,7 +5130,10 @@ new file mode 100644
 +	}
 +	{
 +		const uint32_t rptr = rd(gpu3d + 4 * 0x0806);
-+		const uint32_t used = (cp_wptr + 8192u - rptr) & 8191u;
++		/* The keep path advances keep_ring_at, the ladder advances
++		 * cp_wptr; neither is authoritative. The hardware WPTR is. */
++		const uint32_t hw_wptr = rd(gpu3d + 4 * 0x0807) & 8191u;
++		const uint32_t used = (hw_wptr + 8192u - rptr) & 8191u;
 +
 +		if ((8192u - used) < 160u) {
 +			return -8;	/* no room for 114 dwords + fence */
@@ -5179,7 +5185,7 @@ new file mode 100644
 +
 +	src_addr = MI8_BLIT_SRC_VA + (uint64_t)(sy * src_pitch + sx * 4u)
 +	    - (uint64_t)first * 0x1000ull;
-+	ring_w = cp_wptr & 8191u;
++	ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
 +	nseq = mi8_blit_emit(seq, src_addr, MI8_BLIT_DST_VA, w, h, src_pitch,
 +	    w, h, MI8_BLIT_PITCH, 0u, 0u,
 +	    g3d_regions[2].address + BS_CLOCK_OFF,
@@ -5206,6 +5212,7 @@ new file mode 100644
 +			sleep_us(10);
 +		}
 +		cp_wptr = target_wptr;
++		keep_ring_at = target_wptr;
 +		drained_now = (rd(gpu3d + 4 * 0x0806) == target_wptr) ? 1u : 0u;
 +	}
 +	sleep_us(500);
