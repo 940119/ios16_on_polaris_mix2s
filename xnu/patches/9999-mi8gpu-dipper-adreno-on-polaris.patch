@@ -6925,7 +6925,7 @@ new file mode 100644
 +						 * WITHOUT touching bl_probe(). All eight register values
 +						 * are recomputed from (w,h,src_pitch,dst_w,dst_h,
 +						 * dst_pitch,x0) and compared against the hard-coded
-+						 * BS_*/BD_* constants the real B89 statement uses.
++						 * BS and BD constants the real B89 statement uses.
 +						 * A mismatch means the formula cannot replace them.
 +						 */
 +						{
