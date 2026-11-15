@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7809 @@
+@@ -0,0 +1,7968 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4736,6 +4736,154 @@ new file mode 100644
 +	}
 +}
 +
++/*
++ * 5-c16 (D-1): a real surface's scattered pages as the blit SOURCE.
++ *
++ * The surface is the driver-owned one B88 created (256 x 128 at pitch 1024).
++ * Its pages are exported by the bridge, mapped at 0x30000000 four KB at a
++ * time, and a fresh contiguous 128 KB buffer is mapped at 0x30200000 as the
++ * destination. The statement itself is mi8_blit_emit()'s -- the same one B89
++ * proved -- so any failure here is about the PAGES, not about the packets.
++ *
++ * Nothing in the display path is touched: both mappings are private IOVA
++ * windows created and torn down inside this function.
++ */
++static void
++bl_surfblit_probe(void)
++{
++	const uint64_t src_va = 0x30000000ull;
++	const uint64_t dst_va = 0x30200000ull;
++	const uint32_t npages = 32u;
++	unsigned long long pas[40];
++	unsigned int bprow = 0, sid;
++	vm_offset_t dstmem = 0;
++	uint64_t dst_pa;
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++	volatile uint32_t *dst_cpu;
++	uint32_t seq[128], nseq, w, i, k;
++	uint32_t matched = 0, guard = 0, mapped = 0, drained;
++	int np;
++
++	sid = mi8_surface_bridge_last_id();
++	np = mi8_surface_bridge_pages(sid, pas, 40, &bprow);
++	/*
++	 * The kernel page size here is 16 KB (step 44 measured 7 x 0x4000
++	 * between the first and last page), while the SMMU tables are 4 KB.
++	 * So each exported page becomes FOUR PTE entries; 8 pages = 128 KB,
++	 * which is exactly the 256 x 128 RGBA8 surface.
++	 */
++	if (np < 8) {
++		printf("mi8gpu: step 48 SURFBLIT: only %d pages from surface %u, need 8%c",
++		    np, sid, 10);
++		return;
++	}
++	if (kmem_alloc_contig(kernel_map, &dstmem, 0x20000, PAGE_MASK, 0, 0,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("mi8gpu: step 48 SURFBLIT: no memory for the destination%c", 10);
++		return;
++	}
++	dst_pa = (uint64_t)kvtophys(dstmem);
++	dst_cpu = (volatile uint32_t *)dstmem;
++
++	/* Source: the surface's own scattered 16 KB pages, split into 4 KB PTEs. */
++	for (i = 0; i < (uint32_t)np; i++) {
++		uint64_t pa = (uint64_t)pas[i];
++
++		for (k = 0; k < 4u; k++) {
++			if (keep_map(src_va + (uint64_t)i * 0x4000ull + (uint64_t)k * 0x1000ull,
++			    pa + (uint64_t)k * 0x1000ull, 0)) {
++				mapped++;
++			}
++		}
++	}
++	/* Destination: 32 contiguous 4 KB pages of our own. */
++	for (k = 0; k < npages; k++) {
++		if (keep_map(dst_va + (uint64_t)k * 0x1000ull,
++		    dst_pa + (uint64_t)k * 0x1000ull, 0)) {
++			mapped++;
++		}
++	}
++	keep_tlb();
++	printf("mi8gpu: step 48 SURFBLIT: %u of %u pages mapped, surface %u pitch %u, %d exported%c",
++	    mapped, (uint32_t)np * 4u + npages, sid, bprow, np, 10);
++	if (mapped != (uint32_t)np * 4u + npages) {
++		goto out;
++	}
++
++	for (i = 0; i < 0x20000u / 4u; i++) {
++		dst_cpu[i] = BS_FILL;
++	}
++	to_memory(dstmem, 0x20000);
++
++	w = cp_wptr & 8191u;
++	nseq = mi8_blit_emit(seq, src_va, dst_va, 32u, 32u, 1024u, 64u, 64u,
++	    1024u, 0u, 0u,
++	    g3d_regions[2].address + BS_CLOCK_OFF,
++	    g3d_regions[2].address + BL_RB_OFF,
++	    g3d_regions[2].address + B79_EV_OFF,
++	    g3d_regions[2].address + BS_FENCE_OFF,
++	    g3d_regions[2].address + BS_MARK_OFF);
++	for (i = 0; i < nseq; i++) {
++		ring[w++ & 8191u] = seq[i];
++	}
++	{
++		const uint32_t target_wptr = w & 8191u;
++
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, target_wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (i = 0; i < 20000; i++) {
++			if (rd(gpu3d + 4 * 0x0806) == target_wptr) {
++				break;
++			}
++			sleep_us(10);
++		}
++		cp_wptr = target_wptr;
++		drained = (rd(gpu3d + 4 * 0x0806) == target_wptr) ? 1u : 0u;
++	}
++	sleep_us(1000);
++	from_memory(dstmem, 0x20000);
++
++	for (i = 0; i < 64u * 64u; i++) {
++		const uint32_t row = i / 64u, col = i % 64u;
++
++		if (dst_cpu[row * 256u + col] == BS_PIX(col / 2u, row / 2u)) {
++			matched++;
++		}
++	}
++	for (i = 0; i < 0x20000u / 4u; i++) {
++		const uint32_t gy = i / 256u, gx = i % 256u;
++
++		if (gy < 64u && gx < 64u) {
++			continue;
++		}
++		if (dst_cpu[i] == BS_FILL) {
++			guard++;
++		}
++	}
++	printf("mi8gpu: step 48 SURFBLIT: %u of 4096 scaled dwords match, %u of 28672 guard, drained %u%c",
++	    matched, guard, drained, 10);
++	printf("mi8gpu: step 48 SURFBLIT %s%c",
++	    (matched == 4096u && guard == 28672u && drained == 1u)
++	        ? "A SURFACE'S OWN PAGES ARE A WORKING BLIT SOURCE"
++	        : "the surface page path did NOT behave like a contiguous buffer",
++	    10);
++
++out:
++	for (i = 0; i < (uint32_t)np; i++) {
++		for (k = 0; k < 4u; k++) {
++			keep_map(src_va + (uint64_t)i * 0x4000ull + (uint64_t)k * 0x1000ull, 0, 0);
++		}
++	}
++	for (k = 0; k < npages; k++) {
++		keep_map(dst_va + (uint64_t)k * 0x1000ull, 0, 0);
++	}
++	keep_tlb();
++	if (dstmem != 0) {
++		kmem_free(kernel_map, dstmem, 0x20000);
++	}
++}
++
 +static void
 +bl_readback(void)
 +{
@@ -4843,6 +4991,17 @@ new file mode 100644
 +		bl_probe();
 +		bl_readback();
 +		wptr = cp_wptr;
++	}
++	/* 5-c16 (D-1): a real surface's pages as the blit source. */
++	{
++		unsigned int csf = 0;
++
++		PE_parse_boot_argn("mi8gpu_surfblit", &csf, sizeof(csf));
++		if (ok && gmu_last_step >= 24 && csf != 0) {
++			cp_wptr = wptr;
++			bl_surfblit_probe();
++			wptr = cp_wptr;
++		}
 +	}
 +	/*
 +	 * 5-c9: repeated A2D submissions. Gated by a NEW boot-arg so the default
