@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8157 @@
+@@ -0,0 +1,8301 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5062,6 +5062,150 @@ new file mode 100644
 +	if (dstmem != 0) {
 +		kmem_free(kernel_map, dstmem, 0x20000);
 +	}
++}
++
++/*
++ * 5-c19 (D-2, C side): blit a rect out of a surface's physical pages into a
++ * private scratch buffer, and hand the scratch back to the caller.
++ *
++ * pas4k[] are 4 KB physical addresses covering the surface from byte 0.
++ * Only the pages spanning rows [sy, sy+h) are mapped. Everything is undone
++ * before returning; no region the display uses is touched.
++ */
++#define MI8_BLIT_SRC_VA	0x34000000ull
++#define MI8_BLIT_DST_VA	0x36000000ull
++#define MI8_BLIT_PITCH	1024u
++#define MI8_BLIT_MAXW	256u
++#define MI8_BLIT_MAXH	64u
++
++int
++mi8_gpu_blit_surface_pages(const unsigned long long *pas4k, unsigned int npages,
++    unsigned int src_pitch, unsigned int sx, unsigned int sy,
++    unsigned int w, unsigned int h, unsigned long long *scratch_kva,
++    unsigned int *scratch_pitch, unsigned int *drained)
++{
++	static vm_offset_t scratch;
++	static uint64_t scratch_pa;
++	static uint32_t scratch_pages;
++	uint32_t seq[128], nseq, ring_w, i, k, first, last, mapped = 0, drained_now = 0;
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++	uint64_t src_addr;
++
++	if (scratch_kva == NULL || scratch_pitch == NULL || drained == NULL) {
++		return -2;
++	}
++	if (w == 0 || h == 0 || w > MI8_BLIT_MAXW || h > MI8_BLIT_MAXH) {
++		return -2;
++	}
++	if (src_pitch == 0 || (src_pitch % 64u) != 0) {
++		/* RB_A2D_SRC_PITCH is PITCH[23:9] with shr=6: not expressible. */
++		return -5;
++	}
++	if (scratch == 0) {
++		if (kmem_alloc_contig(kernel_map, &scratch, 0x10000, PAGE_MASK, 0, 0,
++		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			scratch = 0;
++			return -2;
++		}
++		scratch_pa = (uint64_t)kvtophys(scratch);
++		scratch_pages = 0x10000u / 0x1000u;
++	}
++
++	/* The rows this rect touches, as 4 KB pages of the surface. */
++	first = (sy * src_pitch) >> 12;
++	last = (((sy + h - 1u) * src_pitch) + src_pitch - 1u) >> 12;
++	if (last >= npages || first > last) {
++		return -1;
++	}
++	for (k = first; k <= last; k++) {
++		if (keep_map(MI8_BLIT_SRC_VA + (uint64_t)(k - first) * 0x1000ull,
++		    (uint64_t)pas4k[k], 0)) {
++			mapped++;
++		}
++	}
++	for (k = 0; k < scratch_pages; k++) {
++		if (keep_map(MI8_BLIT_DST_VA + (uint64_t)k * 0x1000ull,
++		    scratch_pa + (uint64_t)k * 0x1000ull, 0)) {
++			mapped++;
++		}
++	}
++	keep_tlb();
++	if (mapped != (last - first + 1u) + scratch_pages) {
++		goto fail;
++	}
++
++	/* Sentinel first, so "never written" is distinguishable from "wrong". */
++	for (i = 0; i < 0x10000u / 4u; i++) {
++		((volatile uint32_t *)scratch)[i] = 0xcdcdcdcdu;
++	}
++	to_memory(scratch, 0x10000);
++
++	src_addr = MI8_BLIT_SRC_VA + (uint64_t)(sy * src_pitch + sx * 4u)
++	    - (uint64_t)first * 0x1000ull;
++	ring_w = cp_wptr & 8191u;
++	nseq = mi8_blit_emit(seq, src_addr, MI8_BLIT_DST_VA, w, h, src_pitch,
++	    w, h, MI8_BLIT_PITCH, 0u, 0u,
++	    g3d_regions[2].address + BS_CLOCK_OFF,
++	    g3d_regions[2].address + BL_RB_OFF,
++	    g3d_regions[2].address + B79_EV_OFF,
++	    g3d_regions[2].address + BS_FENCE_OFF,
++	    g3d_regions[2].address + BS_MARK_OFF);
++	if (nseq != 114u) {
++		goto fail_free;
++	}
++	for (i = 0; i < nseq; i++) {
++		ring[ring_w++ & 8191u] = seq[i];
++	}
++	{
++		const uint32_t target_wptr = ring_w & 8191u;
++
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, target_wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (i = 0; i < 20000; i++) {
++			if (rd(gpu3d + 4 * 0x0806) == target_wptr) {
++				break;
++			}
++			sleep_us(10);
++		}
++		cp_wptr = target_wptr;
++		drained_now = (rd(gpu3d + 4 * 0x0806) == target_wptr) ? 1u : 0u;
++	}
++	sleep_us(500);
++	from_memory(scratch, 0x10000);
++
++	for (k = first; k <= last; k++) {
++		keep_map(MI8_BLIT_SRC_VA + (uint64_t)(k - first) * 0x1000ull, 0, 0);
++	}
++	for (k = 0; k < scratch_pages; k++) {
++		keep_map(MI8_BLIT_DST_VA + (uint64_t)k * 0x1000ull, 0, 0);
++	}
++	keep_tlb();
++
++	*scratch_kva = (unsigned long long)scratch;
++	*scratch_pitch = MI8_BLIT_PITCH;
++	*drained = drained_now;
++	return drained_now ? 0 : -4;
++
++fail_free:
++	for (k = first; k <= last; k++) {
++		keep_map(MI8_BLIT_SRC_VA + (uint64_t)(k - first) * 0x1000ull, 0, 0);
++	}
++	for (k = 0; k < scratch_pages; k++) {
++		keep_map(MI8_BLIT_DST_VA + (uint64_t)k * 0x1000ull, 0, 0);
++	}
++	keep_tlb();
++	return -3;
++
++fail:
++	for (k = first; k <= last; k++) {
++		keep_map(MI8_BLIT_SRC_VA + (uint64_t)(k - first) * 0x1000ull, 0, 0);
++	}
++	for (k = 0; k < scratch_pages; k++) {
++		keep_map(MI8_BLIT_DST_VA + (uint64_t)k * 0x1000ull, 0, 0);
++	}
++	keep_tlb();
++	return -1;
 +}
 +
 +static void
@@ -13367,7 +13511,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,678 @@
+@@ -0,0 +1,763 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -13532,6 +13676,91 @@ new file mode 100644
 +	}
 +	s->release();
 +	return (int)n;
++}
++
++/*
++ * 5-c19 (D-2): run one GPU blit out of a REAL compositor surface's physical
++ * pages and compare it against the same rect read on the CPU. Read-only with
++ * respect to the display: the destination is a private scratch buffer.
++ */
++extern "C" void mi8_gpu_to_memory(void *start, unsigned long long size);
++extern "C" int mi8_gpu_blit_surface_pages(const unsigned long long *pas4k,
++    unsigned int npages, unsigned int src_pitch, unsigned int sx,
++    unsigned int sy, unsigned int w, unsigned int h,
++    unsigned long long *scratch_kva, unsigned int *scratch_pitch,
++    unsigned int *drained);
++
++static unsigned long long cmp_pages[4096];
++
++extern "C" int
++mi8_surface_bridge_compare(unsigned int id, unsigned int sx, unsigned int sy,
++    unsigned int w, unsigned int h, unsigned long long *out)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	IOByteCount len = 0;
++	unsigned char *kva;
++	unsigned long long scratch = 0;
++	unsigned int spitch = 0, drained = 0, n = 0, off, rc, correct = 0, total = 0;
++	unsigned int x, y, dpitch;
++
++	if (s == nullptr) {
++		return -2;
++	}
++	if (out == nullptr) {
++		s->release();
++		return -2;
++	}
++	out[0] = s->bytesPerRow;
++	out[1] = ((s->bytesPerRow % 64u) == 0) ? 1u : 0u;
++	out[2] = out[3] = out[4] = 0;
++	if (out[1] == 0 || s->memory == nullptr) {
++		s->release();
++		return -5;		/* not expressible by RB_A2D_SRC_PITCH */
++	}
++	for (off = 0; off < s->allocSize && n < 4096u; off += 0x1000u) {
++		addr64_t pa = s->memory->getPhysicalSegment(off, &len, 0);
++
++		if (pa == 0) {
++			break;
++		}
++		cmp_pages[n++] = (unsigned long long)pa;
++	}
++	if (n < ((s->allocSize + 0xfffu) >> 12)) {
++		s->release();
++		return -6;		/* the page list is short */
++	}
++	kva = (unsigned char *)s->kernelAddress();
++	if (kva == nullptr) {
++		s->release();
++		return -3;
++	}
++	/* The compositor filled these pixels with the CPU: clean the rect's rows
++	 * before the GPU reads them, or it may see stale lines. */
++	mi8_gpu_to_memory(kva + (unsigned long long)sy * s->bytesPerRow,
++	    (unsigned long long)h * s->bytesPerRow);
++	rc = mi8_gpu_blit_surface_pages(cmp_pages, n, s->bytesPerRow, sx, sy,
++	    w, h, &scratch, &spitch, &drained);
++	out[4] = drained;
++	if (rc != 0) {
++		s->release();
++		return rc;
++	}
++	dpitch = spitch;
++	for (y = 0; y < h; y++) {
++		const unsigned int *a = (const unsigned int *)((const unsigned char *)scratch + (unsigned long long)y * dpitch);
++		const unsigned int *b = (const unsigned int *)(kva + (unsigned long long)(sy + y) * s->bytesPerRow + (unsigned long long)sx * 4u);
++
++		for (x = 0; x < w; x++) {
++			total++;
++			if (a[x] == b[x]) {
++				correct++;
++			}
++		}
++	}
++	out[2] = correct;
++	out[3] = total;
++	s->release();
++	return (correct == total) ? 0 : 1;
 +}
 +
 +/*
@@ -16833,18 +17062,20 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -65,6 +65,10 @@
+@@ -65,6 +65,12 @@
  #include <kern/clock.h>
  #include <sys/proc.h>
  
 +/* D1: the persistent ring is reached through printf(); IOLog does not.
 + * IOKit headers do not declare it, and C++ has no implicit declarations. */
 +extern "C" int printf(const char *, ...);
++extern "C" int mi8_surface_bridge_compare(unsigned int id, unsigned int sx,
++    unsigned int sy, unsigned int w, unsigned int h, unsigned long long *out);
 +
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -79,6 +83,9 @@
+@@ -79,6 +85,9 @@
  };
  
  #define SWEET_FB_SWAP_REC_SIZE          0x46c
@@ -16854,7 +17085,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  #define SWEET_FB_LAYERS                 4
  #define SWEET_FB_NOTIFY_TYPES           8
  #define SWEET_FB_NOTIFY_VSYNC           5
-@@ -193,6 +200,12 @@
+@@ -193,6 +202,12 @@
  	IOLock       *fLock;            /* swaps and client list */
  	OSArray      *fClients;
  	uint32_t      fSwapID;
@@ -16867,7 +17098,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	bool          fConsolePaused;
  	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
  	bool          fDirty;
-@@ -218,6 +231,8 @@
+@@ -218,6 +233,8 @@
  	mach_port_t         fPort;
  	io_user_reference_t fFunc[SWEET_FB_NOTIFY_TYPES];
  	io_user_reference_t fRefcon[SWEET_FB_NOTIFY_TYPES];
@@ -16876,7 +17107,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-@@ -706,6 +721,7 @@
+@@ -706,6 +723,7 @@
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
  			fb->fDirty = false;
@@ -16884,7 +17115,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  	}
  	IOLockUnlock(fb->fLock);
-@@ -896,6 +912,7 @@
+@@ -896,6 +914,7 @@
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -16892,11 +17123,34 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockUnlock(fLock);
  	++sweet_fb_swap_count;
  	/*
-@@ -971,6 +988,22 @@
+@@ -971,6 +990,45 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
 +		}
++		/*
++		 * 5-c19 (D-2): ONE GPU blit out of this real surface, compared
++		 * against the same rect read on the CPU. The screen still comes
++		 * from the CPU path; the GPU writes only a private scratch.
++		 * Runs once per boot, gated by its own boot-arg.
++		 */
++		{
++			static bool cmp_done;
++			uint32_t cmp = 0;
++
++			if (!cmp_done && PE_parse_boot_argn("mi8gpu_gpucmp", &cmp,
++			    sizeof(cmp)) && cmp != 0) {
++				unsigned long long c[8];
++				int crc;
++
++				cmp_done = true;
++				crc = mi8_surface_bridge_compare(s->id, (unsigned)sx,
++				    (unsigned)sy, 64u, 64u, c);
++				printf("mi8gpu: step 51 GPUCMP id %u rc %d bpr %llu align %llu match %llu of %llu drained %llu\n",
++				    s->id, crc, c[0], c[1], c[2], c[3], c[4]);
++			}
++		}
++
 +		/*
 +		 * 5-c17: the row width the A2D source-pitch register would have to
 +		 * express. Printed once, gated by a boot-arg. No display change.
@@ -16915,7 +17169,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1251,7 +1284,7 @@
+@@ -1251,7 +1309,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -16924,7 +17178,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1300,7 @@
+@@ -1267,7 +1325,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -16933,7 +17187,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1316,7 @@
+@@ -1283,7 +1341,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -16942,7 +17196,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1305,6 +1338,23 @@
+@@ -1305,6 +1363,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -16966,7 +17220,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1503,51 @@
+@@ -1453,7 +1528,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
