@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,7736 @@
+@@ -0,0 +1,7884 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4330,6 +4330,111 @@ new file mode 100644
 + * cannot distinguish "blitted" from "cleared", and cannot tell whether
 + * the scale factor was applied at all.
 + */
++/*
++ * 5-c14: parameterised copy of bl_probe()'s 114-dword A2D statement.
++ *
++ * This function writes to a CALLER buffer and never touches cp_wptr, the
++ * ring, or any hardware. It exists so step 47 can prove the extraction is
++ * byte-identical BEFORE bl_probe() is changed to use it.
++ *
++ * The 11 parameter dwords (indexes 11,12,13,14,17,18,19,29,30,33,35) come
++ * from the geometry formulas verified by step 46. Everything else is a
++ * constant or a B89 diagnostic facility (6 TICKs, 11 CP_REG_TO_MEM groups)
++ * and is copied verbatim. See BLIT-SEQUENCE.md.
++ */
++static uint32_t
++mi8_blit_emit(uint32_t *out, uint64_t src_iova, uint64_t dst_iova,
++    uint32_t sw, uint32_t sh, uint32_t sp, uint32_t dw, uint32_t dh,
++    uint32_t dp, uint32_t x0, uint32_t y0, uint64_t clock_iova,
++    uint64_t rb_iova, uint64_t ev_iova, uint64_t fence_iova,
++    uint64_t mark_iova)
++{
++	uint32_t n = 0, i;
++	const uint32_t g_src_size  = sw | (sh << 15);
++	const uint32_t g_src_pitch = (sp >> 6) << 9;
++	const uint32_t g_dst_pitch = dp >> 6;
++	const uint32_t g_dest_tl   = x0 | (y0 << 16);
++	const uint32_t g_dest_br   = (x0 + dw - 1u) | ((y0 + dh - 1u) << 16);
++	const uint32_t g_src_max_x = (sw - 1u) << 8;
++	const uint32_t g_src_max_y = (sh - 1u) << 8;
++
++#define E_PUT(v)	(out[n++] = (uint32_t)(v))
++#define E_TICK(t)	do {							\
++		const uint64_t c_ = clock_iova + 4u * ((uint32_t)(t) - 1u);	\
++										\
++		E_PUT(pkt7(CP_MEM_WRITE_OPCODE, 3u));				\
++		E_PUT((uint32_t)c_);						\
++		E_PUT((uint32_t)(c_ >> 32));					\
++		E_PUT(BS_CLOCK(t));						\
++	} while (0)
++	E_TICK(1);
++	E_PUT(pkt7(0x26u, 0u));
++	E_TICK(2);
++	E_PUT(pkt4(0xb4c0u, 5u));
++	E_PUT(BS_SRC_INFO);
++	E_PUT(g_src_size);
++	E_PUT((uint32_t)src_iova);
++	E_PUT((uint32_t)(src_iova >> 32));
++	E_PUT(g_src_pitch);
++	E_PUT(pkt4(0x8c17u, 4u));
++	E_PUT(BS_DST_INFO);
++	E_PUT((uint32_t)dst_iova);
++	E_PUT((uint32_t)(dst_iova >> 32));
++	E_PUT(g_dst_pitch);
++	E_PUT(pkt4(0x8c01u, 1u));
++	E_PUT(0u);
++	E_PUT(pkt4(0x8c00u, 1u));
++	E_PUT(BS_BLIT_CNTL);
++	E_PUT(pkt4(0x8400u, 1u));
++	E_PUT(BS_BLIT_CNTL);
++	E_PUT(pkt4(0xacc0u, 1u));
++	E_PUT(BS_OUTPUT_INFO);
++	E_PUT(pkt4(0x8405u, 2u));
++	E_PUT(g_dest_tl);
++	E_PUT(g_dest_br);
++	E_PUT(pkt4(0x8401u, 4u));
++	E_PUT(0u);
++	E_PUT(g_src_max_x);
++	E_PUT(0u);
++	E_PUT(g_src_max_y);
++	E_TICK(3);
++	for (i = 0; i < BL_NREG; i++) {
++		const uint32_t d_ = (uint32_t)(rb_iova + 4u * i);
++
++		E_PUT(pkt7(0x3eu, 3u));
++		E_PUT(bl_regs[i] & 0x3ffffu);
++		E_PUT(d_);
++		E_PUT(0u);
++	}
++	E_PUT(pkt7(0x2cu, 1u));
++	E_PUT(3u);
++	E_PUT(pkt7(0x26u, 0u));
++	E_PUT(pkt7(0x46u, 4u));
++	E_PUT(0x1du);
++	E_PUT((uint32_t)(ev_iova + 8u));
++	E_PUT((uint32_t)((ev_iova + 8u) >> 32));
++	E_PUT(0xb79cc03u);
++	E_TICK(4);
++	E_PUT(pkt7(0x26u, 0u));
++	E_TICK(5);
++	E_PUT(pkt7(0x46u, 4u));
++	E_PUT(0x04u);
++	E_PUT((uint32_t)fence_iova);
++	E_PUT((uint32_t)(fence_iova >> 32));
++	E_PUT(BS_FENCE);
++	E_TICK(6);
++	E_PUT(pkt7(CP_MEM_WRITE_OPCODE, 3u));
++	E_PUT((uint32_t)mark_iova);
++	E_PUT((uint32_t)(mark_iova >> 32));
++	E_PUT(BS_MARK);
++#undef E_TICK
++#undef E_PUT
++	return n;
++}
++
++static uint32_t bl_snapshot[114];
++static uint32_t bl_snapshot_valid;
++
 +static void
 +bl_probe(void)
 +{
@@ -4491,6 +4596,14 @@ new file mode 100644
 +	B_PUT(BS_MARK);
 +#undef B_TICK
 +#undef B_PUT
++	/* 5-c14: read-only snapshot of the 114 dwords just emitted.
++	 * No B_PUT is touched; this only copies ring[] into RAM. */
++	if (w >= 114u) {
++		for (i = 0; i < 114u; i++) {
++			bl_snapshot[i] = ring[(w - 114u + i) & 8191u];
++		}
++		bl_snapshot_valid = 1;
++	}
 +	{
 +		const uint32_t target_wptr = w & 8191u;
 +
@@ -6961,6 +7074,41 @@ new file mode 100644
 +								}
 +							}
 +						}
++\t\t\t\t\t\t{
++\t\t\t\t\t\t\tunsigned int cemit = 0;
++\t\t\t\t\t\t\tPE_parse_boot_argn("mi8gpu_blitemit", &cemit, sizeof(cemit));
++\t\t\t\t\t\t\tif (cemit != 0) {
++\t\t\t\t\t\t\t\tuint32_t emitted[128];
++\t\t\t\t\t\t\t\tuint32_t same = 0, bad = 0, k;
++\t\t\t\t\t\t\t\tuint32_t n = mi8_blit_emit(emitted,
++\t\t\t\t\t\t\t\t    g3d_regions[G3D_R_BLITSRC].address,
++\t\t\t\t\t\t\t\t    g3d_regions[G3D_R_SURF].address,
++\t\t\t\t\t\t\t\t    BS_W, BS_H, BS_PITCH, BD_W, BD_H,
++\t\t\t\t\t\t\t\t    BD_PITCH, BD_X0, 0u,
++\t\t\t\t\t\t\t\t    g3d_regions[2].address + BS_CLOCK_OFF,
++\t\t\t\t\t\t\t\t    g3d_regions[2].address + BL_RB_OFF,
++\t\t\t\t\t\t\t\t    g3d_regions[2].address + B79_EV_OFF,
++\t\t\t\t\t\t\t\t    g3d_regions[2].address + BS_FENCE_OFF,
++\t\t\t\t\t\t\t\t    g3d_regions[2].address + BS_MARK_OFF);
++\t\t\t\t\t\t\t\tprintf("mi8gpu: step 47 BLITEMIT %u dwords emitted, snapshot %u, want 114%c",
++\t\t\t\t\t\t\t\t    n, bl_snapshot_valid, 10);
++\t\t\t\t\t\t\t\tif (n == 114u && bl_snapshot_valid) {
++\t\t\t\t\t\t\t\t\tfor (k = 0; k < 114u; k++) {
++\t\t\t\t\t\t\t\t\t\tif (emitted[k] == bl_snapshot[k]) {
++\t\t\t\t\t\t\t\t\t\t\tsame++;
++\t\t\t\t\t\t\t\t\t\t} else {
++\t\t\t\t\t\t\t\t\t\t\tbad++;
++\t\t\t\t\t\t\t\t\t\t\tif (bad <= 4) {
++\t\t\t\t\t\t\t\t\t\t\t\tprintf("mi8gpu: step 47 BLITEMIT dword %u: emit %#x vs blit %#x%c",
++\t\t\t\t\t\t\t\t\t\t\t\t    k, emitted[k], bl_snapshot[k], 10);
++\t\t\t\t\t\t\t\t\t\t\t}
++\t\t\t\t\t\t\t\t\t\t}
++\t\t\t\t\t\t\t\t\t}
++\t\t\t\t\t\t\t\t\tprintf("mi8gpu: step 47 BLITEMIT %u of 114 dwords identical, %u bad%c",
++\t\t\t\t\t\t\t\t\t    same, bad, 10);
++\t\t\t\t\t\t\t\t}
++\t\t\t\t\t\t\t}
++\t\t\t\t\t\t}
 +
 +					}
 +				}
