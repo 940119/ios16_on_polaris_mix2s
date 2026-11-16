@@ -14377,7 +14377,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1054 @@
+@@ -0,0 +1,1060 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -14903,7 +14903,13 @@ new file mode 100644
 +				n[3] = *(const uint32_t *)(const void *)(r1 + (unsigned long long)cx1 * 4u);
 +				for (q = 0; q < 4u; q++) { if (got == n[q]) { hit = 1; break; } }
 +				if (hit) { correct++; }
-+				else if (got == 0u) { untouched++; }
++				else if (got == 0u) {
++					if (untouched < 6u) {
++						printf("mi8gpu: step 63 E1 HOLE at (%u,%u) neighbours %#x %#x %#x %#x%c",
++						    x, y, n[0], n[1], n[2], n[3], 10);
++					}
++					untouched++;
++				}
 +				else {
 +					other++;
 +				if (other == 1u) { first_bad_x = x; first_bad_y = y; first_bad_got = got; first_bad_want = want; }
