@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8952 @@
+@@ -0,0 +1,9026 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5341,6 +5341,73 @@ new file mode 100644
 +	printf("mi8gpu: step 57 GPUCC callbacks: read-only survey, nothing written%c", 10);
 +}
 +
++/*
++ * 5-c46 (E-0d): the memory semantics this whole night depended on and
++ * never checked. Four questions, one 4 KB page:
++ *
++ *   A  write via KVA, to_memory, read through an UNCACHED mapping
++ *      -> does to_memory really push the dirty line to DRAM?
++ *   B  write via KVA, NO flush, read through the uncached mapping
++ *      -> does the uncached read really bypass the CPU cache?
++ *      (it must return A's value here, not this new one)
++ *   C  from_memory, then read via KVA
++ *      -> does from_memory really pull DRAM back into the cache?
++ *   D  write via KVA, read via KVA immediately
++ *      -> sanity: a cached read sees its own write
++ *
++ * If A is false, every "already written" verdict tonight was the
++ * previous frame still sitting in DRAM. If B is false, the uncached
++ * window is not uncached and the 11 us was a cache hit.
++ */
++static void
++bl_mem_selftest(void)
++{
++	vm_offset_t page = 0;
++	register_t pa;
++	vm_offset_t dev;
++	volatile uint32_t *cached;
++	volatile uint32_t *uncached;
++
++	if (kmem_alloc(kernel_map, &page, 0x1000, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("mi8gpu: step 62 MEM: no page%c", 10);
++		return;
++	}
++	pa = (register_t)kvtophys(page);
++	dev = ml_io_map((addr64_t)pa, 0x1000);
++	if (dev == 0) {
++		printf("mi8gpu: step 62 MEM: ml_io_map failed for pa %#llx%c", (unsigned long long)pa, 10);
++		kmem_free(kernel_map, page, 0x1000);
++		return;
++	}
++	cached = (volatile uint32_t *)page;
++	uncached = (volatile uint32_t *)dev;
++
++	/* A: write, flush, read uncached -- to_memory must have reached DRAM. */
++	cached[0] = 0x11111111u;
++	to_memory(page, 0x1000);
++	printf("mi8gpu: step 62 MEM A flush-then-uncached: uncached sees %#x (want 0x11111111) %s%c",
++	    uncached[0], (uncached[0] == 0x11111111u) ? "OK" : "FAIL: to_memory did not reach DRAM", 10);
++
++	/* B: write without flushing -- the uncached read must still see A. */
++	cached[0] = 0x22222222u;
++	printf("mi8gpu: step 62 MEM B unflushed-uncached: uncached sees %#x (want 0x11111111) %s%c",
++	    uncached[0], (uncached[0] == 0x11111111u) ? "OK: uncached really bypasses" : "FAIL: the window is cached", 10);
++
++	/* C: invalidate, then the cached read must return DRAM (which is still A). */
++	from_memory(page, 0x1000);
++	printf("mi8gpu: step 62 MEM C invalidate-then-cached: cached sees %#x (want 0x11111111) %s%c",
++	    cached[0], (cached[0] == 0x11111111u) ? "OK: from_memory really invalidates" : "FAIL", 10);
++
++	/* D: sanity. */
++	cached[0] = 0x33333333u;
++	printf("mi8gpu: step 62 MEM D cached-readback: cached sees %#x (want 0x33333333) %s%c",
++	    cached[0], (cached[0] == 0x33333333u) ? "OK" : "FAIL", 10);
++
++	/* the probe leaks one ml_io_map page; that is cheaper than risking
++	 * an unmap this tree may not provide. */
++	kmem_free(kernel_map, page, 0x1000);
++}
 +static void
 +bl_wide_probe(void)
 +{
@@ -8747,6 +8814,13 @@ new file mode 100644
 +
 +				if (PE_parse_boot_argn("mi8gpu_gpuwide", &wide, sizeof(wide)) && wide) {
 +					bl_wide_probe();
++				}
++				{
++					unsigned int mc = 0;
++
++					if (PE_parse_boot_argn("mi8gpu_memtest", &mc, sizeof(mc)) && mc) {
++						bl_mem_selftest();
++					}
 +				}
 +				{
 +					unsigned int gc = 0;
