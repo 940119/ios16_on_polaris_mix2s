@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9150 @@
+@@ -0,0 +1,9163 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5337,6 +5337,19 @@ new file mode 100644
 + * contiguous allocation may block, and present() is not an obviously
 + * safe place for that. Same lesson as the 278 KB scratch.
 + */
++/* 5-c48: the bridge is C++ and these are static in this file. */
++void
++mi8_gpu_sleep_us(unsigned int us)
++{
++	sleep_us((uint32_t)us);
++}
++
++void
++mi8_gpu_from_memory(unsigned long long start, unsigned long long size)
++{
++	from_memory((vm_offset_t)start, (vm_size_t)size);
++}
++
 +int
 +mi8_gpu_padded_prepare(void)
 +{
@@ -14364,7 +14377,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1031 @@
+@@ -0,0 +1,1033 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -14538,6 +14551,8 @@ new file mode 100644
 + */
 +extern "C" int printf(const char *, ...);
 +extern "C" void mi8_gpu_to_memory(void *start, unsigned long long size);
++extern "C" void mi8_gpu_sleep_us(unsigned int us);
++extern "C" void mi8_gpu_from_memory(unsigned long long start, unsigned long long size);
 +extern "C" int mi8_gpu_padded_prepare(void);
 +extern "C" unsigned long long mi8_gpu_padded_kva(void);
 +extern "C" int mi8_gpu_blit_to_padded(const unsigned long long *pas4k,
@@ -14852,8 +14867,8 @@ new file mode 100644
 +	if (rc != 0) { s->release(); return rc; }
 +
 +	/* 5 ms is ~50x the bound measured in step 60; correctness, not timing. */
-+	sleep_us(5000);
-+	from_memory((vm_offset_t)pad, 9400320);
++	mi8_gpu_sleep_us(5000u);
++	mi8_gpu_from_memory(pad, 9400320ull);
 +	padp = (const unsigned char *)(const void *)pad;
 +
 +	for (y = 0; y < 2160u; y += 68u) {
