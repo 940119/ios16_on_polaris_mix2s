@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8745 @@
+@@ -0,0 +1,8761 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5507,11 +5507,27 @@ new file mode 100644
 +			const uint64_t last_pa = (uint64_t)kvtophys(dst + (vm_offset_t)last_off) & ~0xfffull;
 +			const uint32_t in_page = (uint32_t)(last_off & 0xfffull);
 +
-+			for (k = 0; k < 4000000u; k++) {
-+				if ((uint32_t)ml_phys_read_word(last_pa + in_page) != 0xcdcdcdcdu) {
++			uint32_t iters = 0;
++			uint32_t lastval = 0;
++			uint64_t cal0, cal1;
++
++			/* Empty-loop calibration: how long does ONE poll iteration cost? */
++			cal0 = mach_absolute_time();
++			for (iters = 0; iters < 100000u; iters++) {
++				(void)ml_phys_read_word(last_pa + in_page);
++			}
++			cal1 = mach_absolute_time();
++			printf("mi8gpu: step 56 CAL: 1e5 polls in %llu us (%llu ns each)%c",
++				(cal1 - cal0) / 1000ull, (cal1 - cal0) / 100ull, 10);
++
++			for (iters = 0; iters < 4000000u; iters++) {
++				lastval = (uint32_t)ml_phys_read_word(last_pa + in_page);
++				if (lastval != 0xcdcdcdcdu) {
 +					break;
 +				}
 +			}
++			printf("mi8gpu: step 56 LASTPIX: %u iterations, value %#x, %s%c",
++				iters, lastval, (iters >= 4000000u) ? "TIMED OUT" : "written", 10);
 +		}
 +		t1 = mach_absolute_time();
 +		for (i = 0; i < 40000; i++) {
