@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8396 @@
+@@ -0,0 +1,8475 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5280,6 +5280,78 @@ new file mode 100644
 +	return -1;
 +}
 +
++/*
++ * 5-c28 (D-3b, driver-thread version): the padded destination.
++ *
++ * Running this from present() crashed the kernel twice before it could
++ * print anything (x0 = 0, x1/x23 a masked page-table address), so the
++ * probe now runs from the A2D-prime point instead: same question, known-
++ * safe context, and the display path is not involved at all.
++ *
++ * Source is the driver-owned surface (256 x 128 at pitch 1024); the
++ * destination is 1080 x 64 at stride 4352, because the panel's own 4320
++ * cannot be expressed by RB_A2D_DEST_BUFFER_PITCH. The eight padding
++ * columns per row must stay sentinel.
++ */
++static void
++bl_wide_probe(void)
++{
++	const uint32_t sw = 200u, sh = 48u, dw = 1080u, dh = 64u;
++	const uint32_t spitch = 1024u;
++	unsigned long long pas[40];
++	unsigned int bprow = 0, sid, i, x, y, dpitch = 0, drained = 0;
++	uint32_t decoded = 0, floor_ok = 0, half_ok = 0, other = 0, guard = 0, rc;
++	volatile uint32_t *src_cpu = (volatile uint32_t *)g3d_regions[G3D_R_SURF].memory;
++	volatile uint32_t *dst_cpu = 0;
++	unsigned long long skva = 0;
++	int np;
++
++	sid = mi8_surface_bridge_last_id();
++	np = mi8_surface_bridge_pages(sid, pas, 40, &bprow);
++	if (np < 8) {
++		printf("mi8gpu: step 55 WIDE: only %d pages from surface %u%c", np, sid, 10);
++		return;
++	}
++	/* Known source window: PAT(x,y) = 0x5a000000 | (y << 12) | x. */
++	for (y = 0; y < sh; y++) {
++		for (x = 0; x < sw; x++) {
++			src_cpu[y * (spitch / 4u) + x] = 0x5a000000u | (y << 12) | x;
++		}
++	}
++	to_memory((vm_offset_t)src_cpu, 0x20000);
++
++	rc = mi8_gpu_blit_surface_pages(pas, np, bprow, 0u, 0u, sw, sh, dw, dh,
++	    &skva, &dpitch, &drained);
++	printf("mi8gpu: step 55 WIDE rc %u drained %u pitch %u%c", rc, drained, dpitch, 10);
++	if (rc != 0) {
++		return;
++	}
++	dst_cpu = (volatile uint32_t *)skva;
++	for (y = 0; y < dh; y++) {
++		for (x = 0; x < dw; x++) {
++			uint32_t v = dst_cpu[y * (dpitch / 4u) + x];
++			unsigned int ox, oy;
++
++			if ((v >> 24) != 0x5au) { other++; continue; }
++			ox = v & 0xfffu;
++			oy = (v >> 12) & 0xfffu;
++			decoded++;
++			if (ox == (x * sw) / dw && oy == (y * sh) / dh) { floor_ok++; }
++			else if (ox == ((2u * x + 1u) * sw) / (2u * dw) && oy == ((2u * y + 1u) * sh) / (2u * dh)) { half_ok++; }
++			else { other++; }
++		}
++		for (x = dw; x < dw + 8u; x++) {
++			if (dst_cpu[y * (dpitch / 4u) + x] == 0xcdcdcdcdu) { guard++; }
++		}
++	}
++	printf("mi8gpu: step 55 WIDE decoded %u floor %u half %u other %u guard %u want %u%c",
++	    decoded, floor_ok, half_ok, other, guard, dw * dh, 10);
++	printf("mi8gpu: step 55 WIDE %s%c",
++	    (decoded == dw * dh && other == 0u && guard == 8u * dh && drained == 1u)
++	        ? "THE PADDED 4352-STRIDE DESTINATION WORKS"
++	        : "the padded destination did NOT behave as expected", 10);
++}
++
 +static void
 +bl_readback(void)
 +{
@@ -8206,6 +8278,13 @@ new file mode 100644
 +			bl_readback();
 +			if (mi8_gpu_blit_scratch_prepare() != 0) {
 +				printf("mi8gpu: step 54 SCRATCH: allocation failed%c", 10);
++			}
++			{
++				unsigned int wide = 0;
++
++				if (PE_parse_boot_argn("mi8gpu_gpuwide", &wide, sizeof(wide)) && wide) {
++					bl_wide_probe();
++				}
 +			}
 +			printf("mi8gpu: step 52 A2DPRIME done, snapshot_valid %u%c",
 +			    bl_snapshot_valid, 10);
@@ -17394,7 +17473,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockUnlock(fLock);
  	++sweet_fb_swap_count;
  	/*
-@@ -971,6 +994,96 @@
+@@ -971,6 +994,72 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
@@ -17450,30 +17529,6 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			}
 +		}
 +		/*
-+		 * 5-c26 (D-3b): the padded destination. 750x48 -> 1080x64 into a
-+		 * buffer whose stride is 4352 (68 * 64), because the panel's own 4320
-+		 * cannot be expressed by RB_A2D_DEST_BUFFER_PITCH. Checks the eight
-+		 * padding columns per row stay untouched.
-+		 */
-+		{
-+			static bool wide_done;
-+			uint32_t wide = 0;
-+
-+			if (!wide_done && PE_parse_boot_argn("mi8gpu_gpuwide", &wide,
-+			    sizeof(wide)) && wide != 0) {
-+				unsigned long long c[8];
-+				int wrc;
-+
-+				wrc = mi8_surface_bridge_wide_test(s->id, (unsigned)sx,
-+				    (unsigned)sy, c);
-+				if (wrc != -7) {
-+					wide_done = true;
-+					printf("mi8gpu: step 54 GPUWIDE rc %d decoded %llu floor %llu half %llu other %llu guard %llu drained %llu\n",
-+					    wrc, c[0], c[1], c[2], c[3], c[4], c[5]);
-+				}
-+			}
-+		}
-+		/*
 +		 * 5-c17: the row width the A2D source-pitch register would have to
 +		 * express. Printed once, gated by a boot-arg. No display change.
 +		 */
@@ -17491,7 +17546,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1251,7 +1364,7 @@
+@@ -1251,7 +1340,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -17500,7 +17555,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1380,7 @@
+@@ -1267,7 +1356,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -17509,7 +17564,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1396,7 @@
+@@ -1283,7 +1372,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -17518,7 +17573,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1305,6 +1418,23 @@
+@@ -1305,6 +1394,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -17542,7 +17597,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1583,51 @@
+@@ -1453,7 +1559,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
