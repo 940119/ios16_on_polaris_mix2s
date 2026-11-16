@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8475 @@
+@@ -0,0 +1,8481 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5138,7 +5138,8 @@ new file mode 100644
 +int
 +mi8_gpu_blit_surface_pages(const unsigned long long *pas4k, unsigned int npages,
 +    unsigned int src_pitch, unsigned int sx, unsigned int sy,
-+    unsigned int w, unsigned int h, unsigned long long *scratch_kva,
++    unsigned int w, unsigned int h, unsigned int dw, unsigned int dh,
++    unsigned long long *scratch_kva,
 +    unsigned int *scratch_pitch, unsigned int *drained)
 +{
 +	static vm_offset_t g_blit_scratch;
@@ -5152,6 +5153,9 @@ new file mode 100644
 +		return -2;
 +	}
 +	if (w == 0 || h == 0 || w > MI8_BLIT_MAXW || h > MI8_BLIT_MAXH) {
++		return -2;
++	}
++	if (dw == 0 || dh == 0 || dw > MI8_BLIT_MAXW || dh > MI8_BLIT_MAXH) {
 +		return -2;
 +	}
 +	if (!mi8_gpu_blit_ready()) {
@@ -5212,8 +5216,10 @@ new file mode 100644
 +	src_addr = MI8_BLIT_SRC_VA + (uint64_t)(sy * src_pitch + sx * 4u)
 +	    - (uint64_t)first * 0x1000ull;
 +	ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
++	/* 5-c29: dw/dh are the DESTINATION size; passing w,h for both made
++	 * every call a 1:1 copy (that is what the first scale test measured). */
 +	nseq = mi8_blit_emit(seq, src_addr, MI8_BLIT_DST_VA, w, h, src_pitch,
-+	    w, h, MI8_BLIT_PITCH, 0u, 0u,
++	    dw, dh, MI8_BLIT_PITCH, 0u, 0u,
 +	    g3d_regions[2].address + BS_CLOCK_OFF,
 +	    g3d_regions[2].address + BL_RB_OFF,
 +	    g3d_regions[2].address + B79_EV_OFF,
