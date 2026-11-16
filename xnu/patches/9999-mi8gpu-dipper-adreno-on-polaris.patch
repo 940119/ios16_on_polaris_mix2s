@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8734 @@
+@@ -0,0 +1,8745 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5497,9 +5497,20 @@ new file mode 100644
 +		 * 47 us for a whole frame, which is impossible. Wait on the GPU's own
 +		 * fence write instead -- that is real completion.
 +		 */
-+		for (k = 0; k < 4000000u; k++) {
-+			if ((uint32_t)ml_phys_read_word(fence_pa) != f0) {
-+				break;
++		/*
++		 * 5-c37: the fence turned out to be the slow part, not the blit -- B89
++		 * reads correct pixels 1000 us after the drain. Poll the LAST destination
++		 * pixel instead: that is the moment the write actually finished.
++		 */
++		{
++			const uint64_t last_off = (uint64_t)(FF_DH - 1u) * FF_DPITCH + (FF_DW - 1u) * 4u;
++			const uint64_t last_pa = (uint64_t)kvtophys(dst + (vm_offset_t)last_off) & ~0xfffull;
++			const uint32_t in_page = (uint32_t)(last_off & 0xfffull);
++
++			for (k = 0; k < 4000000u; k++) {
++				if ((uint32_t)ml_phys_read_word(last_pa + in_page) != 0xcdcdcdcdu) {
++					break;
++				}
 +			}
 +		}
 +		t1 = mach_absolute_time();
@@ -5517,7 +5528,7 @@ new file mode 100644
 +	    rd(smmu_cb(G3D_CTX) + CB_FSR), 10);
 +	sleep_us(2000);
 +	/* xnu's timebase on this SoC is 1 ns per tick, so /1000 is microseconds. */
-+	printf("mi8gpu: step 56 FULL timing: map %llu us, blit (fence) %llu us%c",
++	printf("mi8gpu: step 56 FULL timing: map %llu us, blit (dst pixel) %llu us%c",
 +	    tmap / 1000ull, (t1 - t0) / 1000ull, 10);
 +	/*
 +	 * 5-c36 (E-0): the same source into 1080 x 64. If this also takes ~95 ms
