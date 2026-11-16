@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8927 @@
+@@ -0,0 +1,8952 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5722,6 +5722,31 @@ new file mode 100644
 +		    k, (p1 - p0) / 1000ull, m, hits ? "written" : "TIMED OUT", v, 10);
 +	}
 +
++	/*
++	 * 5-c45 FIRST, before any timing: can this code write sentinel and read
++	 * it back? Every measurement tonight assumed yes. If the flush does not
++	 * land in DRAM the buffer still holds the PREVIOUS frame, and every
++	 * "already written" answer is that stale frame, not this submission.
++	 */
++	{
++		uint32_t probe_ok = 0, probe_seen = 0, py;
++
++		for (y = 0; y < FF_DH; y++) {
++			for (x = 0; x < FF_DW; x++) {
++				dcpu[y * (FF_DPITCH / 4u) + x] = 0xcdcdcdcdu;
++			}
++		}
++		to_memory(dst, dbytes);
++		from_memory(dst, dbytes);
++		for (py = 0; py < FF_DH; py += 34u) {
++			probe_seen++;
++			if (dcpu[py * (FF_DPITCH / 4u) + (FF_DW - 1u)] == 0xcdcdcdcdu) {
++				probe_ok++;
++			}
++		}
++		printf("mi8gpu: step 61 FILLCHECK %u of %u rows read back as sentinel after a round trip%c",
++		    probe_ok, probe_seen, 10);
++	}
 +	/*
 +	 * 5-c44 (E-0c): delay sweep -- the cache-proof way to bound the blit.
 +	 * For each delay: sentinel the frame, submit ONE blit, sleep exactly that
