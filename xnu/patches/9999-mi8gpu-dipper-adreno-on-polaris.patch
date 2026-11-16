@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8671 @@
+@@ -0,0 +1,8679 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5406,6 +5406,7 @@ new file mode 100644
 +static void
 +bl_fullframe_probe(void)
 +{
++	uint64_t t0 = 0, t1 = 0, tmap = 0;
 +	const uint32_t sbytes = FF_SPITCH * FF_SH;
 +	const uint32_t dbytes = FF_DPITCH * FF_DH;
 +	const uint32_t spages = (sbytes + 0xfffu) >> 12;
@@ -5432,6 +5433,7 @@ new file mode 100644
 +	scpu = (volatile uint32_t *)src;
 +	dcpu = (volatile uint32_t *)dst;
 +
++	t0 = mach_absolute_time();
 +	for (i = 0; i < spages; i++) {
 +		if (keep_map(FF_SRC_VA + (unsigned long long)i * 0x1000ull,
 +		    (unsigned long long)kvtophys(src + (vm_offset_t)(i << 12)), 0)) {
@@ -5445,6 +5447,7 @@ new file mode 100644
 +		}
 +	}
 +	keep_tlb();
++	tmap = mach_absolute_time() - t0;
 +	printf("mi8gpu: step 56 FULL mapped %u of %u%c", mapped, spages + dpages, 10);
 +	if (mapped != spages + dpages) {
 +		goto out;
@@ -5462,6 +5465,7 @@ new file mode 100644
 +	}
 +	to_memory(dst, dbytes);
 +	printf("mi8gpu: step 56 FULL filled, submitting%c", 10);
++	t0 = mach_absolute_time();
 +
 +	ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
 +	nseq = mi8_blit_emit(seq, FF_SRC_VA, FF_DST_VA, FF_SW, FF_SH, FF_SPITCH,
@@ -5493,6 +5497,10 @@ new file mode 100644
 +	printf("mi8gpu: step 56 FULL drained %u, FSR %#x%c", drained,
 +	    rd(smmu_cb(G3D_CTX) + CB_FSR), 10);
 +	sleep_us(2000);
++	t1 = mach_absolute_time();
++	/* xnu's timebase on this SoC is 1 ns per tick, so /1000 is microseconds. */
++	printf("mi8gpu: step 56 FULL timing: map %llu us, submit+drain %llu us%c",
++	    tmap / 1000ull, (t1 - t0) / 1000ull, 10);
 +	from_memory(dst, dbytes);
 +
 +	for (y = 0; y < FF_DH; y++) {
