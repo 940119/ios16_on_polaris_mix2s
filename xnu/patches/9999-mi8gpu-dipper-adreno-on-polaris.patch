@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8761 @@
+@@ -0,0 +1,8811 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5613,6 +5613,56 @@ new file mode 100644
 +	}
 +	printf("mi8gpu: step 56 FULL correct %u untouched %u wrong %u guard %u want %u/%u%c",
 +	    correct, untouched, wrong, guard, FF_DW * FF_DH, 8u * FF_DH, 10);
++	/*
++	 * 5-c39: is the >95 ms a wake-up that amortises, or a per-submission cost?
++	 * Re-sentinel rows 0..255, then submit four blits back to back, each into
++	 * its own 64-row band, timing each on its own last pixel. The first one
++	 * pays any wake-up; the rest are steady state.
++	 */
++	for (y = 0; y < 256u; y++) {
++		for (x = 0; x < FF_DW; x++) {
++			dcpu[y * (FF_DPITCH / 4u) + x] = 0xcdcdcdcdu;
++		}
++	}
++	to_memory(dst, (vm_offset_t)256u * FF_DPITCH);
++	for (k = 0; k < 4u; k++) {
++		const uint32_t band = k * 64u;
++		const uint64_t boff = (uint64_t)(band + 63u) * FF_DPITCH + (FF_DW - 1u) * 4u;
++		const uint64_t bpa = (uint64_t)kvtophys(dst + (vm_offset_t)boff) & ~0xfffull;
++		const uint32_t binp = (uint32_t)(boff & 0xfffull);
++		uint64_t p0, p1;
++		uint32_t m, hits = 0;
++		uint32_t v = 0xcdcdcdcdu;
++
++		p0 = mach_absolute_time();
++		ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
++		nseq = mi8_blit_emit(seq, FF_SRC_VA, FF_DST_VA, FF_SW, FF_SH, FF_SPITCH,
++		    FF_DW, 64u, FF_DPITCH, 0u, band,
++		    g3d_regions[2].address + BS_CLOCK_OFF,
++		    g3d_regions[2].address + BL_RB_OFF,
++		    g3d_regions[2].address + B79_EV_OFF,
++		    g3d_regions[2].address + BS_FENCE_OFF,
++		    g3d_regions[2].address + BS_MARK_OFF);
++		for (i = 0; i < nseq; i++) {
++			ring[ring_w++ & 8191u] = seq[i];
++		}
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, ring_w & 8191u);
++		cp_wptr = ring_w & 8191u;
++		keep_ring_at = cp_wptr;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (m = 0; m < 4000000u; m++) {
++			v = (uint32_t)ml_phys_read_word(bpa + binp);
++			if (v != 0xcdcdcdcdu) {
++				hits = 1;
++				break;
++			}
++		}
++		p1 = mach_absolute_time();
++		printf("mi8gpu: step 56 BURST %u: %llu us, %u iters, %s, val %#x%c",
++		    k, (p1 - p0) / 1000ull, m, hits ? "written" : "TIMED OUT", v, 10);
++	}
++
 +	printf("mi8gpu: step 56 FULL %s%c",
 +	    (correct == FF_DW * FF_DH && wrong == 0u && untouched == 0u
 +	        && guard == 8u * FF_DH && drained == 1u)
