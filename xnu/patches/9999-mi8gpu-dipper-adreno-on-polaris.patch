@@ -14377,7 +14377,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1033 @@
+@@ -0,0 +1,1053 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -14878,14 +14878,34 @@ new file mode 100644
 +		for (x = 0; x < 1080u; x += 68u) {
 +			uint32_t got = *(const uint32_t *)(const void *)(prow + (unsigned long long)x * 4u);
 +			uint32_t want = *(const uint32_t *)(const void *)(srow + (unsigned long long)((x * s->width) / 1080u) * 4u);
-+			uint32_t want2 = *(const uint32_t *)(const void *)(srow +
-+			    (unsigned long long)(((2u * x + 1u) * s->width) / (2u * 1080u)) * 4u);
 +
 +			sampled++;
-+			if (got == want || got == want2) { correct++; }
-+			else if (got == 0xcdcdcdcdu) { untouched++; }
-+			else {
-+				other++;
++			/*
++			 * Four-neighbour tolerance. Real content is high frequency, so a
++			 * one-pixel sampling difference shows up as a completely different
++			 * colour -- D-3c hid that because its PAT encoding stayed decodable.
++			 * If the GPU sampled any of the four neighbouring source pixels, the
++			 * geometry is right and the difference is only the rounding rule.
++			 */
++			{
++				unsigned int cx0 = (x * s->width) / 1080u;
++				unsigned int cx1 = ((2u * x + 1u) * s->width) / (2u * 1080u);
++				unsigned int cy0 = (y * s->height) / 2160u;
++				unsigned int cy1 = ((2u * y + 1u) * s->height) / (2u * 2160u);
++				uint32_t n[4];
++				unsigned int q, hit = 0;
++				const unsigned char *r0 = kva + (unsigned long long)cy0 * s->bytesPerRow;
++				const unsigned char *r1 = kva + (unsigned long long)cy1 * s->bytesPerRow;
++				
++				n[0] = *(const uint32_t *)(const void *)(r0 + (unsigned long long)cx0 * 4u);
++				n[1] = *(const uint32_t *)(const void *)(r0 + (unsigned long long)cx1 * 4u);
++				n[2] = *(const uint32_t *)(const void *)(r1 + (unsigned long long)cx0 * 4u);
++				n[3] = *(const uint32_t *)(const void *)(r1 + (unsigned long long)cx1 * 4u);
++				for (q = 0; q < 4u; q++) { if (got == n[q]) { hit = 1; break; } }
++				if (hit) { correct++; }
++				else if (got == 0u) { untouched++; }
++				else {
++					other++;
 +				if (other == 1u) { first_bad_x = x; first_bad_y = y; first_bad_got = got; first_bad_want = want; }
 +			}
 +		}
