@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8377 @@
+@@ -0,0 +1,8396 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5111,16 +5111,39 @@ new file mode 100644
 +#define MI8_BLIT_MAXW	1088u
 +#define MI8_BLIT_MAXH	64u
 +
++static vm_offset_t g_blit_scratch;
++static uint64_t g_blit_scratch_pa;
++static uint32_t g_blit_scratch_pages;
++
++/* 5-c27: allocate the 4352 x 64 scratch from the driver thread. A
++ * 278 KB contiguous allocation may block, and present() is not an
++ * obviously safe place to do that. */
++int
++mi8_gpu_blit_scratch_prepare(void)
++{
++	if (g_blit_scratch != 0) {
++		return 0;
++	}
++	if (kmem_alloc_contig(kernel_map, &g_blit_scratch, 0x44000,
++	    PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		g_blit_scratch = 0;
++		return -1;
++	}
++	g_blit_scratch_pa = (uint64_t)kvtophys(g_blit_scratch);
++	g_blit_scratch_pages = 0x44000u / 0x1000u;
++	return 0;
++}
++
 +int
 +mi8_gpu_blit_surface_pages(const unsigned long long *pas4k, unsigned int npages,
 +    unsigned int src_pitch, unsigned int sx, unsigned int sy,
-+    unsigned int w, unsigned int h, unsigned int dw, unsigned int dh,
-+    unsigned long long *scratch_kva,
++    unsigned int w, unsigned int h, unsigned long long *scratch_kva,
 +    unsigned int *scratch_pitch, unsigned int *drained)
 +{
-+	static vm_offset_t scratch;
-+	static uint64_t scratch_pa;
-+	static uint32_t scratch_pages;
++	static vm_offset_t g_blit_scratch;
++	static uint64_t g_blit_scratch_pa;
++	static uint32_t g_blit_scratch_pages;
 +	uint32_t seq[128], nseq, ring_w, i, k, first, last, mapped = 0, drained_now = 0;
 +	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
 +	uint64_t src_addr;
@@ -5129,9 +5152,6 @@ new file mode 100644
 +		return -2;
 +	}
 +	if (w == 0 || h == 0 || w > MI8_BLIT_MAXW || h > MI8_BLIT_MAXH) {
-+		return -2;
-+	}
-+	if (dw == 0 || dh == 0 || dw > MI8_BLIT_MAXW || dh > MI8_BLIT_MAXH) {
 +		return -2;
 +	}
 +	if (!mi8_gpu_blit_ready()) {
@@ -5153,14 +5173,8 @@ new file mode 100644
 +		/* RB_A2D_SRC_PITCH is PITCH[23:9] with shr=6: not expressible. */
 +		return -5;
 +	}
-+	if (scratch == 0) {
-+		if (kmem_alloc_contig(kernel_map, &scratch, 0x10000, PAGE_MASK, 0, 0,
-+		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-+			scratch = 0;
-+			return -2;
-+		}
-+		scratch_pa = (uint64_t)kvtophys(scratch);
-+		scratch_pages = 0x44000u / 0x1000u;
++	if (mi8_gpu_blit_scratch_prepare() != 0) {
++		return -2;
 +	}
 +
 +	/* The rows this rect touches, as 4 KB pages of the surface. */
@@ -5175,31 +5189,31 @@ new file mode 100644
 +			mapped++;
 +		}
 +	}
-+	for (k = 0; k < scratch_pages; k++) {
++	for (k = 0; k < g_blit_scratch_pages; k++) {
 +		if (keep_map(MI8_BLIT_DST_VA + (uint64_t)k * 0x1000ull,
-+		    scratch_pa + (uint64_t)k * 0x1000ull, 0)) {
++		    g_blit_scratch_pa + (uint64_t)k * 0x1000ull, 0)) {
 +			mapped++;
 +		}
 +	}
 +	keep_tlb();
-+	if (mapped != (last - first + 1u) + scratch_pages) {
++	if (mapped != (last - first + 1u) + g_blit_scratch_pages) {
 +		goto fail;
 +	}
++	printf("mi8gpu: step 54 A mapped %u (src %u..%u, dst %u)%c",
++	    mapped, first, last, g_blit_scratch_pages, 10);
 +
 +	/* Sentinel first, so "never written" is distinguishable from "wrong". */
 +	for (i = 0; i < 0x44000u / 4u; i++) {
-+		((volatile uint32_t *)scratch)[i] = 0xcdcdcdcdu;
++		((volatile uint32_t *)g_blit_scratch)[i] = 0xcdcdcdcdu;
 +	}
-+	to_memory(scratch, 0x44000);
++	to_memory(g_blit_scratch, 0x44000);
++	printf("mi8gpu: step 54 B sentinel filled%c", 10);
 +
 +	src_addr = MI8_BLIT_SRC_VA + (uint64_t)(sy * src_pitch + sx * 4u)
 +	    - (uint64_t)first * 0x1000ull;
 +	ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
-+	/* 5-c25: the destination size is its own parameter. Passing w,h for
-+	 * both made every call a 1:1 copy -- which is what the first scale
-+	 * test measured (decoded == sw*sh exactly) before this was fixed. */
 +	nseq = mi8_blit_emit(seq, src_addr, MI8_BLIT_DST_VA, w, h, src_pitch,
-+	    dw, dh, MI8_BLIT_PITCH, 0u, 0u,
++	    w, h, MI8_BLIT_PITCH, 0u, 0u,
 +	    g3d_regions[2].address + BS_CLOCK_OFF,
 +	    g3d_regions[2].address + BL_RB_OFF,
 +	    g3d_regions[2].address + B79_EV_OFF,
@@ -5227,18 +5241,20 @@ new file mode 100644
 +		keep_ring_at = target_wptr;
 +		drained_now = (rd(gpu3d + 4 * 0x0806) == target_wptr) ? 1u : 0u;
 +	}
++	printf("mi8gpu: step 54 C submitted, drained %u%c", drained_now, 10);
 +	sleep_us(500);
-+	from_memory(scratch, 0x44000);
++	from_memory(g_blit_scratch, 0x44000);
++	printf("mi8gpu: step 54 D read back%c", 10);
 +
 +	for (k = first; k <= last; k++) {
 +		keep_map(MI8_BLIT_SRC_VA + (uint64_t)(k - first) * 0x1000ull, 0, 0);
 +	}
-+	for (k = 0; k < scratch_pages; k++) {
++	for (k = 0; k < g_blit_scratch_pages; k++) {
 +		keep_map(MI8_BLIT_DST_VA + (uint64_t)k * 0x1000ull, 0, 0);
 +	}
 +	keep_tlb();
 +
-+	*scratch_kva = (unsigned long long)scratch;
++	*scratch_kva = (unsigned long long)g_blit_scratch;
 +	*scratch_pitch = MI8_BLIT_PITCH;
 +	*drained = drained_now;
 +	return drained_now ? 0 : -4;
@@ -5247,7 +5263,7 @@ new file mode 100644
 +	for (k = first; k <= last; k++) {
 +		keep_map(MI8_BLIT_SRC_VA + (uint64_t)(k - first) * 0x1000ull, 0, 0);
 +	}
-+	for (k = 0; k < scratch_pages; k++) {
++	for (k = 0; k < g_blit_scratch_pages; k++) {
 +		keep_map(MI8_BLIT_DST_VA + (uint64_t)k * 0x1000ull, 0, 0);
 +	}
 +	keep_tlb();
@@ -5257,7 +5273,7 @@ new file mode 100644
 +	for (k = first; k <= last; k++) {
 +		keep_map(MI8_BLIT_SRC_VA + (uint64_t)(k - first) * 0x1000ull, 0, 0);
 +	}
-+	for (k = 0; k < scratch_pages; k++) {
++	for (k = 0; k < g_blit_scratch_pages; k++) {
 +		keep_map(MI8_BLIT_DST_VA + (uint64_t)k * 0x1000ull, 0, 0);
 +	}
 +	keep_tlb();
@@ -8188,6 +8204,9 @@ new file mode 100644
 +			    cp_wptr, 10);
 +			bl_probe();
 +			bl_readback();
++			if (mi8_gpu_blit_scratch_prepare() != 0) {
++				printf("mi8gpu: step 54 SCRATCH: allocation failed%c", 10);
++			}
 +			printf("mi8gpu: step 52 A2DPRIME done, snapshot_valid %u%c",
 +			    bl_snapshot_valid, 10);
 +		}
@@ -13587,7 +13606,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,931 @@
+@@ -0,0 +1,935 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -13759,6 +13778,7 @@ new file mode 100644
 + * pages and compare it against the same rect read on the CPU. Read-only with
 + * respect to the display: the destination is a private scratch buffer.
 + */
++extern "C" int printf(const char *, ...);
 +extern "C" void mi8_gpu_to_memory(void *start, unsigned long long size);
 +extern "C" int mi8_gpu_blit_ready(void);
 +extern "C" int mi8_gpu_blit_surface_pages(const unsigned long long *pas4k,
@@ -13955,6 +13975,7 @@ new file mode 100644
 +		if (s != nullptr) { s->release(); }
 +		return -2;
 +	}
++	printf("mi8gpu: step 54 W entry id %u %ux%u bpr %u%c", id, s->width, s->height, s->bytesPerRow, 10);
 +	for (x = 0; x < 7u; x++) { out[x] = 0; }
 +	if (s->memory == nullptr || (s->bytesPerRow % 64u) != 0) { s->release(); return -5; }
 +	if (sx + sw > s->width || sy + sh > s->height) { s->release(); return -1; }
@@ -13976,6 +13997,8 @@ new file mode 100644
 +	    (unsigned long long)sh * s->bytesPerRow);
 +	rc = mi8_gpu_blit_surface_pages(cmp_pages, n, s->bytesPerRow, sx, sy,
 +	    sw, sh, dw, dh, &scratch, &spitch, &drained);
++	printf("mi8gpu: step 54 X %u pages, blitting %u x %u -> %u x %u%c",
++	    n, sw, sh, dw, dh, 10);
 +	out[5] = drained;
 +	out[6] = (unsigned long long)(unsigned int)rc;
 +	if (rc == 0) {
