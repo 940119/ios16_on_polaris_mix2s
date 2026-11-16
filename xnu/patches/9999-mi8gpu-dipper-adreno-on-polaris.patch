@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8500 @@
+@@ -0,0 +1,8502 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5142,9 +5142,6 @@ new file mode 100644
 +    unsigned long long *scratch_kva,
 +    unsigned int *scratch_pitch, unsigned int *drained)
 +{
-+	static vm_offset_t g_blit_scratch;
-+	static uint64_t g_blit_scratch_pa;
-+	static uint32_t g_blit_scratch_pages;
 +	uint32_t seq[128], nseq, ring_w, i, k, first, last, mapped = 0, drained_now = 0;
 +	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
 +	uint64_t src_addr;
@@ -5178,6 +5175,11 @@ new file mode 100644
 +		return -5;
 +	}
 +	if (mi8_gpu_blit_scratch_prepare() != 0) {
++		return -2;
++	}
++	/* 5-c31: belt and braces. A shadowed declaration once made this NULL
++	 * while the check above had already passed (panic, 0448). */
++	if (g_blit_scratch == 0 || g_blit_scratch_pages == 0) {
 +		return -2;
 +	}
 +
