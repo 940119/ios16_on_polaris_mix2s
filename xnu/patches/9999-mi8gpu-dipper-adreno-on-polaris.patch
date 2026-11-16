@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9026 @@
+@@ -0,0 +1,9150 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5321,6 +5321,119 @@ new file mode 100644
 +#define GPUCC_GMU_RCG_CMD       0x1120u
 +#define GPUCC_GMU_RCG_CFG       0x1124u
 +
++/* ---- E-1: the padded frame buffer ------------------------------------ */
++#define MI8_PAD_VA      0x38000000ull
++#define MI8_PAD_W       1080u
++#define MI8_PAD_H       2160u
++#define MI8_PAD_PITCH   4352u
++#define MI8_PAD_BYTES   (MI8_PAD_PITCH * MI8_PAD_H)
++#define MI8_PAD_PAGES   ((MI8_PAD_BYTES + 0xfffu) / 0x1000u)
++
++static vm_offset_t pad_buf;
++static uint32_t pad_pages;
++
++/*
++ * Allocated from the driver thread, never from present(): a 9 MB
++ * contiguous allocation may block, and present() is not an obviously
++ * safe place for that. Same lesson as the 278 KB scratch.
++ */
++int
++mi8_gpu_padded_prepare(void)
++{
++	uint32_t k;
++
++	if (pad_buf != 0) {
++		return 0;
++	}
++	if (kmem_alloc_contig(kernel_map, &pad_buf, MI8_PAD_BYTES, PAGE_MASK, 0, 0,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		pad_buf = 0;
++		printf("mi8gpu: step 63 E1: no memory for the padded frame%c", 10);
++		return -1;
++	}
++	pad_pages = MI8_PAD_PAGES;
++	for (k = 0; k < pad_pages; k++) {
++		if (!keep_map(MI8_PAD_VA + (uint64_t)k * 0x1000ull,
++		    (uint64_t)kvtophys(pad_buf + (vm_offset_t)(k << 12)), 0)) {
++			printf("mi8gpu: step 63 E1: map failed at page %u of %u%c", k, pad_pages, 10);
++			pad_buf = 0;
++			return -2;
++		}
++	}
++	keep_tlb();
++	printf("mi8gpu: step 63 E1 padded: %u x %u at stride %u, %u bytes, %u pages mapped%c",
++	    MI8_PAD_W, MI8_PAD_H, MI8_PAD_PITCH, MI8_PAD_BYTES, pad_pages, 10);
++	return 0;
++}
++
++unsigned long long
++mi8_gpu_padded_kva(void)
++{
++	return (unsigned long long)pad_buf;
++}
++
++/*
++ * Submit one blit from a surface (given as 4 KB pages) into the padded
++ * frame. Returns as soon as the ring is written; the caller must wait
++ * for completion the only way that has proven trustworthy tonight --
++ * a sleep long enough to be irrelevant, then from_memory before reading.
++ */
++int
++mi8_gpu_blit_to_padded(const unsigned long long *pas4k, unsigned int npages,
++    unsigned int src_pitch, unsigned int sx, unsigned int sy,
++    unsigned int sw, unsigned int sh)
++{
++	uint32_t seq[128], nseq, ring_w, i;
++	uint64_t src_addr;
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++	uint32_t first, last, k;
++
++	if (pad_buf == 0) {
++		return -2;
++	}
++	/*
++	 * MI8_BLIT_MAXW/H are the scratch-path limits (1088 x 64). This path's
++	 * destination is the padded frame, and the source only has to fit
++	 * RB_A2D_SRC_MAX at 16.8 fixed point: (n-1) << 8 must fit 16 bits.
++	 */
++	if (sw == 0 || sh == 0 || sw > 4096u || sh > 4096u) {
++		return -2;
++	}
++	if (!mi8_gpu_blit_ready()) {
++		return -7;
++	}
++	first = (sy * src_pitch) >> 12;
++	last = (((sy + sh - 1u) * src_pitch) + src_pitch - 1u) >> 12;
++	if (last >= npages || first > last) {
++		return -1;
++	}
++	for (k = first; k <= last; k++) {
++		if (!keep_map(MI8_BLIT_SRC_VA + (uint64_t)(k - first) * 0x1000ull, pas4k[k], 0)) {
++			return -3;
++		}
++	}
++	keep_tlb();
++	src_addr = MI8_BLIT_SRC_VA + (uint64_t)(sy * src_pitch + sx * 4u)
++	    - (uint64_t)first * 0x1000ull;
++
++	ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
++	nseq = mi8_blit_emit(seq, src_addr, MI8_PAD_VA, sw, sh, src_pitch,
++	    MI8_PAD_W, MI8_PAD_H, MI8_PAD_PITCH, 0u, 0u,
++	    g3d_regions[2].address + BS_CLOCK_OFF,
++	    g3d_regions[2].address + BL_RB_OFF,
++	    g3d_regions[2].address + B79_EV_OFF,
++	    g3d_regions[2].address + BS_FENCE_OFF,
++	    g3d_regions[2].address + BS_MARK_OFF);
++	for (i = 0; i < nseq; i++) {
++		ring[ring_w++ & 8191u] = seq[i];
++	}
++	to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++	wr(gpu3d + 4 * 0x0807, ring_w & 8191u);
++	cp_wptr = ring_w & 8191u;
++	keep_ring_at = cp_wptr;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return 0;
++}
 +static void
 +bl_gpucc_survey(void)
 +{
@@ -8814,6 +8927,17 @@ new file mode 100644
 +
 +				if (PE_parse_boot_argn("mi8gpu_gpuwide", &wide, sizeof(wide)) && wide) {
 +					bl_wide_probe();
++				}
++				{
++					unsigned int e1 = 0;
++
++					if (PE_parse_boot_argn("mi8gpu_e1", &e1, sizeof(e1)) && e1) {
++						if (mi8_gpu_padded_prepare() == 0) {
++							unsigned long long c[8];
++
++							mi8_surface_bridge_e1(mi8_surface_bridge_last_id(), c);
++						}
++					}
 +				}
 +				{
 +					unsigned int mc = 0;
@@ -14112,7 +14236,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,123 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -14168,6 +14292,10 @@ new file mode 100644
 + * surface past the call. This is the missing half of GPU-blit plan C'. */
 +extern int mi8_surface_bridge_pages(unsigned int id, unsigned long long *out,
 +    unsigned int max_pages, unsigned int *bytes_per_row_out);
++/* 5-c47 (E-1): blit the given surface into the padded frame and compare.
++ * No panel write. Waits with sleep + from_memory, the only signal that
++ * proved trustworthy in step 61. */
++extern int mi8_surface_bridge_e1(unsigned int id, unsigned long long *out);
 +/* id of the most recent surface created by the bridge (for the probe). */
 +extern unsigned int mi8_surface_bridge_last_id(void);
 +/* 5-a: the GPU ioctl surface. Returns 0 on success and writes one 64-bit
@@ -14236,7 +14364,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,1031 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -14410,6 +14538,11 @@ new file mode 100644
 + */
 +extern "C" int printf(const char *, ...);
 +extern "C" void mi8_gpu_to_memory(void *start, unsigned long long size);
++extern "C" int mi8_gpu_padded_prepare(void);
++extern "C" unsigned long long mi8_gpu_padded_kva(void);
++extern "C" int mi8_gpu_blit_to_padded(const unsigned long long *pas4k,
++    unsigned int npages, unsigned int src_pitch, unsigned int sx, unsigned int sy,
++    unsigned int sw, unsigned int sh);
 +extern "C" int mi8_gpu_blit_ready(void);
 +extern "C" int mi8_gpu_blit_surface_pages(const unsigned long long *pas4k,
 +    unsigned int npages, unsigned int src_pitch, unsigned int sx,
@@ -14658,6 +14791,97 @@ new file mode 100644
 +	out[4] = guard_ok;
 +	s->release();
 +	return rc;
++}
++
++/*
++ * E-1 (5-c47): blit the REAL compositor surface into the padded frame and
++ * compare against the source. No panel write, no present() involvement.
++ *
++ * Completion is waited out with a fixed 5 ms sleep and then from_memory,
++ * because every cheaper signal lied tonight: drain means the CP consumed
++ * the packet, the fence write has its own latency, and polling through
++ * ml_phys_read_word reads the CPU's cache. from_memory is the only
++ * primitive here proven to make the read reflect DRAM (step 61).
++ *
++ * out[0] rc, [1] sampled, [2] correct, [3] other, [4] untouched
++ */
++extern "C" int
++mi8_surface_bridge_e1(unsigned int id, unsigned long long *out)
++{
++	static unsigned long long pas16[700];
++	static unsigned long long pas4k[2800];
++	SweetSurface *s = sweet_surface_copy(id);
++	IOByteCount len = 0;
++	unsigned char *kva;
++	unsigned int n16 = 0, n4 = 0, i, k, x, y, np;
++	unsigned int sampled = 0, correct = 0, other = 0, untouched = 0;
++	unsigned int first_bad_x = 0, first_bad_y = 0, first_bad_got = 0, first_bad_want = 0;
++	int rc;
++	unsigned long long pad;
++	const unsigned char *padp;
++
++	if (s == nullptr || out == nullptr) {
++		if (s != nullptr) { s->release(); }
++		return -2;
++	}
++	for (i = 0; i < 5u; i++) { out[i] = 0; }
++	if (s->memory == nullptr || s->width == 0 || s->height == 0) { s->release(); return -5; }
++	/* the wide probe already proved this shape; keep it explicit */
++	if (s->width > 4096u || s->height > 4096u) { s->release(); return -6; }
++
++	for (unsigned long long off = 0; off < s->allocSize && n16 < 700u; off += 0x4000u) {
++		addr64_t pa = s->memory->getPhysicalSegment(off, &len, 0);
++
++		if (pa == 0) { break; }
++		pas16[n16++] = (unsigned long long)pa;
++	}
++	for (i = 0; i < n16 && n4 + 4u <= 2800u; i++) {
++		for (k = 0; k < 4u; k++) {
++			pas4k[n4++] = pas16[i] + (unsigned long long)k * 0x1000ull;
++		}
++	}
++	np = n4;
++
++	kva = (unsigned char *)s->kernelAddress();
++	if (kva == nullptr) { s->release(); return -3; }
++	pad = mi8_gpu_padded_kva();
++	if (pad == 0) { s->release(); return -4; }
++
++	rc = mi8_gpu_blit_to_padded(pas4k, np, s->bytesPerRow, 0u, 0u, s->width, s->height);
++	out[0] = (unsigned long long)(unsigned int)rc;
++	if (rc != 0) { s->release(); return rc; }
++
++	/* 5 ms is ~50x the bound measured in step 60; correctness, not timing. */
++	sleep_us(5000);
++	from_memory((vm_offset_t)pad, 9400320);
++	padp = (const unsigned char *)(const void *)pad;
++
++	for (y = 0; y < 2160u; y += 68u) {
++		const unsigned char *prow = padp + (unsigned long long)y * 4352u;
++		const unsigned char *srow = kva + (unsigned long long)((y * s->height) / 2160u) * s->bytesPerRow;
++
++		for (x = 0; x < 1080u; x += 68u) {
++			uint32_t got = *(const uint32_t *)(const void *)(prow + (unsigned long long)x * 4u);
++			uint32_t want = *(const uint32_t *)(const void *)(srow + (unsigned long long)((x * s->width) / 1080u) * 4u);
++			uint32_t want2 = *(const uint32_t *)(const void *)(srow +
++			    (unsigned long long)(((2u * x + 1u) * s->width) / (2u * 1080u)) * 4u);
++
++			sampled++;
++			if (got == want || got == want2) { correct++; }
++			else if (got == 0xcdcdcdcdu) { untouched++; }
++			else {
++				other++;
++				if (other == 1u) { first_bad_x = x; first_bad_y = y; first_bad_got = got; first_bad_want = want; }
++			}
++		}
++	}
++
++	out[1] = sampled; out[2] = correct; out[3] = other; out[4] = untouched;
++	printf("mi8gpu: step 63 E1 %s: %u of %u sampled pixels match (%u other, %u untouched); first bad (%u,%u) got %#x want %#x%c",
++	    (correct == sampled) ? "PASS" : "MISMATCH", correct, sampled, other, untouched,
++	    first_bad_x, first_bad_y, first_bad_got, first_bad_want, 10);
++	s->release();
++	return 0;
 +}
 +
 +/*
