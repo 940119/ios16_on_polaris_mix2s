@@ -14377,7 +14377,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1060 @@
+@@ -0,0 +1,1065 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -14867,7 +14867,12 @@ new file mode 100644
 +	if (rc != 0) { s->release(); return rc; }
 +
 +	/* 5 ms is ~50x the bound measured in step 60; correctness, not timing. */
-+	mi8_gpu_sleep_us(5000u);
++	/*
++	 * 5-c51: 5 ms was not enough. Holes cluster at y >= 1428 and their
++	 * number varies between runs (28 then 100), which is a race, not a
++	 * geometry error. Wait far longer than any plausible blit.
++	 */
++	mi8_gpu_sleep_us(50000u);
 +	mi8_gpu_from_memory(pad, 9400320ull);
 +	padp = (const unsigned char *)(const void *)pad;
 +
