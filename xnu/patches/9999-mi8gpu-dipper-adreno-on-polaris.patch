@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8869 @@
+@@ -0,0 +1,8877 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5546,6 +5546,14 @@ new file mode 100644
 +			const uint64_t last_off = (uint64_t)(FF_DH - 1u) * FF_DPITCH + (FF_DW - 1u) * 4u;
 +			const uint64_t last_pa = (uint64_t)kvtophys(dst + (vm_offset_t)last_off) & ~0xfffull;
 +			const uint32_t in_page = (uint32_t)(last_off & 0xfffull);
++			/*
++			 * 5-c42: ml_phys_read_word evidently does NOT bypass this CPU's cache --
++			 * the pixel read as sentinel for a full second while the verify right
++			 * afterwards (after from_memory) found every pixel written. Map the page
++			 * through ml_io_map instead: that is a device mapping and cannot be
++			 * cached, so what it reads is what the GPU actually put in DRAM.
++			 */
++			vm_offset_t probe_va = ml_io_map(last_pa, 0x1000);
 +
 +			/*
 +			 * 5-c41: time-boxed. The earlier version capped at 4 M polls, which
@@ -5560,7 +5568,7 @@ new file mode 100644
 +				uint32_t v = 0xcdcdcdcdu;
 +
 +				for (;;) {
-+					v = (uint32_t)ml_phys_read_word(last_pa + in_page);
++					v = (probe_va != 0) ? *(volatile uint32_t *)(probe_va + in_page) : 0xcdcdcdcdu;
 +					el = mach_absolute_time() - t_start;
 +					if (v != 0xcdcdcdcdu) {
 +						break;
