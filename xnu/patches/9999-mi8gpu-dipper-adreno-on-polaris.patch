@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8694 @@
+@@ -0,0 +1,8734 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5469,6 +5469,9 @@ new file mode 100644
 +	uint32_t f0 = (uint32_t)ml_phys_read_word(fence_pa);
 +	uint32_t k;
 +
++	((volatile uint32_t *)g3d_regions[2].memory)[BS_FENCE_OFF >> 2] = 0;
++	to_memory(g3d_regions[2].memory, g3d_regions[2].size);
++	f0 = 0;
 +	t0 = mach_absolute_time();
 +
 +	ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
@@ -5516,6 +5519,43 @@ new file mode 100644
 +	/* xnu's timebase on this SoC is 1 ns per tick, so /1000 is microseconds. */
 +	printf("mi8gpu: step 56 FULL timing: map %llu us, blit (fence) %llu us%c",
 +	    tmap / 1000ull, (t1 - t0) / 1000ull, 10);
++	/*
++	 * 5-c36 (E-0): the same source into 1080 x 64. If this also takes ~95 ms
++	 * the cost is fixed overhead; if it scales with area, the engine is
++	 * throughput-bound and the clock is the variable to chase.
++	 */
++	((volatile uint32_t *)g3d_regions[2].memory)[BS_FENCE_OFF >> 2] = 0;
++	to_memory(g3d_regions[2].memory, g3d_regions[2].size);
++	{
++		uint64_t s0, s1;
++		uint32_t m;
++
++		s0 = mach_absolute_time();
++		ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
++		nseq = mi8_blit_emit(seq, FF_SRC_VA, FF_DST_VA, FF_SW, FF_SH, FF_SPITCH,
++		    FF_DW, 64u, FF_DPITCH, 0u, 0u,
++		    g3d_regions[2].address + BS_CLOCK_OFF,
++		    g3d_regions[2].address + BL_RB_OFF,
++		    g3d_regions[2].address + B79_EV_OFF,
++		    g3d_regions[2].address + BS_FENCE_OFF,
++		    g3d_regions[2].address + BS_MARK_OFF);
++		for (i = 0; i < nseq; i++) {
++			ring[ring_w++ & 8191u] = seq[i];
++		}
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, ring_w & 8191u);
++		cp_wptr = ring_w & 8191u;
++		keep_ring_at = cp_wptr;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (m = 0; m < 4000000u; m++) {
++			if ((uint32_t)ml_phys_read_word(fence_pa) != 0) {
++				break;
++			}
++		}
++		s1 = mach_absolute_time();
++		printf("mi8gpu: step 56 SMALL blit 1080x64 (fence) %llu us%c",
++		    (s1 - s0) / 1000ull, 10);
++	}
 +	from_memory(dst, dbytes);
 +
 +	for (y = 0; y < FF_DH; y++) {
