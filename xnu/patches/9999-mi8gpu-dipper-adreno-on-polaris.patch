@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8883 @@
+@@ -0,0 +1,8731 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5673,34 +5673,32 @@ new file mode 100644
 +	printf("mi8gpu: step 56 FULL correct %u untouched %u wrong %u guard %u want %u/%u%c",
 +	    correct, untouched, wrong, guard, FF_DW * FF_DH, 8u * FF_DH, 10);
 +	/*
-+	 * 5-c43 (E-0b): per-submission cost vs per-pixel throughput.
++	 * 5-c44 (E-0c): delay sweep -- the cache-proof way to bound the blit.
 +	 *
-+	 * 32 submissions of 64 destination rows each -- about one frame of
-+	 * pixels split into 32 packets. Poll only the LAST band's last pixel,
-+	 * through an uncached window. If the total is ~one frame's worth of
-+	 * work, submissions are cheap and a per-frame loop is fine. If it is
-+	 * 32x a single band, each submission has its own fixed cost.
++	 * Polling memory taught me nothing tonight: every read either came from
++	 * the CPU cache or raced a sentinel fill whose flush I could not verify.
++	 * So stop polling. For each delay: sentinel the frame, submit ONE blit,
++	 * sleep exactly that long, then from_memory (a real invalidate) and test.
++	 * The smallest delay that yields a complete frame is the blit's bound,
++	 * and from_memory makes the answer independent of any cache state.
 +	 */
-+	for (y = 0; y < 2048u; y++) {
-+		for (x = 0; x < FF_DW; x++) {
-+			dcpu[y * (FF_DPITCH / 4u) + x] = 0xcdcdcdcdu;
-+		}
-+	}
-+	to_memory(dst, (vm_offset_t)2048u * FF_DPITCH);
 +	{
-+		const uint32_t bands = 32u;
-+		const uint64_t boff = (uint64_t)((bands - 1u) * 64u + 63u) * FF_DPITCH + (FF_DW - 1u) * 4u;
-+		const uint64_t bpa = (uint64_t)kvtophys(dst + (vm_offset_t)boff) & ~0xfffull;
-+		const uint32_t binp = (uint32_t)(boff & 0xfffull);
-+		vm_offset_t bva = ml_io_map(bpa, 0x1000);
-+		uint64_t q0, q1;
-+		uint32_t v = 0xcdcdcdcdu;
++		static const uint32_t delays_us[] = { 0u, 50u, 100u, 200u, 400u, 800u, 1600u, 3200u };
++		uint32_t d;
 +
-+		q0 = mach_absolute_time();
-+		ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
-+		for (k = 0; k < bands; k++) {
++		for (d = 0; d < sizeof(delays_us) / sizeof(delays_us[0]); d++) {
++			uint32_t ok = 0, seen = 0;
++			uint32_t ry;
++
++			for (y = 0; y < FF_DH; y++) {
++				for (x = 0; x < FF_DW; x++) {
++					dcpu[y * (FF_DPITCH / 4u) + x] = 0xcdcdcdcdu;
++				}
++			}
++			to_memory(dst, dbytes);
++			ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
 +			nseq = mi8_blit_emit(seq, FF_SRC_VA, FF_DST_VA, FF_SW, FF_SH, FF_SPITCH,
-+			    FF_DW, 64u, FF_DPITCH, 0u, k * 64u,
++			    FF_DW, FF_DH, FF_DPITCH, 0u, 0u,
 +			    g3d_regions[2].address + BS_CLOCK_OFF,
 +			    g3d_regions[2].address + BL_RB_OFF,
 +			    g3d_regions[2].address + B79_EV_OFF,
@@ -5709,176 +5707,26 @@ new file mode 100644
 +			for (i = 0; i < nseq; i++) {
 +				ring[ring_w++ & 8191u] = seq[i];
 +			}
-+		}
-+		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
-+		wr(gpu3d + 4 * 0x0807, ring_w & 8191u);
-+		cp_wptr = ring_w & 8191u;
-+		keep_ring_at = cp_wptr;
-+		__asm__ volatile ("dsb sy" ::: "memory");
-+		/* 200 ms time box: an outcome here must never hang the boot. */
-+		{
-+			const uint64_t lim = q0 + 200000000ull;
-+
-+			for (;;) {
-+				v = (bva != 0) ? *(volatile uint32_t *)(bva + binp) : 0xcdcdcdcdu;
-+				if (v != 0xcdcdcdcdu) {
-+					break;
-+				}
-+				if (mach_absolute_time() > lim) {
-+					break;
++			to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++			wr(gpu3d + 4 * 0x0807, ring_w & 8191u);
++			cp_wptr = ring_w & 8191u;
++			keep_ring_at = cp_wptr;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			if (delays_us[d] != 0u) {
++				sleep_us(delays_us[d]);
++			}
++			from_memory(dst, dbytes);
++			/* sample 64 rows spread over the frame instead of all 2160 */
++			for (ry = 0; ry < FF_DH; ry += 34u) {
++				seen++;
++				if (dcpu[ry * (FF_DPITCH / 4u) + (FF_DW - 1u)] != 0xcdcdcdcdu) {
++					ok++;
 +				}
 +			}
++			printf("mi8gpu: step 60 SWEEP delay %u us: %u of %u sampled rows written%c",
++			    delays_us[d], ok, seen, 10);
 +		}
-+		q1 = mach_absolute_time();
-+		printf("mi8gpu: step 59 BANDS %u x 64 rows: %llu us total, %llu us per band, val %#x%c",
-+		    bands, (q1 - q0) / 1000ull, (q1 - q0) / 1000ull / bands, v, 10);
 +	}
-+
-+out:
-+	for (i = 0; i < spages; i++) {
-+		keep_map(FF_SRC_VA + (unsigned long long)i * 0x1000ull, 0, 0);
-+	}
-+	for (i = 0; i < dpages; i++) {
-+		keep_map(FF_DST_VA + (unsigned long long)i * 0x1000ull, 0, 0);
-+	}
-+	keep_tlb();
-+	if (src != 0) { kmem_free(kernel_map, src, round_page(sbytes)); }
-+	if (dst != 0) { kmem_free(kernel_map, dst, round_page(dbytes)); }
-+}
-+
-+static void
-+bl_readback(void)
-+{
-+	vm_offset_t slots = (vm_offset_t)g3d_regions[2].memory + BL_RB_OFF;
-+	uint32_t landed = 0, i, cpv, cpu, control, ccu_cp, ccu_cpu, eco_cp, eco_cpu;
-+
-+	from_memory(slots, 4u * BL_NREG);
-+	control = *(volatile uint32_t *)(slots + 4u * BL_CTRL_IDX);
-+	ccu_cp = *(volatile uint32_t *)(slots + 4u * BL_CCU_IDX);
-+	ccu_cpu = rd(gpu3d + 4 * 0x8e07u);
-+	eco_cp = *(volatile uint32_t *)(slots + 4u * BL_ECO_IDX);
-+	eco_cpu = rd(gpu3d + 4 * 0x8e04u);
-+	/* B86: the SAME 114 dwords. The only new variable is a C-linkage call into the C++ SweetSurface TU; the probe returns a magic and touches no IOKit object, so a negative can only be "the link failed". */
-+	printf("mi8gpu: step 27 BRIDGE: C TU reached the C++ SweetSurface TU, magic %#010x (want %#010x)\n",
-+	    mi8_surface_bridge_probe(), 0x53555246u);
-+	/* B88: the emitted statement is still byte-identical. The bridge now CALLS the real IOKit path in five stages; every PRE/POST pair is printed so a panic names its own stage (lesson 67). */
-+	printf("mi8gpu: step 26 B89 TABLE: same 114 dwords, 256 x 128 at pitch 16, GRAS_A2D_DEST_TL (0,0), 2D BS_PIX pattern, 11 CP_REG_TO_MEM reads, THE DESTINATION IS THE DRIVER-OWNED SURFACE\n");
-+	for (i = 0; i < BL_NREG; i++) {
-+		cpv = *(volatile uint32_t *)(slots + 4u * i);
-+		cpu = rd(gpu3d + 4 * bl_regs[i]);
-+		if (i < 8u && cpv == bl_want[i]) {
-+			landed++;
-+		}
-+		printf("mi8gpu: step 26 B89 REG %-10s %#07x: CPU %#010x, CP %#010x, want %#010x, %s\n",
-+		    bl_names[i], bl_regs[i], cpu, cpv, bl_want[i],
-+		    (cpv == bl_want[i]) ? "MATCH" : "differs");
-+	}
-+	printf("mi8gpu: step 26 B89 READBACK: %u of 8 A2D registers hold what we wrote, control %#010x (want %#010x), %s\n",
-+	    landed, control, 0x80100180u,
-+	    (control == 0x80100180u) ? "CP_REG_TO_MEM IS ALIVE" : "CP_REG_TO_MEM IS BLIND");
-+	printf("mi8gpu: step 26 B89 CCU: RB_CCU_CNTL CPU %#010x CP %#010x (B79 wrote %#010x, not written here), RB_DBG_ECO_CNTL CPU %#010x CP %#010x, %s\n",
-+	    ccu_cpu, ccu_cp, B79_CCU_CNTL, eco_cpu, eco_cp,
-+	    (ccu_cpu == ccu_cp) ? "CCU PRE-IMAGE CPU==CP" : "CCU PRE-IMAGE BLIND");
-+
-+	mi8_okit_probe();
-+}
-+
-+static void
-+gpu_zap_and_command(void)
-+{
-+	uint32_t *ring = (uint32_t *)g3d_regions[1].memory, wptr = cp_wptr;
-+	volatile uint32_t *memptrs = (volatile uint32_t *)g3d_regions[2].memory;
-+
-+	if (!cp_ok || !g3d_ready) {
-+		printf("mi8gpu: the CP has not taken CP_ME_INIT; no zap\n");
-+		return;
-+	}
-+	printf("mi8gpu: SECVID_TRUST_CNTL before: %#x\n", rd(gpu3d + 4 * 0xf400));
-+	bool ok;
-+
-+	if (rd(gpu3d + 4 * 0xf400) == 0) {
-+		/* a slumber leaves the core where it was (EXP-0114): out of secure mode, with the zap still authenticated if it was kept */
-+		printf("mi8gpu: the 3D core is already out of secure mode: the zap shader is not loaded again, no CP_SET_SECURE_MODE\n");
-+		ok = true;
-+	} else {
-+		if (!zap_load(true)) {
-+			printf("mi8gpu: zap not authenticated; the secure mode is left as it is\n");
-+			return;
-+		}
-+		ring[wptr++] = pkt7(CP_SET_SECURE_MODE_OPCODE, 1);
-+		ring[wptr++] = 0;
-+		printf("mi8gpu: CP_SET_SECURE_MODE(0) submitted\n");
-+		ok = gpu_wait_ring(wptr, "after CP_SET_SECURE_MODE");
-+	}
-+	printf("mi8gpu: SECVID_TRUST_CNTL after: %#x (%s); GPU idle: %s\n", rd(gpu3d + 4 * 0xf400),
-+	    rd(gpu3d + 4 * 0xf400) == 0 ? "NON-SECURE MODE" : "still secure", ok ? "yes" : "NO");
-+	gpu_nonsecure = ok && rd(gpu3d + 4 * 0xf400) == 0;
-+	if (!ok) {
-+		return;
-+	}
-+	/* the first real command: CP_MEM_WRITE of two words into the memptrs page, read back by us afterwards */
-+	memptrs[2] = memptrs[3] = 0;
-+	to_memory((vm_offset_t)memptrs, 0x1000);
-+	ring[wptr++] = pkt7(CP_MEM_WRITE_OPCODE, 4);
-+	ring[wptr++] = (uint32_t)(g3d_regions[2].address + 8);
-+	ring[wptr++] = (uint32_t)((g3d_regions[2].address + 8) >> 32);
-+	ring[wptr++] = 0xc0ffee21;
-+	ring[wptr++] = 0x0badf00d;
-+	printf("mi8gpu: CP_MEM_WRITE submitted (iova %#llx <- c0ffee21 0badf00d)\n", g3d_regions[2].address + 8);
-+	ok = gpu_wait_ring(wptr, "after CP_MEM_WRITE");
-+	cp_wptr = wptr;
-+	to_memory((vm_offset_t)memptrs, 0x1000);
-+	printf("mi8gpu: memptrs[2..3] = %#010x %#010x -> the CP's first write %s\n", memptrs[2], memptrs[3],
-+	    (memptrs[2] == 0xc0ffee21 && memptrs[3] == 0x0badf00d) ? "ARRIVED in memory" : "did NOT arrive");
-+	/*
-+	 * Step 23 runs before the paint, and only when the CP has been shown to
-+	 * write memory: the shader test needs a working ring and a fence that
-+	 * arrives, and it must not be read through a picture that step 22 has
-+	 * just put on the screen.
-+	 */
-+	if (ok && gmu_last_step >= 23) {
-+		cp_wptr = wptr;
-+		cs_probe();
-+		wptr = cp_wptr;
-+	}
-+	/* B70: the render backend, right after compute has proved the ring works */
-+	if (ok && gmu_last_step >= 23) {
-+		cp_wptr = wptr;
-+		rs_probe();
-+		wptr = cp_wptr;
-+	}
-+	/* B77: A2D scale, after step 24 proved the CP and the RB are alive */
-+	if (ok && gmu_last_step >= 24) {
-+		cp_wptr = wptr;
-+		bl_probe();
-+		bl_readback();
-+		wptr = cp_wptr;
-+	}
-+	/*
-+	 * 5-c9: repeated A2D submissions. Gated by a NEW boot-arg so the default
-+	 * behaviour is byte-identical to the previous rung. NO display path is
-+	 * touched here: the probe still writes only its own driver-owned buffer.
-+	 */
-+	{
-+		uint32_t reps = 0;
-+		PE_parse_boot_argn("mi8gpu_blitrep", &reps, sizeof(reps));
-+		if (reps > 8) {
-+			reps = 8;
-+		}
-+		if (ok && gmu_last_step >= 24 && reps > 0) {
-+			uint32_t r;
-+			printf("mi8gpu: step 43 REPEAT: %u extra A2D submissions\n", reps);
-+			for (r = 0; r < reps; r++) {
-+				uint32_t before_w = rd(gpu3d + 4 * 0x0807);
-+				uint32_t before_r = rd(gpu3d + 4 * 0x0806);
-+				cp_wptr = wptr;
-+				bl_probe();
-+				wptr = cp_wptr;
-+				printf("mi8gpu: step 43 REP %u: WPTR %u -> %u, RPTR %u -> %u%s%c",
-+				    r, before_w, rd(gpu3d + 4 * 0x0807),
-+				    before_r, rd(gpu3d + 4 * 0x0806),
-+				    rd(gpu3d + 4 * 0x0806) == rd(gpu3d + 4 * 0x0807)
-+				        ? " DRAINED" : " RING-BEHIND", 10);
 +			}
 +			printf("mi8gpu: step 43 REPEAT DONE%c", 10);
 +		}
