@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8664 @@
+@@ -0,0 +1,8671 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5508,7 +5508,14 @@ new file mode 100644
 +			if (ox == ex && oy == ey) { correct++; }
 +			else if (ox == ((2u * x + 1u) * FF_SW) / (2u * FF_DW)
 +			    && oy == ((2u * y + 1u) * FF_SH) / (2u * FF_DH)) { correct++; }
-+			else { wrong++; }
++			else {
++		wrong++;
++		/* 5-c33: exactly 4 per row deviate from both models; record where. */
++		if (wrong <= 6u) {
++			printf("mi8gpu: step 56 SAMPLE at (%u,%u): got ox %u oy %u, floor %u half %u%c",
++			    x, y, ox, oy, ex, ((2u * x + 1u) * FF_SW) / (2u * FF_DW), 10);
++		}
++	}
 +		}
 +		for (x = FF_DW; x < FF_DW + 8u; x++) {
 +			if (dcpu[y * (FF_DPITCH / 4u) + x] == 0xcdcdcdcdu) { guard++; }
