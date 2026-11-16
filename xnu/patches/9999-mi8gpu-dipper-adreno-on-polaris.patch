@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8858 @@
+@@ -0,0 +1,8869 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5446,7 +5446,7 @@ new file mode 100644
 +static void
 +bl_fullframe_probe(void)
 +{
-+	uint64_t t0 = 0, t1 = 0, tmap = 0;
++	uint64_t t0 = 0, t1 = 0, tmap = 0, pixel_us = 0;
 +	const uint32_t sbytes = FF_SPITCH * FF_SH;
 +	const uint32_t dbytes = FF_DPITCH * FF_DH;
 +	const uint32_t spages = (sbytes + 0xfffu) >> 12;
@@ -5547,27 +5547,38 @@ new file mode 100644
 +			const uint64_t last_pa = (uint64_t)kvtophys(dst + (vm_offset_t)last_off) & ~0xfffull;
 +			const uint32_t in_page = (uint32_t)(last_off & 0xfffull);
 +
-+			uint32_t iters = 0;
-+			uint32_t lastval = 0;
-+			uint64_t cal0, cal1;
++			/*
++			 * 5-c41: time-boxed. The earlier version capped at 4 M polls, which
++			 * is ~95 ms -- so "TIMED OUT" only ever proved the pixel was not
++			 * there within 95 ms. Watch for a full second and report when it
++			 * actually appears; that number is the real latency.
++			 */
++			{
++				uint64_t t_start = mach_absolute_time();
++				uint64_t ms_next = 50ull;
++				uint64_t el = 0;
++				uint32_t v = 0xcdcdcdcdu;
 +
-+			/* Empty-loop calibration: how long does ONE poll iteration cost? */
-+			cal0 = mach_absolute_time();
-+			for (iters = 0; iters < 100000u; iters++) {
-+				(void)ml_phys_read_word(last_pa + in_page);
-+			}
-+			cal1 = mach_absolute_time();
-+			printf("mi8gpu: step 56 CAL: 1e5 polls in %llu us (%llu ns each)%c",
-+				(cal1 - cal0) / 1000ull, (cal1 - cal0) / 100ull, 10);
-+
-+			for (iters = 0; iters < 4000000u; iters++) {
-+				lastval = (uint32_t)ml_phys_read_word(last_pa + in_page);
-+				if (lastval != 0xcdcdcdcdu) {
-+					break;
++				for (;;) {
++					v = (uint32_t)ml_phys_read_word(last_pa + in_page);
++					el = mach_absolute_time() - t_start;
++					if (v != 0xcdcdcdcdu) {
++						break;
++					}
++					if (el > 1000000000ull) {
++						break;
++					}
++					if (el / 1000000ull >= ms_next) {
++						printf("mi8gpu: step 58 PIXEL still sentinel at %llu ms%c",
++						    ms_next, 10);
++						ms_next += 50ull;
++					}
 +				}
++				pixel_us = el / 1000ull;
++				printf("mi8gpu: step 58 PIXEL %s at %llu us (val %#x)%c",
++					(v != 0xcdcdcdcdu) ? "appeared" : "TIMED OUT after 1 s",
++					el / 1000ull, v, 10);
 +			}
-+			printf("mi8gpu: step 56 LASTPIX: %u iterations, value %#x, %s%c",
-+				iters, lastval, (iters >= 4000000u) ? "TIMED OUT" : "written", 10);
 +		}
 +		t1 = mach_absolute_time();
 +		for (i = 0; i < 40000; i++) {
@@ -5584,8 +5595,8 @@ new file mode 100644
 +	    rd(smmu_cb(G3D_CTX) + CB_FSR), 10);
 +	sleep_us(2000);
 +	/* xnu's timebase on this SoC is 1 ns per tick, so /1000 is microseconds. */
-+	printf("mi8gpu: step 56 FULL timing: map %llu us, blit (dst pixel) %llu us%c",
-+	    tmap / 1000ull, (t1 - t0) / 1000ull, 10);
++	printf("mi8gpu: step 56 FULL timing: map %llu us, pixel appeared at %llu us%c",
++	    tmap / 1000ull, pixel_us, 10);
 +	/*
 +	 * 5-c36 (E-0): the same source into 1080 x 64. If this also takes ~95 ms
 +	 * the cost is fixed overhead; if it scales with area, the engine is
