@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8811 @@
+@@ -0,0 +1,8858 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5301,6 +5301,46 @@ new file mode 100644
 + * cannot be expressed by RB_A2D_DEST_BUFFER_PITCH. The eight padding
 + * columns per row must stay sentinel.
 + */
++/*
++ * 5-c40 (GPUCC round 1, READ ONLY): what clock is the 3D core actually on?
++ *
++ * Everything in this function is a read. No register is written, no divider
++ * is touched. The offsets sit inside the range step_gpucc() already reads
++ * (0x100c .. 0x1540), so the block is known to be readable rather than
++ * gated -- a read of an ungated Qualcomm slave can hang the bus.
++ *
++ * The raw values are printed rather than decoded here: turning an RCG CFG
++ * into a frequency needs the parent PLL's own L/M/N, which lives in a
++ * different sub-block and is NOT read yet. Decoding offline from these
++ * numbers is the next step and needs no device.
++ */
++#define GPUCC_GX_GFX3D_RCG_CMD  0x1060u  /* gpu_cc_gx_gfx3d_clk_src */
++#define GPUCC_GX_GFX3D_RCG_CFG  0x1064u
++#define GPUCC_GX_GFX3D_CBCR     0x1068u
++#define GPUCC_CX_GFX3D_CBCR     0x1090u
++#define GPUCC_GMU_RCG_CMD       0x1120u
++#define GPUCC_GMU_RCG_CFG       0x1124u
++
++static void
++bl_gpucc_survey(void)
++{
++	if (gpucc == 0) {
++		printf("mi8gpu: step 57 GPUCC: the block was never mapped%c", 10);
++		return;
++	}
++	printf("mi8gpu: step 57 GPUCC gfx3d RCG  cmd %#010x cfg %#010x%c",
++	    rd(gpucc + GPUCC_GX_GFX3D_RCG_CMD), rd(gpucc + GPUCC_GX_GFX3D_RCG_CFG), 10);
++	printf("mi8gpu: step 57 GPUCC gfx3d CBCR    gx %#010x cx %#010x%c",
++	    rd(gpucc + GPUCC_GX_GFX3D_CBCR), rd(gpucc + GPUCC_CX_GFX3D_CBCR), 10);
++	printf("mi8gpu: step 57 GPUCC gmu RCG       cmd %#010x cfg %#010x%c",
++	    rd(gpucc + GPUCC_GMU_RCG_CMD), rd(gpucc + GPUCC_GMU_RCG_CFG), 10);
++	printf("mi8gpu: step 57 GPUCC gx gdscr %#010x cx gdscr %#010x (powered: gx %u cx %u)%c",
++	    rd(gpucc + 0x100c), rd(gpucc + 0x106c),
++	    (rd(gpucc + 0x100c) & (1u << 31)) ? 1u : 0u,
++	    (rd(gpucc + 0x106c) & (1u << 31)) ? 1u : 0u, 10);
++	printf("mi8gpu: step 57 GPUCC callbacks: read-only survey, nothing written%c", 10);
++}
++
 +static void
 +bl_wide_probe(void)
 +{
@@ -8613,6 +8653,13 @@ new file mode 100644
 +
 +				if (PE_parse_boot_argn("mi8gpu_gpuwide", &wide, sizeof(wide)) && wide) {
 +					bl_wide_probe();
++				}
++				{
++					unsigned int gc = 0;
++
++					if (PE_parse_boot_argn("mi8gpu_gpucc", &gc, sizeof(gc)) && gc) {
++						bl_gpucc_survey();
++					}
 +				}
 +				{
 +					unsigned int ff = 0;
