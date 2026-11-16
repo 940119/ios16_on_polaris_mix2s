@@ -5107,8 +5107,8 @@ new file mode 100644
 + */
 +#define MI8_BLIT_SRC_VA	0x34000000ull
 +#define MI8_BLIT_DST_VA	0x36000000ull
-+#define MI8_BLIT_PITCH	1024u
-+#define MI8_BLIT_MAXW	256u
++#define MI8_BLIT_PITCH	4352u
++#define MI8_BLIT_MAXW	1088u
 +#define MI8_BLIT_MAXH	64u
 +
 +int
@@ -5160,7 +5160,7 @@ new file mode 100644
 +			return -2;
 +		}
 +		scratch_pa = (uint64_t)kvtophys(scratch);
-+		scratch_pages = 0x10000u / 0x1000u;
++		scratch_pages = 0x44000u / 0x1000u;
 +	}
 +
 +	/* The rows this rect touches, as 4 KB pages of the surface. */
@@ -5187,10 +5187,10 @@ new file mode 100644
 +	}
 +
 +	/* Sentinel first, so "never written" is distinguishable from "wrong". */
-+	for (i = 0; i < 0x10000u / 4u; i++) {
++	for (i = 0; i < 0x44000u / 4u; i++) {
 +		((volatile uint32_t *)scratch)[i] = 0xcdcdcdcdu;
 +	}
-+	to_memory(scratch, 0x10000);
++	to_memory(scratch, 0x44000);
 +
 +	src_addr = MI8_BLIT_SRC_VA + (uint64_t)(sy * src_pitch + sx * 4u)
 +	    - (uint64_t)first * 0x1000ull;
@@ -5228,7 +5228,7 @@ new file mode 100644
 +		drained_now = (rd(gpu3d + 4 * 0x0806) == target_wptr) ? 1u : 0u;
 +	}
 +	sleep_us(500);
-+	from_memory(scratch, 0x10000);
++	from_memory(scratch, 0x44000);
 +
 +	for (k = first; k <= last; k++) {
 +		keep_map(MI8_BLIT_SRC_VA + (uint64_t)(k - first) * 0x1000ull, 0, 0);
@@ -13587,7 +13587,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,851 @@
+@@ -0,0 +1,931 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -13923,6 +13923,86 @@ new file mode 100644
 +		}
 +	}
 +	out[0] = decoded; out[1] = floor_ok; out[2] = half_ok; out[3] = other;
++	s->release();
++	return rc;
++}
++
++/*
++ * 5-c26 (D-3b): the PADDED destination. The panel row is 1080 pixels
++ * but 4320 bytes is not a multiple of 64, and RB_A2D_DEST_BUFFER_PITCH
++ * can only encode pitch/64. So a GPU frame must land in a buffer whose
++ * stride IS 64-aligned (4352 = 68*64) and be copied to the panel after.
++ * This blits 750x48 -> 1080x64 into such a buffer and checks that the
++ * eight padding columns per row are untouched.
++ *
++ * out[0] decoded, [1] floor, [2] half, [3] other, [4] guard_ok,
++ * out[5] drained, [6] rc
++ */
++extern "C" int
++mi8_surface_bridge_wide_test(unsigned int id, unsigned int sx, unsigned int sy,
++    unsigned long long *out)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	IOByteCount len = 0;
++	unsigned char *kva;
++	unsigned long long scratch = 0;
++	unsigned int spitch = 0, drained = 0, n = 0, off, rc, dpitch;
++	unsigned int x, y, decoded = 0, floor_ok = 0, half_ok = 0, other = 0, guard_ok = 0;
++	const unsigned int sw = 750u, sh = 48u, dw = 1080u, dh = 64u;
++	const unsigned int pad = 8u;
++
++	if (s == nullptr || out == nullptr) {
++		if (s != nullptr) { s->release(); }
++		return -2;
++	}
++	for (x = 0; x < 7u; x++) { out[x] = 0; }
++	if (s->memory == nullptr || (s->bytesPerRow % 64u) != 0) { s->release(); return -5; }
++	if (sx + sw > s->width || sy + sh > s->height) { s->release(); return -1; }
++	for (off = 0; off < s->allocSize && n < 4096u; off += 0x1000u) {
++		addr64_t pa = s->memory->getPhysicalSegment(off, &len, 0);
++
++		if (pa == 0) { break; }
++		cmp_pages[n++] = (unsigned long long)pa;
++	}
++	kva = (unsigned char *)s->kernelAddress();
++	if (kva == nullptr) { s->release(); return -3; }
++
++	for (y = 0; y < sh; y++) {
++		uint32_t *row = (uint32_t *)(kva + (unsigned long long)(sy + y) * s->bytesPerRow);
++
++		for (x = 0; x < sw; x++) { row[sx + x] = 0x5a000000u | (y << 12) | x; }
++	}
++	mi8_gpu_to_memory(kva + (unsigned long long)sy * s->bytesPerRow,
++	    (unsigned long long)sh * s->bytesPerRow);
++	rc = mi8_gpu_blit_surface_pages(cmp_pages, n, s->bytesPerRow, sx, sy,
++	    sw, sh, dw, dh, &scratch, &spitch, &drained);
++	out[5] = drained;
++	out[6] = (unsigned long long)(unsigned int)rc;
++	if (rc == 0) {
++		dpitch = spitch;
++		for (y = 0; y < dh; y++) {
++			const uint32_t *d = (const uint32_t *)((const unsigned char *)scratch + (unsigned long long)y * dpitch);
++
++			for (x = 0; x < dw; x++) {
++				uint32_t v = d[x];
++				unsigned int ox, oy;
++
++				if ((v >> 24) != 0x5au) { other++; continue; }
++				ox = v & 0xfffu;
++				oy = (v >> 12) & 0xfffu;
++				decoded++;
++				if (ox == (x * sw) / dw && oy == (y * sh) / dh) { floor_ok++; }
++				else if (ox == ((2u * x + 1u) * sw) / (2u * dw) && oy == ((2u * y + 1u) * sh) / (2u * dh)) { half_ok++; }
++				else { other++; }
++			}
++			/* the eight padding columns must still be the sentinel */
++			for (x = dw; x < dw + pad; x++) {
++				if (d[x] == 0xcdcdcdcdu) { guard_ok++; }
++			}
++		}
++	}
++	out[0] = decoded; out[1] = floor_ok; out[2] = half_ok; out[3] = other;
++	out[4] = guard_ok;
 +	s->release();
 +	return rc;
 +}
@@ -17226,7 +17306,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -65,6 +65,14 @@
+@@ -65,6 +65,16 @@
  #include <kern/clock.h>
  #include <sys/proc.h>
  
@@ -17237,11 +17317,13 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +    unsigned int sy, unsigned int w, unsigned int h, unsigned long long *out);
 +extern "C" int mi8_surface_bridge_scale_test(unsigned int id, unsigned int sx,
 +    unsigned int sy, unsigned long long *out);
++extern "C" int mi8_surface_bridge_wide_test(unsigned int id, unsigned int sx,
++    unsigned int sy, unsigned long long *out);
 +
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -79,6 +87,9 @@
+@@ -79,6 +89,9 @@
  };
  
  #define SWEET_FB_SWAP_REC_SIZE          0x46c
@@ -17251,7 +17333,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  #define SWEET_FB_LAYERS                 4
  #define SWEET_FB_NOTIFY_TYPES           8
  #define SWEET_FB_NOTIFY_VSYNC           5
-@@ -193,6 +204,12 @@
+@@ -193,6 +206,12 @@
  	IOLock       *fLock;            /* swaps and client list */
  	OSArray      *fClients;
  	uint32_t      fSwapID;
@@ -17264,7 +17346,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	bool          fConsolePaused;
  	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
  	bool          fDirty;
-@@ -218,6 +235,8 @@
+@@ -218,6 +237,8 @@
  	mach_port_t         fPort;
  	io_user_reference_t fFunc[SWEET_FB_NOTIFY_TYPES];
  	io_user_reference_t fRefcon[SWEET_FB_NOTIFY_TYPES];
@@ -17273,7 +17355,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-@@ -706,6 +725,7 @@
+@@ -706,6 +727,7 @@
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
  			fb->fDirty = false;
@@ -17281,7 +17363,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  	}
  	IOLockUnlock(fb->fLock);
-@@ -896,6 +916,7 @@
+@@ -896,6 +918,7 @@
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -17289,7 +17371,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockUnlock(fLock);
  	++sweet_fb_swap_count;
  	/*
-@@ -971,6 +992,72 @@
+@@ -971,6 +994,96 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
@@ -17345,6 +17427,30 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			}
 +		}
 +		/*
++		 * 5-c26 (D-3b): the padded destination. 750x48 -> 1080x64 into a
++		 * buffer whose stride is 4352 (68 * 64), because the panel's own 4320
++		 * cannot be expressed by RB_A2D_DEST_BUFFER_PITCH. Checks the eight
++		 * padding columns per row stay untouched.
++		 */
++		{
++			static bool wide_done;
++			uint32_t wide = 0;
++
++			if (!wide_done && PE_parse_boot_argn("mi8gpu_gpuwide", &wide,
++			    sizeof(wide)) && wide != 0) {
++				unsigned long long c[8];
++				int wrc;
++
++				wrc = mi8_surface_bridge_wide_test(s->id, (unsigned)sx,
++				    (unsigned)sy, c);
++				if (wrc != -7) {
++					wide_done = true;
++					printf("mi8gpu: step 54 GPUWIDE rc %d decoded %llu floor %llu half %llu other %llu guard %llu drained %llu\n",
++					    wrc, c[0], c[1], c[2], c[3], c[4], c[5]);
++				}
++			}
++		}
++		/*
 +		 * 5-c17: the row width the A2D source-pitch register would have to
 +		 * express. Printed once, gated by a boot-arg. No display change.
 +		 */
@@ -17362,7 +17468,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1251,7 +1338,7 @@
+@@ -1251,7 +1364,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -17371,7 +17477,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1354,7 @@
+@@ -1267,7 +1380,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -17380,7 +17486,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1370,7 @@
+@@ -1283,7 +1396,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -17389,7 +17495,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1305,6 +1392,23 @@
+@@ -1305,6 +1418,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -17413,7 +17519,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1557,51 @@
+@@ -1453,7 +1583,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
