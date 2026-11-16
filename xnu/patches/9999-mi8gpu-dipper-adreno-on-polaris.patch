@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8502 @@
+@@ -0,0 +1,8664 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5379,6 +5379,161 @@ new file mode 100644
 +	        : "the padded destination did NOT behave as expected", 10);
 +}
 +
++/*
++ * 5-c32 (D-3c): a WHOLE FRAME.
++ *
++ * Everything up to here proved one piece at a time: scattered pages as a
++ * source (D-1.5), a real compositor surface (D-2), a non-integer scale
++ * (D-3a), and a 4352-stride padded destination (D-3b). This does all of
++ * them at once at the real geometry: 750 x 1624 -> 1080 x 2160, source
++ * and destination both physically scattered, destination stride 4352
++ * because the panel's 4320 cannot be encoded.
++ *
++ * The source is synthesised here rather than taken from backboardd:
++ * at this point in boot the compositor has not drawn yet, and the point
++ * is the geometry and the memory, not the pixel source.
++ */
++#define FF_SW	750u
++#define FF_SH	1624u
++#define FF_DW	1080u
++#define FF_DH	2160u
++#define FF_SPITCH	3072u
++#define FF_DPITCH	4352u
++#define FF_SRC_VA	0x34000000ull
++#define FF_DST_VA	0x38000000ull
++
++
++static void
++bl_fullframe_probe(void)
++{
++	const uint32_t sbytes = FF_SPITCH * FF_SH;
++	const uint32_t dbytes = FF_DPITCH * FF_DH;
++	const uint32_t spages = (sbytes + 0xfffu) >> 12;
++	const uint32_t dpages = (dbytes + 0xfffu) >> 12;
++	vm_offset_t src = 0, dst = 0;
++	volatile uint32_t *scpu, *dcpu;
++	uint32_t seq[128], nseq, ring_w, i, x, y, mapped = 0, drained = 0;
++	uint32_t correct = 0, untouched = 0, wrong = 0, guard = 0;
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++
++	printf("mi8gpu: step 56 FULL: %ux%u -> %ux%u, %u + %u pages, %u KB%c",
++	    FF_SW, FF_SH, FF_DW, FF_DH, spages, dpages, (sbytes + dbytes) / 1024u, 10);
++	if (kmem_alloc(kernel_map, &src, round_page(sbytes), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("mi8gpu: step 56 FULL: no memory for the source%c", 10);
++		return;
++	}
++	if (kmem_alloc(kernel_map, &dst, round_page(dbytes), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("mi8gpu: step 56 FULL: no memory for the destination%c", 10);
++		kmem_free(kernel_map, src, round_page(sbytes));
++		return;
++	}
++	scpu = (volatile uint32_t *)src;
++	dcpu = (volatile uint32_t *)dst;
++
++	for (i = 0; i < spages; i++) {
++		if (keep_map(FF_SRC_VA + (unsigned long long)i * 0x1000ull,
++		    (unsigned long long)kvtophys(src + (vm_offset_t)(i << 12)), 0)) {
++			mapped++;
++		}
++	}
++	for (i = 0; i < dpages; i++) {
++		if (keep_map(FF_DST_VA + (unsigned long long)i * 0x1000ull,
++		    (unsigned long long)kvtophys(dst + (vm_offset_t)(i << 12)), 0)) {
++			mapped++;
++		}
++	}
++	keep_tlb();
++	printf("mi8gpu: step 56 FULL mapped %u of %u%c", mapped, spages + dpages, 10);
++	if (mapped != spages + dpages) {
++		goto out;
++	}
++
++	/* Known source: PAT(x,y) = 0x5a000000 | (y << 12) | x. */
++	for (y = 0; y < FF_SH; y++) {
++		for (x = 0; x < FF_SW; x++) {
++			scpu[y * (FF_SPITCH / 4u) + x] = 0x5a000000u | (y << 12) | x;
++		}
++	}
++	to_memory(src, sbytes);
++	for (i = 0; i < dbytes / 4u; i++) {
++		dcpu[i] = 0xcdcdcdcdu;
++	}
++	to_memory(dst, dbytes);
++	printf("mi8gpu: step 56 FULL filled, submitting%c", 10);
++
++	ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
++	nseq = mi8_blit_emit(seq, FF_SRC_VA, FF_DST_VA, FF_SW, FF_SH, FF_SPITCH,
++	    FF_DW, FF_DH, FF_DPITCH, 0u, 0u,
++	    g3d_regions[2].address + BS_CLOCK_OFF,
++	    g3d_regions[2].address + BL_RB_OFF,
++	    g3d_regions[2].address + B79_EV_OFF,
++	    g3d_regions[2].address + BS_FENCE_OFF,
++	    g3d_regions[2].address + BS_MARK_OFF);
++	for (i = 0; i < nseq; i++) {
++		ring[ring_w++ & 8191u] = seq[i];
++	}
++	{
++		const uint32_t target_wptr = ring_w & 8191u;
++
++		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++		wr(gpu3d + 4 * 0x0807, target_wptr);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (i = 0; i < 40000; i++) {
++			if (rd(gpu3d + 4 * 0x0806) == target_wptr) {
++				break;
++			}
++			sleep_us(50);
++		}
++		cp_wptr = target_wptr;
++		keep_ring_at = target_wptr;
++		drained = (rd(gpu3d + 4 * 0x0806) == target_wptr) ? 1u : 0u;
++	}
++	printf("mi8gpu: step 56 FULL drained %u, FSR %#x%c", drained,
++	    rd(smmu_cb(G3D_CTX) + CB_FSR), 10);
++	sleep_us(2000);
++	from_memory(dst, dbytes);
++
++	for (y = 0; y < FF_DH; y++) {
++		for (x = 0; x < FF_DW; x++) {
++			uint32_t v = dcpu[y * (FF_DPITCH / 4u) + x];
++			unsigned int ox, oy, ex, ey;
++
++			if ((v >> 24) != 0x5au) { untouched++; continue; }
++			ox = v & 0xfffu;
++			oy = (v >> 12) & 0xfffu;
++			ex = (x * FF_SW) / FF_DW;
++			ey = (y * FF_SH) / FF_DH;
++			if (ox == ex && oy == ey) { correct++; }
++			else if (ox == ((2u * x + 1u) * FF_SW) / (2u * FF_DW)
++			    && oy == ((2u * y + 1u) * FF_SH) / (2u * FF_DH)) { correct++; }
++			else { wrong++; }
++		}
++		for (x = FF_DW; x < FF_DW + 8u; x++) {
++			if (dcpu[y * (FF_DPITCH / 4u) + x] == 0xcdcdcdcdu) { guard++; }
++		}
++	}
++	printf("mi8gpu: step 56 FULL correct %u untouched %u wrong %u guard %u want %u/%u%c",
++	    correct, untouched, wrong, guard, FF_DW * FF_DH, 8u * FF_DH, 10);
++	printf("mi8gpu: step 56 FULL %s%c",
++	    (correct == FF_DW * FF_DH && wrong == 0u && untouched == 0u
++	        && guard == 8u * FF_DH && drained == 1u)
++	        ? "A WHOLE FRAME, SCALED AND PADDED, IS PIXEL-CORRECT"
++	        : "the full frame did NOT come out as expected", 10);
++
++out:
++	for (i = 0; i < spages; i++) {
++		keep_map(FF_SRC_VA + (unsigned long long)i * 0x1000ull, 0, 0);
++	}
++	for (i = 0; i < dpages; i++) {
++		keep_map(FF_DST_VA + (unsigned long long)i * 0x1000ull, 0, 0);
++	}
++	keep_tlb();
++	if (src != 0) { kmem_free(kernel_map, src, round_page(sbytes)); }
++	if (dst != 0) { kmem_free(kernel_map, dst, round_page(dbytes)); }
++}
++
 +static void
 +bl_readback(void)
 +{
@@ -8311,6 +8466,13 @@ new file mode 100644
 +
 +				if (PE_parse_boot_argn("mi8gpu_gpuwide", &wide, sizeof(wide)) && wide) {
 +					bl_wide_probe();
++				}
++				{
++					unsigned int ff = 0;
++
++					if (PE_parse_boot_argn("mi8gpu_fullframe", &ff, sizeof(ff)) && ff) {
++						bl_fullframe_probe();
++					}
 +				}
 +			}
 +			printf("mi8gpu: step 52 A2DPRIME done, snapshot_valid %u%c",
