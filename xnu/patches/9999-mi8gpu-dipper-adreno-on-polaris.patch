@@ -14377,7 +14377,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1053 @@
+@@ -0,0 +1,1054 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -14907,6 +14907,7 @@ new file mode 100644
 +				else {
 +					other++;
 +				if (other == 1u) { first_bad_x = x; first_bad_y = y; first_bad_got = got; first_bad_want = want; }
++			}
 +			}
 +		}
 +	}
