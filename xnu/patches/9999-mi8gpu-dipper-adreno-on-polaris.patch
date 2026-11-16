@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,8679 @@
+@@ -0,0 +1,8694 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5465,6 +5465,10 @@ new file mode 100644
 +	}
 +	to_memory(dst, dbytes);
 +	printf("mi8gpu: step 56 FULL filled, submitting%c", 10);
++	const uint64_t fence_pa = (uint64_t)kvtophys(g3d_regions[2].memory) + BS_FENCE_OFF;
++	uint32_t f0 = (uint32_t)ml_phys_read_word(fence_pa);
++	uint32_t k;
++
 +	t0 = mach_absolute_time();
 +
 +	ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
@@ -5484,6 +5488,18 @@ new file mode 100644
 +		to_memory(g3d_regions[1].memory, g3d_regions[1].size);
 +		wr(gpu3d + 4 * 0x0807, target_wptr);
 +		__asm__ volatile ("dsb sy" ::: "memory");
++		/*
++		 * 5-c35: draining the ring only means the CP consumed the packet; the
++		 * blit runs on asynchronously. The first version of this probe reported
++		 * 47 us for a whole frame, which is impossible. Wait on the GPU's own
++		 * fence write instead -- that is real completion.
++		 */
++		for (k = 0; k < 4000000u; k++) {
++			if ((uint32_t)ml_phys_read_word(fence_pa) != f0) {
++				break;
++			}
++		}
++		t1 = mach_absolute_time();
 +		for (i = 0; i < 40000; i++) {
 +			if (rd(gpu3d + 4 * 0x0806) == target_wptr) {
 +				break;
@@ -5497,9 +5513,8 @@ new file mode 100644
 +	printf("mi8gpu: step 56 FULL drained %u, FSR %#x%c", drained,
 +	    rd(smmu_cb(G3D_CTX) + CB_FSR), 10);
 +	sleep_us(2000);
-+	t1 = mach_absolute_time();
 +	/* xnu's timebase on this SoC is 1 ns per tick, so /1000 is microseconds. */
-+	printf("mi8gpu: step 56 FULL timing: map %llu us, submit+drain %llu us%c",
++	printf("mi8gpu: step 56 FULL timing: map %llu us, blit (fence) %llu us%c",
 +	    tmap / 1000ull, (t1 - t0) / 1000ull, 10);
 +	from_memory(dst, dbytes);
 +
