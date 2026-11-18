@@ -18567,17 +18567,20 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  void
  AppleCLCD::present(const uint8_t *rec)
  {
-@@ -960,6 +989,27 @@
+@@ -960,6 +989,42 @@
  		if (!(mask & (1u << layer)) || id == 0) {
  			continue;
  		}
 +		/*
-+		 * 5-c56: hand this layer to the GPU. Only for a full-screen single
-+		 * layer -- a partial rect would be scaled across the whole frame.
-+		 * Any failure falls through to the CPU path.
++		 * 5-c58: hand this layer to the GPU, and time it. Only for a full-screen
++		 * single layer -- a partial rect would be scaled across the whole frame.
++		 * Any failure, or a frame that does not verify, falls through to the CPU
++		 * path: the screen must never show unverified GPU output.
 +		 */
 +		{
 +			static int gpu_present = -1;
++			static unsigned long long acc_ns;
++			static unsigned int acc_n;
 +
 +			if (gpu_present < 0) {
 +				int v = 0;
@@ -18585,17 +18588,29 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +				gpu_present = (PE_parse_boot_argn("sweetgpu", &v, sizeof(v)) && v != 0) ? 1 : 0;
 +			}
 +			if (gpu_present != 0 && dx == 0 && dy == 0 &&
-+			    w == (int32_t)fLogicalW && h == (int32_t)fLogicalH &&
-+			    mi8_surface_bridge_present(id) == 0) {
-+				fBlitFrames++;
-+				fBlitsTotal++;
-+				return;
++			    w == (int32_t)fLogicalW && h == (int32_t)fLogicalH) {
++				uint64_t g0 = mach_absolute_time();
++				int grc = mi8_surface_bridge_present(id);
++				uint64_t gn = 0;
++
++				if (grc == 0) {
++					absolutetime_to_nanoseconds(mach_absolute_time() - g0, &gn);
++					acc_ns += gn;
++					acc_n++;
++					if ((acc_n % 60u) == 0u) {
++						printf("mi8gpu: step 66 GPUFRAME avg %llu us over %u frames%c",
++						    acc_ns / acc_n / 1000ull, acc_n, 10);
++					}
++					fBlitFrames++;
++					fBlitsTotal++;
++					return;
++				}
 +			}
 +		}
  		SweetSurface *s = sweet_surface_copy(id);
  		if (sweet_fb_swaps_logged < 16) {
  			sweet_fb_swaps_logged++;
-@@ -971,6 +1021,72 @@
+@@ -971,6 +1036,72 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
@@ -18668,7 +18683,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1251,7 +1367,7 @@
+@@ -1251,7 +1382,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -18677,7 +18692,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1383,7 @@
+@@ -1267,7 +1398,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -18686,7 +18701,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1399,7 @@
+@@ -1283,7 +1414,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -18695,7 +18710,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1305,6 +1421,23 @@
+@@ -1305,6 +1436,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -18719,7 +18734,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1586,51 @@
+@@ -1453,7 +1601,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
@@ -18772,7 +18787,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	default:
  		break;
  	}
-@@ -1477,3 +1654,18 @@
+@@ -1477,3 +1669,18 @@
  	return ret;
  }
  #endif /* SWEET */
