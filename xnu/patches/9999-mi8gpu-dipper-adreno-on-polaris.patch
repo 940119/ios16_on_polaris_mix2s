@@ -15625,11 +15625,11 @@ new file mode 100644
 +	if (rc != 0) { return -5; }
 +
 +	/*
-+	 * 200 us: step 60 measured the frame landing within one 9.4 MB invalidate,
++	 * 50 us: step 60 measured the frame landing within one 9.4 MB invalidate,
 +	 * far under this. It is a bounded wait, not a correct one -- if the blit
 +	 * ever runs long the frame is stale for one swap instead of wedging.
 +	 */
-+	mi8_gpu_sleep_us(200u);
++	mi8_gpu_sleep_us(50u);
 +
 +	/*
 +	 * Never show unverified GPU output: if the padded frame does not look
