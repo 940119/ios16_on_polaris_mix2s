@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9163 @@
+@@ -0,0 +1,9184 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5330,6 +5330,7 @@ new file mode 100644
 +#define MI8_PAD_PAGES   ((MI8_PAD_BYTES + 0xfffu) / 0x1000u)
 +
 +static vm_offset_t pad_buf;
++static vm_offset_t pad_dev;
 +static uint32_t pad_pages;
 +
 +/*
@@ -5374,6 +5375,19 @@ new file mode 100644
 +		}
 +	}
 +	keep_tlb();
++	/*
++	 * 5-c52: a second, UNCACHED view of the same frame. step 62 MEM C proved
++	 * that from_memory does not invalidate on this platform, so any cached
++	 * read of the padded frame can return the zero-fill from allocation
++	 * instead of what the GPU wrote. Everything that inspects the result
++	 * must go through this window instead.
++	 */
++	pad_dev = ml_io_map((addr64_t)kvtophys(pad_buf), MI8_PAD_BYTES);
++	if (pad_dev == 0) {
++		printf("mi8gpu: step 63 E1 padded: uncached window failed%c", 10);
++		return -4;
++	}
++	keep_tlb();
 +	printf("mi8gpu: step 63 E1 padded: %u x %u at stride %u, %u bytes, %u pages mapped%c",
 +	    MI8_PAD_W, MI8_PAD_H, MI8_PAD_PITCH, MI8_PAD_BYTES, pad_pages, 10);
 +	return 0;
@@ -5383,6 +5397,13 @@ new file mode 100644
 +mi8_gpu_padded_kva(void)
 +{
 +	return (unsigned long long)pad_buf;
++}
++
++/* the same frame, through a device mapping (never cached). */
++unsigned long long
++mi8_gpu_padded_dev(void)
++{
++	return (unsigned long long)pad_dev;
 +}
 +
 +/*
@@ -14377,7 +14398,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1065 @@
+@@ -0,0 +1,1066 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -14555,6 +14576,7 @@ new file mode 100644
 +extern "C" void mi8_gpu_from_memory(unsigned long long start, unsigned long long size);
 +extern "C" int mi8_gpu_padded_prepare(void);
 +extern "C" unsigned long long mi8_gpu_padded_kva(void);
++extern "C" unsigned long long mi8_gpu_padded_dev(void);
 +extern "C" int mi8_gpu_blit_to_padded(const unsigned long long *pas4k,
 +    unsigned int npages, unsigned int src_pitch, unsigned int sx, unsigned int sy,
 +    unsigned int sw, unsigned int sh);
@@ -14859,7 +14881,7 @@ new file mode 100644
 +
 +	kva = (unsigned char *)s->kernelAddress();
 +	if (kva == nullptr) { s->release(); return -3; }
-+	pad = mi8_gpu_padded_kva();
++	pad = mi8_gpu_padded_dev();
 +	if (pad == 0) { s->release(); return -4; }
 +
 +	rc = mi8_gpu_blit_to_padded(pas4k, np, s->bytesPerRow, 0u, 0u, s->width, s->height);
