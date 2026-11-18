@@ -18511,15 +18511,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockUnlock(fLock);
  	++sweet_fb_swap_count;
  	/*
-@@ -934,6 +961,8 @@
+@@ -933,6 +960,8 @@
+ 	}
  }
  
- void
 +extern "C" int mi8_surface_bridge_present(void);
 +
+ void
  AppleCLCD::present(const uint8_t *rec)
  {
- 	uint32_t mask = get32(rec, 0x104);
 @@ -948,6 +977,26 @@
  			sweet_console_muted = 1;
  		}
