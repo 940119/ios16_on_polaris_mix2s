@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9184 @@
+@@ -0,0 +1,9207 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5376,17 +5376,17 @@ new file mode 100644
 +	}
 +	keep_tlb();
 +	/*
-+	 * 5-c52: a second, UNCACHED view of the same frame. step 62 MEM C proved
-+	 * that from_memory does not invalidate on this platform, so any cached
-+	 * read of the padded frame can return the zero-fill from allocation
-+	 * instead of what the GPU wrote. Everything that inspects the result
-+	 * must go through this window instead.
++	 * 5-c53: NO whole-frame device mapping.
++	 *
++	 * 0471 mapped all 9,400,320 bytes with ml_io_map and the machine panicked
++	 * in the CCU handshake: kalloc.16 failed twice and a handshake structure
++	 * was then used uninitialised. ml_io_map is meant for MMIO windows of a
++	 * few pages; asking it for 9 MB of submap and page tables starves the
++	 * small-object zones.
++	 *
++	 * Readers map one 8 KB window per row instead (see mi8_gpu_padded_map).
 +	 */
-+	pad_dev = ml_io_map((addr64_t)kvtophys(pad_buf), MI8_PAD_BYTES);
-+	if (pad_dev == 0) {
-+		printf("mi8gpu: step 63 E1 padded: uncached window failed%c", 10);
-+		return -4;
-+	}
++	pad_dev = 0;
 +	keep_tlb();
 +	printf("mi8gpu: step 63 E1 padded: %u x %u at stride %u, %u bytes, %u pages mapped%c",
 +	    MI8_PAD_W, MI8_PAD_H, MI8_PAD_PITCH, MI8_PAD_BYTES, pad_pages, 10);
@@ -5404,6 +5404,29 @@ new file mode 100644
 +mi8_gpu_padded_dev(void)
 +{
 +	return (unsigned long long)pad_dev;
++}
++
++/*
++ * Map one page-aligned window of the padded frame for an UNCACHED read.
++ * Callers keep the window small (8 KB) and few (one per sampled row):
++ * that is the size ml_io_map is actually for.
++ */
++unsigned long long
++mi8_gpu_padded_map(unsigned int off, unsigned int len)
++{
++	vm_offset_t pa;
++
++	if (pad_buf == 0 || len == 0) {
++		return 0;
++	}
++	if ((vm_offset_t)off + len > MI8_PAD_BYTES) {
++		return 0;
++	}
++	pa = (vm_offset_t)kvtophys(pad_buf + (vm_offset_t)off);
++	if (pa == 0) {
++		return 0;
++	}
++	return (unsigned long long)ml_io_map((addr64_t)pa, (vm_size_t)len);
 +}
 +
 +/*
@@ -14398,7 +14421,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1066 @@
+@@ -0,0 +1,1073 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -14577,6 +14600,7 @@ new file mode 100644
 +extern "C" int mi8_gpu_padded_prepare(void);
 +extern "C" unsigned long long mi8_gpu_padded_kva(void);
 +extern "C" unsigned long long mi8_gpu_padded_dev(void);
++extern "C" unsigned long long mi8_gpu_padded_map(unsigned int off, unsigned int len);
 +extern "C" int mi8_gpu_blit_to_padded(const unsigned long long *pas4k,
 +    unsigned int npages, unsigned int src_pitch, unsigned int sx, unsigned int sy,
 +    unsigned int sw, unsigned int sh);
@@ -14854,8 +14878,6 @@ new file mode 100644
 +	unsigned int sampled = 0, correct = 0, other = 0, untouched = 0;
 +	unsigned int first_bad_x = 0, first_bad_y = 0, first_bad_got = 0, first_bad_want = 0;
 +	int rc;
-+	unsigned long long pad;
-+	const unsigned char *padp;
 +
 +	if (s == nullptr || out == nullptr) {
 +		if (s != nullptr) { s->release(); }
@@ -14881,8 +14903,6 @@ new file mode 100644
 +
 +	kva = (unsigned char *)s->kernelAddress();
 +	if (kva == nullptr) { s->release(); return -3; }
-+	pad = mi8_gpu_padded_dev();
-+	if (pad == 0) { s->release(); return -4; }
 +
 +	rc = mi8_gpu_blit_to_padded(pas4k, np, s->bytesPerRow, 0u, 0u, s->width, s->height);
 +	out[0] = (unsigned long long)(unsigned int)rc;
@@ -14896,10 +14916,20 @@ new file mode 100644
 +	 */
 +	mi8_gpu_sleep_us(50000u);
 +	mi8_gpu_from_memory(pad, 9400320ull);
-+	padp = (const unsigned char *)(const void *)pad;
 +
 +	for (y = 0; y < 2160u; y += 68u) {
-+		const unsigned char *prow = padp + (unsigned long long)y * 4352u;
++		/*
++		 * 5-c53: one 16 KB UNCACHED window per sampled row. The row is 4320
++		 * bytes and may start up to 4095 bytes into a page, so 16 KB covers
++		 * it with room to spare while staying at the size ml_io_map is for.
++		 */
++		unsigned int roff = y * 4352u;
++		unsigned int pbase = roff & ~0xfffu;
++		unsigned int delta = roff - pbase;
++		unsigned long long rdev = mi8_gpu_padded_map(pbase, 0x4000u);
++		const unsigned char *prow = (rdev != 0)
++		    ? (const unsigned char *)(const void *)rdev + delta : nullptr;
++		if (prow == nullptr) { continue; }
 +		const unsigned char *srow = kva + (unsigned long long)((y * s->height) / 2160u) * s->bytesPerRow;
 +
 +		for (x = 0; x < 1080u; x += 68u) {
