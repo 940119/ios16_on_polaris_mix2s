@@ -18597,9 +18597,9 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +					absolutetime_to_nanoseconds(mach_absolute_time() - g0, &gn);
 +					acc_ns += gn;
 +					acc_n++;
-+					if ((acc_n % 60u) == 0u) {
-+						printf("mi8gpu: step 66 GPUFRAME avg %llu us over %u frames%c",
-+						    acc_ns / acc_n / 1000ull, acc_n, 10);
++					if (acc_n <= 3u || (acc_n % 10u) == 0u) {
++						printf("mi8gpu: step 66 GPUFRAME #%u %llu us (avg %llu us over %u)%c",
++						    acc_n, gn / 1000ull, acc_ns / acc_n / 1000ull, acc_n, 10);
 +					}
 +					fBlitFrames++;
 +					fBlitsTotal++;
