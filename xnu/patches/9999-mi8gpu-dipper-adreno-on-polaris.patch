@@ -14444,7 +14444,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1231 @@
+@@ -0,0 +1,1243 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -15638,7 +15638,8 @@ new file mode 100644
 +	 * white panel.
 +	 */
 +	{
-+		unsigned int vx, vy, hit = 0, tried = 0;
++		static unsigned int present_reported;
++		unsigned int vx, vy, hit = 0, tried = 0, vs_w = 0, vs_h = 0;
 +
 +		src = (const unsigned char *)(const void *)pad;
 +		SweetSurface *vs = sweet_surface_copy(id);
@@ -15661,9 +15662,20 @@ new file mode 100644
 +				if (got == a || got == b2) { hit++; }
 +			}
 +		}
++		vs_w = vs->width; vs_h = vs->height;
 +		vs->release();
 +		if (tried == 0u || hit * 4u < tried * 3u) {
++			/* observable: a rejected frame must leave a trace, or we are back
++			 * to guessing from the screen. */
++			if (present_reported++ < 4) {
++				printf("mi8gpu: step 65 PRESENT reject: id %u %ux%u verify %u of %u, CPU path%c",
++					id, vs_w, vs_h, hit, tried, 10);
++			}
 +			return -6;
++		}
++		if (present_reported++ < 4) {
++			printf("mi8gpu: step 65 PRESENT gpu: id %u %ux%u verify %u of %u, panel %ux%u%c",
++				id, vs_w, vs_h, hit, tried, (unsigned int)info[2], (unsigned int)info[3], 10);
 +		}
 +	}
 +	src = (const unsigned char *)(const void *)pad;
