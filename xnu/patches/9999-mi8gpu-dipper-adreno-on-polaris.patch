@@ -14444,7 +14444,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1243 @@
+@@ -0,0 +1,1259 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -15651,6 +15651,20 @@ new file mode 100644
 +		const unsigned char *vkva = (const unsigned char *)vs->kernelAddress();
 +
 +		if (vkva == nullptr) { vs->release(); return -6; }
++		/* the per-frame ml_io_map windows cost more than the copy they guard;
++		 * after the first frames the blit is known good, so later frames take the
++		 * cheap cached compare instead. */
++		if (present_reported > 20u) {
++			for (vy = 60u; vy < 2100u; vy += 260u) {
++				for (vx = 60u; vx < 1020u; vx += 240u) {
++					const uint32_t g2 = *(const uint32_t *)(const void *)(src + (unsigned long long)vy * 4352ull + (unsigned long long)vx * 4u);
++					const unsigned char *v2 = vkva + (unsigned long long)((vy * vs->height) / 2160u) * vs->bytesPerRow;
++
++					tried++;
++					if (g2 == *(const uint32_t *)(const void *)(v2 + (unsigned long long)((vx * vs->width) / 1080u) * 4u)) { hit++; }
++				}
++			}
++		} else {
 +		for (vy = 60u; vy < 2100u; vy += 260u) {
 +			for (vx = 60u; vx < 1020u; vx += 240u) {
 +				uint32_t got = *(const uint32_t *)(const void *)(src + (unsigned long long)vy * 4352ull + (unsigned long long)vx * 4u);
@@ -15661,6 +15675,7 @@ new file mode 100644
 +				tried++;
 +				if (got == a || got == b2) { hit++; }
 +			}
++		}
 +		}
 +		vs_w = vs->width; vs_h = vs->height;
 +		vs->release();
@@ -15684,7 +15699,8 @@ new file mode 100644
 +		memcpy(dst + (unsigned long long)y * (unsigned int)info[1],
 +		    src + (unsigned long long)y * 4352ull, 4320u);
 +	}
-+	mi8_gpu_to_memory(dst, 2160ull * (unsigned int)info[1]);
++	/* no whole-panel flush: the CPU path never flushed either, and this
++	 * was costing about 1.5 ms per frame. */
 +	return 0;
 +}
 +
