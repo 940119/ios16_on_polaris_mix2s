@@ -14421,7 +14421,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1073 @@
+@@ -0,0 +1,1074 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -14915,7 +14915,8 @@ new file mode 100644
 +	 * geometry error. Wait far longer than any plausible blit.
 +	 */
 +	mi8_gpu_sleep_us(50000u);
-+	mi8_gpu_from_memory(pad, 9400320ull);
++	/* step 62 MEM C: from_memory does not invalidate here; the reads below go
++	 * through per-row device windows instead. */
 +
 +	for (y = 0; y < 2160u; y += 68u) {
 +		/*
