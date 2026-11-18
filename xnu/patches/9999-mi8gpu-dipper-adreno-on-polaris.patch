@@ -14444,7 +14444,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1196 @@
+@@ -0,0 +1,1231 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -15588,7 +15588,7 @@ new file mode 100644
 + * present() can fall back to the CPU path.
 + */
 +extern "C" int
-+mi8_surface_bridge_present(void)
++mi8_surface_bridge_present(unsigned int id)
 +{
 +	static unsigned long long info[8];
 +	static unsigned long long pas16[800];
@@ -15604,7 +15604,7 @@ new file mode 100644
 +	if (sweet_fb_panel_info(info) != 0 || info[4] == 0) { return -1; }
 +	pad = mi8_gpu_padded_kva();
 +	if (pad == 0) { return -2; }
-+	s = sweet_surface_copy(mi8_surface_bridge_last_id());
++	s = sweet_surface_copy(id);
 +	if (s == nullptr) { return -3; }
 +	if (s->memory == nullptr || s->width == 0 || s->height == 0) { s->release(); return -4; }
 +
@@ -15631,6 +15631,41 @@ new file mode 100644
 +	 */
 +	mi8_gpu_sleep_us(200u);
 +
++	/*
++	 * Never show unverified GPU output: if the padded frame does not look
++	 * like the source, fall back to the CPU path. This is what turns a
++	 * wrong-surface mistake into 'the screen stays correct' instead of a
++	 * white panel.
++	 */
++	{
++		unsigned int vx, vy, hit = 0, tried = 0;
++
++		src = (const unsigned char *)(const void *)pad;
++		SweetSurface *vs = sweet_surface_copy(id);
++
++		if (vs == nullptr || vs->memory == nullptr) {
++			if (vs != nullptr) { vs->release(); }
++			return -6;
++		}
++		const unsigned char *vkva = (const unsigned char *)vs->kernelAddress();
++
++		if (vkva == nullptr) { vs->release(); return -6; }
++		for (vy = 60u; vy < 2100u; vy += 260u) {
++			for (vx = 60u; vx < 1020u; vx += 240u) {
++				uint32_t got = *(const uint32_t *)(const void *)(src + (unsigned long long)vy * 4352ull + (unsigned long long)vx * 4u);
++				const unsigned char *vr = vkva + (unsigned long long)((vy * vs->height) / 2160u) * vs->bytesPerRow;
++				uint32_t a = *(const uint32_t *)(const void *)(vr + (unsigned long long)((vx * vs->width) / 1080u) * 4u);
++				uint32_t b2 = *(const uint32_t *)(const void *)(vr + (unsigned long long)(((2u * vx + 1u) * vs->width) / (2u * 1080u)) * 4u);
++
++				tried++;
++				if (got == a || got == b2) { hit++; }
++			}
++		}
++		vs->release();
++		if (tried == 0u || hit * 4u < tried * 3u) {
++			return -6;
++		}
++	}
 +	src = (const unsigned char *)(const void *)pad;
 +	dst = (unsigned char *)(unsigned long long)info[4];
 +	for (y = 0; y < 2160u; y++) {
@@ -18515,39 +18550,40 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-+extern "C" int mi8_surface_bridge_present(void);
++extern "C" int mi8_surface_bridge_present(unsigned int id);
 +
  void
  AppleCLCD::present(const uint8_t *rec)
  {
-@@ -948,6 +977,26 @@
- 			sweet_console_muted = 1;
+@@ -960,6 +989,27 @@
+ 		if (!(mask & (1u << layer)) || id == 0) {
+ 			continue;
  		}
- 	}
-+	/*
-+	 * 5-c55: hand the frame to the GPU. One blit of the layer surface into the
-+	 * padded frame, then the same row copy the CPU path ends with. Any failure
-+	 * falls through to the CPU path -- this must never be the reason a frame
-+	 * is missed.
-+	 */
-+	{
-+		static int gpu_present = -1;
++		/*
++		 * 5-c56: hand this layer to the GPU. Only for a full-screen single
++		 * layer -- a partial rect would be scaled across the whole frame.
++		 * Any failure falls through to the CPU path.
++		 */
++		{
++			static int gpu_present = -1;
 +
-+		if (gpu_present < 0) {
-+			int v = 0;
++			if (gpu_present < 0) {
++				int v = 0;
 +
-+			gpu_present = (PE_parse_boot_argn("sweetgpu", &v, sizeof(v)) && v != 0) ? 1 : 0;
++				gpu_present = (PE_parse_boot_argn("sweetgpu", &v, sizeof(v)) && v != 0) ? 1 : 0;
++			}
++			if (gpu_present != 0 && dx == 0 && dy == 0 &&
++			    w == (int32_t)fLogicalW && h == (int32_t)fLogicalH &&
++			    mi8_surface_bridge_present(id) == 0) {
++				fBlitFrames++;
++				fBlitsTotal++;
++				return;
++			}
 +		}
-+		if (gpu_present != 0 && mi8_surface_bridge_present() == 0) {
-+			fBlitFrames++;
-+			fBlitsTotal++;
-+			return;
-+		}
-+	}
- 
- 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
- 		uint32_t id = get32(rec, 0x54 + 4 * layer);
-@@ -971,6 +1020,72 @@
+ 		SweetSurface *s = sweet_surface_copy(id);
+ 		if (sweet_fb_swaps_logged < 16) {
+ 			sweet_fb_swaps_logged++;
+@@ -971,6 +1021,72 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
@@ -18620,7 +18656,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1251,7 +1366,7 @@
+@@ -1251,7 +1367,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -18629,7 +18665,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1382,7 @@
+@@ -1267,7 +1383,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -18638,7 +18674,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1398,7 @@
+@@ -1283,7 +1399,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -18647,7 +18683,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1305,6 +1420,23 @@
+@@ -1305,6 +1421,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -18671,7 +18707,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1585,51 @@
+@@ -1453,7 +1586,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
@@ -18724,7 +18760,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	default:
  		break;
  	}
-@@ -1477,3 +1653,18 @@
+@@ -1477,3 +1654,18 @@
  	return ret;
  }
  #endif /* SWEET */
