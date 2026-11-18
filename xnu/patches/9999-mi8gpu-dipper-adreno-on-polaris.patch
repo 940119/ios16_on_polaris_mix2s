@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9207 @@
+@@ -0,0 +1,9229 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5412,6 +5412,21 @@ new file mode 100644
 + * that is the size ml_io_map is actually for.
 + */
 +unsigned long long
++mi8_gpu_pa(unsigned long long va)
++{
++	return (unsigned long long)kvtophys((vm_offset_t)va);
++}
++
++unsigned long long
++mi8_gpu_map_pa(unsigned long long pa, unsigned int len)
++{
++	if (pa == 0 || len == 0) {
++		return 0;
++	}
++	return (unsigned long long)ml_io_map((addr64_t)pa, (vm_size_t)len);
++}
++
++unsigned long long
 +mi8_gpu_padded_map(unsigned int off, unsigned int len)
 +{
 +	vm_offset_t pa;
@@ -8993,6 +9008,13 @@ new file mode 100644
 +							unsigned long long c[8];
 +
 +							mi8_surface_bridge_e1(mi8_surface_bridge_last_id(), c);
++						{
++							unsigned int e2 = 0;
++
++							if (PE_parse_boot_argn("mi8gpu_e2", &e2, sizeof(e2)) && e2) {
++								mi8_surface_bridge_e2(c);
++							}
++						}
 +						}
 +					}
 +				}
@@ -14293,7 +14315,7 @@ diff --git a/bsd/dev/mi8gpu_sweet.h b/bsd/dev/mi8gpu_sweet.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8gpu_sweet.h
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,124 @@
 +#ifndef _BSD_DEV_MI8GPU_SWEET_H_
 +#define _BSD_DEV_MI8GPU_SWEET_H_
 +/*
@@ -14353,6 +14375,7 @@ new file mode 100644
 + * No panel write. Waits with sleep + from_memory, the only signal that
 + * proved trustworthy in step 61. */
 +extern int mi8_surface_bridge_e1(unsigned int id, unsigned long long *out);
++extern int mi8_surface_bridge_e2(unsigned long long *out);
 +/* id of the most recent surface created by the bridge (for the probe). */
 +extern unsigned int mi8_surface_bridge_last_id(void);
 +/* 5-a: the GPU ioctl surface. Returns 0 on success and writes one 64-bit
@@ -14421,7 +14444,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1074 @@
+@@ -0,0 +1,1133 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -15495,6 +15518,65 @@ new file mode 100644
 +	default:
 +		return -3;		/* unknown ioctl */
 +	}
++}
++
++extern "C" int sweet_fb_panel_info(unsigned long long *out);
++extern "C" unsigned long long mi8_gpu_pa(unsigned long long va);
++extern "C" unsigned long long mi8_gpu_map_pa(unsigned long long pa, unsigned int len);
++
++extern "C" int
++mi8_surface_bridge_e2(unsigned long long *out)
++{
++	static unsigned long long info[8];
++	SweetSurface *p;
++	unsigned char *pkva;
++	unsigned int prow, y, x, bad = 0, checked = 0;
++
++	if (out == nullptr || sweet_fb_panel_info(info) != 0) { return -1; }
++	prow = (unsigned int)info[1];
++	if (prow < 1080u * 4u || info[3] < 64ull) { return -2; }
++	p = sweet_surface_copy((unsigned int)info[0]);
++	if (p == nullptr) { return -3; }
++	pkva = (unsigned char *)p->kernelAddress();
++	if (pkva == nullptr) { p->release(); return -4; }
++
++	for (y = 0; y < 64u; y++) {
++		const unsigned int roff = y * 4352u;
++		const unsigned int pbase = roff & ~0xfffu;
++		const unsigned int delta = roff - pbase;
++		const unsigned long long rdev = mi8_gpu_padded_map(pbase, 0x4000u);
++
++		if (rdev == 0) { p->release(); return -5; }
++		memcpy(pkva + (unsigned long long)y * prow,
++		    (const void *)(const void *)(rdev + delta), 4320u);
++	}
++	mi8_gpu_to_memory(pkva, (unsigned long long)64u * prow);
++
++	for (y = 0; y < 64u; y += 8u) {
++		const unsigned int roff = y * 4352u;
++		const unsigned int pbase = roff & ~0xfffu;
++		const unsigned int delta = roff - pbase;
++		const unsigned long long rdev = mi8_gpu_padded_map(pbase, 0x4000u);
++		const unsigned long long pa = mi8_gpu_pa((unsigned long long)(pkva + (unsigned long long)y * prow));
++		const unsigned long long ddev = (pa != 0) ? mi8_gpu_map_pa(pa, 0x4000u) : 0;
++		const unsigned int doff = (unsigned int)(((unsigned long long)y * prow) & 0xfffull);
++
++		if (rdev == 0 || ddev == 0) { continue; }
++		for (x = 0; x < 1080u; x += 68u) {
++			const uint32_t a = *(const uint32_t *)(const void *)(rdev + delta + (unsigned long long)x * 4u);
++			const uint32_t b = *(const uint32_t *)(const void *)(ddev + doff + (unsigned long long)x * 4u);
++
++			checked++;
++			if (a != b) { bad++; }
++		}
++	}
++
++	out[0] = checked; out[1] = bad; out[2] = 64; out[3] = prow;
++	printf("mi8gpu: step 64 E2 %s: 64 panel rows copied, %u of %u read back equal (prow %u)%c",
++	    (bad == 0u && checked != 0u) ? "PASS" : "MISMATCH",
++	    checked - bad, checked, prow, 10);
++	p->release();
++	return 0;
 +}
 diff --git a/bsd/dev/mi8gpu_probe_bin.h b/bsd/dev/mi8gpu_probe_bin.h
 new file mode 100644
@@ -18332,7 +18414,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-@@ -706,6 +727,7 @@
+@@ -391,6 +412,7 @@
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++		gSweetFB = this;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -706,6 +728,7 @@
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
  			fb->fDirty = false;
@@ -18340,7 +18430,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  	}
  	IOLockUnlock(fb->fLock);
-@@ -896,6 +918,7 @@
+@@ -896,6 +919,7 @@
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -18348,7 +18438,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockUnlock(fLock);
  	++sweet_fb_swap_count;
  	/*
-@@ -971,6 +994,72 @@
+@@ -971,6 +995,72 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
@@ -18421,7 +18511,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1251,7 +1340,7 @@
+@@ -1251,7 +1341,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -18430,7 +18520,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1356,7 @@
+@@ -1267,7 +1357,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -18439,7 +18529,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1372,7 @@
+@@ -1283,7 +1373,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -18448,7 +18538,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1305,6 +1394,23 @@
+@@ -1305,6 +1395,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -18472,7 +18562,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1559,51 @@
+@@ -1453,7 +1560,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
@@ -18525,3 +18615,22 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	default:
  		break;
  	}
+@@ -1477,3 +1628,18 @@
+ 	return ret;
+ }
+ #endif /* SWEET */
++
++/* 5-c54: panel geometry and surface id for the driver-thread probes. */
++extern "C" int
++sweet_fb_panel_info(unsigned long long *out)
++{
++	if (gSweetFB == nullptr || gSweetFB->fSurface == nullptr || out == nullptr) {
++		return -1;
++	}
++	out[0] = (unsigned long long)gSweetFB->fSurface->id;
++	out[1] = (unsigned long long)gSweetFB->fRowBytes;
++	out[2] = (unsigned long long)gSweetFB->fWidth;
++	out[3] = (unsigned long long)gSweetFB->fHeight;
++	out[4] = (unsigned long long)gSweetFB->fPixels;
++	return 0;
++}
