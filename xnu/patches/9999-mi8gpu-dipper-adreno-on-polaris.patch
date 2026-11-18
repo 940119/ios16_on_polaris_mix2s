@@ -14444,7 +14444,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1133 @@
+@@ -0,0 +1,1196 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -15578,6 +15578,69 @@ new file mode 100644
 +	p->release();
 +	return 0;
 +}
++
++/*
++ * E (5-c55): the whole frame through the GPU, called from present().
++ *
++ * The CPU path gathers 1080x2160 into a staging row and copies each row to
++ * the panel. This does one A2D blit into the padded frame, waits, then does
++ * exactly the same row copy from there. Returns non-zero on any problem so
++ * present() can fall back to the CPU path.
++ */
++extern "C" int
++mi8_surface_bridge_present(void)
++{
++	static unsigned long long info[8];
++	static unsigned long long pas16[800];
++	static unsigned long long pas4k[3200];
++	SweetSurface *s;
++	IOByteCount len = 0;
++	unsigned int n16 = 0, n4 = 0, i, k, y;
++	unsigned long long pad;
++	const unsigned char *src;
++	unsigned char *dst;
++	int rc;
++
++	if (sweet_fb_panel_info(info) != 0 || info[4] == 0) { return -1; }
++	pad = mi8_gpu_padded_kva();
++	if (pad == 0) { return -2; }
++	s = sweet_surface_copy(mi8_surface_bridge_last_id());
++	if (s == nullptr) { return -3; }
++	if (s->memory == nullptr || s->width == 0 || s->height == 0) { s->release(); return -4; }
++
++	for (unsigned long long off = 0; off < s->allocSize && n16 < 800u; off += 0x4000u) {
++		addr64_t pa = s->memory->getPhysicalSegment(off, &len, 0);
++
++		if (pa == 0) { break; }
++		pas16[n16++] = (unsigned long long)pa;
++	}
++	for (i = 0; i < n16 && n4 + 4u <= 3200u; i++) {
++		for (k = 0; k < 4u; k++) {
++			pas4k[n4++] = pas16[i] + (unsigned long long)k * 0x1000ull;
++		}
++	}
++
++	rc = mi8_gpu_blit_to_padded(pas4k, n4, s->bytesPerRow, 0u, 0u, s->width, s->height);
++	s->release();
++	if (rc != 0) { return -5; }
++
++	/*
++	 * 200 us: step 60 measured the frame landing within one 9.4 MB invalidate,
++	 * far under this. It is a bounded wait, not a correct one -- if the blit
++	 * ever runs long the frame is stale for one swap instead of wedging.
++	 */
++	mi8_gpu_sleep_us(200u);
++
++	src = (const unsigned char *)(const void *)pad;
++	dst = (unsigned char *)(unsigned long long)info[4];
++	for (y = 0; y < 2160u; y++) {
++		memcpy(dst + (unsigned long long)y * (unsigned int)info[1],
++		    src + (unsigned long long)y * 4352ull, 4320u);
++	}
++	mi8_gpu_to_memory(dst, 2160ull * (unsigned int)info[1]);
++	return 0;
++}
++
 diff --git a/bsd/dev/mi8gpu_probe_bin.h b/bsd/dev/mi8gpu_probe_bin.h
 new file mode 100644
 --- /dev/null
@@ -18448,7 +18511,43 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockUnlock(fLock);
  	++sweet_fb_swap_count;
  	/*
-@@ -971,6 +998,72 @@
+@@ -934,6 +961,8 @@
+ }
+ 
+ void
++extern "C" int mi8_surface_bridge_present(void);
++
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+@@ -948,6 +977,26 @@
+ 			sweet_console_muted = 1;
+ 		}
+ 	}
++	/*
++	 * 5-c55: hand the frame to the GPU. One blit of the layer surface into the
++	 * padded frame, then the same row copy the CPU path ends with. Any failure
++	 * falls through to the CPU path -- this must never be the reason a frame
++	 * is missed.
++	 */
++	{
++		static int gpu_present = -1;
++
++		if (gpu_present < 0) {
++			int v = 0;
++
++			gpu_present = (PE_parse_boot_argn("sweetgpu", &v, sizeof(v)) && v != 0) ? 1 : 0;
++		}
++		if (gpu_present != 0 && mi8_surface_bridge_present() == 0) {
++			fBlitFrames++;
++			fBlitsTotal++;
++			return;
++		}
++	}
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+@@ -971,6 +1020,72 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
@@ -18521,7 +18620,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1251,7 +1344,7 @@
+@@ -1251,7 +1366,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -18530,7 +18629,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1360,7 @@
+@@ -1267,7 +1382,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -18539,7 +18638,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1376,7 @@
+@@ -1283,7 +1398,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -18548,7 +18647,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1305,6 +1398,23 @@
+@@ -1305,6 +1420,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -18572,7 +18671,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1563,51 @@
+@@ -1453,7 +1585,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
@@ -18625,7 +18724,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	default:
  		break;
  	}
-@@ -1477,3 +1631,18 @@
+@@ -1477,3 +1653,18 @@
  	return ret;
  }
  #endif /* SWEET */
