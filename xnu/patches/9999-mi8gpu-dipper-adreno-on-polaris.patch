@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9229 @@
+@@ -0,0 +1,9277 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5506,6 +5506,51 @@ new file mode 100644
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +	return 0;
 +}
++/*
++ * F-1 (5-c62): read-only survey of the MDSS source-surface processors.
++ *
++ * The boot shim configures the console scanout through these: its own code
++ * reads SRC_SIZE/SRC_ADDR/SRC_STRIDE from 0xAE00000 + {0x5000, 0x7000, ...}.
++ * If the panel really scans out of one of them, changing its stride from
++ * 4320 to 4352 would let the GPU write the panel directly -- 4352 is a
++ * multiple of 64, 4320 is not. Nothing is written here: this rung only
++ * reports what is programmed, because a wrong stride skews the display.
++ */
++static void
++bl_sspp_survey(void)
++{
++	static const uint32_t off[8] = {
++		0x5000, 0x7000, 0x9000, 0xb000,
++		0x25000, 0x27000, 0x29000, 0x2b000,
++	};
++	uint32_t i;
++
++	for (i = 0; i < 8u; i++) {
++		const addr64_t pa = (addr64_t)(0xae00000ull + off[i]);
++		vm_offset_t va = ml_io_map(pa, 0x1000);
++		uint32_t size, xy, out, addr, stride, fmt, opm;
++
++		if (va == 0) {
++			printf("mi8gpu: step 67 SSPP %u: map failed%c", i, 10);
++			continue;
++		}
++		size = rd((vm_offset_t)(va + 0x00));
++		xy = rd((vm_offset_t)(va + 0x08));
++		out = rd((vm_offset_t)(va + 0x0c));
++		addr = rd((vm_offset_t)(va + 0x14));
++		stride = rd((vm_offset_t)(va + 0x24));
++		fmt = rd((vm_offset_t)(va + 0x30));
++		opm = rd((vm_offset_t)(va + 0x38));
++
++		printf("mi8gpu: step 67 SSPP %u @%#x: size %ux%u xy %u,%u out %ux%u addr %#x stride %u fmt %#x opm %#x%c",
++		    i, (unsigned int)(0xae00000u + off[i]),
++		    (unsigned int)(size & 0xffffu), (unsigned int)(size >> 16),
++		    (unsigned int)(xy & 0xffffu), (unsigned int)(xy >> 16),
++		    (unsigned int)(out & 0xffffu), (unsigned int)(out >> 16),
++		    addr, (unsigned int)(stride & 0xffffu),
++		    fmt, opm, 10);
++	}
++}
 +static void
 +bl_gpucc_survey(void)
 +{
@@ -9011,6 +9056,9 @@ new file mode 100644
 +						{
 +							unsigned int e2 = 0;
 +
++							if (PE_parse_boot_argn("mi8gpu_sspp", &e2, sizeof(e2)) && e2) {
++								bl_sspp_survey();
++							}
 +							if (PE_parse_boot_argn("mi8gpu_e2", &e2, sizeof(e2)) && e2) {
 +								mi8_surface_bridge_e2(c);
 +							}
