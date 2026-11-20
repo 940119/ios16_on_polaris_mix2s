@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9576 @@
+@@ -0,0 +1,9605 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5664,6 +5664,33 @@ new file mode 100644
 +	return 0;
 +}
 +
++#define MI8_CTL0_PA   0xae02000ull
++#define MI8_CTL_FLUSH  0x018u
++#define MI8_CTL_START  0x01Cu
++
++/*
++ * 5-c67: the commit. SSPP registers are shadowed; writing them does not
++ * change what the display reads until the CTL flushes them. Offsets and
++ * bit assignments come from the upstream DPU driver (dpu_hw_ctl.c):
++ * CTL_FLUSH 0x018, CTL_START 0x01C, SSPP_VIG0 BIT(0), LM_0 BIT(6),
++ * CTL itself BIT(17). Our active surface sits at mdp+0x4000, which is
++ * VIG0, and it feeds LM_0 -- the single-layer 1080x2160 case.
++ */
++static void
++panel_flush(void)
++{
++	vm_offset_t va = ml_io_map((addr64_t)MI8_CTL0_PA, 0x40);
++	uint32_t mask = (1u << 0) | (1u << 6) | (1u << 17);
++
++	if (va == 0) {
++		return;
++	}
++	wr((vm_offset_t)(va + MI8_CTL_FLUSH), mask);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr((vm_offset_t)(va + MI8_CTL_START), 1u);
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
 +/* returns 0 when the panel is scanning at MI8_PANEL_PITCH. */
 +int
 +mi8_gpu_panel_stride_on(void)
@@ -5686,7 +5713,8 @@ new file mode 100644
 +		printf("mi8gpu: step 69 PANEL: stride would not take %u%c", MI8_PANEL_PITCH, 10);
 +		return -2;
 +	}
-+	printf("mi8gpu: step 69 PANEL: scanout stride %u -> %u (was %u)%c",
++	panel_flush();
++	printf("mi8gpu: step 69 PANEL: scanout stride %u -> %u (was %u), CTL flushed%c",
 +	    MI8_PANEL_PITCH, MI8_PANEL_PITCH, panel_stride_old, 10);
 +	return 0;
 +}
@@ -5702,6 +5730,7 @@ new file mode 100644
 +	raw = rd((vm_offset_t)(panel_sspp_va + 0x24));
 +	wr((vm_offset_t)(panel_sspp_va + 0x24), (raw & 0xffff0000u) | panel_stride_old);
 +	__asm__ volatile ("dsb sy" ::: "memory");
++	panel_flush();
 +	printf("mi8gpu: step 69 PANEL: stride restored to %u%c", panel_stride_old, 10);
 +}
 +
