@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9532 @@
+@@ -0,0 +1,9576 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5786,6 +5786,43 @@ new file mode 100644
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +	return 0;
 +}
++/*
++ * F-4 (5-c66): read-only dump of the two MDSS blocks that matter.
++ *
++ * step 69 proved the A2D can write the panel: the read-back matched the
++ * source 20 of 20. What did not happen is the scanout picking up the new
++ * stride -- the panel shows the frame sheared, so the hardware is still
++ * reading at 4320. In MDSS the SSPP registers are shadowed and latch only
++ * on a CTL flush, and this port has no commit sequence at all.
++ *
++ * So: print what is programmed instead of guessing offsets.
++ */
++static void
++bl_mdss_dump(void)
++{
++	static const uint32_t base[2] = { 0xae00000u, 0xae02000u };
++	static const char *name[2] = { "MDSS", "CTL " };
++	uint32_t b, i;
++
++	for (b = 0; b < 2u; b++) {
++		vm_offset_t va = ml_io_map((addr64_t)base[b], 0x400);
++
++		if (va == 0) {
++			printf("mi8gpu: step 70 %s: map failed%c", name[b], 10);
++			continue;
++		}
++		printf("mi8gpu: step 70 %s base %#x%c", name[b], base[b], 10);
++		for (i = 0; i < 0x100u; i += 8u) {
++			printf("  +%03x: %08x %08x %08x %08x %08x %08x %08x %08x%c",
++				    (unsigned int)(i * 4u),
++				    rd((vm_offset_t)(va + i * 4u + 0x00u)), rd((vm_offset_t)(va + i * 4u + 0x04u)),
++				    rd((vm_offset_t)(va + i * 4u + 0x08u)), rd((vm_offset_t)(va + i * 4u + 0x0cu)),
++				    rd((vm_offset_t)(va + i * 4u + 0x10u)), rd((vm_offset_t)(va + i * 4u + 0x14u)),
++				    rd((vm_offset_t)(va + i * 4u + 0x18u)), rd((vm_offset_t)(va + i * 4u + 0x1cu)),
++				    10);
++		}
++	}
++}
 +static void
 +bl_gpucc_survey(void)
 +{
@@ -9306,6 +9343,13 @@ new file mode 100644
 +
 +							if (PE_parse_boot_argn("mi8gpu_stride", &st, sizeof(st)) && st) {
 +								bl_sspp_stride_probe();
++							}
++							{
++								unsigned int md = 0;
++
++								if (PE_parse_boot_argn("mi8gpu_mdss", &md, sizeof(md)) && md) {
++									bl_mdss_dump();
++								}
 +							}
 +						}
 +					}
