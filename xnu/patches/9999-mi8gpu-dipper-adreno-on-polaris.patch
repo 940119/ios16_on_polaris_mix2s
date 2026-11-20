@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9361 @@
+@@ -0,0 +1,9520 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5614,6 +5614,165 @@ new file mode 100644
 +		    (after == want && restored == old) ? "WRITABLE" :
 +		    (after == want) ? "took, restore odd" : "REJECTED", 10);
 +	}
++}
++/*
++ * F-3 (5-c65): point the GPU at the panel itself.
++ *
++ * step 67/68 answered the only question this needed: SSPP0 scans out of
++ * 0x9d400000 at stride 4320, and the stride register takes 4352. 4352 is
++ * 68 * 64, so the A2D destination pitch is expressible -- which is exactly
++ * what 4320 could never be. The padded frame and the 9.33 MB row copy are
++ * no longer needed on this path.
++ *
++ * Everything here is reversible: the original stride is kept and put back
++ * if the blit or the read-back does not look right.
++ */
++#define MI8_PANEL_VA     0x39000000ull
++#define MI8_PANEL_PA     0x9d400000ull
++#define MI8_PANEL_PITCH  4352u
++#define MI8_PANEL_BYTES  ((uint64_t)MI8_PANEL_PITCH * 2160u)
++#define MI8_PANEL_PAGES  ((uint32_t)((MI8_PANEL_BYTES + 0xfffu) / 0x1000u))
++
++static uint32_t panel_stride_old;
++static vm_offset_t panel_sspp_va;
++static int panel_direct_state;
++
++static vm_offset_t
++panel_find_sspp(void)
++{
++	static const uint32_t off[8] = {
++		0x5000, 0x7000, 0x9000, 0xb000,
++		0x25000, 0x27000, 0x29000, 0x2b000,
++	};
++	uint32_t i;
++
++	for (i = 0; i < 8u; i++) {
++		const addr64_t pa = (addr64_t)(0xae00000ull + off[i]);
++		vm_offset_t va = ml_io_map(pa, 0x1000);
++		uint32_t addr, old;
++
++		if (va == 0) {
++			continue;
++		}
++		addr = rd((vm_offset_t)(va + 0x14));
++		old = rd((vm_offset_t)(va + 0x24)) & 0xffffu;
++		if (addr >= 0x9d400000u && addr < 0x9f800000u && old != 0u) {
++			panel_stride_old = old;
++			return va;
++		}
++	}
++	return 0;
++}
++
++/* returns 0 when the panel is scanning at MI8_PANEL_PITCH. */
++int
++mi8_gpu_panel_stride_on(void)
++{
++	uint32_t raw;
++
++	if (panel_sspp_va == 0) {
++		panel_sspp_va = panel_find_sspp();
++		if (panel_sspp_va == 0) {
++			printf("mi8gpu: step 69 PANEL: no active SSPP found%c", 10);
++			return -1;
++		}
++	}
++	raw = rd((vm_offset_t)(panel_sspp_va + 0x24));
++	wr((vm_offset_t)(panel_sspp_va + 0x24), (raw & 0xffff0000u) | MI8_PANEL_PITCH);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if ((rd((vm_offset_t)(panel_sspp_va + 0x24)) & 0xffffu) != MI8_PANEL_PITCH) {
++		wr((vm_offset_t)(panel_sspp_va + 0x24), raw);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("mi8gpu: step 69 PANEL: stride would not take %u%c", MI8_PANEL_PITCH, 10);
++		return -2;
++	}
++	printf("mi8gpu: step 69 PANEL: scanout stride %u -> %u (was %u)%c",
++	    MI8_PANEL_PITCH, MI8_PANEL_PITCH, panel_stride_old, 10);
++	return 0;
++}
++
++void
++mi8_gpu_panel_stride_off(void)
++{
++	uint32_t raw;
++
++	if (panel_sspp_va == 0 || panel_stride_old == 0u) {
++		return;
++	}
++	raw = rd((vm_offset_t)(panel_sspp_va + 0x24));
++	wr((vm_offset_t)(panel_sspp_va + 0x24), (raw & 0xffff0000u) | panel_stride_old);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("mi8gpu: step 69 PANEL: stride restored to %u%c", panel_stride_old, 10);
++}
++
++/* map the panel's own pages so the A2D can write them. */
++int
++mi8_gpu_panel_map(void)
++{
++	uint32_t k;
++
++	for (k = 0; k < MI8_PANEL_PAGES; k++) {
++		if (!keep_map(MI8_PANEL_VA + (uint64_t)k * 0x1000ull,
++		    MI8_PANEL_PA + (uint64_t)k * 0x1000ull, 0)) {
++			printf("mi8gpu: step 69 PANEL: map failed at page %u of %u%c", k, MI8_PANEL_PAGES, 10);
++			return -1;
++		}
++	}
++	keep_tlb();
++	printf("mi8gpu: step 69 PANEL: %u pages at %#llx -> %#llx, pitch %u%c",
++	    MI8_PANEL_PAGES, (unsigned long long)MI8_PANEL_PA,
++	    (unsigned long long)MI8_PANEL_VA, MI8_PANEL_PITCH, 10);
++	return 0;
++}
++
++/* one blit, straight from a surface into the panel. */
++int
++mi8_gpu_blit_to_panel(const unsigned long long *pas4k, unsigned int npages,
++    unsigned int src_pitch, unsigned int sx, unsigned int sy,
++    unsigned int sw, unsigned int sh)
++{
++	uint32_t seq[128], nseq, ring_w, i;
++	uint64_t src_addr;
++	uint32_t *ring = (uint32_t *)g3d_regions[1].memory;
++	uint32_t first, last, k;
++
++	if (sw == 0 || sh == 0 || sw > 4096u || sh > 4096u) {
++		return -2;
++	}
++	if (!mi8_gpu_blit_ready()) {
++		return -7;
++	}
++	first = (sy * src_pitch) >> 12;
++	last = (((sy + sh - 1u) * src_pitch) + src_pitch - 1u) >> 12;
++	if (last >= npages || first > last) {
++		return -1;
++	}
++	for (k = first; k <= last; k++) {
++		if (!keep_map(MI8_BLIT_SRC_VA + (uint64_t)(k - first) * 0x1000ull, pas4k[k], 0)) {
++			return -3;
++		}
++	}
++	keep_tlb();
++	src_addr = MI8_BLIT_SRC_VA + (uint64_t)(sy * src_pitch + sx * 4u)
++	    - (uint64_t)first * 0x1000ull;
++
++	ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
++	nseq = mi8_blit_emit(seq, src_addr, MI8_PANEL_VA, sw, sh, src_pitch,
++	    1080u, 2160u, MI8_PANEL_PITCH, 0u, 0u,
++	    g3d_regions[2].address + BS_CLOCK_OFF,
++	    g3d_regions[2].address + BL_RB_OFF,
++	    g3d_regions[2].address + B79_EV_OFF,
++	    g3d_regions[2].address + BS_FENCE_OFF,
++	    g3d_regions[2].address + BS_MARK_OFF);
++	for (i = 0; i < nseq; i++) {
++		ring[ring_w++ & 8191u] = seq[i];
++	}
++	to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++	wr(gpu3d + 4 * 0x0807, ring_w & 8191u);
++	cp_wptr = ring_w & 8191u;
++	keep_ring_at = cp_wptr;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return 0;
 +}
 +static void
 +bl_gpucc_survey(void)
@@ -14576,7 +14735,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1259 @@
+@@ -0,0 +1,1368 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -14756,6 +14915,15 @@ new file mode 100644
 +extern "C" unsigned long long mi8_gpu_padded_kva(void);
 +extern "C" unsigned long long mi8_gpu_padded_dev(void);
 +extern "C" unsigned long long mi8_gpu_padded_map(unsigned int off, unsigned int len);
++extern "C" int mi8_gpu_panel_stride_on(void);
++extern "C" void mi8_gpu_panel_stride_off(void);
++extern "C" int mi8_gpu_panel_map(void);
++extern "C" int mi8_gpu_blit_to_panel(const unsigned long long *pas4k,
++    unsigned int npages, unsigned int src_pitch, unsigned int sx,
++    unsigned int sy, unsigned int sw, unsigned int sh);
++/* F-3: defined further down, used by present() above it. */
++extern "C" int mi8_surface_bridge_present_direct(unsigned int id);
++static int panel_direct;
 +extern "C" int mi8_gpu_blit_to_padded(const unsigned long long *pas4k,
 +    unsigned int npages, unsigned int src_pitch, unsigned int sx, unsigned int sy,
 +    unsigned int sw, unsigned int sh);
@@ -15712,6 +15880,84 @@ new file mode 100644
 +}
 +
 +/*
++ * F-3 (5-c65): the whole frame from the GPU straight into the panel.
++ * No padded frame, no row copy: the scanout stride is 4352 while this runs,
++ * and 4352 / 64 = 68, so the A2D pitch is expressible.
++ *
++ * The first three frames are read back through an uncached window; a frame
++ * that does not match puts the old stride back and the caller falls through
++ * to the padded path for good.
++ */
++
++extern "C" int
++mi8_surface_bridge_present_direct(unsigned int id)
++{
++	static unsigned long long pas16[800];
++	static unsigned long long pas4k[3200];
++	static unsigned int checked_frames;
++	SweetSurface *s;
++	IOByteCount len = 0;
++	unsigned int n16 = 0, n4 = 0, i, k;
++	int rc;
++
++	s = sweet_surface_copy(id);
++	if (s == nullptr) { return -3; }
++	if (s->memory == nullptr || s->width == 0 || s->height == 0) { s->release(); return -4; }
++
++	for (unsigned long long off = 0; off < s->allocSize && n16 < 800u; off += 0x4000u) {
++		addr64_t pa = s->memory->getPhysicalSegment(off, &len, 0);
++
++		if (pa == 0) { break; }
++		pas16[n16++] = (unsigned long long)pa;
++	}
++	for (i = 0; i < n16 && n4 + 4u <= 3200u; i++) {
++		for (k = 0; k < 4u; k++) {
++			pas4k[n4++] = pas16[i] + (unsigned long long)k * 0x1000ull;
++		}
++	}
++
++	rc = mi8_gpu_blit_to_panel(pas4k, n4, s->bytesPerRow, 0u, 0u, s->width, s->height);
++	if (rc != 0) { s->release(); return -5; }
++	mi8_gpu_sleep_us(50u);
++
++	if (checked_frames < 3u) {
++		unsigned int vy, vx, hit = 0, tried = 0;
++		const unsigned char *vkva = (const unsigned char *)s->kernelAddress();
++
++		checked_frames++;
++		if (vkva == nullptr) { s->release(); return -6; }
++		for (vy = 300u; vy < 2000u; vy += 400u) {
++			const unsigned long long pa = MI8_PANEL_PA + (unsigned long long)vy * 4352ull;
++			const unsigned long long dev = mi8_gpu_map_pa(pa, 0x4000u);
++			const unsigned char *vr = vkva + (unsigned long long)((vy * s->height) / 2160u) * s->bytesPerRow;
++
++			if (dev == 0) { continue; }
++			for (vx = 60u; vx < 1020u; vx += 240u) {
++				uint32_t got = *(const uint32_t *)(const void *)(dev + (unsigned long long)vx * 4u);
++				uint32_t a = *(const uint32_t *)(const void *)(vr + (unsigned long long)((vx * s->width) / 1080u) * 4u);
++				uint32_t b2 = *(const uint32_t *)(const void *)(vr + (unsigned long long)(((2u * vx + 1u) * s->width) / (2u * 1080u)) * 4u);
++
++				tried++;
++				if (got == a || got == b2) { hit++; }
++			}
++		}
++		s->release();
++		if (tried == 0u || hit * 4u < tried * 3u) {
++			printf("mi8gpu: step 69 PANEL: direct read-back %u of %u, falling back%c",
++			    hit, tried, 10);
++			return -7;
++		}
++		printf("mi8gpu: step 69 PANEL: direct read-back %u of %u, stride stays %u%c",
++		    hit, tried, MI8_PANEL_PITCH, 10);
++		return 0;
++	}
++
++	s->release();
++	return 0;
++}
++
++
++/*
 + * E (5-c55): the whole frame through the GPU, called from present().
 + *
 + * The CPU path gathers 1080x2160 into a staging row and copies each row to
@@ -15734,6 +15980,28 @@ new file mode 100644
 +	int rc;
 +
 +	if (sweet_fb_panel_info(info) != 0 || info[4] == 0) { return -1; }
++	/*
++	 * F-3: try the panel itself first. Any problem here is permanent for
++	 * the rest of the boot: the stride goes back and the padded path takes
++	 * over, so a failure costs one bad attempt, not a broken screen.
++	 */
++	if (panel_direct >= 0) {
++		if (panel_direct == 0) {
++			if (mi8_gpu_panel_stride_on() == 0 && mi8_gpu_panel_map() == 0) {
++				panel_direct = 1;
++			} else {
++				mi8_gpu_panel_stride_off();
++				panel_direct = -1;
++			}
++		}
++		if (panel_direct == 1) {
++			if (mi8_surface_bridge_present_direct(id) == 0) {
++				return 0;
++			}
++			mi8_gpu_panel_stride_off();
++			panel_direct = -1;
++		}
++	}
 +	pad = mi8_gpu_padded_kva();
 +	if (pad == 0) { return -2; }
 +	s = sweet_surface_copy(id);
