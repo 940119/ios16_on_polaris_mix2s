@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9520 @@
+@@ -0,0 +1,9532 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5723,6 +5723,18 @@ new file mode 100644
 +	    MI8_PANEL_PAGES, (unsigned long long)MI8_PANEL_PA,
 +	    (unsigned long long)MI8_PANEL_VA, MI8_PANEL_PITCH, 10);
 +	return 0;
++}
++
++unsigned long long
++mi8_gpu_panel_pa(void)
++{
++	return MI8_PANEL_PA;
++}
++
++unsigned int
++mi8_gpu_panel_pitch(void)
++{
++	return MI8_PANEL_PITCH;
 +}
 +
 +/* one blit, straight from a surface into the panel. */
@@ -14735,7 +14747,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1368 @@
+@@ -0,0 +1,1370 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -14915,6 +14927,8 @@ new file mode 100644
 +extern "C" unsigned long long mi8_gpu_padded_kva(void);
 +extern "C" unsigned long long mi8_gpu_padded_dev(void);
 +extern "C" unsigned long long mi8_gpu_padded_map(unsigned int off, unsigned int len);
++extern "C" unsigned long long mi8_gpu_panel_pa(void);
++extern "C" unsigned int mi8_gpu_panel_pitch(void);
 +extern "C" int mi8_gpu_panel_stride_on(void);
 +extern "C" void mi8_gpu_panel_stride_off(void);
 +extern "C" int mi8_gpu_panel_map(void);
@@ -15927,7 +15941,7 @@ new file mode 100644
 +		checked_frames++;
 +		if (vkva == nullptr) { s->release(); return -6; }
 +		for (vy = 300u; vy < 2000u; vy += 400u) {
-+			const unsigned long long pa = MI8_PANEL_PA + (unsigned long long)vy * 4352ull;
++			const unsigned long long pa = mi8_gpu_panel_pa() + (unsigned long long)vy * (unsigned long long)mi8_gpu_panel_pitch();
 +			const unsigned long long dev = mi8_gpu_map_pa(pa, 0x4000u);
 +			const unsigned char *vr = vkva + (unsigned long long)((vy * s->height) / 2160u) * s->bytesPerRow;
 +
@@ -15948,7 +15962,7 @@ new file mode 100644
 +			return -7;
 +		}
 +		printf("mi8gpu: step 69 PANEL: direct read-back %u of %u, stride stays %u%c",
-+		    hit, tried, MI8_PANEL_PITCH, 10);
++		    hit, tried, mi8_gpu_panel_pitch(), 10);
 +		return 0;
 +	}
 +
