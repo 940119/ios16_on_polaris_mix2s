@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9277 @@
+@@ -0,0 +1,9361 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5551,6 +5551,70 @@ new file mode 100644
 +		    fmt, opm, 10);
 +	}
 +}
++/*
++ * F-2 (5-c64): can the scanout stride be changed at all?
++ *
++ * 4320 is not a multiple of 64, so the GPU cannot write the panel directly.
++ * 4352 is -- but only if the SSPP will scan out of a 4352 stride. This
++ * writes the candidate, reads it back, then RESTORES the original before
++ * returning, so the display is never left skewed. It answers one question:
++ * does the register take the value?
++ *
++ * Nothing here touches the panel contents. The worst case is a single frame
++ * scanned with the wrong stride between the two writes.
++ */
++static void
++bl_sspp_stride_probe(void)
++{
++	static const uint32_t off[8] = {
++		0x5000, 0x7000, 0x9000, 0xb000,
++		0x25000, 0x27000, 0x29000, 0x2b000,
++	};
++	uint32_t i;
++
++	for (i = 0; i < 8u; i++) {
++		const addr64_t pa = (addr64_t)(0xae00000ull + off[i]);
++		vm_offset_t va = ml_io_map(pa, 0x1000);
++		uint32_t addr, size, old, want, after, restored, raw;
++
++		if (va == 0) {
++			continue;
++		}
++		size = rd((vm_offset_t)(va + 0x00));
++		addr = rd((vm_offset_t)(va + 0x14));
++		raw = rd((vm_offset_t)(va + 0x24));
++		old = raw & 0xffffu;
++
++		if (addr < 0x9d400000u || addr >= 0x9f800000u || old == 0u) {
++			continue;
++		}
++
++		if (old == 1080u) {
++			want = 1088u;
++		} else if (old == 4320u) {
++			want = 4352u;
++		} else {
++			printf("mi8gpu: step 68 STRIDE SSPP %u: stride %u is neither 1080 nor 4320, not touched%c",
++			    i, old, 10);
++			continue;
++		}
++
++		wr((vm_offset_t)(va + 0x24), (raw & 0xffff0000u) | want);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		after = rd((vm_offset_t)(va + 0x24)) & 0xffffu;
++
++		wr((vm_offset_t)(va + 0x24), raw);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		restored = rd((vm_offset_t)(va + 0x24)) & 0xffffu;
++
++		printf("mi8gpu: step 68 STRIDE SSPP %u @%#x: src %ux%u addr %#x old %u -> wrote %u read %u restored %u : %s%c",
++		    i, (unsigned int)(0xae00000u + off[i]),
++		    (unsigned int)(size & 0xffffu), (unsigned int)(size >> 16), addr,
++		    old, want, after, restored,
++		    (after == want && restored == old) ? "WRITABLE" :
++		    (after == want) ? "took, restore odd" : "REJECTED", 10);
++	}
++}
 +static void
 +bl_gpucc_survey(void)
 +{
@@ -9048,21 +9112,41 @@ new file mode 100644
 +				{
 +					unsigned int e1 = 0;
 +
++					/*
++					 * The GPU probes are siblings on purpose. 0481 asked only
++					 * for mi8gpu_sspp and got nothing, because that block had
++					 * ended up nested inside the e1 gate.
++					 */
 +					if (PE_parse_boot_argn("mi8gpu_e1", &e1, sizeof(e1)) && e1) {
 +						if (mi8_gpu_padded_prepare() == 0) {
 +							unsigned long long c[8];
 +
 +							mi8_surface_bridge_e1(mi8_surface_bridge_last_id(), c);
-+						{
-+							unsigned int e2 = 0;
++						}
++					}
++					{
++						unsigned int sp = 0;
 +
-+							if (PE_parse_boot_argn("mi8gpu_sspp", &e2, sizeof(e2)) && e2) {
-+								bl_sspp_survey();
-+							}
-+							if (PE_parse_boot_argn("mi8gpu_e2", &e2, sizeof(e2)) && e2) {
-+								mi8_surface_bridge_e2(c);
++						if (PE_parse_boot_argn("mi8gpu_sspp", &sp, sizeof(sp)) && sp) {
++							bl_sspp_survey();
++						}
++						{
++							unsigned int st = 0;
++
++							if (PE_parse_boot_argn("mi8gpu_stride", &st, sizeof(st)) && st) {
++								bl_sspp_stride_probe();
 +							}
 +						}
++					}
++					{
++						unsigned int e2 = 0;
++
++						if (PE_parse_boot_argn("mi8gpu_e2", &e2, sizeof(e2)) && e2) {
++							unsigned long long c[8];
++
++							if (mi8_gpu_padded_prepare() == 0) {
++								mi8_surface_bridge_e2(c);
++							}
 +						}
 +					}
 +				}
