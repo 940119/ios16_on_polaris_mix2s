@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9605 @@
+@@ -0,0 +1,9613 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5672,9 +5672,14 @@ new file mode 100644
 + * 5-c67: the commit. SSPP registers are shadowed; writing them does not
 + * change what the display reads until the CTL flushes them. Offsets and
 + * bit assignments come from the upstream DPU driver (dpu_hw_ctl.c):
-+ * CTL_FLUSH 0x018, CTL_START 0x01C, SSPP_VIG0 BIT(0), LM_0 BIT(6),
-+ * CTL itself BIT(17). Our active surface sits at mdp+0x4000, which is
-+ * VIG0, and it feeds LM_0 -- the single-layer 1080x2160 case.
++ * CTL_FLUSH 0x018, SSPP_VIG0 BIT(0), LM_0 BIT(6), CTL itself BIT(17).
++ * Our active surface sits at mdp+0x4000, which is VIG0, and it feeds
++ * LM_0 -- the single-layer 1080x2160 case.
++ *
++ * CTL_START is deliberately NOT written. sdm845_ctl carries only
++ * DPU_CTL_SPLIT_DISPLAY, not DPU_CTL_ACTIVE_CFG, so trigger_start is
++ * the video-mode encoder's kick, not a commit step. 0486 wrote it and
++ * the panel went black: the pipeline was restarted, not flushed.
 + */
 +static void
 +panel_flush(void)
@@ -5686,8 +5691,6 @@ new file mode 100644
 +		return;
 +	}
 +	wr((vm_offset_t)(va + MI8_CTL_FLUSH), mask);
-+	__asm__ volatile ("dsb sy" ::: "memory");
-+	wr((vm_offset_t)(va + MI8_CTL_START), 1u);
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
 +
@@ -5714,8 +5717,12 @@ new file mode 100644
 +		return -2;
 +	}
 +	panel_flush();
-+	printf("mi8gpu: step 69 PANEL: scanout stride %u -> %u (was %u), CTL flushed%c",
-+	    MI8_PANEL_PITCH, MI8_PANEL_PITCH, panel_stride_old, 10);
++	/* the flush latches at the next frame boundary: 17 ms at 60 Hz */
++	mi8_gpu_sleep_us(20000u);
++	printf("mi8gpu: step 69 PANEL: scanout stride %u -> %u (was %u), CTL flushed%s%c",
++	    MI8_PANEL_PITCH, MI8_PANEL_PITCH, panel_stride_old,
++	    (rd((vm_offset_t)(panel_sspp_va + 0x24)) & 0xffffu) == MI8_PANEL_PITCH
++	        ? "" : " (stride readback differs)", 10);
 +	return 0;
 +}
 +
@@ -5731,6 +5738,7 @@ new file mode 100644
 +	wr((vm_offset_t)(panel_sspp_va + 0x24), (raw & 0xffff0000u) | panel_stride_old);
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +	panel_flush();
++	mi8_gpu_sleep_us(20000u);
 +	printf("mi8gpu: step 69 PANEL: stride restored to %u%c", panel_stride_old, 10);
 +}
 +
