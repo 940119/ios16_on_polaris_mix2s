@@ -19125,7 +19125,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  void
  AppleCLCD::present(const uint8_t *rec)
  {
-@@ -960,6 +989,42 @@
+@@ -960,6 +989,52 @@
  		if (!(mask & (1u << layer)) || id == 0) {
  			continue;
  		}
@@ -19141,9 +19141,19 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			static unsigned int acc_n;
 +
 +			if (gpu_present < 0) {
-+				int v = 0;
++				/*
++				 * 5-c70: on by default. The path is self-healing (a frame that
++				 * does not verify puts the scanout stride back and the CPU path
++				 * takes over for the rest of the boot), and it is worth 4.5 ms
++				 * of a 16.7 ms frame -- the biggest single win this port has.
++				 * sweetgpu=0 still turns it off.
++				 */
++				int v = 1;
 +
-+				gpu_present = (PE_parse_boot_argn("sweetgpu", &v, sizeof(v)) && v != 0) ? 1 : 0;
++				if (PE_parse_boot_argn("sweetgpu", &v, sizeof(v))) {
++					/* the boot-arg wins, including an explicit 0 */
++				}
++				gpu_present = (v != 0) ? 1 : 0;
 +			}
 +			if (gpu_present != 0 && dx == 0 && dy == 0 &&
 +			    w == (int32_t)fLogicalW && h == (int32_t)fLogicalH) {
@@ -19168,7 +19178,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		SweetSurface *s = sweet_surface_copy(id);
  		if (sweet_fb_swaps_logged < 16) {
  			sweet_fb_swaps_logged++;
-@@ -971,6 +1036,72 @@
+@@ -971,6 +1046,72 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
@@ -19241,7 +19251,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1251,7 +1382,7 @@
+@@ -1251,7 +1392,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -19250,7 +19260,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1398,7 @@
+@@ -1267,7 +1408,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -19259,7 +19269,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1414,7 @@
+@@ -1283,7 +1424,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -19268,7 +19278,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1305,6 +1436,23 @@
+@@ -1305,6 +1446,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -19292,7 +19302,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1601,51 @@
+@@ -1453,7 +1611,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
@@ -19345,7 +19355,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	default:
  		break;
  	}
-@@ -1477,3 +1669,18 @@
+@@ -1477,3 +1679,18 @@
  	return ret;
  }
  #endif /* SWEET */
