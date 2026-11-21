@@ -19177,7 +19177,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  void
  AppleCLCD::present(const uint8_t *rec)
  {
-@@ -960,6 +1004,52 @@
+@@ -960,6 +1004,71 @@
  		if (!(mask & (1u << layer)) || id == 0) {
  			continue;
  		}
@@ -19207,7 +19207,26 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +				}
 +				gpu_present = (v != 0) ? 1 : 0;
 +			}
-+			if (gpu_present != 0 && dx == 0 && dy == 0 &&
++			/*
++			 * 5-c74: exactly one layer, and it covers the screen.
++			 *
++			 * This branch returns as soon as the layer is drawn, which is only
++			 * correct when there is nothing else to draw. With two layers -- the
++			 * wallpaper under the icons is the common case -- taking the GPU path
++			 * here silently dropped the rest, and the wallpaper never appeared.
++			 * Multi-layer frames go to the CPU path, which blends them.
++			 */
++			if (gpu_present != 0 && mask != 0u &&
++			    (mask & (mask - 1u)) != 0u) {
++				static int many_layers_reported;
++
++				if (many_layers_reported++ == 0) {
++					printf("mi8gpu: step 72 LAYERS: mask %#x is not a single layer, CPU path blends it%c",
++					    mask, 10);
++				}
++			}
++			if (gpu_present != 0 && mask != 0u && (mask & (mask - 1u)) == 0u &&
++			    dx == 0 && dy == 0 &&
 +			    w == (int32_t)fLogicalW && h == (int32_t)fLogicalH) {
 +				uint64_t g0 = mach_absolute_time();
 +				int grc = mi8_surface_bridge_present(id);
@@ -19230,7 +19249,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		SweetSurface *s = sweet_surface_copy(id);
  		if (sweet_fb_swaps_logged < 16) {
  			sweet_fb_swaps_logged++;
-@@ -971,6 +1061,72 @@
+@@ -971,6 +1080,72 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
@@ -19303,7 +19322,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1185,7 +1341,7 @@
+@@ -1185,7 +1360,7 @@
  					const uint32_t *srow = (const uint32_t *)(const void *)
  					    (src + s->offset + (uint64_t)syy * s->bytesPerRow);
  					uint32_t *drow = (uint32_t *)(void *)
@@ -19312,7 +19331,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  					int32_t n = px1 - px0;
  					fBlitPixels += (uint64_t)n;
  					if (stage != NULL && ly == lastLy) {
-@@ -1237,7 +1393,7 @@
+@@ -1237,7 +1412,7 @@
  					if (syy < sy || syy >= sy + h) {
  						continue;
  					}
@@ -19321,7 +19340,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  					    (const void *)(src + s->offset +
  					    (uint64_t)syy * s->bytesPerRow + (uint64_t)sxc * 4),
  					    (size_t)(px1 - px0) * 4);
-@@ -1251,7 +1407,7 @@
+@@ -1251,7 +1426,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -19330,7 +19349,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1423,7 @@
+@@ -1267,7 +1442,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -19339,7 +19358,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1439,7 @@
+@@ -1283,7 +1458,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -19348,7 +19367,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1297,7 +1453,7 @@
+@@ -1297,7 +1472,7 @@
  		} else if (src != 0 && bpe == 4) {
  			fBlitsTotal++;
  			for (int32_t y = 0; y < h; y++) {
@@ -19357,7 +19376,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
  				    (size_t)w * 4);
  			}
-@@ -1305,6 +1461,23 @@
+@@ -1305,6 +1480,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -19381,7 +19400,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1626,51 @@
+@@ -1453,7 +1645,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
@@ -19434,7 +19453,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	default:
  		break;
  	}
-@@ -1477,3 +1694,18 @@
+@@ -1477,3 +1713,18 @@
  	return ret;
  }
  #endif /* SWEET */
