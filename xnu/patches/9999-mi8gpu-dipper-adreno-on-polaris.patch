@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9613 @@
+@@ -0,0 +1,9651 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5742,6 +5742,44 @@ new file mode 100644
 +	printf("mi8gpu: step 69 PANEL: stride restored to %u%c", panel_stride_old, 10);
 +}
 +
++/*
++ * 5-c69: cheap watchdog for the two things the direct path depends on.
++ *
++ * Nothing in xnu resets the display, but a panel power collapse would take
++ * both of these with it, and then every later frame would be drawn into a
++ * stale buffer or scanned at the wrong pitch. One read of two registers
++ * every few dozen frames is cheap insurance.
++ *
++ * returns 0  nothing changed
++ * returns 1  the stride had drifted and was put back
++ * returns -1 the scanout address is not the one we write: caller must fall
++ *             back to the CPU path
++ */
++int
++mi8_gpu_panel_check(unsigned long long expect_addr)
++{
++	uint32_t addr, raw;
++
++	if (panel_sspp_va == 0) {
++		return -1;
++	}
++	addr = rd((vm_offset_t)(panel_sspp_va + 0x14));
++	if ((unsigned long long)addr != expect_addr) {
++		printf("mi8gpu: step 71 PANEL: scanout moved to %#x, expected %#llx%c",
++		    addr, expect_addr, 10);
++		return -1;
++	}
++	raw = rd((vm_offset_t)(panel_sspp_va + 0x24));
++	if ((raw & 0xffffu) != MI8_PANEL_PITCH) {
++		wr((vm_offset_t)(panel_sspp_va + 0x24), (raw & 0xffff0000u) | MI8_PANEL_PITCH);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		panel_flush();
++		printf("mi8gpu: step 71 PANEL: stride drifted to %u, put back to %u%c",
++		    raw & 0xffffu, MI8_PANEL_PITCH, 10);
++		return 1;
++	}
++	return 0;
++}
 +/* map the panel's own pages so the A2D can write them. */
 +int
 +mi8_gpu_panel_map(void)
@@ -14828,7 +14866,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1370 @@
+@@ -0,0 +1,1379 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -15013,6 +15051,7 @@ new file mode 100644
 +extern "C" int mi8_gpu_panel_stride_on(void);
 +extern "C" void mi8_gpu_panel_stride_off(void);
 +extern "C" int mi8_gpu_panel_map(void);
++extern "C" int mi8_gpu_panel_check(unsigned long long expect_addr);
 +extern "C" int mi8_gpu_blit_to_panel(const unsigned long long *pas4k,
 +    unsigned int npages, unsigned int src_pitch, unsigned int sx,
 +    unsigned int sy, unsigned int sw, unsigned int sh);
@@ -15990,6 +16029,7 @@ new file mode 100644
 +	static unsigned long long pas16[800];
 +	static unsigned long long pas4k[3200];
 +	static unsigned int checked_frames;
++	static unsigned int direct_frames;
 +	SweetSurface *s;
 +	IOByteCount len = 0;
 +	unsigned int n16 = 0, n4 = 0, i, k;
@@ -16008,6 +16048,13 @@ new file mode 100644
 +	for (i = 0; i < n16 && n4 + 4u <= 3200u; i++) {
 +		for (k = 0; k < 4u; k++) {
 +			pas4k[n4++] = pas16[i] + (unsigned long long)k * 0x1000ull;
++		}
++	}
++
++	if ((++direct_frames % 30u) == 0u) {
++		if (mi8_gpu_panel_check(mi8_gpu_panel_pa()) < 0) {
++			s->release();
++			return -8;
 +		}
 +	}
 +
