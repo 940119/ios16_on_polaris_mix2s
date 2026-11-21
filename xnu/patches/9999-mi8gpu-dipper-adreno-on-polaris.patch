@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9651 @@
+@@ -0,0 +1,9677 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -4284,6 +4284,32 @@ new file mode 100644
 +	rs2_exact = exact;
 +	rs2_clipped = (rt[RS_DWORDS] == RS_FILL);
 +	rs_clock_report(1u, "RS2 CLEAR");
++
++	/*
++	 * B90 (5-c71): the clear is not reproducible -- B82 0/1024, B83 416/1024,
++	 * B84 1024/1024, B85 0/1024 across boots with identical code. Before
++	 * looking for a cause, find out what kind of flakiness this is: two more
++	 * attempts in the SAME boot. If a retry lands, it is a per-attempt race
++	 * and a retry loop makes the engine usable. If all three fail together,
++	 * it is per-boot state and a retry is worthless.
++	 */
++	for (uint32_t rep = 0; rep < 2u; rep++) {
++		uint32_t again = 0;
++
++		for (i = 0; i < bytes / 4u; i++) {
++			rt[i] = RS_FILL;
++		}
++		to_memory(g3d_regions[G3D_R_RT].memory, bytes);
++		drained = rs_launch(1u, "RS2 AGAIN", false);
++		from_memory(g3d_regions[G3D_R_RT].memory, bytes);
++		for (i = 0; i < RS_DWORDS; i++) {
++			if (rt[i] == RS_COLOR0) {
++				again++;
++			}
++		}
++		printf("mi8gpu: step 24 RS2again%u: %u of %u dwords are %#010x, drained %u%c",
++		    rep, again, (unsigned)RS_DWORDS, RS_COLOR0, drained ? 1u : 0u, 10);
++	}
 +
 +	/* arm 3: arm 1 minus the opening CP_WAIT_FOR_IDLE -- ONE variable */
 +	for (i = 0; i < bytes / 4u; i++) {
