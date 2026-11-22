@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9677 @@
+@@ -0,0 +1,9719 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -3463,6 +3463,15 @@ new file mode 100644
 +	}
 +}
 +
++/*
++ * B91 / mi8gpu_cs=1: cs_probe() run from mi8_gpu_start_by_itself(), i.e. on the
++ * KEPT core after the release path's own step 21 (zap authenticated, secure mode
++ * left, CP_MEM_WRITE landed: ring-mi8gpu-ROOT.txt:962-978). The only behaviour it
++ * changes inside cs_probe() is that the hole sensor is skipped: a faulting write
++ * parks the CP (B74), and A2D + present() still need that CP afterwards.
++ */
++static bool cs_keep_mode;
++
 +static void
 +cs_probe(void)
 +{
@@ -3776,7 +3785,9 @@ new file mode 100644
 +	 * unmapped access does fault, FSR 0x400 -> 0x402) is in the record, so it is
 +	 * skipped when step 24 needs a live CP.
 +	 */
-+	if (gmu_last_step < 24) {
++	if (cs_keep_mode) {
++		printf("mi8gpu: step 80 CSKEEP HOLE SENSOR: SKIPPED -- the kept CP still runs A2D and present() after this%c", 10);
++	} else if (gmu_last_step < 24) {
 +		cs_hole_sensor();
 +	} else {
 +		printf("mi8gpu: step 23 HOLE SENSOR: SKIPPED -- a write that faults parks the CP, and step 24 runs after it in the same boot (B74)\n");
@@ -9391,6 +9402,37 @@ new file mode 100644
 +
 +		if (PE_parse_boot_argn("mi8gpu_selftest", &test, sizeof(test)) && test) {
 +			mi8_gpu_selftest();
++		}
++		/*
++		 * B91: one variable -- does step 23 (real compiled compute, B60) run on the
++		 * kept core of the release path? Default off; only mi8gpu_cs=1 reaches it.
++		 * Before a2dprime on purpose: a2dprime resyncs cp_wptr from WPTR itself, and
++		 * the ladder already proved step 23 followed by A2D in one boot (B77..B89).
++		 */
++		{
++			uint32_t cs = 0;
++
++			if (PE_parse_boot_argn("mi8gpu_cs", &cs, sizeof(cs)) && cs) {
++				if (!gpu_nonsecure) {
++					printf("mi8gpu: step 80 CSKEEP: SKIPPED -- the core is not out of secure mode (SECVID_TRUST_CNTL %#x)%c",
++					    rd(gpu3d + 4 * 0xf400), 10);
++				} else {
++					vm_offset_t cscb = smmu_cb(G3D_CTX);
++
++					cp_wptr = rd(gpu3d + 4 * 0x0807) & 8191u;
++					printf("mi8gpu: step 80 CSKEEP: step 23 on the kept core from %u, RPTR %u, SECVID_TRUST_CNTL %#x, CB1 FSR %#x%c",
++					    cp_wptr, rd(gpu3d + 4 * 0x0806) & 8191u, rd(gpu3d + 4 * 0xf400), rd(cscb + CB_FSR), 10);
++					cs_keep_mode = true;
++					cs_probe();
++					cs_keep_mode = false;
++					/* cs_probe() advanced the ring through cp_wptr only; the service's own
++					 * bookkeeping must follow the hardware WPTR, or its next submission
++					 * would write behind the CP (the 0441 shape). */
++					keep_ring_at = keep_ring_sent = rd(gpu3d + 4 * 0x0807) & (KEEP_RING_WORDS - 1);
++					printf("mi8gpu: step 80 CSKEEP done: RPTR %u WPTR %u, CB1 FSR %#x%c",
++					    rd(gpu3d + 4 * 0x0806) & 8191u, rd(gpu3d + 4 * 0x0807) & 8191u, rd(cscb + CB_FSR), 10);
++				}
++			}
 +		}
 +		/*
 +		 * 5-c21 (D-2b): this path stops at step 21, so bl_probe() -- gated on
