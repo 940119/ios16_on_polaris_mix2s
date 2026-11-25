@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9769 @@
+@@ -0,0 +1,9785 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5941,7 +5941,23 @@ new file mode 100644
 +	for (i = 0; i < nseq; i++) {
 +		ring[ring_w++ & 8191u] = seq[i];
 +	}
-+	to_memory(g3d_regions[1].memory, g3d_regions[1].size);
++	{
++		/*
++		 * 5-c76: flush only the dwords just written; the ring is 32 KB and
++		 * flushing all of it cost more than the submission itself.
++		 */
++		unsigned int first_w = (ring_w - nseq) & 8191u;
++
++		if (first_w + nseq <= 8192u) {
++			to_memory(g3d_regions[1].memory + 4u * (uint64_t)first_w,
++			    (vm_size_t)(4u * nseq));
++		} else {
++			to_memory(g3d_regions[1].memory + 4u * (uint64_t)first_w,
++			    (vm_size_t)(4u * (8192u - first_w)));
++			to_memory(g3d_regions[1].memory,
++			    (vm_size_t)(4u * (nseq - (8192u - first_w))));
++		}
++	}
 +	wr(gpu3d + 4 * 0x0807, ring_w & 8191u);
 +	cp_wptr = ring_w & 8191u;
 +	keep_ring_at = cp_wptr;
@@ -14984,7 +15000,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1379 @@
+@@ -0,0 +1,1384 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -16178,7 +16194,12 @@ new file mode 100644
 +
 +	rc = mi8_gpu_blit_to_panel(pas4k, n4, s->bytesPerRow, 0u, 0u, s->width, s->height);
 +	if (rc != 0) { s->release(); return -5; }
-+	mi8_gpu_sleep_us(50u);
++	/*
++	 * 5-c76: no per-frame settle sleep here. The blit is submitted and runs
++	 * asynchronously; the 50 us this used to burn was 36% of the measured
++	 * submit cost and bought nothing -- the stride change that actually
++	 * needs settling already waits 50 ms in panel_direct_setup().
++	 */
 +
 +	if (checked_frames < 3u) {
 +		unsigned int vy, vx, hit = 0, tried = 0;
