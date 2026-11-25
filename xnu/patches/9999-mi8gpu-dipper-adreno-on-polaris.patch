@@ -5692,7 +5692,7 @@ new file mode 100644
 +} blit_slots[MI8_BLIT_SLOTS];
 +static int blit_slot_next;
 +
-+int mi8_gpu_done(uint32_t fence);
++bool mi8_gpu_done(uint32_t fence);
 +
 +static int panel_direct_state;
 +
