@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9719 @@
+@@ -0,0 +1,9769 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5672,6 +5672,26 @@ new file mode 100644
 +
 +static uint32_t panel_stride_old;
 +static vm_offset_t panel_sspp_va;
++/*
++ * 5-c75: the source pages rarely move.
++ *
++ * Every frame used to rewrite ~1190 page-table entries and flush each one.
++ * The blit itself is submitted and not waited for, so that walk -- not the
++ * GPU -- was most of the 1.25 ms the frame hook measured. The compositor
++ * hands back the same buffers frame after frame; remember the page list and
++ * skip the walk when nothing moved.
++ */
++#define MI8_BLIT_SLOT_VA    0x40000000ull
++#define MI8_BLIT_SLOT_BYTES 0x00c00000ull      /* 12 MiB: covers 1080x2160x4 */
++#define MI8_BLIT_SLOTS      4
++
++static struct {
++	uint64_t sig;
++	unsigned int pages;
++	int valid;
++} blit_slots[MI8_BLIT_SLOTS];
++static int blit_slot_next;
++
 +static int panel_direct_state;
 +
 +static vm_offset_t
@@ -5871,14 +5891,44 @@ new file mode 100644
 +	if (last >= npages || first > last) {
 +		return -1;
 +	}
-+	for (k = first; k <= last; k++) {
-+		if (!keep_map(MI8_BLIT_SRC_VA + (uint64_t)(k - first) * 0x1000ull, pas4k[k], 0)) {
-+			return -3;
++	{
++		unsigned int n = last - first + 1u;
++		uint64_t sig = 0xcbf29ce484222325ull ^ (uint64_t)n;
++		uint64_t slot_va;
++		int slot = -1, i;
++
++		if ((uint64_t)n * 0x1000ull > MI8_BLIT_SLOT_BYTES) {
++			return -2;
 +		}
++		for (k = first; k <= last; k++) {
++			sig = (sig ^ (uint64_t)pas4k[k]) * 0x100000001b3ull;
++		}
++		for (i = 0; i < MI8_BLIT_SLOTS; i++) {
++			if (blit_slots[i].valid && blit_slots[i].sig == sig &&
++			    blit_slots[i].pages == n) {
++				slot = i;
++				break;
++			}
++		}
++		if (slot < 0) {
++			slot = blit_slot_next;
++			blit_slot_next = (blit_slot_next + 1) % MI8_BLIT_SLOTS;
++			slot_va = MI8_BLIT_SLOT_VA + (uint64_t)slot * MI8_BLIT_SLOT_BYTES;
++			for (k = first; k <= last; k++) {
++				if (!keep_map(slot_va + (uint64_t)(k - first) * 0x1000ull,
++				    pas4k[k], 0)) {
++					return -3;
++				}
++			}
++			keep_tlb();
++			blit_slots[slot].sig = sig;
++			blit_slots[slot].pages = n;
++			blit_slots[slot].valid = 1;
++		}
++		slot_va = MI8_BLIT_SLOT_VA + (uint64_t)slot * MI8_BLIT_SLOT_BYTES;
++		src_addr = slot_va + (uint64_t)(sy * src_pitch + sx * 4u)
++		    - (uint64_t)first * 0x1000ull;
 +	}
-+	keep_tlb();
-+	src_addr = MI8_BLIT_SRC_VA + (uint64_t)(sy * src_pitch + sx * 4u)
-+	    - (uint64_t)first * 0x1000ull;
 +
 +	ring_w = rd(gpu3d + 4 * 0x0807) & 8191u;
 +	nseq = mi8_blit_emit(seq, src_addr, MI8_PANEL_VA, sw, sh, src_pitch,
