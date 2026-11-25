@@ -15000,7 +15000,7 @@ diff --git a/bsd/dev/mi8_surface_bridge.cpp b/bsd/dev/mi8_surface_bridge.cpp
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_surface_bridge.cpp
-@@ -0,0 +1,1384 @@
+@@ -0,0 +1,1388 @@
 +/*
 + * B87b staged early-IOKit probe (V2c).
 + *
@@ -15182,6 +15182,7 @@ new file mode 100644
 +extern "C" unsigned long long mi8_gpu_padded_map(unsigned int off, unsigned int len);
 +extern "C" unsigned long long mi8_gpu_panel_pa(void);
 +extern "C" unsigned int mi8_gpu_panel_pitch(void);
++extern "C" void sweet_panel_set_pitch(uint32_t pitch);
 +extern "C" int mi8_gpu_panel_stride_on(void);
 +extern "C" void mi8_gpu_panel_stride_off(void);
 +extern "C" int mi8_gpu_panel_map(void);
@@ -16195,11 +16196,10 @@ new file mode 100644
 +	rc = mi8_gpu_blit_to_panel(pas4k, n4, s->bytesPerRow, 0u, 0u, s->width, s->height);
 +	if (rc != 0) { s->release(); return -5; }
 +	/*
-+	 * 5-c76: no per-frame settle sleep here. The blit is submitted and runs
-+	 * asynchronously; the 50 us this used to burn was 36% of the measured
-+	 * submit cost and bought nothing -- the stride change that actually
-+	 * needs settling already waits 50 ms in panel_direct_setup().
++	 * 5-c77: the settle sleep stays. Removing it (5-c76) made tearing
++	 * measurable worse; 50 us is cheap next to a visible artefact.
 +	 */
++	mi8_gpu_sleep_us(50u);
 +
 +	if (checked_frames < 3u) {
 +		unsigned int vy, vx, hit = 0, tried = 0;
@@ -16269,10 +16269,13 @@ new file mode 100644
 +	if (panel_direct >= 0) {
 +		if (panel_direct == 0) {
 +			if (mi8_gpu_panel_stride_on() == 0 && mi8_gpu_panel_map() == 0) {
++				/* 5-c77: tell the CPU path what the scanout really uses. */
++				sweet_panel_set_pitch(mi8_gpu_panel_pitch());
 +				panel_direct = 1;
 +			} else {
 +				mi8_gpu_panel_stride_off();
-+					panel_direct = -1;
++				sweet_panel_set_pitch(0);
++				panel_direct = -1;
 +			}
 +		}
 +		if (panel_direct == 1) {
@@ -16280,6 +16283,7 @@ new file mode 100644
 +				return 0;
 +			}
 +			mi8_gpu_panel_stride_off();
++			sweet_panel_set_pitch(0);
 +			panel_direct = -1;
 +		}
 +	}
@@ -19172,7 +19176,36 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -65,6 +65,16 @@
+@@ -52,6 +52,28 @@
+  */
+ static uint64_t sweet_fb_swap_count;
+ 
++/*
++ * 5-c77: the scanout can run at a pitch the surface was not created with.
++ *
++ * The GPU path switches the panel to 4352 so A2D can write it directly; the
++ * CPU path still laid rows out at fRowBytes (4320), so every frame that fell
++ * back to the CPU was scanned at the wrong pitch and sheared. The GPU path
++ * publishes the real pitch here and the row copies below honour it.
++ */
++static uint32_t sweet_panel_pitch_override;
++
++extern "C" void
++sweet_panel_set_pitch(uint32_t pitch)
++{
++	sweet_panel_pitch_override = pitch;
++}
++
++static inline uint32_t
++sweet_panel_pitch(uint32_t fallback)
++{
++	return sweet_panel_pitch_override != 0 ? sweet_panel_pitch_override : fallback;
++}
++
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+@@ -65,6 +87,16 @@
  #include <kern/clock.h>
  #include <sys/proc.h>
  
@@ -19189,7 +19222,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -79,6 +89,9 @@
+@@ -79,6 +111,9 @@
  };
  
  #define SWEET_FB_SWAP_REC_SIZE          0x46c
@@ -19199,7 +19232,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  #define SWEET_FB_LAYERS                 4
  #define SWEET_FB_NOTIFY_TYPES           8
  #define SWEET_FB_NOTIFY_VSYNC           5
-@@ -123,6 +136,9 @@
+@@ -123,6 +158,9 @@
  OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
  
  class IOMobileFramebufferUserClient;
@@ -19209,7 +19242,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  
  class AppleCLCD : public IOMobileFramebuffer {
  	OSDeclareDefaultStructors(AppleCLCD);
-@@ -193,6 +209,12 @@
+@@ -193,6 +231,12 @@
  	IOLock       *fLock;            /* swaps and client list */
  	OSArray      *fClients;
  	uint32_t      fSwapID;
@@ -19222,7 +19255,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	bool          fConsolePaused;
  	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
  	bool          fDirty;
-@@ -218,6 +240,8 @@
+@@ -218,6 +262,8 @@
  	mach_port_t         fPort;
  	io_user_reference_t fFunc[SWEET_FB_NOTIFY_TYPES];
  	io_user_reference_t fRefcon[SWEET_FB_NOTIFY_TYPES];
@@ -19231,7 +19264,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-@@ -391,6 +415,7 @@
+@@ -391,6 +437,7 @@
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
  	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
@@ -19239,7 +19272,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fWorkLoop = IOWorkLoop::workLoop();
  	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
  		IOLog("SWEET FB: setup failed\n");
-@@ -706,6 +731,7 @@
+@@ -706,6 +753,7 @@
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
  			fb->fDirty = false;
@@ -19247,7 +19280,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  	}
  	IOLockUnlock(fb->fLock);
-@@ -896,6 +922,7 @@
+@@ -896,6 +944,7 @@
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -19255,7 +19288,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLockUnlock(fLock);
  	++sweet_fb_swap_count;
  	/*
-@@ -933,6 +960,8 @@
+@@ -933,6 +982,8 @@
  	}
  }
  
@@ -19264,7 +19297,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  void
  AppleCLCD::present(const uint8_t *rec)
  {
-@@ -960,6 +989,71 @@
+@@ -960,6 +1011,71 @@
  		if (!(mask & (1u << layer)) || id == 0) {
  			continue;
  		}
@@ -19336,7 +19369,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		SweetSurface *s = sweet_surface_copy(id);
  		if (sweet_fb_swaps_logged < 16) {
  			sweet_fb_swaps_logged++;
-@@ -971,6 +1065,72 @@
+@@ -971,6 +1087,72 @@
  		if (s == NULL || s == fSurface) {
  			OSSafeReleaseNULL(s);
  			continue;
@@ -19409,7 +19442,25 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
-@@ -1251,7 +1411,7 @@
+@@ -1185,7 +1367,7 @@
+ 					const uint32_t *srow = (const uint32_t *)(const void *)
+ 					    (src + s->offset + (uint64_t)syy * s->bytesPerRow);
+ 					uint32_t *drow = (uint32_t *)(void *)
+-					    (fPixels + (uint64_t)y * fRowBytes + (uint64_t)px0 * 4);
++					    (fPixels + (uint64_t)y * sweet_panel_pitch(fRowBytes) + (uint64_t)px0 * 4);
+ 					int32_t n = px1 - px0;
+ 					fBlitPixels += (uint64_t)n;
+ 					if (stage != NULL && ly == lastLy) {
+@@ -1237,7 +1419,7 @@
+ 					if (syy < sy || syy >= sy + h) {
+ 						continue;
+ 					}
+-					memcpy((void *)(fPixels + (uint64_t)y * fRowBytes + (uint64_t)px0 * 4),
++					memcpy((void *)(fPixels + (uint64_t)y * sweet_panel_pitch(fRowBytes) + (uint64_t)px0 * 4),
+ 					    (const void *)(src + s->offset +
+ 					    (uint64_t)syy * s->bytesPerRow + (uint64_t)sxc * 4),
+ 					    (size_t)(px1 - px0) * 4);
+@@ -1251,7 +1433,7 @@
  				fBlitMax = dt;
  			}
  			fBlitSum += dt;
@@ -19418,7 +19469,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				uint64_t nmin = 0, navg = 0, nmax = 0, nsum = 0, ngath = 0;
  				uint64_t us, mbs, perrow;
  				absolutetime_to_nanoseconds(fBlitMin, &nmin);
-@@ -1267,7 +1427,7 @@
+@@ -1267,7 +1449,7 @@
  				mbs = (fBlitPixels * 4) / us;
  				/* ns per gathered row, which is the number to watch */
  				perrow = fBlitGatherRows != 0 ? ngath / fBlitGatherRows : 0;
@@ -19427,7 +19478,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    fBlitFrames, nmin / 1000, navg / 1000, nmax / 1000, fBlitStage);
  				/*
  				 * The line that says where the time went. px is what
-@@ -1283,7 +1443,7 @@
+@@ -1283,7 +1465,7 @@
  				 * against 487200 gathers is not a difference, it is two
  				 * different counts.)
  				 */
@@ -19436,7 +19487,16 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				    "gather %llu rows %llu us (%llu ns/row), %llu dup rows\n",
  				    fBlitPixels, mbs, us, fBlitGatherRows, ngath / 1000,
  				    perrow, fBlitStage);
-@@ -1305,6 +1465,23 @@
+@@ -1297,7 +1479,7 @@
+ 		} else if (src != 0 && bpe == 4) {
+ 			fBlitsTotal++;
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++				memcpy((void *)(fPixels + (uint64_t)(dy + y) * sweet_panel_pitch(fRowBytes) + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
+@@ -1305,6 +1487,23 @@
  			fBadRects++;
  		}
  		s->release();
@@ -19460,7 +19520,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  }
  
-@@ -1453,7 +1630,51 @@
+@@ -1453,7 +1652,51 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
@@ -19513,7 +19573,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	default:
  		break;
  	}
-@@ -1477,3 +1698,18 @@
+@@ -1477,3 +1720,18 @@
  	return ret;
  }
  #endif /* SWEET */
