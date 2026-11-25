@@ -2,7 +2,7 @@ diff --git a/bsd/dev/mi8_adreno.c b/bsd/dev/mi8_adreno.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mi8_adreno.c
-@@ -0,0 +1,9785 @@
+@@ -0,0 +1,9813 @@
 +/*
 + * The GPU of the Xiaomi Mi 8 (dipper, SDM845): an Adreno 630 (chip id 0x06030001, "qcom,chipid" of the phone's
 + * own device tree), woken step by step. Only with boot-arg mi8gpu=N, which performs steps 1 to N and stops.
@@ -5692,6 +5692,8 @@ new file mode 100644
 +} blit_slots[MI8_BLIT_SLOTS];
 +static int blit_slot_next;
 +
++int mi8_gpu_done(uint32_t fence);
++
 +static int panel_direct_state;
 +
 +static vm_offset_t
@@ -5962,6 +5964,32 @@ new file mode 100644
 +	cp_wptr = ring_w & 8191u;
 +	keep_ring_at = cp_wptr;
 +	__asm__ volatile ("dsb sy" ::: "memory");
++
++	/*
++	 * 5-c78: how long does the panel blit actually take?
++	 *
++	 * Everything until now measured the submit path; the engine runs
++	 * asynchronously so its own cost was invisible. Tearing can only be
++	 * avoided if this fits inside the vertical blanking -- measure it on
++	 * the first three frames, then never again.
++	 */
++	{
++		static int probe_frames;
++
++		if (probe_frames < 3) {
++			uint64_t t0 = mach_absolute_time(), ns = 0;
++			int w = 0;
++
++			probe_frames++;
++			while (!mi8_gpu_done(BS_FENCE) && w < 5000) {
++				mi8_gpu_sleep_us(10u);
++				w++;
++			}
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			printf("mi8gpu: step 73 BLITTIME %llu us (polls %d, %s)%c",
++			    ns / 1000ull, w, mi8_gpu_done(BS_FENCE) ? "done" : "timeout", 10);
++		}
++	}
 +	return 0;
 +}
 +/*
